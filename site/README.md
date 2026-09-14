@@ -23,9 +23,9 @@ npm run preview    # serve dist/ on http://127.0.0.1:4173
 
 ## Deploy to Vercel
 
-Import this repository and set **Root Directory** to `site`. Vercel detects Vite, so the build
-command (`npm run build`) and output directory (`dist`) come from the framework preset;
-`vercel.json` rewrites every path to `index.html` so deep links reach the router.
+Import the repository as it is and leave **Root Directory** empty. The `vercel.json` at the repository
+root installs and builds this package and serves `site/dist`, so no dashboard setting is needed; it
+also rewrites every path to `index.html` so deep links reach the router. Every push to `main` redeploys.
 
 ## What lives where
 
