@@ -42,7 +42,7 @@ target/aarch64-apple-darwin/release/bundle/macos/MonHop.app/Contents/MacOS/monho
 open target/aarch64-apple-darwin/release/bundle/macos/MonHop.app
 ```
 
-The UI's JavaScript is linted with oxlint and formatted with oxfmt, both pinned to exact versions in package.json. Run `npm ci` once, then `npm run lint` and `npm run fmt:check` (or `npm run fmt` to rewrite); `scripts/verify.sh` and `scripts/verify.ps1` already run both.
+The UI's JavaScript is linted with oxlint and formatted with oxfmt, both pinned to exact versions in package.json. Run `pnpm install --frozen-lockfile` once, then `pnpm run lint` and `pnpm run fmt:check` (or `pnpm run fmt` to rewrite); `scripts/verify.sh` and `scripts/verify.ps1` already run both.
 
 The one-time signing setup creates a dedicated development certificate and private key in your login Keychain. It does not change certificate trust, TCC permissions or MonHop's peer identity. Subsequent builds reuse that identity rather than generating a new one. Inspect it with `bash scripts/macos-signing.sh inspect`. Missing or invalid signing state is an error, never an automatic replacement.
 

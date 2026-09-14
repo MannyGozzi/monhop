@@ -9,8 +9,8 @@
     },
     {
       "name": "monhop-site",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["--prefix", "site", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "site", "run", "dev", "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
       "port": 5173
     }
   ]

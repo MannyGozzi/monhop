@@ -5,10 +5,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test -p tauri-runtime-wry --lib --locked navigation_tests
-npm ci --no-fund --no-audit
-npm run --silent lint
-npm run --silent fmt:check
-npm run --silent test:ui
+pnpm install --frozen-lockfile
+pnpm run --silent lint
+pnpm run --silent fmt:check
+pnpm run --silent test:ui
 python3 -m unittest discover -s scripts/tests -p test_icons.py
 python3 -m unittest discover -s scripts/tests -p test_changelog.py
 python3 -m unittest discover -s scripts/tests -p test_release.py
