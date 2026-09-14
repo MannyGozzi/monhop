@@ -26,11 +26,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: package-lock.json
+          node-version-file: package.json
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.20.2,cargo-audit@0.22.2
@@ -56,15 +57,16 @@ jobs:
         working-directory: site
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: site/package-lock.json
-      - run: npm ci --no-fund --no-audit
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm run build
+          node-version-file: site/package.json
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm run lint
+      - run: pnpm run build
 
   scripts:
     # macOS because scripts/tests/test_macos_signing.py typechecks the Swift signer with xcrun.

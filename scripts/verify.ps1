@@ -12,13 +12,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
     cargo test -p tauri-runtime-wry --lib --locked navigation_tests
     if ($LASTEXITCODE -ne 0) { throw 'Desktop navigation tests failed.' }
-    npm ci --no-fund --no-audit
-    if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
-    npm run --silent lint
+    pnpm install --frozen-lockfile
+    if ($LASTEXITCODE -ne 0) { throw 'pnpm install failed.' }
+    pnpm run --silent lint
     if ($LASTEXITCODE -ne 0) { throw 'oxlint failed.' }
-    npm run --silent fmt:check
+    pnpm run --silent fmt:check
     if ($LASTEXITCODE -ne 0) { throw 'oxfmt check failed.' }
-    npm run --silent test:ui
+    pnpm run --silent test:ui
     if ($LASTEXITCODE -ne 0) { throw 'Setup UI model tests failed.' }
     python -m unittest discover -s scripts/tests -p test_icons.py
     if ($LASTEXITCODE -ne 0) { throw 'Logo asset tests failed.' }

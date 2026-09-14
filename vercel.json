@@ -1,7 +1,0 @@
-{
-  "installCommand": "cd site && npm ci --no-fund --no-audit",
-  "buildCommand": "cd site && npm run build",
-  "outputDirectory": "site/dist",
-  "framework": null,
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
-}
