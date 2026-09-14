@@ -1,23 +1,12 @@
 name: build
 
-# Builds the signed updater bundles for macOS (Apple silicon and Intel) and Windows. With publish the
-# three jobs share one draft release and merge latest.json into it; without it they only leave artifacts.
+# Builds stay independent. The release workflow assembles and publishes their artifacts once.
 on:
   workflow_dispatch:
-    inputs:
-      publish:
-        description: Upload the bundles into a draft release for the current tag.
-        type: boolean
-        default: false
   workflow_call:
-    inputs:
-      publish:
-        description: Upload the bundles into a draft release for the current tag.
-        type: boolean
-        default: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -36,82 +25,65 @@ jobs:
             args: --target x86_64-apple-darwin --bundles app,dmg
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            args: --bundles nsis
+            args: --target x86_64-pc-windows-msvc --bundles nsis
     runs-on: ${{ matrix.platform }}
-    env:
-      # bundle.createUpdaterArtifacts is on, so a build without the signing key fails rather than
-      # shipping an unsigned update. Apple signing and notarization start once those secrets exist.
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require the updater signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo 'Configure TAURI_SIGNING_PRIVATE_KEY in repository Actions secrets before building.' >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
         with:
           targets: ${{ matrix.target }}
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
-      # The Windows image ships no `python3`; this adds the symlink the two script steps below call.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
       - name: Install the pinned Tauri CLI
         run: cargo install tauri-cli --version 2.11.4 --locked
       - name: Check the dependency reports
         run: python3 scripts/dependencies.py --check
-      - name: Refuse to publish from anything but a version tag
-        if: inputs.publish && github.ref_type != 'tag'
-        run: |
-          echo "publish needs a v tag; this run is on $GITHUB_REF_TYPE $GITHUB_REF_NAME." >&2
-          exit 1
-      - name: Read the release notes for the tag
-        id: notes
-        if: inputs.publish
-        shell: bash
-        run: |
-          {
-            echo 'body<<MONHOP_NOTES'
-            python3 scripts/changelog.py notes "${GITHUB_REF_NAME#v}"
-            echo 'MONHOP_NOTES'
-          } >> "$GITHUB_OUTPUT"
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         id: tauri
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          tauriScript: cargo tauri
-          args: ${{ matrix.args }}
-          # An empty tagName leaves the action building only: with no releaseId it skips every upload.
-          tagName: ${{ inputs.publish && github.ref_name || '' }}
-          releaseName: ${{ inputs.publish && format('MonHop {0}', github.ref_name) || '' }}
-          releaseBody: ${{ steps.notes.outputs.body }}
-          releaseDraft: true
-          prerelease: false
-          includeUpdaterJson: true
-          updaterJsonPreferNsis: true
+          projectPath: apps/monhop-desktop
+          tauriScript: python3 ../../scripts/tauri_ci.py
+          args: ${{ matrix.args }} --ci -- --locked
+          includeUpdaterJson: false
       - name: Collect the bundle paths
         id: bundles
-        if: ${{ !inputs.publish }}
         shell: bash
         env:
           BUNDLES: ${{ steps.tauri.outputs.artifactPaths }}
         run: |
-          # tauri-action@v0 has no uploadWorkflowArtifacts input, and its .app entry is a directory
-          # superseded by the signed .app.tar.gz beside it.
+          # The signed archive supersedes the .app directory in downloadable artifacts.
           {
             echo 'paths<<MONHOP_BUNDLES'
             printf '%s' "$BUNDLES" | jq -er '.[] | select(endswith(".app") | not)'
             echo 'MONHOP_BUNDLES'
           } >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
-        if: ${{ !inputs.publish }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: monhop-${{ matrix.target }}
           path: ${{ steps.bundles.outputs.paths }}
           if-no-files-found: error
+          overwrite: true

@@ -29,6 +29,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ### Fixed
 
+- Publish downloads only after both Mac installers, the Windows installer, and all update files are assembled together.
 - Crossing slowly no longer sticks the pointer at the seam, and a display the layout leaves out no longer swallows it.
 - A brief stall on the network now holds the session and says it is reconnecting, instead of dropping it and starting over.
 - Pausing, switching computers, or quitting tells the other computer at once, so it no longer reports a drop that never happened.
