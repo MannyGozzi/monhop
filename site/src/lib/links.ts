@@ -6,7 +6,7 @@ export const links = {
   releasesPage: `https://github.com/${repo}/releases`,
   releasesApi: `https://api.github.com/repos/${repo}/releases/latest`,
   sponsor: 'https://github.com/sponsors/MannyGozzi',
-  site: 'https://monhop.app',
+  site: 'https://www.monhop.com',
 } as const
 
 export const product = {
