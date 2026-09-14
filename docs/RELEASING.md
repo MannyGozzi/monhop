@@ -18,17 +18,29 @@ Nothing leaves the machine until you push. Pass `--push` to the script, or run t
 
 ## What the tag does
 
-The tag runs the full gate set (the same one `main` runs: the Rust gates on macOS and Windows, the site build, the script tests, the audits and the dependency report check), then builds three signed bundles (Apple silicon, Intel, and the Windows installer) and uploads them into a single draft release with the changelog notes as the body.
+The tag first checks that its version matches the workspace and has release notes, and that the repository is public. A private repository cannot serve the website's unauthenticated download links. The workflow never changes repository visibility itself.
 
-A last job holds the door. It refuses to publish unless the tag matches the workspace version, the tag has exactly one release, and `latest.json` carries a signed bundle for all three platforms. Only then does the release go public and become the latest one. That order matters: the updater reads only the newest published release, so a half-built one can never reach anybody.
+It then runs the full gate set and builds Apple-silicon, Intel-Mac, and Windows installers in parallel. Each builder uploads a separate workflow artifact and has no release-write permission. You can also run the `build` workflow manually to test packaging without creating a release.
 
-On the release page, check that the notes read like the changelog you wrote, that all three installers are there with a signature file each and `latest.json` beside them, and that the release is published, marked latest, and not a prerelease. Then let an installed copy check for the update and take it.
+One final job downloads all three artifacts. `scripts/assemble_release.py` requires both DMGs, both Mac updater archives, the Windows installer, and the updater signature files. It gives the Mac archives distinct architecture-specific names and writes `latest.json` once, with version-tagged download URLs. Missing or empty files stop publication. Signature files come from the Tauri build; the assembly step checks their presence, not their cryptographic validity.
+
+The publisher creates one draft, uploads the complete asset set, compares the uploaded names and sizes, then publishes it as latest. A failed upload leaves the draft unpublished. Re-running a failed publish may resume that draft, but never overwrite an already published release. Releases are serialized so separate tags cannot publish concurrently. If only the post-publication public-access check fails, investigate the published release rather than re-running the upload against it.
+
+The final check requests the latest-release API and every download without authentication. The website discovers the versioned DMG and EXE names from that public API, so no website rebuild is needed for a new release. Also test an installed copy's update check and installation before calling the release verified end to end.
 
 ## Secrets the workflow needs
 
-`TAURI_SIGNING_PRIVATE_KEY` is the maintainer's updater signing key; its public half is built into the app, and a build without the key fails rather than shipping an unsigned update. `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` must exist but is empty, because the key is stored without one.
+`TAURI_SIGNING_PRIVATE_KEY` must contain the existing updater private key, not its path. Its public half is built into the app. Do not generate a replacement key for CI: existing installations would reject updates signed with it. Builds check for the key before installing the toolchain and fail instead of producing unsigned updater artifacts.
 
-Apple signing and notarization are optional: set `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` to sign and notarize the Mac builds. Until they exist the Mac app is ad hoc signed and macOS asks the person installing it to allow the app by hand.
+The maintainer's local key is at `~/.tauri/monhop-updater.key`. With explicit authorization to send it to this repository's GitHub Actions secrets, configure it without printing it:
+
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY --repo MannyGozzi/monhop < "$HOME/.tauri/monhop-updater.key"
+```
+
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is optional for the current unencrypted key. An absent secret resolves to an empty value. For an encrypted key, set the matching password separately and never commit either value. Keep a separate encrypted backup in a password manager: GitHub can use a saved secret but does not provide its value for recovery.
+
+Apple signing and notarization are optional: set `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` to sign and notarize the Mac builds. Until they exist the Mac app is ad hoc signed and macOS asks the person installing it to allow the app by hand. The CI wrapper omits absent Apple credentials instead of passing empty certificate values to Tauri; partially configured credentials fail with a setup error.
 
 ## Rolling back
 

@@ -12,6 +12,8 @@ pnpm run --silent test:ui
 python3 -m unittest discover -s scripts/tests -p test_icons.py
 python3 -m unittest discover -s scripts/tests -p test_changelog.py
 python3 -m unittest discover -s scripts/tests -p test_release.py
+python3 -m unittest discover -s scripts/tests -p test_assemble_release.py
+python3 -m unittest discover -s scripts/tests -p test_tauri_ci.py
 if [[ "$(uname -s)" == Darwin ]]; then
   python3 -m unittest discover -s scripts/tests -p test_macos_signing.py
 fi

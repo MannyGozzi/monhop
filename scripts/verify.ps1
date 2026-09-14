@@ -26,6 +26,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Changelog tests failed.' }
     python -m unittest discover -s scripts/tests -p test_release.py
     if ($LASTEXITCODE -ne 0) { throw 'Release script tests failed.' }
+    python -m unittest discover -s scripts/tests -p test_assemble_release.py
+    if ($LASTEXITCODE -ne 0) { throw 'Release asset tests failed.' }
+    python -m unittest discover -s scripts/tests -p test_tauri_ci.py
+    if ($LASTEXITCODE -ne 0) { throw 'CI signing environment tests failed.' }
     cargo build --workspace --release --locked
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
     if (-not $Offline) {
