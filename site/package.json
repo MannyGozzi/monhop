@@ -2,6 +2,9 @@
   "name": "monhop-site",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": "24.x"
+  },
   "type": "module",
   "license": "GPL-3.0-or-later",
   "scripts": {

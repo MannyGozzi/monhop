@@ -1,6 +1,9 @@
 {
   "private": true,
   "name": "monhop-tooling",
+  "engines": {
+    "node": "24.x"
+  },
   "type": "module",
   "scripts": {
     "lint": "oxlint",
