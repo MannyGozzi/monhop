@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "monhop-ui-preview",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-c", "import http.server,functools;H=type('H',(http.server.SimpleHTTPRequestHandler,),{'end_headers':lambda s:(s.send_header('Cache-Control','no-store'),http.server.SimpleHTTPRequestHandler.end_headers(s))});http.server.ThreadingHTTPServer(('127.0.0.1',8765),functools.partial(H,directory='apps/monhop-desktop/ui')).serve_forever()"],
+      "port": 8765
+    },
+    {
+      "name": "monhop-site",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "site", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
+      "port": 5173
+    }
+  ]
+}

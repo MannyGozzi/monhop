@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>MonHop</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell" aria-labelledby="page-title">
+      <header class="window-header" data-tauri-drag-region="deep">
+        <div class="window-heading" data-tauri-drag-region="deep">
+          <span class="app-mark" aria-hidden="true"></span>
+          <span class="window-product">MonHop</span>
+          <h1 id="page-title" class="visually-hidden">MonHop</h1>
+          <nav class="primary-nav" id="primary-nav" aria-label="MonHop navigation">
+            <button type="button" data-page="home">Home</button>
+            <button type="button" data-page="setup">Set up</button>
+          </nav>
+        </div>
+        <div class="window-header-end">
+          <div class="status-pill" id="header-connection" role="status" aria-live="polite">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="native-state">Not checked</span>
+          </div>
+          <span id="header-actions"></span>
+          <div class="window-controls" id="window-controls" aria-label="Window controls" hidden>
+            <button class="caption-button" type="button" data-window-action="minimize" aria-label="Minimize window"><svg class="lucide lucide-minus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14" /></svg></button>
+            <button class="caption-button" type="button" data-window-action="maximize" aria-label="Maximize or restore window"><svg class="lucide lucide-square" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2" /></svg></button>
+            <button class="caption-button caption-close" type="button" data-window-action="close" aria-label="Close window"><svg class="lucide lucide-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
+          </div>
+        </div>
+      </header>
+
+      <div class="content-region">
+        <div class="page-alert" id="page-alert" role="alert" hidden></div>
+
+        <section class="app-page" id="home-view" aria-label="Home" hidden>
+          <div id="home-content" class="stack"></div>
+        </section>
+
+        <section class="app-page setup-page" id="setup-view" aria-label="Set up" hidden>
+          <section class="setup-section" data-section="ready" data-locked="false" aria-labelledby="permissions-title">
+            <header class="section-header">
+              <span class="section-index" data-mark="1" aria-hidden="true">1</span>
+              <div class="section-heading">
+                <h2 id="permissions-title">Get ready</h2>
+                <p class="section-status" id="ready-status">Checking this computer.</p>
+              </div>
+              <span class="section-actions" id="ready-actions"></span>
+            </header>
+            <div class="section-body" id="ready-body">
+              <section class="overview" aria-label="Setup status">
+                <div class="overview-copy"><strong id="setup-verdict">Checking this computer</strong><span id="setup-detail">This takes a moment.</span></div>
+                <section class="accordion" data-accordion data-disclosure="overview-details" data-open="false">
+                  <button class="accordion-trigger" type="button" id="overview-details-trigger" data-accordion-trigger data-focus-key="disclosure-overview-details" aria-expanded="false" aria-controls="overview-details-content"><span class="accordion-label">Details</span><svg class="lucide lucide-chevron-right accordion-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg></button>
+                  <div class="accordion-panel" id="overview-details-content" role="region" aria-labelledby="overview-details-trigger" hidden inert><div class="accordion-panel-inner launch-attribution" id="launch-attribution"></div></div>
+                </section>
+              </section>
+              <div id="permissions-content" class="stack"></div>
+              <div id="interface-content" class="stack"></div>
+            </div>
+          </section>
+
+          <section class="setup-section" data-section="computers" data-locked="true" aria-labelledby="computers-title">
+            <header class="section-header">
+              <span class="section-index" data-mark="2" aria-hidden="true">2</span>
+              <div class="section-heading">
+                <h2 id="computers-title">Computers</h2>
+                <p class="section-status" id="computers-status">Finish Get ready first</p>
+              </div>
+              <span class="section-actions" id="computers-actions"></span>
+            </header>
+            <div class="section-body" id="computers-body">
+              <div id="computers-content" class="stack"></div>
+            </div>
+          </section>
+
+          <section class="setup-section" data-section="displays" data-locked="true" aria-labelledby="displays-title">
+            <header class="section-header">
+              <span class="section-index" data-mark="3" aria-hidden="true">3</span>
+              <div class="section-heading">
+                <h2 id="displays-title">Displays</h2>
+                <p class="section-status" id="displays-status">Pair a computer first</p>
+              </div>
+              <span class="section-actions" id="displays-actions"></span>
+            </header>
+            <div class="section-body" id="displays-body">
+              <div id="displays-content" class="stack"></div>
+            </div>
+          </section>
+        </section>
+
+        <section class="app-page" id="settings-view" aria-label="Settings" hidden>
+          <div id="settings-content" class="stack"></div>
+        </section>
+      </div>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

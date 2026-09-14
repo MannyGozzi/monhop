@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-save-setup"
+description = "Enables the sharing_save_setup command without any pre-configured scope."
+commands.allow = ["sharing_save_setup"]
+
+[[permission]]
+identifier = "deny-sharing-save-setup"
+description = "Denies the sharing_save_setup command without any pre-configured scope."
+commands.deny = ["sharing_save_setup"]

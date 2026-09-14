@@ -1,0 +1,46 @@
+[package]
+name = "monhop-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+monhop-core = { path = "../../crates/monhop-core", version = "=0.1.0" }
+monhop-transport = { path = "../../crates/monhop-transport", version = "=0.1.0" }
+monhop-protocol = { path = "../../crates/monhop-protocol", version = "=0.1.0" }
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+monhop-platform-macos = { path = "../../crates/monhop-platform-macos", version = "=0.1.0" }
+monhop-platform-windows = { path = "../../crates/monhop-platform-windows", version = "=0.1.0" }
+log = "=0.4.34"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
+tauri = { version = "=2.11.5", default-features = false, features = ["wry", "compression", "common-controls-v6", "custom-protocol", "tray-icon", "macos-private-api"] }
+tauri-plugin-updater = "=2.11.0"
+
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+arboard = { version = "=3.6.1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "=0.6.2", default-features = false, features = ["std"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGEvent", "CGEventTypes", "objc2"] }
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWorkspace", "NSScreen", "NSGraphics", "NSWindow", "NSView", "NSEvent", "NSResponder", "NSColor", "NSAnimation", "NSAnimationContext", "block2", "objc2-core-graphics"] }
+objc2-core-location = { version = "=0.3.2", default-features = false, features = ["std", "CLLocationManager", "CLLocationManagerDelegate"] }
+objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSDictionary", "NSValue", "NSProcessInfo", "NSNotification", "NSOperation", "NSError"] }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "=0.38.2"
+windows = { version = "=0.61.3", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", default-features = false, features = ["config-json"] }
+
+[dev-dependencies]
+zeroize = "=1.9.0"
+
+[lints]
+workspace = true

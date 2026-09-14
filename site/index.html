@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>MonHop — One keyboard. All your computers.</title>
+    <meta
+      name="description"
+      content="MonHop shares one keyboard and mouse between the Macs and Windows PCs on your own network. Move the pointer across the edge of the screen and the keyboard follows. Free and open source."
+    />
+    <meta name="theme-color" content="#fbf9f6" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#17181c" media="(prefers-color-scheme: dark)" />
+    <meta name="color-scheme" content="light dark" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="MonHop" />
+    <meta property="og:title" content="MonHop — One keyboard. All your computers." />
+    <meta
+      property="og:description"
+      content="Share one keyboard and mouse between every Mac and Windows PC on your desk, entirely on your own network."
+    />
+    <meta property="og:url" content="https://monhop.app/" />
+    <meta property="og:image" content="https://monhop.app/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="MonHop — One keyboard. All your computers." />
+    <meta
+      name="twitter:description"
+      content="Share one keyboard and mouse between every Mac and Windows PC on your desk, entirely on your own network."
+    />
+    <meta name="twitter:image" content="https://monhop.app/og.png" />
+
+    <script>
+      // Paint the stored theme before first paint so the page never flashes the wrong ground.
+      (function () {
+        try {
+          var stored = localStorage.getItem('monhop-theme')
+          var dark =
+            stored === 'dark' ||
+            ((!stored || stored === 'system') &&
+              matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.classList.toggle('dark', dark)
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+        } catch (error) {
+          void error
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

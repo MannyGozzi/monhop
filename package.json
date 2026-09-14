@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "name": "monhop-tooling",
+  "type": "module",
+  "scripts": {
+    "lint": "oxlint",
+    "fmt": "oxfmt apps/monhop-desktop/ui/*.mjs apps/monhop-desktop/ui/*.js",
+    "fmt:check": "oxfmt --check apps/monhop-desktop/ui/*.mjs apps/monhop-desktop/ui/*.js",
+    "test:ui": "node --test apps/monhop-desktop/ui/*.test.mjs"
+  },
+  "devDependencies": {
+    "oxlint": "1.82.0",
+    "oxfmt": "0.67.0"
+  }
+}

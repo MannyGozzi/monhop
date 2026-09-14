@@ -1,0 +1,144 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/inter";
+
+/* Theme is a class on <html>, so the variant must match the root element itself as well as its subtree. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+    --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    --color-ink: var(--ink);
+    --color-glow: var(--glow);
+    --color-seam: var(--seam);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    --background: oklch(0.985 0.004 85);
+    --foreground: oklch(0.17 0.008 70);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.17 0.008 70);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.17 0.008 70);
+    --primary: oklch(0.575 0.205 25);
+    --primary-foreground: oklch(0.99 0.005 25);
+    --secondary: oklch(0.955 0.004 80);
+    --secondary-foreground: oklch(0.24 0.008 70);
+    --muted: oklch(0.955 0.004 80);
+    --muted-foreground: oklch(0.455 0.01 70);
+    --accent: oklch(0.955 0.004 80);
+    --accent-foreground: oklch(0.24 0.008 70);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.895 0.005 80);
+    --input: oklch(0.885 0.005 80);
+    --ring: oklch(0.575 0.205 25);
+    --radius: 0.75rem;
+
+    /* Brand tokens the marketing surfaces read directly. */
+    --ink: oklch(0.545 0.21 25);
+    --glow: oklch(0.62 0.17 275);
+    --seam: oklch(0.575 0.205 25);
+    --surface-veil: color-mix(in oklab, white 72%, transparent);
+    --surface-edge: color-mix(in oklab, white 85%, transparent);
+    --grid-line: color-mix(in oklab, oklch(0.17 0.008 70) 7%, transparent);
+    color-scheme: light;
+}
+
+.dark {
+    --background: oklch(0.13 0.005 260);
+    --foreground: oklch(0.965 0.003 85);
+    --card: oklch(0.175 0.006 260);
+    --card-foreground: oklch(0.965 0.003 85);
+    --popover: oklch(0.185 0.006 260);
+    --popover-foreground: oklch(0.965 0.003 85);
+    --primary: oklch(0.715 0.19 23);
+    --primary-foreground: oklch(0.16 0.02 25);
+    --secondary: oklch(0.245 0.006 260);
+    --secondary-foreground: oklch(0.965 0.003 85);
+    --muted: oklch(0.235 0.006 260);
+    --muted-foreground: oklch(0.72 0.008 260);
+    --accent: oklch(0.245 0.006 260);
+    --accent-foreground: oklch(0.965 0.003 85);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 11%);
+    --input: oklch(1 0 0 / 16%);
+    --ring: oklch(0.715 0.19 23);
+
+    --ink: oklch(0.755 0.16 25);
+    --glow: oklch(0.66 0.16 278);
+    --seam: oklch(0.715 0.19 23);
+    --surface-veil: color-mix(in oklab, white 5%, transparent);
+    --surface-edge: color-mix(in oklab, white 12%, transparent);
+    --grid-line: color-mix(in oklab, white 6%, transparent);
+    color-scheme: dark;
+}
+
+@layer base {
+    * {
+        @apply border-border outline-ring/50;
+    }
+    html {
+        @apply font-sans;
+        scroll-behavior: smooth;
+        scroll-padding-top: 6.5rem;
+        -webkit-text-size-adjust: 100%;
+    }
+    body {
+        @apply bg-background text-foreground antialiased;
+        font-feature-settings: "cv11", "ss01";
+        overflow-x: hidden;
+    }
+    ::selection {
+        background: color-mix(in oklab, var(--ink) 28%, transparent);
+    }
+    @media (prefers-reduced-motion: reduce) {
+        html {
+            scroll-behavior: auto;
+        }
+    }
+}
+
+@utility glass {
+    background: var(--surface-veil);
+    border: 1px solid var(--border);
+    box-shadow:
+        inset 0 1px 0 var(--surface-edge),
+        0 1px 2px oklch(0 0 0 / 5%),
+        0 18px 40px -28px oklch(0 0 0 / 35%);
+    backdrop-filter: blur(20px) saturate(150%);
+}
+
+/* Faint dot lattice behind feature and step sections. */
+@utility dot-grid {
+    background-image: radial-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 22px 22px;
+    background-position: -1px -1px;
+}
+

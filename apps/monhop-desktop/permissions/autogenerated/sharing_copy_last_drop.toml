@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-copy-last-drop"
+description = "Enables the sharing_copy_last_drop command without any pre-configured scope."
+commands.allow = ["sharing_copy_last_drop"]
+
+[[permission]]
+identifier = "deny-sharing-copy-last-drop"
+description = "Denies the sharing_copy_last_drop command without any pre-configured scope."
+commands.deny = ["sharing_copy_last_drop"]

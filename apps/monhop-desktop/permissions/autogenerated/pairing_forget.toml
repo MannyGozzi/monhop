@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pairing-forget"
+description = "Enables the pairing_forget command without any pre-configured scope."
+commands.allow = ["pairing_forget"]
+
+[[permission]]
+identifier = "deny-pairing-forget"
+description = "Denies the pairing_forget command without any pre-configured scope."
+commands.deny = ["pairing_forget"]

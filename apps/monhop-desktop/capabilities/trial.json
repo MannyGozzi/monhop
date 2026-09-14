@@ -1,0 +1,14 @@
+{
+  "identifier": "trial",
+  "description": "One-use bounded self-window input test. No setup, trust, clipboard or general input enable commands.",
+  "windows": [
+    "controlled-trial"
+  ],
+  "local": true,
+  "permissions": [
+    "allow-trial-start",
+    "allow-trial-status",
+    "allow-trial-stop",
+    "allow-trial-close"
+  ]
+}

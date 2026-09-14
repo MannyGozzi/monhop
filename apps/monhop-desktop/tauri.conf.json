@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MonHop",
+  "identifier": "com.manuelgozzi.monhop",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+      "capabilities": [
+        "setup",
+        "trial"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-",
+      "files": {
+        "Library/LaunchAgents/com.manuelgozzi.monhop.login.plist": "macos/com.manuelgozzi.monhop.login.plist"
+      }
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "skip"
+      }
+    },
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../../LICENSE": "licenses/MonHop-LICENSE.txt",
+      "../../THIRD_PARTY_LICENSES.md": "licenses/THIRD_PARTY_LICENSES.md",
+      "../../docs/dependencies/THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
+      "../../docs/dependencies/sbom.cdx.json": "licenses/sbom.cdx.json"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDczQjAzQTQ1REI5MzRCMTcKUldRWFM1UGJSVHF3Yzk3Q3lSM2g5YUtIYVZ4ZnY0bm8wSUpFZ0tmazY5UEc0M1p4TVdya1lDZnMK",
+      "endpoints": [
+        "https://github.com/MannyGozzi/monhop/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

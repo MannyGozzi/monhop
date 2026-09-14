@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-apply-setup"
+description = "Enables the sharing_apply_setup command without any pre-configured scope."
+commands.allow = ["sharing_apply_setup"]
+
+[[permission]]
+identifier = "deny-sharing-apply-setup"
+description = "Denies the sharing_apply_setup command without any pre-configured scope."
+commands.deny = ["sharing_apply_setup"]

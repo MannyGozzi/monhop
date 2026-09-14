@@ -1,0 +1,13 @@
+# A network change notice never ends a session by itself
+
+Both network watchers (crates/monhop-platform-macos/src/network_watch.rs, crates/monhop-platform-windows/src/network_watch.rs) run the transport's `pinned_check` (crates/monhop-transport/src/guarded_endpoint/native.rs) on every notice. The check is the session's own revalidation: the selected adapter must read back with the same identity, address, prefix, and state, its Wi-Fi attachment (network signature) must match, the peer must still be on-link, and the best route to the peer must use the selected interface with no gateway. It runs `NetworkLock::revalidate` against a private copy of the lock, so a notice revokes only when a real change is observed; anything unreadable, a panic, or a notice before the first snapshot also revokes (fail closed).
+
+Why: on 2026-09-13 build 100's log showed the Mac revoking healthy 173 s and 480 s sessions on bursts of 12 to 15 dynamic-store notices; build 101's log named them: Wi-Fi driver sub-keys under State:/Network/Interface/en0/AirPort (BusyUI, AWDLRealTimeMode, BluetoothPagingInProgress, SmartCCA*). The old watcher treated every notice as a change to the selected interface, and the supervisor reconnected at once: that was the connect/drop loop. The Windows watcher had the same shape (any MIB interface, address, or route change on any adapter).
+
+Rules:
+- macOS subscribes only to `State:/Network/Interface/<selected>/.*` and `State:/Network/Global/IPv4`, and every notice runs the full check (CoreWLAN attachment read included) on the watch's serial queue.
+- Windows runs the full check from IP Helper (MIB) callbacks only. Attachment-relevant WLAN events on the selected adapter still revoke outright, because the check queries WLAN state and a WLAN callback must not open or close WLAN handles.
+- An adapter-fields-only comparison is not enough (Astra review, 2026-09-13): it misses a same-address network switch and a gateway route added on the selected NIC.
+- macOS also reads a PF_ROUTE socket (`network::RouteObserver`, thread monhop-route-watch): an IPv4 route added, deleted, or changed on the selected interface (link-layer entries excluded) runs the same check, because the dynamic store never carries kernel routes.
+- Windows revokes outright, without the check, when the selected interface row or its pinned address row is deleted (MibDeleteInstance), because a later add can restore the same values before the check runs and the contract treats the loss as final.
+- Ignored notices log the changed keys at debug; revocations log at warn. Keys name interfaces and services only, never values.

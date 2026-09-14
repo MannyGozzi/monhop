@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-set-active"
+description = "Enables the sharing_set_active command without any pre-configured scope."
+commands.allow = ["sharing_set_active"]
+
+[[permission]]
+identifier = "deny-sharing-set-active"
+description = "Denies the sharing_set_active command without any pre-configured scope."
+commands.deny = ["sharing_set_active"]

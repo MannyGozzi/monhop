@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pairing-open"
+description = "Enables the pairing_open command without any pre-configured scope."
+commands.allow = ["pairing_open"]
+
+[[permission]]
+identifier = "deny-pairing-open"
+description = "Denies the pairing_open command without any pre-configured scope."
+commands.deny = ["pairing_open"]

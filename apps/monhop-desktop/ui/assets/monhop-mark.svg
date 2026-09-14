@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="currentColor" role="img" aria-labelledby="title">
+  <title id="title">MonHop: one pointer, three devices</title>
+  <path d="M27 24C32 24 32 14 42 14V18C35 18 36 28 30 28Z"/>
+  <path d="M33 30H42V34H33Z"/>
+  <path d="M34 39C40 39 39 47 42 47V51C35 51 36 43 34 43Z"/>
+  <rect x="46" y="9" width="13" height="13" rx="3"/>
+  <rect x="46" y="26" width="13" height="13" rx="3"/>
+  <rect x="46" y="43" width="13" height="13" rx="3"/>
+  <path d="M8.6 20.4C7.2 19.3 5.7 20.4 6 22.1L9.9 48.1C10.2 50.1 11.9 50.7 13.2 49.2L17.1 44.4L23.4 53.2C24.2 54.3 25.6 54.5 26.7 53.7L29.2 51.9C30.3 51.1 30.5 49.7 29.7 48.6L24.2 41L30.5 39.3C32.4 38.8 32.8 37 31.3 35.8Z"/>
+</svg>

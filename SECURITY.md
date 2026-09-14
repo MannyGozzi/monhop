@@ -1,0 +1,44 @@
+# MonHop security policy
+
+## System and scope
+
+MonHop shares physical keyboard and mouse control between a Windows workstation and an Apple Silicon Mac. Review all original Rust code, configuration, packaging, dependency choices and operational scripts. The user explicitly requires local-only operation and no administrative helper in the first version. A safe prototype is preferred over exposing incomplete remote input control.
+
+The assets are the user's ability to regain local control, the confidentiality of their input, device identity private keys, paired-peer trust, monitor topology integrity and the guarantee that no input reaches an unselected machine or network.
+
+Screen dimming is MonHop's own: its overlays are click-through, excluded from capture, and never displays or input targets; its shortcut is a single system-wide chord registration, not a hook, and it is the only listener the app installs at startup. The former Monitor Ctrl dimmer is a separate application; MonHop must not change its installed files, startup entry, Ctrl+Alt+0 binding, capture exclusion or monitor state as an incidental build/run action.
+
+## Threat model and boundaries
+
+An attacker may control another LAN device, packet timing and contents, a MITM path during pairing, a previously paired but now malicious peer, or a newly appearing VPN/virtual adapter. A network attachment can change without changing the local IP address. Packets can be replayed, reordered, truncated, duplicated, delayed and sent at excessive rates. Network input remains untrusted after authentication.
+
+The local owner explicitly chooses the interface, peer and trust relationship. A pinned peer receives keyboard/mouse control only during an explicitly enabled session. An enabled peer can operate normal desktop applications with that input, including terminals. The protocol itself has no shell, file, clipboard or arbitrary RPC operations. Pairing therefore establishes trust in the other physical computer, not a sandbox around its desktop input. Any additional protocol capability needs a new user request and threat-model review.
+
+Trust boundaries are native capture to canonical input, configured topology to destination choice, network bytes to validated typed messages, identity verification to session authorization, validated input to the OS injector, and the UI to the native session controller. The UI does not transport hot input events.
+
+## Invariants
+
+1. Runtime has no public Internet communication, HTTP, public DNS, telemetry, analytics, cloud account, relay, crash upload or automatic dependency download, with one exception: the signed update check, one HTTPS request to the pinned release host carrying only the platform and current version, sent only when the user keeps automatic updates on or presses Check now and never while a sharing session is active. A downloaded build is installed only after its signature verifies against the public key built into the app. Explicit build-time downloads are separate from runtime. No clipboard/file transfer, generic command messages or network-triggered shell execution.
+2. Networking is off until the owner chooses one physical Ethernet/Wi-Fi interface and numeric private IPv4 peer. Discovery defaults off and remains unsupported until implemented as optional link-local discovery. IPv6 must be explicitly rejected until it has equivalent binding and route controls.
+3. Listening and outbound sockets bind the selected local address and physical interface, never a wildcard. The peer must be private/link-local, a valid host on the directly connected subnet, and reachable without a gateway. Validate the actual OS route and packet arrival interface, not only address arithmetic. Never automatically fall back to another adapter, route, address or peer.
+4. A disappearance, address/subnet/index change, network attachment change or route-policy failure immediately revokes the session and restores local ownership. Restoring the previous IP does not silently un-revoke it. Authorization is checked again before every new connection.
+5. Input traffic uses an audited TLS 1.3 implementation over QUIC, mutually authenticated and pinned to the explicitly paired device. No default web PKI or trust-on-first-use. Key/certificate changes require explicit re-pairing. Any unauthenticated pairing channel is strictly limited to identity establishment and cannot inject or forward input. Human confirmation must bind to the complete authenticated handshake or compare the full intended identity out of band.
+6. Identity keys stay local, protected by Windows DPAPI or macOS Keychain. Private key material is never displayed, logged, transmitted in plaintext or written unprotected. Zeroize temporary key buffers when supported by the crypto implementation.
+7. Strict bounded decoding enforces versions, message kinds, flags, lengths, UTF-8, numeric ranges, finite coordinates, display counts, session epochs and sequence numbers. Reject unrecognized messages. Bound reliable queues, motion queues and timeouts. Reliable pressed-state events cannot be silently dropped. Overflow fails local and releases managed input.
+8. One state machine owns the active destination. Stale transition acknowledgements and old-session motion cannot change ownership. Release outgoing managed keys/buttons on transitions and failure. Only intentionally transferable held modifiers/buttons cross. Ordinary held keys require a fresh press. Local emergency recovery is independent of network availability.
+9. No hooks, suppression or injection merely from starting the program. Sharing requires permission checks, authenticated peer, compatible capabilities/topology, healthy transport and explicit local enablement. Diagnostics must be bounded and clearly selected. Hook/tap callbacks never perform network I/O, crypto, logging or contended blocking work.
+10. Synthetic input is marked and filtered to prevent capture/injection loops. Injection errors are not reported as success. No UIPI, UAC, secure desktop or macOS TCC bypass. A receiver watchdog releases all MonHop-managed pressed input after loss of heartbeat. Recovery must not depend on an acknowledgement from an unreachable peer.
+11. Logs and diagnostics contain operational metadata only. Never write keystroke values, typed characters, raw input payloads or private keys. Parser failures must not dump packets. No permanent raw input recordings for tests.
+12. Dependencies must have permissive, GPL-compatible licenses, except the five exact MPL-2.0 package allowances explicitly approved by the user and recorded in deny.toml and THIRD_PARTY_LICENSES.md. Direct versions and the lockfile are pinned. Generate a dependency license report, runtime dependency inventory and SBOM. Fail the license check on unknown or disallowed licenses. Report security advisories rather than silently ignoring them.
+
+## Reportability and severity
+
+Unpaired input injection, authentication/pinning bypass, remote code execution, WAN/VPN leakage of input, plaintext input/keys, permanently stranded local input, replay changing active ownership, and unsafe decoding are reportable. Local-only claims do not reduce their importance. A malicious paired peer is an in-scope adversary for parser bounds, arbitrary capabilities and session state.
+
+Resource exhaustion, transient input leakage to the wrong machine, incomplete key release, hook feedback loops, certificate rollover without confirmation and input-bearing logs are also reportable. Calibrate severity to reachable production behavior and concrete impact. A pure policy unit test is not evidence that a live socket or platform hook enforces that policy.
+
+No broad finding classes are excluded. Unsupported OS boundary crossing is a documented platform limitation, not permission to implement a bypass. A compromised administrator/kernel or physically compromised input device is outside the application's protection capability; do not use that limitation to dismiss attacks by ordinary LAN peers or low-privilege local callers.
+
+## Current validation boundary
+
+The Mac checkpoint includes native compilation, display and passive-tap checks, and an explicitly selected self-process delivery fixture. Its input is restricted to its own PID and consumed before application shortcut dispatch. It does not validate system-wide injection, standalone-app TCC attribution, all keyboard semantics or a paired LAN session. See TESTING.md for platform-specific evidence. Do not claim either direction works continuously until physical integration is exercised. Do not enable production remote suppression to compensate for incomplete testing. Actual Windows-to-Mac latency must be measured on the paired machines, not inferred from codec benchmarks.

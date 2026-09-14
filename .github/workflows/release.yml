@@ -1,0 +1,77 @@
+name: release
+
+# A v tag runs every gate, builds the three signed bundles into one draft release, and only then
+# publishes it. Nothing is visible until latest.json carries a signed bundle for all three platforms,
+# so the updater can never read a half-built release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  build:
+    needs: verify
+    uses: ./.github/workflows/build.yml
+    with:
+      publish: true
+    secrets: inherit
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag against the workspace version
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match the workspace version $version." >&2
+            exit 1
+          fi
+      - name: Check the tag has exactly one release
+        run: |
+          # The three build jobs each create the draft if they cannot find it; duplicates would leave
+          # the platforms split across releases.
+          releases="$(gh release list --limit 100 --json tagName \
+            --jq '[.[] | select(.tagName == env.GITHUB_REF_NAME)] | length')"
+          if [ "$releases" != "1" ]; then
+            echo "Expected one release for $GITHUB_REF_NAME, found $releases." >&2
+            exit 1
+          fi
+      - name: Check latest.json covers every platform
+        run: |
+          gh release download "$GITHUB_REF_NAME" --pattern latest.json --clobber
+          python3 - "$GITHUB_REF_NAME" <<'PY'
+          import json
+          import sys
+
+          expected = sys.argv[1][1:]
+          feed = json.loads(open("latest.json", encoding="utf-8").read())
+          if feed.get("version") != expected:
+              sys.exit("latest.json is version {!r}, not {!r}.".format(feed.get("version"), expected))
+          platforms = feed.get("platforms") or {}
+          missing = [
+              name
+              for name in ("darwin-aarch64", "darwin-x86_64", "windows-x86_64")
+              if not (platforms.get(name, {}).get("url") and platforms.get(name, {}).get("signature"))
+          ]
+          if missing:
+              sys.exit("latest.json has no signed bundle for: {}.".format(", ".join(missing)))
+          print("latest.json carries a signed bundle for every platform.")
+          PY
+      - name: Publish the release
+        run: |
+          python3 scripts/changelog.py notes "${GITHUB_REF_NAME#v}" > notes.md
+          gh release edit "$GITHUB_REF_NAME" \
+            --title "MonHop $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --draft=false \
+            --latest
