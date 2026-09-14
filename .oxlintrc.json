@@ -1,0 +1,38 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["unicorn", "oxc", "import", "promise"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "warn",
+    "style": "off",
+    "pedantic": "off"
+  },
+  "env": {
+    "browser": true,
+    "es2024": true,
+    "node": true
+  },
+  "rules": {
+    "no-underscore-dangle": [
+      "error",
+      { "allow": ["__TAURI__", "__MONHOP_PLATFORM__", "__MONHOP_UI_CHECK__"] }
+    ]
+  },
+  "ignorePatterns": [
+    "target/",
+    "node_modules/",
+    "apps/monhop-desktop/gen/",
+    ".tools/",
+    "artifacts/",
+    "site/"
+  ],
+  "overrides": [
+    {
+      "files": ["**/*.test.mjs"],
+      "env": {
+        "node": true
+      }
+    }
+  ]
+}

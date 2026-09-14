@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-pairing-request-network-access"
+description = "Enables the pairing_request_network_access command without any pre-configured scope."
+commands.allow = ["pairing_request_network_access"]
+
+[[permission]]
+identifier = "deny-pairing-request-network-access"
+description = "Denies the pairing_request_network_access command without any pre-configured scope."
+commands.deny = ["pairing_request_network_access"]

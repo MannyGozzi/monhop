@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>MonHop connects to the computer you verify on your selected local network. Pairing does not enable keyboard or mouse sharing.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>MonHop verifies the current Wi-Fi attachment for the selected local peer. No location coordinates are collected or shared.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>MonHop verifies the current Wi-Fi attachment for the selected local peer. No location coordinates are collected or shared.</string>
+</dict>
+</plist>

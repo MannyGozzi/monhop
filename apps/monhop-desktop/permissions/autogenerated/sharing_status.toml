@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-status"
+description = "Enables the sharing_status command without any pre-configured scope."
+commands.allow = ["sharing_status"]
+
+[[permission]]
+identifier = "deny-sharing-status"
+description = "Denies the sharing_status command without any pre-configured scope."
+commands.deny = ["sharing_status"]

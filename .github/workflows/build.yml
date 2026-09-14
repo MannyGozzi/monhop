@@ -1,0 +1,117 @@
+name: build
+
+# Builds the signed updater bundles for macOS (Apple silicon and Intel) and Windows. With publish the
+# three jobs share one draft release and merge latest.json into it; without it they only leave artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Upload the bundles into a draft release for the current tag.
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      publish:
+        description: Upload the bundles into a draft release for the current tag.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles app,dmg
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles app,dmg
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: --bundles nsis
+    runs-on: ${{ matrix.platform }}
+    env:
+      # bundle.createUpdaterArtifacts is on, so a build without the signing key fails rather than
+      # shipping an unsigned update. Apple signing and notarization start once those secrets exist.
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # The Windows image ships no `python3`; this adds the symlink the two script steps below call.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the pinned Tauri CLI
+        run: cargo install tauri-cli --version 2.11.4 --locked
+      - name: Check the dependency reports
+        run: python3 scripts/dependencies.py --check
+      - name: Refuse to publish from anything but a version tag
+        if: inputs.publish && github.ref_type != 'tag'
+        run: |
+          echo "publish needs a v tag; this run is on $GITHUB_REF_TYPE $GITHUB_REF_NAME." >&2
+          exit 1
+      - name: Read the release notes for the tag
+        id: notes
+        if: inputs.publish
+        shell: bash
+        run: |
+          {
+            echo 'body<<MONHOP_NOTES'
+            python3 scripts/changelog.py notes "${GITHUB_REF_NAME#v}"
+            echo 'MONHOP_NOTES'
+          } >> "$GITHUB_OUTPUT"
+      - uses: tauri-apps/tauri-action@v0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: cargo tauri
+          args: ${{ matrix.args }}
+          # An empty tagName leaves the action building only: with no releaseId it skips every upload.
+          tagName: ${{ inputs.publish && github.ref_name || '' }}
+          releaseName: ${{ inputs.publish && format('MonHop {0}', github.ref_name) || '' }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+      - name: Collect the bundle paths
+        id: bundles
+        if: ${{ !inputs.publish }}
+        shell: bash
+        env:
+          BUNDLES: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          # tauri-action@v0 has no uploadWorkflowArtifacts input, and its .app entry is a directory
+          # superseded by the signed .app.tar.gz beside it.
+          {
+            echo 'paths<<MONHOP_BUNDLES'
+            printf '%s' "$BUNDLES" | jq -er '.[] | select(endswith(".app") | not)'
+            echo 'MONHOP_BUNDLES'
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !inputs.publish }}
+        with:
+          name: monhop-${{ matrix.target }}
+          path: ${{ steps.bundles.outputs.paths }}
+          if-no-files-found: error

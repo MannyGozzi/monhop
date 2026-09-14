@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dimming-set-enabled"
+description = "Enables the dimming_set_enabled command without any pre-configured scope."
+commands.allow = ["dimming_set_enabled"]
+
+[[permission]]
+identifier = "deny-dimming-set-enabled"
+description = "Denies the dimming_set_enabled command without any pre-configured scope."
+commands.deny = ["dimming_set_enabled"]

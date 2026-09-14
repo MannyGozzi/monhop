@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-autostart-open-settings"
+description = "Enables the autostart_open_settings command without any pre-configured scope."
+commands.allow = ["autostart_open_settings"]
+
+[[permission]]
+identifier = "deny-autostart-open-settings"
+description = "Denies the autostart_open_settings command without any pre-configured scope."
+commands.deny = ["autostart_open_settings"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-trial-status"
+description = "Enables the trial_status command without any pre-configured scope."
+commands.allow = ["trial_status"]
+
+[[permission]]
+identifier = "deny-trial-status"
+description = "Denies the trial_status command without any pre-configured scope."
+commands.deny = ["trial_status"]

@@ -1,0 +1,16 @@
+Native DLL imports from the Windows MSVC release executable. Windows libraries are supplied by the OS. VCRUNTIME140.dll requires the Microsoft Visual C++ runtime already installed on the development host. MonHop never downloads runtime dependencies.
+Binary SHA256: 1C81889B631F6C3A62DD533A732F7BB88895756760C1191835B55DFEB4A001AB
+
+api-ms-win-core-synch-l1-2-0.dll
+api-ms-win-crt-heap-l1-1-0.dll
+api-ms-win-crt-locale-l1-1-0.dll
+api-ms-win-crt-math-l1-1-0.dll
+api-ms-win-crt-runtime-l1-1-0.dll
+api-ms-win-crt-stdio-l1-1-0.dll
+api-ms-win-shcore-scaling-l1-1-1.dll
+iphlpapi.dll
+kernel32.dll
+ntdll.dll
+user32.dll
+vcruntime140.dll
+wlanapi.dll

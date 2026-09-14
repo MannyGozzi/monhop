@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-request-wifi-permission"
+description = "Enables the request_wifi_permission command without any pre-configured scope."
+commands.allow = ["request_wifi_permission"]
+
+[[permission]]
+identifier = "deny-request-wifi-permission"
+description = "Denies the request_wifi_permission command without any pre-configured scope."
+commands.deny = ["request_wifi_permission"]

@@ -1,0 +1,54 @@
+[graph]
+targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
+all-features = false
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unicode-3.0", "CC0-1.0", "BSL-1.0"]
+confidence-threshold = 0.95
+unused-allowed-license = "allow"
+private = { ignore = true }
+
+[[licenses.exceptions]]
+name = "cssparser"
+version = "=0.36.0"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "cssparser-macros"
+version = "=0.6.1"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "dtoa-short"
+version = "=0.3.5"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "selectors"
+version = "=0.36.1"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "option-ext"
+version = "=0.2.0"
+allow = ["MPL-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The updater plugin and its reqwest client (system trust store through rustls-platform-verifier)
+# are the one sanctioned HTTP path: the signed update check to the pinned release host.
+deny = [
+  { name = "ureq" },
+  { name = "tauri-plugin-http" },
+  { name = "sentry" },
+  { name = "rustls-native-certs" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

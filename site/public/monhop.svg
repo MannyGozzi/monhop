@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">MonHop</title>
+  <desc id="desc">A silver pointer connects to three devices on a softly rounded graphite tile.</desc>
+  <defs>
+    <linearGradient id="tile" x1="214" y1="82" x2="780" y2="961" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#292a2b"/>
+      <stop offset=".42" stop-color="#141517"/>
+      <stop offset="1" stop-color="#090a0b"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0" cy="0" r="1" gradientTransform="translate(337 99) rotate(66) scale(610 754)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" stop-opacity=".085"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="303" y1="67" x2="671" y2="968" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" stop-opacity=".82"/>
+      <stop offset=".21" stop-color="#c1c2c4" stop-opacity=".2"/>
+      <stop offset=".5" stop-color="#fff" stop-opacity=".06"/>
+      <stop offset=".85" stop-color="#c1c2c4" stop-opacity=".14"/>
+      <stop offset="1" stop-color="#fff" stop-opacity=".42"/>
+    </linearGradient>
+    <linearGradient id="silver" x1=".18" y1=".08" x2=".88" y2="1">
+      <stop stop-color="#fff"/>
+      <stop offset=".32" stop-color="#f4f5f6"/>
+      <stop offset=".68" stop-color="#d9dcdf"/>
+      <stop offset="1" stop-color="#b6bcc2"/>
+    </linearGradient>
+    <linearGradient id="bevel" x1="0" y1="0" x2=".8" y2="1">
+      <stop stop-color="#fff"/>
+      <stop offset=".53" stop-color="#fff" stop-opacity=".65"/>
+      <stop offset="1" stop-color="#fff" stop-opacity=".16"/>
+    </linearGradient>
+    <filter id="shadow" x="-.25" y="-.25" width="1.5" height="1.65" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#000" flood-opacity=".62"/>
+    </filter>
+    <g id="mark">
+      <path d="M424 470C473 470 499 468 521 427C550 373 552 330 624 330V364C577 365 567 399 551 439C527 499 491 510 462 507C450 505 438 484 424 470Z"/>
+      <path d="M488 521H624V555H484C489 542 490 532 488 521Z"/>
+      <path d="M455 587C494 570 533 586 553 621C582 668 572 700 624 707V741C544 737 546 687 523 648C505 621 480 622 464 617Z"/>
+      <rect x="640" y="276" width="124" height="128" rx="29"/>
+      <rect x="640" y="467" width="124" height="128" rx="29"/>
+      <rect x="640" y="658" width="124" height="128" rx="29"/>
+      <path d="M246 365C232 354 218 365 221 383L260 654C263 676 278 681 291 665L318 628C322 623 328 623 332 629L378 694C387 707 402 709 415 700L427 691C440 681 442 668 433 655L397 604C393 598 395 594 402 592L451 579C469 574 474 560 459 547L246 365Z"/>
+    </g>
+  </defs>
+  <rect x="72" y="72" width="880" height="880" rx="206" fill="#070809"/>
+  <rect x="75" y="75" width="874" height="874" rx="203" fill="url(#tile)" stroke="url(#rim)" stroke-width="3"/>
+  <rect x="80" y="80" width="864" height="864" rx="198" fill="url(#sheen)" stroke="#fff" stroke-opacity=".045" stroke-width="2"/>
+  <use href="#mark" fill="#050608" filter="url(#shadow)"/>
+  <use href="#mark" fill="url(#silver)" stroke="url(#bevel)" stroke-width="2.2" stroke-linejoin="round"/>
+</svg>

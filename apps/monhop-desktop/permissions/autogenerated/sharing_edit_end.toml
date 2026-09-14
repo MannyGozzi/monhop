@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-edit-end"
+description = "Enables the sharing_edit_end command without any pre-configured scope."
+commands.allow = ["sharing_edit_end"]
+
+[[permission]]
+identifier = "deny-sharing-edit-end"
+description = "Denies the sharing_edit_end command without any pre-configured scope."
+commands.deny = ["sharing_edit_end"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-dismiss-display-notice"
+description = "Enables the sharing_dismiss_display_notice command without any pre-configured scope."
+commands.allow = ["sharing_dismiss_display_notice"]
+
+[[permission]]
+identifier = "deny-sharing-dismiss-display-notice"
+description = "Denies the sharing_dismiss_display_notice command without any pre-configured scope."
+commands.deny = ["sharing_dismiss_display_notice"]

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/monhop-core", "crates/monhop-protocol", "crates/monhop-platform-windows", "crates/monhop-platform-macos", "crates/monhop-transport", "apps/monhop", "apps/monhop-desktop"]
+exclude = ["vendor/tao", "vendor/tauri-runtime-wry"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "GPL-3.0-or-later"
+authors = ["Manuel Gozzi"]
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[patch.crates-io]
+tao = { path = "vendor/tao" }
+tauri-runtime-wry = { path = "vendor/tauri-runtime-wry" }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-touch"
+description = "Enables the sharing_touch command without any pre-configured scope."
+commands.allow = ["sharing_touch"]
+
+[[permission]]
+identifier = "deny-sharing-touch"
+description = "Denies the sharing_touch command without any pre-configured scope."
+commands.deny = ["sharing_touch"]

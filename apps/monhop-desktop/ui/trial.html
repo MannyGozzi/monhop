@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>MonHop test</title>
+    <link rel="stylesheet" href="./trial.css" />
+  </head>
+  <body>
+    <header class="trial-header">
+      <div class="trial-heading">
+        <span class="trial-mark" aria-hidden="true"></span>
+        <div class="trial-titles">
+          <h1>Input test</h1>
+          <p class="trial-role" id="trial-role">Bounded to this window. 60 seconds at most.</p>
+        </div>
+      </div>
+      <div class="trial-actions">
+        <span class="trial-timer" id="trial-remaining" aria-label="Seconds remaining">60s</span>
+        <button id="trial-stop" type="button" data-variant="outline">Stop</button>
+        <button id="trial-start" type="button">Start</button>
+      </div>
+    </header>
+
+    <main id="input-pad" aria-label="Input test pad" tabindex="-1">
+      <div class="trial-state" aria-live="polite">
+        <span class="trial-state-glyph" aria-hidden="true"></span>
+        <strong id="trial-phase">Ready</strong>
+        <span id="trial-message">Press Start here and on the other computer, in either order. Input stays inside this window.</span>
+      </div>
+      <section id="trial-failure" hidden aria-live="polite">
+        <h2 id="trial-failure-title">The test needs attention</h2>
+        <p id="trial-failure-message"></p>
+      </section>
+    </main>
+
+    <footer class="trial-footer">
+      <div class="trial-counters" aria-live="polite">
+        <span id="trial-arrivals">Reached MonHop · keys 0 · clicks 0 · moves 0 · scrolls 0</span>
+        <span id="trial-landed">Landed in this window · keys 0 · clicks 0 · moves 0 · scrolls 0</span>
+        <span id="trial-protocol">Sent 0 · received 0</span>
+      </div>
+      <button id="trial-return" type="button" data-variant="ghost">Return to setup</button>
+    </footer>
+    <script type="module" src="./trial.js"></script>
+  </body>
+</html>

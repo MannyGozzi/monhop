@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-trial-close"
+description = "Enables the trial_close command without any pre-configured scope."
+commands.allow = ["trial_close"]
+
+[[permission]]
+identifier = "deny-trial-close"
+description = "Denies the trial_close command without any pre-configured scope."
+commands.deny = ["trial_close"]
