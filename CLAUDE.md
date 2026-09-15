@@ -14,4 +14,4 @@ Original code is licensed under GPL-3.0-or-later (LICENSE). Third-party dependen
 
 Verification: cargo fmt --all -- --check; cargo clippy --workspace --all-targets -- -D warnings; cargo test --workspace; cargo audit; scripts/dependencies.ps1. Read scripts/verify.ps1 for the project-local Windows toolchain setup. macOS work must be built and tested on macOS before claiming support.
 
-Current lane ownership and handoffs are in .claude/state and communication.txt. Workers are leaves and never delegate. Primary owns Cargo.lock and root workspace changes. No git commits/pushes/PRs unless requested.
+Current lane ownership and handoffs are in .claude/state and communication.txt. Workers are leaves and never delegate. Primary owns Cargo.lock and root workspace changes. Work directly on `main` unless Manuel explicitly requests another branch. No git commits/pushes/PRs unless requested.
