@@ -20,8 +20,8 @@ function updatesCard(ctx) {
     switchRow("Install updates automatically", {
       checked: view.automatic,
       description:
-        "Checks github.com for a signed MonHop build a few times a day and downloads it. " +
-        "It is installed when you quit MonHop or press Restart to update, never while sharing runs.",
+        "Off until you enable it. Checks github.com and downloads signed updates only while sharing is paused. " +
+        "Install by quitting MonHop or pressing Restart to update.",
       disabled: pending || !core,
       id: "settings-updates-automatic",
       onChange: actions.setUpdatesAutomatic,

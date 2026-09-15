@@ -17,6 +17,8 @@ python3 -m unittest discover -s scripts/tests -p test_tauri_ci.py
 if [[ "$(uname -s)" == Darwin ]]; then
   python3 -m unittest discover -s scripts/tests -p test_macos_signing.py
   python3 -m unittest discover -s scripts/tests -p test_verify_macos_bundle.py
+  python3 -m unittest discover -s scripts/tests -p test_native_quit.py
+  cargo test -p tauri-plugin-updater --lib --locked
 fi
 cargo build --workspace --release --locked
 if ! command -v cargo-audit >/dev/null || ! command -v cargo-deny >/dev/null; then

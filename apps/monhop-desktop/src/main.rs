@@ -895,10 +895,9 @@ fn on_app_event(handle: &tauri::AppHandle, event: tauri::RunEvent) {
             }
         }
         tauri::RunEvent::ExitRequested { api, .. } => {
-            if handle.state::<Arc<AppController>>().shutdown_ready() {
-                // The way out is where a verified build lands; it never waits on the network.
-                updates::install_on_quit(handle);
-            } else {
+            if !updates::exit_ready(handle)
+                || !handle.state::<Arc<AppController>>().shutdown_ready()
+            {
                 api.prevent_exit();
                 request_app_shutdown(handle);
             }
@@ -912,28 +911,15 @@ fn on_app_event(handle: &tauri::AppHandle, event: tauri::RunEvent) {
         }
         tauri::RunEvent::MainEventsCleared => tray::refresh(handle),
         tauri::RunEvent::Exit => {
-            // Cmd+Q, an AppleScript quit and logout reach only this event on macOS, so the
-            // bounded drain and the verified install happen here; after a tray Quit both are no-ops.
+            // This callback is irreversible. Installation must finish before exit is approved.
             handle.state::<Arc<AppController>>().drain_for_exit();
-            updates::install_on_quit(handle);
         }
         _ => {}
     }
 }
 
 fn request_app_shutdown(handle: &tauri::AppHandle) {
-    let controller = handle.state::<Arc<AppController>>().inner().clone();
-    if !controller.request_shutdown() {
-        return;
-    }
-    let handle = handle.clone();
-    tauri::async_runtime::spawn(async move {
-        // Keep the native event loop alive until prompt continuations and input releases finish.
-        while !controller.shutdown_ready() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        handle.exit(0);
-    });
+    updates::request_quit(handle);
 }
 
 fn window_platform() -> &'static str {

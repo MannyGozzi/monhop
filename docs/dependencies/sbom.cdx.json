@@ -2933,18 +2933,6 @@
     },
     {
       "type": "library",
-      "name": "objc2-osa-kit",
-      "version": "0.3.2",
-      "bom-ref": "objc2-osa-kit@0.3.2",
-      "purl": "pkg:cargo/objc2-osa-kit@0.3.2",
-      "licenses": [
-        {
-          "expression": "Zlib OR Apache-2.0 OR MIT"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "name": "objc2-quartz-core",
       "version": "0.3.2",
       "bom-ref": "objc2-quartz-core@0.3.2",
@@ -3060,18 +3048,6 @@
       "licenses": [
         {
           "expression": "MPL-2.0"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "name": "osakit",
-      "version": "0.3.1",
-      "bom-ref": "osakit@0.3.1",
-      "purl": "pkg:cargo/osakit@0.3.1",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
         }
       ]
     },
@@ -4513,7 +4489,12 @@
       "name": "tauri-plugin-updater",
       "version": "2.11.0",
       "bom-ref": "tauri-plugin-updater@2.11.0",
-      "purl": "pkg:cargo/tauri-plugin-updater@2.11.0",
+      "properties": [
+        {
+          "name": "monhop:source",
+          "value": "Vendored third-party source (modified)"
+        }
+      ],
       "licenses": [
         {
           "expression": "Apache-2.0 OR MIT"
@@ -8125,7 +8106,6 @@
       "dependsOn": [
         "bitflags@2.13.2",
         "block2@0.6.2",
-        "libc@0.2.189",
         "objc2-core-foundation@0.3.2",
         "objc2@0.6.4"
       ]
@@ -8135,15 +8115,6 @@
       "dependsOn": [
         "bitflags@2.13.2",
         "objc2-core-foundation@0.3.2",
-        "objc2@0.6.4"
-      ]
-    },
-    {
-      "ref": "objc2-osa-kit@0.3.2",
-      "dependsOn": [
-        "bitflags@2.13.2",
-        "objc2-app-kit@0.3.2",
-        "objc2-foundation@0.3.2",
         "objc2@0.6.4"
       ]
     },
@@ -8233,17 +8204,6 @@
     {
       "ref": "option-ext@0.2.0",
       "dependsOn": []
-    },
-    {
-      "ref": "osakit@0.3.1",
-      "dependsOn": [
-        "objc2-foundation@0.3.2",
-        "objc2-osa-kit@0.3.2",
-        "objc2@0.6.4",
-        "serde@1.0.229",
-        "serde_json@1.0.151",
-        "thiserror@2.0.20"
-      ]
     },
     {
       "ref": "pango-sys@0.18.0",
@@ -9233,9 +9193,9 @@
         "futures-util@0.3.34",
         "http@1.5.0",
         "infer@0.19.0",
+        "libc@0.2.189",
         "log@0.4.34",
         "minisign-verify@0.2.5",
-        "osakit@0.3.1",
         "percent-encoding@2.3.2",
         "reqwest@0.13.5",
         "rustls@0.23.45",

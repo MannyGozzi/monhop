@@ -124,6 +124,7 @@ impl<T> EventHandler for EventLoopHandler<T> {
 struct Handler {
   ready: AtomicBool,
   in_callback: AtomicBool,
+  native_termination: NativeTermination,
   control_flow: Mutex<ControlFlow>,
   control_flow_prev: Mutex<ControlFlow>,
   start_time: Mutex<Option<Instant>>,
@@ -131,6 +132,19 @@ struct Handler {
   pending_events: Mutex<VecDeque<EventWrapper>>,
   pending_redraw: Mutex<Vec<WindowId>>,
   waker: Mutex<EventLoopWaker>,
+}
+
+#[derive(Default)]
+struct NativeTermination(AtomicBool);
+
+impl NativeTermination {
+  fn request(&self) -> bool {
+    !self.0.swap(true, Ordering::AcqRel)
+  }
+
+  fn take_approved(&self, exiting: bool, in_callback: bool) -> bool {
+    exiting && !in_callback && self.0.swap(false, Ordering::AcqRel)
+  }
 }
 
 unsafe impl Send for Handler {}
@@ -259,6 +273,13 @@ impl Handler {
 pub enum AppState {}
 
 impl AppState {
+  pub fn request_exit() {
+    if HANDLER.native_termination.request() {
+      Self::queue_event(EventWrapper::StaticEvent(Event::ExitRequested));
+      unsafe { CFRunLoopWakeUp(CFRunLoopGetMain()) };
+    }
+  }
+
   pub fn set_callback<T>(
     callback: Weak<RefCell<dyn FnMut(Event<'_, T>, &RootWindowTarget<T>, &mut ControlFlow)>>,
     window_target: Rc<RootWindowTarget<T>>,
@@ -405,9 +426,17 @@ impl AppState {
         let mtm = MainThreadMarker::new().unwrap();
         let app = NSApp(mtm);
         let _pool = NSAutoreleasePool::new();
-        let () = msg_send![&app, stop: nil];
-        // To stop event loop immediately, we need to post some event here.
-        post_dummy_event(&app);
+        if HANDLER
+          .native_termination
+          .take_approved(true, HANDLER.get_in_callback())
+        {
+          // AppKit can synchronously call exit(), so no callback lock may be held here.
+          app.replyToApplicationShouldTerminate(true);
+        } else {
+          let () = msg_send![&app, stop: nil];
+          // To stop event loop immediately, we need to post some event here.
+          post_dummy_event(&app);
+        }
       };
     }
     HANDLER.update_start_time();
@@ -465,5 +494,45 @@ fn apply_activation_policy(app_delegate: &Object) {
       ActivationPolicy::Accessory => NSApplicationActivationPolicy::Accessory,
       ActivationPolicy::Prohibited => NSApplicationActivationPolicy::Prohibited,
     });
+  }
+}
+
+#[cfg(test)]
+mod native_termination_tests {
+  use super::NativeTermination;
+
+  #[test]
+  fn native_termination_waits_for_approval_outside_callbacks() {
+    let termination = NativeTermination::default();
+    assert!(!termination.take_approved(true, false));
+    assert!(termination.request());
+    assert!(!termination.take_approved(false, false));
+    assert!(!termination.take_approved(true, true));
+    assert!(!termination.request());
+    assert!(termination.take_approved(true, false));
+    assert!(!termination.take_approved(true, false));
+  }
+
+  #[test]
+  fn native_termination_deduplicates_until_the_reply_is_taken() {
+    let termination = NativeTermination::default();
+    assert!(termination.request());
+    assert!(!termination.request());
+    assert!(!termination.request());
+    assert!(termination.take_approved(true, false));
+    assert!(termination.request());
+  }
+}
+
+#[cfg(test)]
+mod native_exit_event_tests {
+  use crate::event::Event;
+
+  #[test]
+  fn native_termination_event_survives_event_conversions() {
+    let event: Event<'static, ()> = Event::ExitRequested;
+    assert_eq!(event.clone(), Event::ExitRequested);
+    assert_eq!(event.clone().to_static(), Some(Event::ExitRequested));
+    assert_eq!(event.map_nonuser_event::<u8>(), Ok(Event::ExitRequested));
   }
 }

@@ -25,6 +25,9 @@ export function Footer() {
             <GithubMark className="size-4" />
             GitHub
           </a>
+          <a href="/changelog" className="text-muted-foreground hover:text-foreground">
+            Release notes
+          </a>
           <a
             href={links.releasesPage}
             target="_blank"

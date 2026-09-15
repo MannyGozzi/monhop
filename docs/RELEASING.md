@@ -2,7 +2,9 @@
 
 ## Keep the changelog current
 
-Every change a person would notice goes into the Unreleased section of `CHANGELOG.md` as one plain line, under Added, Changed, Fixed or Security. Write it for someone who has never seen the code: what they can now do, what stopped going wrong, no file names and no internal terms. The Unreleased section becomes the release notes, linked from the download page, and the release script refuses to run while it is empty.
+Write release notes once in `CHANGELOG.md`. Keep notable, user-visible changes under Unreleased, grouped by Added, Changed, Fixed or Security. Open a substantial release with a one-sentence summary, then use short bullets that explain what a person can do or what stopped going wrong. Skip commit messages, internal refactors and empty categories. Include compatibility changes, required actions and installation limitations. Aim for a one-minute read.
+
+The release script moves Unreleased into a dated version and the workflow publishes that exact section as the GitHub release body. The website reads published notes from GitHub, not a second content file. Do not hand-maintain website copies or use GitHub-generated commit lists. Update the changelog before publication so the repository, release and website agree.
 
 ## Cut the release
 

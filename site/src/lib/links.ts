@@ -5,6 +5,7 @@ export const links = {
   source: `https://github.com/${repo}`,
   releasesPage: `https://github.com/${repo}/releases`,
   releasesApi: `https://api.github.com/repos/${repo}/releases/latest`,
+  releaseHistoryApi: `https://api.github.com/repos/${repo}/releases?per_page=100`,
   sponsor: 'https://github.com/sponsors/MannyGozzi',
   site: 'https://www.monhop.com',
 } as const

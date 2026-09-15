@@ -7,9 +7,10 @@ const PHASES = new Set([
   "available",
   "downloading",
   "ready",
+  "installing",
   "failed",
 ]);
-const BUSY_PHASES = new Set(["checking", "downloading"]);
+const BUSY_PHASES = new Set(["checking", "downloading", "installing"]);
 const SHARING_HINT = "Sharing is running. Turn it off first or quit MonHop to update.";
 const CHECK_FAILED = "The update check did not finish.";
 
@@ -33,7 +34,7 @@ function clampedInt(value, min, max) {
 export function normalizeUpdatesView(value) {
   const source = value && typeof value === "object" ? value : {};
   return {
-    automatic: source.automatic !== false,
+    automatic: source.automatic === true,
     phase: PHASES.has(source.phase) ? source.phase : "idle",
     currentVersion: text(source.currentVersion),
     buildCommit: text(source.buildCommit),
@@ -54,6 +55,7 @@ function minutesAgo(seconds) {
 }
 
 export function updatesStatusText(view) {
+  if (view.message && !BUSY_PHASES.has(view.phase)) return view.message;
   switch (view.phase) {
     case "checking":
       return `Checking ${view.host}…`;
@@ -67,6 +69,8 @@ export function updatesStatusText(view) {
       return `Downloading MonHop ${view.availableVersion}… ${view.progressPercent ?? 0}%`;
     case "ready":
       return `MonHop ${view.availableVersion} is ready to install.`;
+    case "installing":
+      return `Installing MonHop ${view.availableVersion}…`;
     case "failed":
       return view.message || CHECK_FAILED;
     default:
@@ -77,7 +81,7 @@ export function updatesStatusText(view) {
 }
 
 export function canCheck(view) {
-  return !BUSY_PHASES.has(view.phase);
+  return !view.sharingActive && !BUSY_PHASES.has(view.phase);
 }
 
 export function canInstall(view) {

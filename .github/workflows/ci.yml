@@ -66,6 +66,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run typecheck
       - run: pnpm run lint
+      - run: pnpm run test:releases
       - run: pnpm run build
 
   scripts:
@@ -73,5 +74,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'

@@ -25,6 +25,7 @@
     "apps/monhop-desktop/gen/",
     ".tools/",
     "artifacts/",
+    "vendor/tauri-plugin-updater/api-iife.js",
     "site/"
   ],
   "overrides": [

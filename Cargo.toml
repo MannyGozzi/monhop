@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/monhop-core", "crates/monhop-protocol", "crates/monhop-platform-windows", "crates/monhop-platform-macos", "crates/monhop-transport", "apps/monhop", "apps/monhop-desktop"]
-exclude = ["vendor/tao", "vendor/tauri-runtime-wry"]
+exclude = ["vendor/tao", "vendor/tauri-runtime-wry", "vendor/tauri-plugin-updater"]
 
 [workspace.package]
 version = "0.1.1"
@@ -25,3 +25,4 @@ strip = "debuginfo"
 [patch.crates-io]
 tao = { path = "vendor/tao" }
 tauri-runtime-wry = { path = "vendor/tauri-runtime-wry" }
+tauri-plugin-updater = { path = "vendor/tauri-plugin-updater" }
