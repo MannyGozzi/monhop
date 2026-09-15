@@ -39,6 +39,7 @@ use std::sync::Arc;
 use tauri::Manager;
 use tauri::{WebviewUrl, WebviewWindowBuilder, webview::NewWindowResponse};
 
+/// Held by every test that claims native input ownership or asserts on state that reads it.
 #[cfg(test)]
 static NATIVE_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
