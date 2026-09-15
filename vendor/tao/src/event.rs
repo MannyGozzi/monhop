@@ -145,6 +145,11 @@ pub enum Event<'a, T: 'static> {
   /// gets emitted. You generally want to treat this as an "do on quit" event.
   LoopDestroyed,
 
+  /// A native macOS quit request. Keep the loop running to defer termination,
+  /// then set `ControlFlow::Exit` when asynchronous cleanup has finished.
+  #[cfg(target_os = "macos")]
+  ExitRequested,
+
   /// Emitted when the app is open by external resources, like opening a file or deeplink.
   Opened { urls: Vec<url::Url> },
 
@@ -189,6 +194,8 @@ impl<T: Clone> Clone for Event<'static, T> {
       RedrawRequested(wid) => RedrawRequested(*wid),
       RedrawEventsCleared => RedrawEventsCleared,
       LoopDestroyed => LoopDestroyed,
+      #[cfg(target_os = "macos")]
+      ExitRequested => ExitRequested,
       Suspended => Suspended,
       Resumed => Resumed,
       Opened { urls } => Opened { urls: urls.clone() },
@@ -218,6 +225,8 @@ impl<'a, T> Event<'a, T> {
       RedrawRequested(wid) => Ok(RedrawRequested(wid)),
       RedrawEventsCleared => Ok(RedrawEventsCleared),
       LoopDestroyed => Ok(LoopDestroyed),
+      #[cfg(target_os = "macos")]
+      ExitRequested => Ok(ExitRequested),
       Suspended => Ok(Suspended),
       Resumed => Ok(Resumed),
       Opened { urls } => Ok(Opened { urls }),
@@ -246,6 +255,8 @@ impl<'a, T> Event<'a, T> {
       RedrawRequested(wid) => Some(RedrawRequested(wid)),
       RedrawEventsCleared => Some(RedrawEventsCleared),
       LoopDestroyed => Some(LoopDestroyed),
+      #[cfg(target_os = "macos")]
+      ExitRequested => Some(ExitRequested),
       Suspended => Some(Suspended),
       Resumed => Some(Resumed),
       Opened { urls } => Some(Opened { urls }),

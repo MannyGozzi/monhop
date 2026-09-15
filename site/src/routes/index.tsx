@@ -20,4 +20,7 @@ function LandingPage() {
   )
 }
 
-export const Route = createFileRoute('/')({ component: LandingPage })
+export const Route = createFileRoute('/')({
+  component: LandingPage,
+  head: () => ({ meta: [{ title: 'MonHop — One keyboard. All your computers.' }] }),
+})

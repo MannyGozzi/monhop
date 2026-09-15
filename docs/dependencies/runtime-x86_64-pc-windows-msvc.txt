@@ -140,7 +140,7 @@ subtle v2.6.1 BSD-3-Clause
 sync_wrapper v1.0.2 Apache-2.0
 tao v0.35.3 (Vendored third-party source (modified)) Apache-2.0
 tauri v2.11.5 Apache-2.0 OR MIT
-tauri-plugin-updater v2.11.0 Apache-2.0 OR MIT
+tauri-plugin-updater v2.11.0 (Vendored third-party source (modified)) Apache-2.0 OR MIT
 tauri-runtime v2.11.3 Apache-2.0 OR MIT
 tauri-runtime-wry v2.11.4 (Vendored third-party source (modified)) Apache-2.0 OR MIT
 tauri-utils v2.9.3 Apache-2.0 OR MIT

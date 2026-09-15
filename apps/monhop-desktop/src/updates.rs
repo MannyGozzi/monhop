@@ -21,17 +21,16 @@ pub const EVENT: &str = "updates";
 /// The only host MonHop ever talks to, shown to the user so the one request is never a surprise.
 const HOST: &str = "github.com";
 const FILE_NAME: &str = "updates.json";
-const FILE_VERSION: u32 = 1;
+const FILE_VERSION: u32 = 2;
 const MAX_FILE_BYTES: u64 = 512;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(30);
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-/// A quit waits no longer than this for the install; the download is verified, so a retry is cheap.
-const QUIT_INSTALL_LIMIT: Duration = Duration::from_secs(5);
 /// The endpoint's own JSON is not signed, so its text is bounded before it reaches the window.
 const MAX_VERSION_CHARS: usize = 32;
 const MAX_NOTES_CHARS: usize = 2000;
 
+#[cfg(test)]
 const SHARING_HINT: &str = "Sharing is running. Turn it off first or quit MonHop to update.";
 const NOTHING_READY: &str = "No update is ready to install yet.";
 const NO_BUILD: &str = "The downloaded build is no longer available. Check again.";
@@ -55,7 +54,7 @@ impl Default for UpdatesFile {
     fn default() -> Self {
         Self {
             version: FILE_VERSION,
-            automatic: true,
+            automatic: false,
         }
     }
 }
@@ -91,6 +90,7 @@ pub enum Phase {
     Available,
     Downloading,
     Ready,
+    Installing,
     Failed,
 }
 
@@ -130,6 +130,7 @@ pub trait Environment: Send + Sync + 'static {
         progress: Arc<dyn Fn(u8) + Send + Sync>,
     ) -> Eventual<'_, Result<Vec<u8>, String>>;
     fn install(&self, found: &Found, bytes: &[u8]) -> Result<(), String>;
+    fn acquire_lease(&self, installing: bool) -> Result<Box<dyn Send>, String>;
     fn sharing_active(&self) -> bool;
     /// True once a paired computer is the active one; no automatic check runs before that.
     fn paired(&self) -> bool;
@@ -146,6 +147,8 @@ struct State {
     message: String,
     checked_at: Option<Instant>,
     running: bool,
+    exit_intent: Option<ExitIntent>,
+    exit_ready: bool,
 }
 
 pub struct Updates {
@@ -153,12 +156,38 @@ pub struct Updates {
     /// False in the UI smoke check: no scheduler, and a check request reaches no network.
     allowed: bool,
     state: Mutex<State>,
+    cancel_network: tokio::sync::Notify,
     environment: Box<dyn Environment>,
 }
 
+#[derive(Clone, Copy)]
+enum ExitIntent {
+    Quit,
+    Restart,
+}
+
+struct Operation {
+    updates: Arc<Updates>,
+    lease: Option<Box<dyn Send>>,
+}
+
+impl Drop for Operation {
+    fn drop(&mut self) {
+        self.lease.take();
+        let mut state = lock(&self.updates.state);
+        state.running = false;
+        if matches!(
+            state.phase,
+            Phase::Checking | Phase::Downloading | Phase::Installing
+        ) {
+            state.message = "The update did not finish. Try again.".into();
+            self.updates.settle(&mut state, Phase::Failed);
+        }
+    }
+}
+
 impl Updates {
-    /// Loads the preference and, when allowed, starts the background schedule. A preference that
-    /// cannot be read leaves automatic updates on rather than blocking startup.
+    /// Missing, old or unreadable preferences require a fresh opt-in.
     pub fn start(app: &AppHandle, allowed: bool) -> Arc<Self> {
         let path = app
             .path()
@@ -168,7 +197,7 @@ impl Updates {
         let file = match path.as_deref().map(UpdatesFile::load) {
             Some(Ok(file)) => file,
             Some(Err(_)) | None => {
-                log::warn!("updates: preference could not be read, keeping automatic updates on");
+                log::warn!("updates: preference could not be read, keeping automatic updates off");
                 UpdatesFile::default()
             }
         };
@@ -202,7 +231,10 @@ impl Updates {
                 message: String::new(),
                 checked_at: None,
                 running: false,
+                exit_intent: None,
+                exit_ready: false,
             }),
+            cancel_network: tokio::sync::Notify::new(),
             environment,
         })
     }
@@ -258,36 +290,55 @@ impl Updates {
         view
     }
 
-    /// Claims the one in-flight check and moves to `checking`; None when a check already runs.
-    fn enter_checking(&self) -> Option<UpdatesView> {
+    fn enter_checking(self: &Arc<Self>, automatic: bool) -> Option<(UpdatesView, Operation)> {
         let mut state = lock(&self.state);
-        if state.running || !self.allowed {
+        if state.running
+            || !self.allowed
+            || state.exit_intent.is_some()
+            || (automatic && !state.file.automatic)
+        {
             return None;
         }
+        let lease = match self.environment.acquire_lease(false) {
+            Ok(lease) => lease,
+            Err(message) => {
+                state.message = message;
+                let view = self.view_of(&state);
+                self.environment.announce(&view);
+                return None;
+            }
+        };
         state.running = true;
         state.message.clear();
         state.progress = None;
-        Some(self.settle(&mut state, Phase::Checking))
+        let view = self.settle(&mut state, Phase::Checking);
+        Some((
+            view,
+            Operation {
+                updates: self.clone(),
+                lease: Some(lease),
+            },
+        ))
     }
 
-    /// Check now: answers with `checking` at once and reports the rest through the event.
+    /// Check now grants consent for this check and its signed download only.
     pub fn request_check(self: &Arc<Self>) -> UpdatesView {
-        match self.enter_checking() {
-            Some(view) => {
+        match self.enter_checking(false) {
+            Some((view, operation)) => {
                 let updates = self.clone();
-                tauri::async_runtime::spawn(async move { updates.run_check("user").await });
+                tauri::async_runtime::spawn(async move {
+                    updates.run_check("user", operation).await;
+                });
                 view
             }
             None => self.view(),
         }
     }
 
-    /// One whole check, awaited. Used by the schedule and by the tests.
     async fn check_now(self: &Arc<Self>, reason: &'static str) -> UpdatesView {
-        if self.enter_checking().is_none() {
-            return self.view();
+        if let Some((_, operation)) = self.enter_checking(reason == "schedule") {
+            self.clone().run_check(reason, operation).await;
         }
-        self.clone().run_check(reason).await;
         self.view()
     }
 
@@ -303,7 +354,28 @@ impl Updates {
     }
 
     /// A found build is downloaded straight away: the window offers no separate download step.
-    async fn run_check(self: Arc<Self>, reason: &'static str) {
+    async fn run_check(self: Arc<Self>, reason: &'static str, _operation: Operation) {
+        let cancelled = tokio::select! {
+            biased;
+            () = self.cancel_network.notified() => true,
+            () = self.clone().check_and_download(reason) => false,
+        };
+        // Drop the request future before releasing the lease. Already verified bytes survive quit.
+        if cancelled {
+            let mut state = lock(&self.state);
+            state.message.clear();
+            state.progress = None;
+            let phase = if state.package.is_some() {
+                Phase::Ready
+            } else {
+                state.found = None;
+                Phase::Idle
+            };
+            self.settle(&mut state, phase);
+        }
+    }
+
+    async fn check_and_download(self: Arc<Self>, reason: &'static str) {
         log::info!("updates: checking ({reason})");
         let result = self.environment.check().await;
         let found = {
@@ -338,9 +410,8 @@ impl Updates {
                 }
             }
         };
-        match found {
-            Some(found) => self.download(found).await,
-            None => lock(&self.state).running = false,
+        if let Some(found) = found {
+            self.download(found).await;
         }
     }
 
@@ -356,7 +427,6 @@ impl Updates {
         };
         let result = self.environment.download(&found, reporter).await;
         let mut state = lock(&self.state);
-        state.running = false;
         state.progress = None;
         match result {
             Ok(bytes) => {
@@ -391,26 +461,101 @@ impl Updates {
         view
     }
 
-    fn fail(&self, message: &str) -> UpdatesView {
-        let mut state = lock(&self.state);
-        state.message = message.to_owned();
-        self.settle(&mut state, Phase::Failed)
+    fn running(&self) -> bool {
+        lock(&self.state).running
     }
 
-    /// Takes the verified bytes so one download is never installed twice. `honor_sharing` is false
-    /// only on the way out: quitting is the user's own choice.
-    fn take_package(&self, honor_sharing: bool) -> Result<(Found, Vec<u8>), String> {
-        if honor_sharing && self.environment.sharing_active() {
-            return Err(SHARING_HINT.to_owned());
-        }
-        let mut state = lock(&self.state);
-        if state.phase != Phase::Ready {
-            return Err(NOTHING_READY.to_owned());
-        }
-        let (Some(found), Some(bytes)) = (state.found.clone(), state.package.take()) else {
-            return Err(NOTHING_READY.to_owned());
+    async fn install_ready(self: &Arc<Self>, during_quit: bool) -> Result<(), String> {
+        let (found, bytes, operation) = {
+            let mut state = lock(&self.state);
+            if state.running
+                || state.phase != Phase::Ready
+                || (!during_quit && state.exit_intent.is_some())
+            {
+                return Err(NOTHING_READY.to_owned());
+            }
+            let lease = self.environment.acquire_lease(true)?;
+            let (Some(found), Some(bytes)) = (state.found.clone(), state.package.take()) else {
+                return Err(NOTHING_READY.to_owned());
+            };
+            state.running = true;
+            state.message.clear();
+            self.settle(&mut state, Phase::Installing);
+            (
+                found,
+                bytes,
+                Operation {
+                    updates: self.clone(),
+                    lease: Some(lease),
+                },
+            )
         };
-        Ok((found, bytes))
+        let updates = self.clone();
+        // The blocking worker owns the lease even if the invoking future is cancelled.
+        tauri::async_runtime::spawn_blocking(move || {
+            let _operation = operation;
+            let result = updates.environment.install(&found, &bytes);
+            let mut state = lock(&updates.state);
+            match &result {
+                Ok(()) => {
+                    state.found = None;
+                    updates.settle(&mut state, Phase::Idle);
+                }
+                Err(message) => {
+                    state.package = Some(bytes);
+                    state.message.clone_from(message);
+                    updates.settle(&mut state, Phase::Ready);
+                }
+            }
+            result
+        })
+        .await
+        .map_err(|_| INSTALL_FAILED.to_owned())?
+    }
+
+    async fn finish_update_before_exit(self: &Arc<Self>, intent: ExitIntent) {
+        while self.running() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ready = lock(&self.state).phase == Phase::Ready;
+        if matches!(intent, ExitIntent::Quit)
+            && ready
+            && let Err(message) = self.install_ready(true).await
+        {
+            log::warn!("updates: could not install before quit: {message}");
+        }
+    }
+
+    fn begin_shutdown(&self, intent: ExitIntent) -> bool {
+        let mut state = lock(&self.state);
+        if state.exit_intent.is_some() {
+            return false;
+        }
+        state.exit_intent = Some(intent);
+        // At most one network operation exists. Keep a permit if it has not started polling yet.
+        self.cancel_network.notify_one();
+        true
+    }
+
+    fn request_shutdown(self: &Arc<Self>, app: &AppHandle, intent: ExitIntent) {
+        if !self.begin_shutdown(intent) {
+            return;
+        }
+        let controller = app.state::<Arc<AppController>>().inner().clone();
+        controller.request_shutdown();
+        let updates = self.clone();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            while !controller.shutdown_ready() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            updates.finish_update_before_exit(intent).await;
+            lock(&updates.state).exit_ready = true;
+            match intent {
+                ExitIntent::Quit => app.exit(0),
+                ExitIntent::Restart => app.restart(),
+            }
+        });
     }
 }
 
@@ -424,43 +569,18 @@ fn schedule(updates: Arc<Updates>) {
     });
 }
 
-/// Installs a verified download while the app exits. Bounded, and never on the network.
-pub fn install_on_quit(app: &AppHandle) {
-    let Some(updates) = app
-        .try_state::<Arc<Updates>>()
-        .map(|state| state.inner().clone())
-    else {
-        return;
-    };
-    let Ok((found, bytes)) = updates.take_package(false) else {
-        return;
-    };
-    let version = found.version.clone();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(updates.environment.install(&found, &bytes));
-    });
-    match receiver.recv_timeout(QUIT_INSTALL_LIMIT) {
-        Ok(Ok(())) => log::info!("updates: {version} installed while quitting"),
-        Ok(Err(message)) => log::warn!("updates: install while quitting failed: {message}"),
-        Err(_) => log::warn!("updates: install while quitting did not finish in time"),
-    }
+pub fn request_quit(app: &AppHandle) {
+    app.state::<Arc<Updates>>()
+        .inner()
+        .request_shutdown(app, ExitIntent::Quit);
 }
 
-/// The install replaced the app on disk; relaunch once nothing holds input or the port.
-fn relaunch(app: &AppHandle) {
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let controller = handle.state::<Arc<AppController>>().inner().clone();
-        controller.request_shutdown();
-        while !controller.shutdown_ready() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        handle.restart();
-    });
+pub fn exit_ready(app: &AppHandle) -> bool {
+    app.try_state::<Arc<Updates>>()
+        .is_none_or(|updates| lock(&updates.state).exit_ready)
 }
 
-fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -513,6 +633,22 @@ fn kind(error: &tauri_plugin_updater::Error) -> String {
     }
 }
 
+fn install_error_message(error: &tauri_plugin_updater::Error) -> &'static str {
+    #[cfg(target_os = "macos")]
+    if matches!(
+        error,
+        tauri_plugin_updater::Error::MacInstallParentNotWritable(_)
+    ) {
+        return "MonHop cannot replace this installation. Download the latest installer and replace it manually.";
+    }
+    if matches!(error, tauri_plugin_updater::Error::Io(io)
+        if matches!(io.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem))
+    {
+        return "MonHop cannot replace this installation. Download the latest installer and replace it manually.";
+    }
+    INSTALL_FAILED
+}
+
 struct AppEnvironment {
     app: AppHandle,
 }
@@ -521,12 +657,17 @@ impl Environment for AppEnvironment {
     fn check(&self) -> Eventual<'_, Result<Option<Found>, String>> {
         let app = self.app.clone();
         Box::pin(async move {
-            // On Windows the plugin exits the process right after starting the installer, so
-            // input and sockets are released before that happens.
+            // The install lease requires idle input and sockets. Latch shutdown only after
+            // Windows launches its installer, so a failed launch leaves MonHop usable.
             let controller = app.state::<Arc<AppController>>().inner().clone();
             let mut builder = app
                 .updater_builder()
                 .timeout(CHECK_TIMEOUT)
+                .configure_client(|client| {
+                    client
+                        .connect_timeout(CHECK_TIMEOUT)
+                        .read_timeout(CHECK_TIMEOUT)
+                })
                 .on_before_exit(move || controller.drain_for_exit());
             if let Some(endpoint) = endpoint_override(CONFIGURED_ENDPOINT) {
                 builder = builder.endpoints(vec![endpoint]).map_err(describe)?;
@@ -575,15 +716,32 @@ impl Environment for AppEnvironment {
     }
 
     fn install(&self, found: &Found, bytes: &[u8]) -> Result<(), String> {
-        found
+        let result = found
             .update
             .as_ref()
             .ok_or_else(|| NO_BUILD.to_owned())?
-            .install(bytes)
-            .map_err(|error| {
+            .install(bytes);
+        match result {
+            Ok(()) => Ok(()),
+            #[cfg(target_os = "macos")]
+            Err(tauri_plugin_updater::Error::MacUpdateInstalledCleanupFailed(_)) => {
+                log::warn!(
+                    "updates: update installed, but old application files could not be fully removed"
+                );
+                Ok(())
+            }
+            Err(error) => {
                 log::warn!("updates: install failed ({})", kind(&error));
-                INSTALL_FAILED.to_owned()
-            })
+                Err(install_error_message(&error).to_owned())
+            }
+        }
+    }
+
+    fn acquire_lease(&self, installing: bool) -> Result<Box<dyn Send>, String> {
+        self.app
+            .state::<Arc<AppController>>()
+            .begin_update(installing)
+            .map(|lease| Box::new(lease) as Box<dyn Send>)
     }
 
     fn sharing_active(&self) -> bool {
@@ -627,22 +785,12 @@ pub fn updates_check(updates: tauri::State<'_, Arc<Updates>>) -> UpdatesView {
 #[tauri::command]
 pub async fn updates_install(app: AppHandle) -> UpdatesView {
     let updates = app.state::<Arc<Updates>>().inner().clone();
-    let (found, bytes) = match updates.take_package(true) {
-        Ok(package) => package,
-        Err(message) => return updates.note(&message),
-    };
-    log::info!("user: installing {}", found.version);
-    let installer = updates.clone();
-    let installed =
-        tauri::async_runtime::spawn_blocking(move || installer.environment.install(&found, &bytes))
-            .await;
-    match installed {
-        Ok(Ok(())) => {
-            relaunch(&app);
+    match updates.install_ready(false).await {
+        Ok(()) => {
+            updates.request_shutdown(&app, ExitIntent::Restart);
             updates.note(RESTARTING)
         }
-        Ok(Err(message)) => updates.fail(&message),
-        Err(_) => updates.fail(INSTALL_FAILED),
+        Err(message) => updates.note(&message),
     }
 }
 
@@ -661,6 +809,12 @@ mod tests {
         sharing: AtomicBool,
         paired: AtomicBool,
         events: Mutex<Vec<UpdatesView>>,
+        busy: Arc<AtomicBool>,
+        active_requests: Arc<AtomicUsize>,
+        install_error: Mutex<Option<String>>,
+        check_pause: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        download_pause: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        install_pause: Mutex<Option<Arc<std::sync::Barrier>>>,
     }
 
     impl Fake {
@@ -674,6 +828,12 @@ mod tests {
                 sharing: AtomicBool::new(false),
                 paired: AtomicBool::new(true),
                 events: Mutex::new(Vec::new()),
+                busy: Arc::new(AtomicBool::new(false)),
+                active_requests: Arc::new(AtomicUsize::new(0)),
+                install_error: Mutex::new(None),
+                check_pause: Mutex::new(None),
+                download_pause: Mutex::new(None),
+                install_pause: Mutex::new(None),
             })
         }
 
@@ -690,11 +850,41 @@ mod tests {
     /// The environment the machine sees; the test keeps its own handle on the same counters.
     struct FakeEnvironment(Arc<Fake>);
 
+    struct FakeLease(Arc<Fake>);
+    impl Drop for FakeLease {
+        fn drop(&mut self) {
+            assert_eq!(self.0.active_requests.load(Ordering::SeqCst), 0);
+            self.0.busy.store(false, Ordering::SeqCst);
+        }
+    }
+
+    struct RequestLifetime(Arc<AtomicUsize>);
+    impl RequestLifetime {
+        fn new(counter: &Arc<AtomicUsize>) -> Self {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Self(counter.clone())
+        }
+    }
+
+    impl Drop for RequestLifetime {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     impl Environment for FakeEnvironment {
         fn check(&self) -> Eventual<'_, Result<Option<Found>, String>> {
             self.0.checks.fetch_add(1, Ordering::Relaxed);
             let found = self.0.found.lock().unwrap().clone();
-            Box::pin(async move { found })
+            let pause = lock(&self.0.check_pause).clone();
+            let request = RequestLifetime::new(&self.0.active_requests);
+            Box::pin(async move {
+                let _request = request;
+                if let Some(pause) = pause {
+                    pause.notified().await;
+                }
+                found
+            })
         }
 
         fn download(
@@ -705,12 +895,37 @@ mod tests {
             self.0.downloads.fetch_add(1, Ordering::Relaxed);
             progress(50);
             let bytes = self.0.bytes.lock().unwrap().clone();
-            Box::pin(async move { bytes })
+            let pause = lock(&self.0.download_pause).clone();
+            let request = RequestLifetime::new(&self.0.active_requests);
+            Box::pin(async move {
+                let _request = request;
+                if let Some(pause) = pause {
+                    pause.notified().await;
+                }
+                bytes
+            })
         }
 
         fn install(&self, _found: &Found, _bytes: &[u8]) -> Result<(), String> {
             self.0.installs.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if let Some(pause) = lock(&self.0.install_pause).clone() {
+                pause.wait();
+            }
+            match lock(&self.0.install_error).clone() {
+                Some(message) => Err(message),
+                None => Ok(()),
+            }
+        }
+
+        fn acquire_lease(&self, _installing: bool) -> Result<Box<dyn Send>, String> {
+            if self.0.sharing.load(Ordering::SeqCst) {
+                return Err(SHARING_HINT.to_owned());
+            }
+            self.0
+                .busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| "Update work is already running.".to_owned())?;
+            Ok(Box::new(FakeLease(self.0.clone())))
         }
 
         fn sharing_active(&self) -> bool {
@@ -756,10 +971,10 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_keeps_automatic_updates_on() {
+    fn a_missing_file_keeps_automatic_updates_off() {
         let path = temporary_path("missing");
         let _ = std::fs::remove_file(&path);
-        assert!(UpdatesFile::load(&path).unwrap().automatic);
+        assert!(!UpdatesFile::load(&path).unwrap().automatic);
     }
 
     #[test]
@@ -774,7 +989,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_file_falls_back_to_automatic_updates() {
+    fn an_unreadable_file_does_not_enable_automatic_updates() {
         let path = temporary_path("unreadable");
         std::fs::write(&path, br#"{"version":9,"automatic":false}"#).unwrap();
         assert!(UpdatesFile::load(&path).is_err());
@@ -787,7 +1002,7 @@ mod tests {
         )
         .unwrap();
         assert!(UpdatesFile::load(&path).is_err());
-        assert!(UpdatesFile::default().automatic);
+        assert!(!UpdatesFile::default().automatic);
     }
 
     #[test]
@@ -830,6 +1045,7 @@ mod tests {
             (Phase::Available, "\"available\""),
             (Phase::Downloading, "\"downloading\""),
             (Phase::Ready, "\"ready\""),
+            (Phase::Installing, "\"installing\""),
             (Phase::Failed, "\"failed\""),
         ] {
             assert_eq!(serde_json::to_string(&phase).unwrap(), text);
@@ -895,7 +1111,7 @@ mod tests {
         assert_eq!(view.phase, Phase::Failed);
         assert_eq!(view.message, "The build was not signed by MonHop.");
         assert_eq!(
-            updates.take_package(false).err().as_deref(),
+            updates.install_ready(false).await.err().as_deref(),
             Some(NOTHING_READY)
         );
     }
@@ -946,7 +1162,7 @@ mod tests {
         fake.sharing.store(true, Ordering::Relaxed);
 
         assert_eq!(
-            updates.take_package(true).err().as_deref(),
+            updates.install_ready(false).await.err().as_deref(),
             Some(SHARING_HINT)
         );
         let view = updates.note(SHARING_HINT);
@@ -955,12 +1171,12 @@ mod tests {
         assert!(view.sharing_active);
         assert_eq!(fake.installs.load(Ordering::Relaxed), 0);
 
-        // Quitting is the user's own choice, so the way out still installs.
-        let (found, bytes) = updates.take_package(false).unwrap();
-        assert_eq!(found.version, "9.9.9");
-        assert_eq!(bytes, vec![1, 2, 3]);
+        assert!(updates.install_ready(true).await.is_err());
+        fake.sharing.store(false, Ordering::Relaxed);
+        updates.install_ready(true).await.unwrap();
+        assert_eq!(fake.installs.load(Ordering::Relaxed), 1);
         assert_eq!(
-            updates.take_package(false).err().as_deref(),
+            updates.install_ready(true).await.err().as_deref(),
             Some(NOTHING_READY)
         );
     }
@@ -988,5 +1204,226 @@ mod tests {
         assert_eq!(percent(1, 0), 0);
         assert_eq!(bounded("abcdef", 3), "abc");
         assert_eq!(bounded(&"n".repeat(5000), MAX_NOTES_CHARS).len(), 2000);
+    }
+    async fn wait_until(condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn old_preferences_do_not_count_as_explicit_opt_in() {
+        let path = temporary_path("old-consent");
+        std::fs::write(&path, br#"{"version":1,"automatic":true}"#).unwrap();
+        assert!(UpdatesFile::load(&path).is_err());
+        assert!(!UpdatesFile::default().automatic);
+    }
+
+    #[test]
+    fn explicit_opt_in_round_trips_in_the_new_preference_format() {
+        let path = temporary_path("explicit-consent");
+        let (mut updates, _) = machine(false, Ok(None));
+        Arc::get_mut(&mut updates).unwrap().path = Some(path.clone());
+        assert!(updates.set_automatic(true).automatic);
+        assert!(UpdatesFile::load(&path).unwrap().automatic);
+        assert!(!updates.set_automatic(false).automatic);
+        assert!(!UpdatesFile::load(&path).unwrap().automatic);
+    }
+
+    #[tokio::test]
+    async fn sharing_blocks_both_manual_and_scheduled_network_requests() {
+        let (updates, fake) = machine(true, build("9.9.9"));
+        fake.sharing.store(true, Ordering::SeqCst);
+        updates.request_check();
+        updates.check_now("user").await;
+        updates.scheduled_check().await;
+        assert_eq!(fake.checks.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.downloads.load(Ordering::SeqCst), 0);
+        assert!(!fake.busy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn check_and_download_keep_exclusive_ownership_until_completion() {
+        let (updates, fake) = machine(true, build("9.9.9"));
+        let check = Arc::new(tokio::sync::Notify::new());
+        let download = Arc::new(tokio::sync::Notify::new());
+        *lock(&fake.check_pause) = Some(check.clone());
+        *lock(&fake.download_pause) = Some(download.clone());
+        let worker = updates.clone();
+        let task = tokio::spawn(async move { worker.check_now("user").await });
+        wait_until(|| fake.checks.load(Ordering::SeqCst) == 1).await;
+        assert!(fake.busy.load(Ordering::SeqCst));
+        assert!(updates.environment.acquire_lease(false).is_err());
+        updates.request_check();
+        assert_eq!(fake.checks.load(Ordering::SeqCst), 1);
+        check.notify_one();
+        wait_until(|| fake.downloads.load(Ordering::SeqCst) == 1).await;
+        assert!(fake.busy.load(Ordering::SeqCst));
+        assert!(updates.environment.acquire_lease(true).is_err());
+        download.notify_one();
+        assert_eq!(task.await.unwrap().phase, Phase::Ready);
+        assert!(!fake.busy.load(Ordering::SeqCst));
+        assert!(!updates.running());
+    }
+
+    #[tokio::test]
+    async fn cancelled_check_releases_the_sharing_reservation() {
+        let (updates, fake) = machine(true, build("9.9.9"));
+        *lock(&fake.check_pause) = Some(Arc::new(tokio::sync::Notify::new()));
+        let worker = updates.clone();
+        let task = tokio::spawn(async move { worker.check_now("user").await });
+        wait_until(|| fake.checks.load(Ordering::SeqCst) == 1).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!fake.busy.load(Ordering::SeqCst));
+        assert!(!updates.running());
+        assert_eq!(fake.downloads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn quitting_cancels_stalled_checks_and_downloads_without_installing() {
+        for intent in [ExitIntent::Quit, ExitIntent::Restart] {
+            for downloading in [false, true] {
+                let (updates, fake) = machine(true, build("9.9.9"));
+                let pause = Arc::new(tokio::sync::Notify::new());
+                let counter = if downloading {
+                    *lock(&fake.download_pause) = Some(pause);
+                    &fake.downloads
+                } else {
+                    *lock(&fake.check_pause) = Some(pause);
+                    &fake.checks
+                };
+                let worker = updates.clone();
+                let task = tokio::spawn(async move { worker.check_now("user").await });
+                wait_until(|| counter.load(Ordering::SeqCst) == 1).await;
+                assert!(updates.begin_shutdown(intent));
+                assert!(!updates.begin_shutdown(intent));
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    updates.finish_update_before_exit(intent),
+                )
+                .await
+                .unwrap();
+                assert_eq!(task.await.unwrap().phase, Phase::Idle);
+                assert_eq!(fake.active_requests.load(Ordering::SeqCst), 0);
+                assert_eq!(fake.installs.load(Ordering::SeqCst), 0);
+                assert!(!fake.busy.load(Ordering::SeqCst));
+                assert!(!updates.running());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quit_cancellation_is_not_lost_before_the_network_task_starts() {
+        let (updates, fake) = machine(true, build("9.9.9"));
+        let (_, operation) = updates.enter_checking(false).unwrap();
+        assert!(updates.begin_shutdown(ExitIntent::Quit));
+        updates.clone().run_check("user", operation).await;
+        updates.finish_update_before_exit(ExitIntent::Quit).await;
+        assert_eq!(fake.checks.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.installs.load(Ordering::SeqCst), 0);
+        assert!(!fake.busy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_new_check_on_quit_preserves_the_verified_package() {
+        let (updates, fake) = machine(true, build("9.9.9"));
+        updates.check_now("user").await;
+        *lock(&fake.check_pause) = Some(Arc::new(tokio::sync::Notify::new()));
+        let worker = updates.clone();
+        let task = tokio::spawn(async move { worker.check_now("user").await });
+        wait_until(|| fake.checks.load(Ordering::SeqCst) == 2).await;
+        assert!(updates.begin_shutdown(ExitIntent::Quit));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            updates.finish_update_before_exit(ExitIntent::Quit),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap();
+        assert_eq!(fake.downloads.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(updates.view().phase, Phase::Idle);
+    }
+
+    #[test]
+    fn unwritable_installations_explain_manual_recovery() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::ReadOnlyFilesystem,
+        ] {
+            let error = tauri_plugin_updater::Error::Io(io::Error::from(kind));
+            assert!(install_error_message(&error).contains("replace it manually"));
+        }
+    }
+
+    #[tokio::test]
+    async fn install_failure_keeps_verified_bytes_and_does_not_latch_shutdown() {
+        let (updates, fake) = machine(true, build("9.9.9"));
+        updates.check_now("user").await;
+        *lock(&fake.install_error) = Some("Cannot replace this app.".into());
+        assert!(updates.install_ready(false).await.is_err());
+        assert_eq!(updates.view().phase, Phase::Ready);
+        assert!(lock(&updates.state).exit_intent.is_none());
+        assert!(!fake.busy.load(Ordering::SeqCst));
+        *lock(&fake.install_error) = None;
+        updates.install_ready(false).await.unwrap();
+        assert_eq!(fake.installs.load(Ordering::SeqCst), 2);
+        assert_eq!(updates.view().phase, Phase::Idle);
+    }
+
+    #[tokio::test]
+    async fn quit_waits_for_install_completion_and_never_starts_it_twice() {
+        let (updates, fake) = machine(true, build("9.9.9"));
+        updates.check_now("user").await;
+        let pause = Arc::new(std::sync::Barrier::new(2));
+        *lock(&fake.install_pause) = Some(pause.clone());
+        let worker = updates.clone();
+        let install = tokio::spawn(async move { worker.install_ready(false).await });
+        wait_until(|| fake.installs.load(Ordering::SeqCst) == 1).await;
+        assert!(updates.install_ready(false).await.is_err());
+        let worker = updates.clone();
+        assert!(updates.begin_shutdown(ExitIntent::Quit));
+        let quit = tokio::spawn(async move {
+            worker.finish_update_before_exit(ExitIntent::Quit).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!quit.is_finished());
+        assert!(fake.busy.load(Ordering::SeqCst));
+        pause.wait();
+        install.await.unwrap().unwrap();
+        quit.await.unwrap();
+        assert_eq!(fake.installs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_install_caller_cannot_release_an_active_installer() {
+        let (updates, fake) = machine(true, build("9.9.9"));
+        updates.check_now("user").await;
+        let pause = Arc::new(std::sync::Barrier::new(2));
+        *lock(&fake.install_pause) = Some(pause.clone());
+        let worker = updates.clone();
+        let install = tokio::spawn(async move { worker.install_ready(false).await });
+        wait_until(|| fake.installs.load(Ordering::SeqCst) == 1).await;
+        install.abort();
+        assert!(install.await.unwrap_err().is_cancelled());
+        assert!(updates.running());
+        assert!(fake.busy.load(Ordering::SeqCst));
+        pause.wait();
+        wait_until(|| !updates.running()).await;
+        assert!(!fake.busy.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn closing_refuses_new_update_networking() {
+        let (updates, fake) = machine(true, Ok(None));
+        assert!(updates.begin_shutdown(ExitIntent::Quit));
+        updates.request_check();
+        updates.scheduled_check().await;
+        assert_eq!(fake.checks.load(Ordering::SeqCst), 0);
     }
 }

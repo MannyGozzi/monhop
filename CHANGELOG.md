@@ -14,7 +14,7 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - **Multiple computers.** Remember sixteen paired computers and choose one to control.
 - **Screen dimming.** Choose your preferred darkness and dim with a keyboard shortcut.
 - **Everyday controls.** Menu bar and tray access, light and dark themes, and optional launch at login.
-- **Update controls.** Check manually, disable automatic checks, or restart to install.
+- **Update controls.** Check manually, opt into automatic checks, or restart to install.
 
 ### Changed
 
@@ -26,17 +26,20 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - macOS builds now include the permission needed to request Location access and recognize Wi-Fi networks during setup.
 - Slow crossings no longer stick the pointer or send it into excluded screens.
 - Sharing recovers after brief interruptions. Pausing or switching computers no longer reports a dropped connection.
+- Quitting cancels unfinished downloads and waits for installation to finish. Failed Mac replacements leave the installed app intact.
+- Failed Windows installer launches no longer leave MonHop stuck in shutdown. Stalled downloads stop instead of blocking sharing indefinitely.
 
 ### Security
 
 - Sharing stays on your selected local connection with a paired computer.
 - Updates require a valid signature. Opening MonHop does not capture input or change system permissions.
+- Automatic checks are off until you opt in, including after older or unreadable settings. Update checks and downloads cannot run alongside sharing.
 
 ### Installation notes
 
 - Apple silicon and Intel Macs require macOS 14+. Windows requires 64-bit Windows 10 or 11 with Microsoft Edge WebView2 Runtime installed.
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
-- macOS permissions may need approval again after an update. Automatic update installation still has known reliability issues. Use the installers for this release.
+- macOS permissions may need approval again after an update.
 
 [Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.1

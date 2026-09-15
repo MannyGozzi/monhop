@@ -245,7 +245,6 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | objc2-exception-helper | 0.1.1 | Zlib OR Apache-2.0 OR MIT |
 | objc2-foundation | 0.3.2 | MIT |
 | objc2-io-surface | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
-| objc2-osa-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | objc2-quartz-core | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | objc2-security | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | objc2-service-management | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
@@ -256,7 +255,6 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | openssl-probe | 0.2.1 | MIT OR Apache-2.0 |
 | option-ext | 0.2.0 | MPL-2.0 |
-| osakit | 0.3.1 | MIT OR Apache-2.0 |
 | pango | 0.18.3 | MIT |
 | pango-sys | 0.18.0 | MIT |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 |

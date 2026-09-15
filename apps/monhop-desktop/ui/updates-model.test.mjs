@@ -27,20 +27,20 @@ test("a full view normalizes to itself", () => {
   assert.deepEqual(normalizeUpdatesView(base), base);
 });
 
-const defaults = { ...base, currentVersion: "", buildCommit: "" };
+const defaults = { ...base, automatic: false, currentVersion: "", buildCommit: "" };
 
 test("missing or malformed fields fall back to safe defaults", () => {
   assert.deepEqual(normalizeUpdatesView(null), defaults);
   assert.deepEqual(normalizeUpdatesView({}), defaults);
   assert.equal(normalizeUpdatesView({ phase: "mid-flight" }).phase, "idle");
-  assert.equal(normalizeUpdatesView({ automatic: "yes" }).automatic, true);
+  assert.equal(normalizeUpdatesView({ automatic: "yes" }).automatic, false);
   assert.equal(normalizeUpdatesView({ currentVersion: 12 }).currentVersion, "");
   assert.equal(normalizeUpdatesView({ host: 12 }).host, "github.com");
 });
 
-test("automatic is on unless the view says otherwise", () => {
+test("automatic stays off unless the backend confirms consent", () => {
   assert.equal(normalizeUpdatesView({ automatic: false }).automatic, false);
-  assert.equal(normalizeUpdatesView({}).automatic, true);
+  assert.equal(normalizeUpdatesView({}).automatic, false);
 });
 
 test("numbers are clamped and out-of-range strings become null", () => {
@@ -128,4 +128,29 @@ test("the install hint only appears when sharing blocks a ready install", () => 
   );
   assert.equal(installHint({ ...base, phase: "ready", sharingActive: false }), "");
   assert.equal(installHint({ ...base, phase: "downloading", sharingActive: true }), "");
+});
+
+test("installing cannot start another check or install", () => {
+  const view = { ...base, phase: "installing", availableVersion: "0.2.0" };
+  assert.equal(normalizeUpdatesView(view).phase, "installing");
+  assert.equal(updatesStatusText(view), "Installing MonHop 0.2.0…");
+  assert.equal(canCheck(view), false);
+  assert.equal(canInstall(view), false);
+});
+
+test("checking is disabled while sharing is active", () => {
+  assert.equal(canCheck({ ...base, sharingActive: true }), false);
+});
+
+test("a failed install stays retryable and explains the failure", () => {
+  const view = { ...base, phase: "ready", message: "The app could not be replaced." };
+  assert.equal(updatesStatusText(view), "The app could not be replaced.");
+  assert.equal(canInstall(view), true);
+});
+
+test("a refused check explains why no request started", () => {
+  assert.equal(
+    updatesStatusText({ ...base, message: "Pause sharing first." }),
+    "Pause sharing first.",
+  );
 });

@@ -111,12 +111,10 @@ objc2-core-location v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-encode v4.1.0 MIT
 objc2-exception-helper v0.1.1 Zlib OR Apache-2.0 OR MIT
 objc2-foundation v0.3.2 MIT
-objc2-osa-kit v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-service-management v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-web-kit v0.3.2 Zlib OR Apache-2.0 OR MIT
 once_cell v1.21.4 MIT OR Apache-2.0
 option-ext v0.2.0 MPL-2.0
-osakit v0.3.1 MIT OR Apache-2.0
 percent-encoding v2.3.2 MIT OR Apache-2.0
 phf v0.13.1 MIT
 phf_shared v0.13.1 MIT
@@ -170,7 +168,7 @@ system-configuration-sys v0.6.0 MIT OR Apache-2.0
 tao v0.35.3 (Vendored third-party source (modified)) Apache-2.0
 tar v0.4.46 MIT OR Apache-2.0
 tauri v2.11.5 Apache-2.0 OR MIT
-tauri-plugin-updater v2.11.0 Apache-2.0 OR MIT
+tauri-plugin-updater v2.11.0 (Vendored third-party source (modified)) Apache-2.0 OR MIT
 tauri-runtime v2.11.3 Apache-2.0 OR MIT
 tauri-runtime-wry v2.11.4 (Vendored third-party source (modified)) Apache-2.0 OR MIT
 tauri-utils v2.9.3 Apache-2.0 OR MIT

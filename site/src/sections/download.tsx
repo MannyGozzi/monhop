@@ -60,19 +60,12 @@ export function Download() {
                   <span>Released {releaseDate(release.publishedAt)}</span>
                 </>
               ) : null}
-              {release.notesUrl ? (
-                <>
-                  <span aria-hidden>·</span>
-                  <a
-                    href={release.notesUrl}
-                    className="underline underline-offset-4 hover:text-foreground"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Release notes
-                  </a>
-                </>
-              ) : null}
+              <>
+                <span aria-hidden>·</span>
+                <a href="/changelog" className="underline underline-offset-4 hover:text-foreground">
+                  Release notes
+                </a>
+              </>
             </p>
           </Reveal>
         ) : null}

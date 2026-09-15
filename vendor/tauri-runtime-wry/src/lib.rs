@@ -4186,6 +4186,15 @@ fn handle_event_loop<T: UserEvent>(
       callback(RunEvent::Exit);
     }
 
+    #[cfg(target_os = "macos")]
+    Event::ExitRequested => {
+      let (tx, rx) = channel();
+      callback(RunEvent::ExitRequested { code: None, tx });
+      if !matches!(rx.try_recv(), Ok(ExitRequestedEventAction::Prevent)) {
+        *control_flow = ControlFlow::Exit;
+      }
+    }
+
     #[cfg(windows)]
     Event::RedrawRequested(id) => {
       if let Some(window_id) = window_id_map.get(&id) {

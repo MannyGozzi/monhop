@@ -17,9 +17,10 @@ import { cn } from '@/lib/utils'
 import { links, product } from '@/lib/links'
 
 const sections = [
-  { href: '#features', label: 'Features' },
-  { href: '#how-it-works', label: 'How it works' },
-  { href: '#download', label: 'Download' },
+  { href: '/#features', label: 'Features' },
+  { href: '/#how-it-works', label: 'How it works' },
+  { href: '/#download', label: 'Download' },
+  { href: '/changelog', label: 'Release notes' },
 ]
 
 export function Nav() {
@@ -42,7 +43,7 @@ export function Nav() {
         )}
       >
         <a
-          href="#hero"
+          href="/"
           className="mr-auto flex items-center gap-2 rounded-full px-1 py-1 font-semibold tracking-tight focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
         >
           <img src="/monhop.svg" alt="" width={26} height={26} className="size-[26px] rounded-[7px]" />

@@ -26,12 +26,15 @@ use crate::{
 struct GateState {
     action_running: bool,
     shutting_down: bool,
+    updating: bool,
 }
 
 #[derive(Default)]
 struct ActionGate(Mutex<GateState>);
 
 struct ActionLease<'a>(&'a ActionGate);
+
+pub struct UpdateLease(Arc<ActionGate>);
 
 impl ActionGate {
     fn begin(&self) -> Result<ActionLease<'_>, String> {
@@ -41,6 +44,11 @@ impl ActionGate {
         }
         if state.action_running {
             return Err("Finish the current setup action before starting another.".into());
+        }
+        if state.updating {
+            return Err(
+                "An update is in progress. Wait for it to finish before starting sharing.".into(),
+            );
         }
         state.action_running = true;
         Ok(ActionLease(self))
@@ -56,6 +64,12 @@ impl ActionGate {
     fn is_drained(&self) -> bool {
         let state = lock(&self.0);
         state.shutting_down && !state.action_running
+    }
+}
+
+impl Drop for UpdateLease {
+    fn drop(&mut self) {
+        lock(&self.0.0).updating = false;
     }
 }
 
@@ -77,7 +91,7 @@ pub struct AppController {
     pub pairing: Arc<PairingController>,
     pub sharing: Arc<SharingController>,
     pub trial: Arc<crate::trial::TrialController>,
-    gate: ActionGate,
+    gate: Arc<ActionGate>,
     /// Resolved once at startup so actions with fixed signatures can still reach the setup file.
     setup_path: Mutex<Option<PathBuf>>,
     /// A failed start waits this long before the supervisor tries again.
@@ -92,6 +106,25 @@ const SUPERVISOR_BACKOFF: Duration = Duration::from_secs(10);
 const PAIRING_HOLDS_PORT: &str = "Pairing in progress. Sharing resumes afterwards.";
 
 impl AppController {
+    /// The same gate reserves sharing starts and update work, including across async downloads.
+    pub fn begin_update(&self, installing: bool) -> Result<UpdateLease, String> {
+        let mut state = lock(&self.gate.0);
+        if state.action_running || state.updating || (state.shutting_down && !installing) {
+            return Err("Finish the current action before updating MonHop.".into());
+        }
+        if !self.sharing.shutdown_ready()
+            || !self.pairing.shutdown_ready()
+            || self.pairing.occupies_port()
+            || self.trial.is_open()
+        {
+            return Err(
+                "Pause sharing and finish pairing before checking or installing updates.".into(),
+            );
+        }
+        state.updating = true;
+        Ok(UpdateLease(self.gate.clone()))
+    }
+
     /// Trust changes use the sharing port, so the live connection ends first; the supervisor
     /// reconnects once the exchange is over.
     pub fn pairing_action(
@@ -790,6 +823,53 @@ mod tests {
         controller.request_shutdown();
         assert!(!controller.shutdown_ready());
         drop(ownership);
+        assert!(controller.shutdown_ready());
+    }
+    #[test]
+    fn update_work_and_sharing_actions_exclude_each_other_in_both_orders() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let controller = AppController::default();
+        let update = controller.begin_update(false).unwrap();
+        assert!(
+            controller
+                .metadata_action(|| -> Result<(), String> {
+                    panic!("action cannot start during update work")
+                })
+                .is_err()
+        );
+        assert!(controller.begin_update(true).is_err());
+        drop(update);
+        controller
+            .metadata_action(|| {
+                assert!(controller.begin_update(false).is_err());
+                assert!(controller.begin_update(true).is_err());
+                Ok(())
+            })
+            .unwrap();
+        assert!(controller.begin_update(false).is_ok());
+    }
+
+    #[test]
+    fn native_cleanup_blocks_checks_even_when_the_view_is_not_sharing() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let controller = AppController::default();
+        let ownership = monhop_core::NativeInputOwnership::claim().unwrap();
+        assert!(!controller.sharing.status().sharing_active);
+        assert!(controller.begin_update(false).is_err());
+        assert!(controller.begin_update(true).is_err());
+        drop(ownership);
+        assert!(controller.begin_update(false).is_ok());
+    }
+
+    #[test]
+    fn shutdown_allows_installation_but_never_new_network_requests() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let controller = AppController::default();
+        controller.request_shutdown();
+        assert!(controller.begin_update(false).is_err());
+        let install = controller.begin_update(true).unwrap();
+        assert!(controller.gate.begin().is_err());
+        drop(install);
         assert!(controller.shutdown_ready());
     }
 }
