@@ -7,11 +7,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-monhop-core = { path = "../../crates/monhop-core", version = "=0.1.0" }
-monhop-protocol = { path = "../../crates/monhop-protocol", version = "=0.1.0" }
-monhop-transport = { path = "../../crates/monhop-transport", version = "=0.1.0" }
-monhop-platform-windows = { path = "../../crates/monhop-platform-windows", version = "=0.1.0" }
-monhop-platform-macos = { path = "../../crates/monhop-platform-macos", version = "=0.1.0" }
+monhop-core = { path = "../../crates/monhop-core", version = "=0.1.1" }
+monhop-protocol = { path = "../../crates/monhop-protocol", version = "=0.1.1" }
+monhop-transport = { path = "../../crates/monhop-transport", version = "=0.1.1" }
+monhop-platform-windows = { path = "../../crates/monhop-platform-windows", version = "=0.1.1" }
+monhop-platform-macos = { path = "../../crates/monhop-platform-macos", version = "=0.1.1" }
 zeroize = "=1.9.0"
 
 [lints]

@@ -80,13 +80,13 @@ memchr v2.8.3 Unlicense OR MIT
 mime v0.3.17 MIT OR Apache-2.0
 minisign-verify v0.2.5 MIT
 mio v1.2.3 MIT
-monhop v0.1.0 (MonHop original source) GPL-3.0-or-later
-monhop-core v0.1.0 (MonHop original source) GPL-3.0-or-later
-monhop-desktop v0.1.0 (MonHop original source) GPL-3.0-or-later
-monhop-platform-macos v0.1.0 (MonHop original source) GPL-3.0-or-later
-monhop-platform-windows v0.1.0 (MonHop original source) GPL-3.0-or-later
-monhop-protocol v0.1.0 (MonHop original source) GPL-3.0-or-later
-monhop-transport v0.1.0 (MonHop original source) GPL-3.0-or-later
+monhop v0.1.1 (MonHop original source) GPL-3.0-or-later
+monhop-core v0.1.1 (MonHop original source) GPL-3.0-or-later
+monhop-desktop v0.1.1 (MonHop original source) GPL-3.0-or-later
+monhop-platform-macos v0.1.1 (MonHop original source) GPL-3.0-or-later
+monhop-platform-windows v0.1.1 (MonHop original source) GPL-3.0-or-later
+monhop-protocol v0.1.1 (MonHop original source) GPL-3.0-or-later
+monhop-transport v0.1.1 (MonHop original source) GPL-3.0-or-later
 muda v0.19.3 Apache-2.0 OR MIT
 num-conv v0.2.2 MIT OR Apache-2.0
 once_cell v1.21.4 MIT OR Apache-2.0
