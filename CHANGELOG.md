@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-14
+
 ### Added
 
 - Share one keyboard and mouse with another computer on the same network: the pointer crosses the seam between their screens and whatever you type follows it.
@@ -46,4 +48,5 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 - Starting the app installs no input hooks, changes no system permissions, and registers nothing to run at startup on its own.
 - The encryption library named in a published advisory is pinned to its fixed version.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/main...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.1
