@@ -538,9 +538,13 @@ private func signBundle(at bundle: URL) throws {
         throw SigningError.message("No MonHop signing identity exists. Run setup explicitly; build never creates or falls back to ad-hoc signing.")
     }
     let requirement = signerRequirement(for: identity)
+    let entitlements = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("apps/monhop-desktop/macos/entitlements.plist")
     _ = try run(codesignPath, [
         "--force", "--sign", identity.fingerprint, "--keychain", identity.loginKeychainPath,
         "--identifier", bundleIdentifier, "--options", "runtime", "--timestamp=none",
+        "--entitlements", entitlements.path,
         "--requirements", "=designated => \(requirement)", bundle.path,
     ])
     _ = try run(codesignPath, ["--verify", "--deep", "--strict", "--verbose=2", bundle.path])

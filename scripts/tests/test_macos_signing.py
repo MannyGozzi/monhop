@@ -1,3 +1,4 @@
+import json
 import pathlib
 import plistlib
 import subprocess
@@ -34,6 +35,22 @@ class MacOSSigningScriptTests(unittest.TestCase):
         self.assertIn("computer you verify", info["NSLocalNetworkUsageDescription"])
         self.assertIn("does not enable", info["NSLocalNetworkUsageDescription"])
         self.assertNotIn("NSBonjourServices", info)
+
+    def test_release_and_local_signing_share_the_location_entitlement(self):
+        desktop = ROOT / "apps/monhop-desktop"
+        config = json.loads((desktop / "tauri.conf.json").read_text())
+        macos = config["bundle"]["macOS"]
+        self.assertTrue(macos.get("hardenedRuntime", True))
+        entitlements = desktop / macos["entitlements"]
+        with entitlements.open("rb") as source:
+            self.assertEqual(plistlib.load(source), {"com.apple.security.personal-information.location": True})
+        self.assertIn(str(entitlements.relative_to(ROOT)), self.swift)
+        self.assertIn('"--entitlements", entitlements.path', self.swift)
+
+    def test_local_and_release_builds_verify_the_final_signed_bundle(self):
+        self.assertIn('python3 "$workspace/scripts/verify_macos_bundle.py" "$bundle"', self.build)
+        workflow = (ROOT / ".github/workflows/build.yml").read_text()
+        self.assertIn("scripts/verify_macos_bundle.py", workflow)
 
     def test_setup_keeps_private_material_encrypted_and_passphrases_off_argv_and_environment(self):
         self.assertIn('"genrsa", "-aes256", "-passout", "fd:0"', self.swift)
