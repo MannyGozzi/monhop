@@ -1305,6 +1305,7 @@ mod tests {
 
     #[test]
     fn worker_failure_is_recorded_before_late_window_events() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let trial = TrialController::default();
         let sharing = SharingController::default();
         let signal = RevocationSignal::default();
@@ -1335,6 +1336,7 @@ mod tests {
 
     #[test]
     fn late_window_events_revoke_finished_attempts_without_replacing_completion() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let trial = TrialController::default();
         let sharing = SharingController::default();
         let signal = RevocationSignal::default();
@@ -1378,6 +1380,7 @@ mod tests {
 
     #[test]
     fn pending_start_is_never_reported_as_completed_cleanup() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let trial = TrialController::default();
         let sharing = SharingController::default();
         {
