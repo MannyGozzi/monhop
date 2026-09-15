@@ -69,6 +69,22 @@ jobs:
           tauriScript: python3 ../../scripts/tauri_ci.py
           args: ${{ matrix.args }} --ci -- --locked
           includeUpdaterJson: false
+      - name: Verify macOS permission packaging
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          BUNDLES: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          bundles = [path for path in json.loads(os.environ['BUNDLES']) if path.endswith('.app')]
+          if len(bundles) != 1:
+              raise SystemExit('Expected exactly one macOS app bundle to verify before upload.')
+          subprocess.run(['python3', 'scripts/verify_macos_bundle.py', bundles[0]], check=True)
+          PY
       - name: Collect the bundle paths
         id: bundles
         shell: bash

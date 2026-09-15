@@ -25,6 +25,7 @@
     "macOS": {
       "minimumSystemVersion": "14.0",
       "signingIdentity": "-",
+      "entitlements": "macos/entitlements.plist",
       "files": {
         "Library/LaunchAgents/com.manuelgozzi.monhop.login.plist": "macos/com.manuelgozzi.monhop.login.plist"
       }

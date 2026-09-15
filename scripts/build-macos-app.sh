@@ -36,4 +36,5 @@ env -u APPLE_CERTIFICATE -u APPLE_CERTIFICATE_PASSWORD -u APPLE_SIGNING_IDENTITY
   cargo tauri build --target "$host" --bundles app --ci -- --locked
 bundle="$workspace/target/$host/release/bundle/macos/MonHop.app"
 "$workspace/scripts/macos-signing.sh" sign "$bundle"
+python3 "$workspace/scripts/verify_macos_bundle.py" "$bundle"
 printf 'Verified stable-signed development app: %s\n' "$bundle"
