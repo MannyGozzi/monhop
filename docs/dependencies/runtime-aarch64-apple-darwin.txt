@@ -94,13 +94,13 @@ minisign-verify v0.2.5 MIT
 miniz_oxide v0.8.9 MIT OR Zlib OR Apache-2.0
 miniz_oxide v0.9.1 MIT OR Zlib OR Apache-2.0
 mio v1.2.3 MIT
-monhop v0.1.2 (MonHop original source) GPL-3.0-or-later
-monhop-core v0.1.2 (MonHop original source) GPL-3.0-or-later
-monhop-desktop v0.1.2 (MonHop original source) GPL-3.0-or-later
-monhop-platform-macos v0.1.2 (MonHop original source) GPL-3.0-or-later
-monhop-platform-windows v0.1.2 (MonHop original source) GPL-3.0-or-later
-monhop-protocol v0.1.2 (MonHop original source) GPL-3.0-or-later
-monhop-transport v0.1.2 (MonHop original source) GPL-3.0-or-later
+monhop v0.1.3 (MonHop original source) GPL-3.0-or-later
+monhop-core v0.1.3 (MonHop original source) GPL-3.0-or-later
+monhop-desktop v0.1.3 (MonHop original source) GPL-3.0-or-later
+monhop-platform-macos v0.1.3 (MonHop original source) GPL-3.0-or-later
+monhop-platform-windows v0.1.3 (MonHop original source) GPL-3.0-or-later
+monhop-protocol v0.1.3 (MonHop original source) GPL-3.0-or-later
+monhop-transport v0.1.3 (MonHop original source) GPL-3.0-or-later
 muda v0.19.3 Apache-2.0 OR MIT
 num-conv v0.2.2 MIT OR Apache-2.0
 objc2 v0.6.4 MIT

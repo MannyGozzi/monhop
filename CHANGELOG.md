@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-21
+
 Your computer stays connected while its displays change. The computer with the keyboard chooses the layout and sends it over; the other follows.
 
 ### Added
@@ -71,6 +73,7 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.3
 [0.1.2]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.2
 [0.1.1]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.1
