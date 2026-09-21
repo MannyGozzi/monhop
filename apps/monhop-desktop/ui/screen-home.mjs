@@ -64,6 +64,8 @@ export function renderHome(nodes, ctx) {
       nodes.homeContent.append(
         computerCard(ctx, activeComputer, {
           scope: "home",
+          // This card draws the full-size arrangement itself, with the button that changes it.
+          viewport: false,
           extras: activeExtras(ctx),
           details: activeDetails(ctx),
         }),
@@ -111,12 +113,13 @@ function updatesReadyCard({ updates, actions }) {
 }
 
 // Only the active computer's own displays can be rearranged, so the banner needs one to point at.
+// A notice MonHop is already settling belongs on that computer's card, not across the page.
 function displayNoticeCard(ctx) {
   const { actions, busy, peerName, sharing, activeComputer } = ctx;
   const notice = sharing.view?.displayNotice;
   if (!notice || !activeComputer) return null;
   const copy = displayNoticeCopy(notice.kind, peerName);
-  if (!copy) return null;
+  if (!copy || copy.presentation !== "banner") return null;
   return card({
     id: "home-display-notice",
     tone: "warning",
@@ -203,6 +206,7 @@ function activeExtras(ctx) {
                 peer: displayName(activeComputer),
                 localPlatform,
                 peerPlatform: activeComputer.platform,
+                motionKey: `${key}-layout`,
               })
             : note("No layout yet. Arrange the displays once to start sharing input."),
           saved ? "layout" : "none",

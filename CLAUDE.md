@@ -6,7 +6,7 @@ Runtime must remain local-only: no telemetry, public DNS, shell execution, clipb
 
 No input hooks, suppression, injection, listeners, pairing trust changes, firewall edits, startup registration, or system permission changes merely from starting the app. Input diagnostics are explicit and bounded. Never log key identities or typed text. A failed connection must restore physical input without depending on the network. Secure desktop/UIPI/TCC boundaries are not bypassed.
 
-Keep performance-critical input/transport/state handling entirely in Rust. Screen dimming is MonHop's own desktop `dimming` module (overlay per display, one system-wide chord, persisted preference); its overlays are never displays or input targets. Do not change C:/dev/monitor-ctrl or its installed process for MonHop work.
+Keep performance-critical input/transport/state handling entirely in Rust. Screen dimming is MonHop's own desktop `dimming` module (overlay per display, one system-wide chord, persisted preference); its overlays are never displays or input targets.
 
 Installation retention: replace MonHop in place without backing up earlier installations. Delete obsolete executable copies, rollback payloads, and pending installers when updating. Preserve the current installed app, user settings, and diagnostic logs.
 

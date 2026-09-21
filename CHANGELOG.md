@@ -4,6 +4,18 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Changed
+
+- A display change goes straight to the layout update instead of retrying the old session first. The computer whose displays changed no longer waits ten seconds before reconnecting.
+- The display-change banner appears only when the layout had to be adapted or when no saved layout fits. Switching to a remembered layout shows a brief inline "Updating the layout" line and nothing else.
+- Use and Pause are one play/stop button that animates between states. Layout switches animate in the arrangement picture.
+- Computer cards show the arrangement picture alone; the duplicate display lists are gone. Remembered layouts no longer carry a Remembered badge.
+
+### Fixed
+
+- Two computers on different MonHop versions both report the version mismatch instead of one of them dialing indefinitely.
+- When another app holds the dimming shortcut at startup, MonHop keeps trying every few seconds and takes the shortcut over as soon as that app lets go, instead of giving up until the next launch. The Home card says so while it waits.
+
 ## [0.1.3] - 2026-09-21
 
 Your computer stays connected while its displays change. The computer with the keyboard chooses the layout and sends it over; the other follows.

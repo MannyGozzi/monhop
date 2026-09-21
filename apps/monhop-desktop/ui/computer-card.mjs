@@ -2,32 +2,39 @@ import { ACCORDION_TOGGLE, createAccordion } from "./accordion.mjs";
 import { computerStatus } from "./computer-status.mjs";
 import { computerArrangements, displayName } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
-import { isConnected } from "./sharing-model.mjs";
+import { displayNoticeCopy, isConnected, noticePresentation } from "./sharing-model.mjs";
+import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
+import { displaysFreshness, layoutChips, layoutRows } from "./computer-card-model.mjs";
 import {
-  displayChipLabel,
-  displayStripSides,
-  hasDisplayStrip,
-  layoutRows,
-} from "./computer-card-model.mjs";
-import {
-  badge,
   button,
   card,
   el,
   icon,
+  iconButton,
   note,
   platformGlyph,
   presence,
   row,
   rows,
+  sinceChanged,
   statusChip,
   swap,
   switchRow,
 } from "./dom.mjs";
 
+// The longest of the play/stop animations. A card rebuilt inside this window starts its motion
+// where the last one left off, so a status poll mid-morph does not replay it from the top.
+const USE_MOTION_MS = 700;
+// A Layouts list rebuilt within this window is still the same entrance, stagger included.
+const LIST_ENTER_MS = 600;
+
 // One computer rendered one way, so Home and the Setup list can never disagree about it.
 // The name is its own editor and the status and switch sit in the header, so the card is one row.
-export function computerCard(ctx, computer, { scope, extras = [], details = [] } = {}) {
+export function computerCard(
+  ctx,
+  computer,
+  { scope, extras = [], details = [], viewport = true } = {},
+) {
   const { busy, renaming, renamePending, active } = ctx;
   const fingerprint = computer.fingerprint;
   const name = displayName(computer);
@@ -66,17 +73,14 @@ export function computerCard(ctx, computer, { scope, extras = [], details = [] }
           className: "computer-actions",
           children: [
             swap(`${key}-status`, statusChip(status), `${status.tone}|${status.label}`),
-            swap(
-              `${key}-switch`,
-              useSwitch(ctx, fingerprint, scope, inUse),
-              inUse ? "pause" : "use",
-            ),
+            useToggle(ctx, fingerprint, scope, inUse),
           ],
         }),
       ],
     }),
     swap(`${key}-detail`, note(status.detail), status.detail, { block: true }),
-    presence(`${key}-displays`, displayStrip(computer)),
+    presence(`${key}-notice`, noticeLine(ctx, computer, inUse)),
+    presence(`${key}-viewport`, viewport ? cardArrangement(ctx, computer, key) : null),
     presence(
       `${key}-extras`,
       extras.some(Boolean)
@@ -97,24 +101,50 @@ export function computerCard(ctx, computer, { scope, extras = [], details = [] }
   return node;
 }
 
-function useSwitch(ctx, fingerprint, scope, inUse) {
+// One button for both states, so pressing it keeps the focus and the glyph morphs in place
+// instead of one control being swapped for another.
+function useToggle(ctx, fingerprint, scope, inUse) {
   const { actions, busy } = ctx;
-  return inUse
-    ? button("Pause", {
-        variant: "outline",
-        size: "sm",
-        iconName: "power-off",
-        disabled: busy,
-        focusKey: `${scope}-pause-${fingerprint}`,
-        onClick: () => actions.useComputer(null),
-      })
-    : button("Use", {
-        size: "sm",
-        iconName: "keyboard",
-        disabled: busy,
-        focusKey: `${scope}-use-${fingerprint}`,
-        onClick: () => actions.useComputer(fingerprint),
-      });
+  const state = inUse ? "sharing" : "idle";
+  const node = iconButton({
+    id: `${scope}-use-${fingerprint}`,
+    label: inUse ? "Pause sharing with this computer" : "Use this computer",
+    art: useGlyphs(inUse),
+    size: "sm",
+    disabled: busy,
+    onClick: () => actions.useComputer(inUse ? null : fingerprint),
+  });
+  node.classList.add("use-toggle");
+  node.dataset.state = state;
+  const elapsed = sinceChanged(`${scope}-use-state-${fingerprint}`, state);
+  if (elapsed < USE_MOTION_MS) {
+    node.dataset.enter = "true";
+    node.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+  }
+  return node;
+}
+
+// Both glyphs are always drawn and the current one is marked, so CSS alone cross-fades and turns
+// one into the other; the fill and the ring are the button's surface under them.
+function useGlyphs(inUse) {
+  return el("span", {
+    className: "use-glyphs",
+    attrs: { "aria-hidden": "true" },
+    children: [
+      el("span", { className: "use-fill" }),
+      el("span", { className: "use-ring" }),
+      useGlyph("play", !inUse),
+      useGlyph("square", inUse),
+    ],
+  });
+}
+
+function useGlyph(name, current) {
+  return el("span", {
+    className: "use-glyph",
+    dataset: { current: String(current) },
+    children: [icon(name, 14)],
+  });
 }
 
 // The name reads as text and edits in place: a pencil appears on hover and focus, and the
@@ -199,49 +229,45 @@ function forgetControls(ctx, computer, name) {
   ];
 }
 
-// --- display strip ---------------------------------------------------------
+// --- displays ---------------------------------------------------------------
 
-// Each side shows its live displays when the link is reporting them and the last saved ones
-// otherwise, so the card is never blank and never claims a stale list is current.
-function displayStrip(computer) {
-  const sides = displayStripSides(computer.setup);
-  if (!hasDisplayStrip(sides)) return null;
+// The picture is the only place a card names displays, so nothing is listed twice. Home's card for
+// the computer in use draws its own bigger one and asks for this to be left out.
+function cardArrangement(ctx, computer, key) {
+  // A computer with nothing saved still says so: blank space under the header reads as a fault.
+  if (computer.setup?.saved !== true)
+    return note("No layout yet. Arrange the displays to start sharing.");
+  const localPlatform = ctx.state.snapshot?.platform ?? ctx.platform;
   return el("div", {
-    className: "computer-displays",
+    className: "computer-viewport",
     children: [
-      displayStripRow("This computer", sides.local),
-      displayStripRow(displayName(computer), sides.peer),
-    ],
-  });
-}
-
-function displayStripRow(title, side) {
-  if (!side.displays.length) return null;
-  return el("div", {
-    className: "display-strip-row",
-    children: [
-      el("span", {
-        className: "display-strip-label",
-        children: [
-          el("span", { text: title }),
-          side.lastSeen
-            ? el("span", { className: "computer-displays-note", text: "Last seen" })
-            : null,
-        ],
-      }),
-      el("div", {
-        className: "display-strip-chips",
-        children: side.displays.map((item) => displayChip(item)),
+      createDashboardArrangement(computer.setup, {
+        local: platformLabel(localPlatform, true),
+        peer: displayName(computer),
+        localPlatform,
+        peerPlatform: computer.platform,
+        compact: true,
+        caption: displaysFreshness(computer.setup),
+        motionKey: `${key}-viewport`,
       }),
     ],
   });
 }
 
-// The label is its own element so a long monitor name is cut with an ellipsis inside the chip.
-function displayChip(display) {
-  const chip = badge("", "secondary", "monitor");
-  chip.append(el("span", { className: "display-chip-text", text: displayChipLabel(display) }));
-  return chip;
+// A display change MonHop is already settling says so on the card itself. Only a change the user
+// has to act on is worth the banner Home puts above everything.
+function noticeLine(ctx, computer, inUse) {
+  const notice = ctx.sharing.view?.displayNotice;
+  if (!inUse || !notice || noticePresentation(notice.kind) !== "inline") return null;
+  const copy = displayNoticeCopy(notice.kind, displayName(computer));
+  return el("p", {
+    className: "notice-line",
+    attrs: { "aria-live": "polite" },
+    children: [
+      el("span", { className: "notice-dot", attrs: { "aria-hidden": "true" } }),
+      el("span", { text: copy.body }),
+    ],
+  });
 }
 
 // --- layout history ---------------------------------------------------------
@@ -269,7 +295,7 @@ function layoutsDisclosure(ctx, computer, key) {
           : "MonHop remembers each layout applied with this computer.",
       ),
     );
-  else content.push(rows(entries.map((item) => layoutRow(ctx, fingerprint, item))));
+  else content.push(layoutList(ctx, fingerprint, entries));
   const label = entries.length ? `Layouts (${entries.length})` : "Layouts";
   const accordion = createAccordion(`${key}-layouts`, "computer-layouts", label, ...content);
   // The manager toggles the panel first and announces it afterwards, so reading the list here
@@ -280,17 +306,46 @@ function layoutsDisclosure(ctx, computer, key) {
   return accordion;
 }
 
-function layoutRow(ctx, fingerprint, item) {
+// The list is rebuilt on every status poll, so the rows only play their entrance when the set of
+// names actually changed; each row follows the one above it.
+function layoutList(ctx, fingerprint, entries) {
+  const list = rows(entries.map((item, index) => layoutRow(ctx, fingerprint, item, index)));
+  const names = JSON.stringify(entries.map((item) => item.entry.name));
+  const elapsed = sinceChanged(`${fingerprint}-layout-list`, names);
+  if (elapsed < LIST_ENTER_MS) {
+    list.dataset.enter = "true";
+    // As the play/stop toggle does: the negative delay resumes the entrance, stagger included,
+    // so a status poll part way through it does not send every row back to the start.
+    list.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+  }
+  return list;
+}
+
+// One chip strip for a saved layout, shared with the connected editor's list so the two can never
+// disagree. "Fits now" sits in a keyed slot of its own, which fades and scales as it comes and goes.
+export function layoutChipStrip(key, entry) {
+  const chips = layoutChips(entry);
+  return el("span", {
+    className: "row-leading-chips",
+    dataset: { empty: String(chips.marks.length === 0 && !chips.fits) },
+    children: [
+      ...chips.marks.map((chip) => statusChip(chip)),
+      swap(
+        `${key}-fits`,
+        chips.fits ? statusChip(chips.fits) : el("span", { className: "chip-slot" }),
+        chips.fits ? "fits" : "none",
+      ),
+    ],
+  });
+}
+
+function layoutRow(ctx, fingerprint, item, index) {
   const { actions } = ctx;
   const { entry, key, armed, disabled, load } = item;
-  const chips = [
-    statusChip({ tone: "neutral", label: entry.automatic ? "Remembered" : "Saved" }),
-    entry.fits ? statusChip({ tone: "connected", label: "Fits now" }) : null,
-  ].filter(Boolean);
-  return row({
+  const node = row({
     title: entry.name,
     detail: `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`,
-    leading: el("span", { className: "row-leading-chips", children: chips }),
+    leading: layoutChipStrip(`layout-${key}`, entry),
     actions: [
       loadButton(actions, fingerprint, entry, key, load, disabled),
       button(armed ? "Confirm forget" : "Forget", {
@@ -303,6 +358,8 @@ function layoutRow(ctx, fingerprint, item) {
       }),
     ],
   });
+  node.style.setProperty("--row-index", String(index));
+  return node;
 }
 
 // Always drawn, so a row never changes shape as the connection comes and goes; the title says

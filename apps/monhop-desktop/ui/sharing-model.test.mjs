@@ -37,6 +37,7 @@ import {
   layoutSignature,
   loadArrangement,
   normalizeArrangements,
+  noticePresentation,
   normalizeDisplayNotice,
   normalizeSharingView,
   normalizeStoredLayout,
@@ -216,27 +217,45 @@ test("the display notice normalizes to a known kind or drops to null", () => {
   assert.deepEqual(notified.view.displayNotice, { kind: "continued" });
 });
 
-test("the display notice banner names the peer only for the kind that needs it", () => {
+test("a display change the user must settle gets the banner; one MonHop is settling gets a line", () => {
+  assert.equal(noticePresentation("waiting"), "banner");
+  assert.equal(noticePresentation("continued"), "banner");
+  assert.equal(noticePresentation("updating"), "inline");
+  assert.equal(noticePresentation("peerDeciding"), "inline");
+  assert.equal(noticePresentation("bogus"), null);
+
   const waiting = displayNoticeCopy("waiting", "Office Windows PC");
+  assert.equal(waiting.presentation, "banner");
   assert.equal(waiting.title, "Your displays changed");
-  assert.equal(waiting.body, "Arrange them to resume sharing with Office Windows PC.");
+  assert.equal(waiting.body, "No saved layout fits. Arrange the displays to start sharing.");
   assert.equal(waiting.primaryLabel, "Arrange displays");
-  assert.equal(waiting.secondaryLabel, "Later");
+  assert.equal(waiting.secondaryLabel, "Dismiss");
+
   const continued = displayNoticeCopy("continued", "Office Windows PC");
+  assert.equal(continued.presentation, "banner");
   assert.equal(continued.title, "Your displays changed");
-  assert.match(continued.body, /previous arrangement/);
+  // A dropped crossing or an unplugged monitor raises this too, so the copy claims no display
+  // is missing from the layout; it says the layout was adapted and offers to change it.
+  assert.equal(
+    continued.body,
+    "Sharing continues with a layout adapted to them. Arrange the displays if you want something different.",
+  );
   assert.equal(continued.primaryLabel, "Arrange displays");
   assert.equal(continued.secondaryLabel, "Keep going");
+
+  // An inline notice reports; it names no buttons because it asks the user for nothing.
   const updating = displayNoticeCopy("updating", "Office Windows PC");
-  assert.equal(updating.title, "Displays changed");
-  assert.equal(updating.body, "Updating the layout for Office Windows PC.");
-  assert.equal(updating.primaryLabel, "Change layout");
-  assert.equal(updating.secondaryLabel, "Dismiss");
+  assert.equal(updating.presentation, "inline");
+  assert.equal(updating.body, "Updating the layout…");
+  assert.equal(updating.title, null);
+  assert.equal(updating.primaryLabel, null);
+  assert.equal(updating.secondaryLabel, null);
+
   const peerDeciding = displayNoticeCopy("peerDeciding", "Office Windows PC");
-  assert.equal(peerDeciding.title, "Displays changed");
+  assert.equal(peerDeciding.presentation, "inline");
   assert.equal(peerDeciding.body, "Office Windows PC is choosing the layout.");
-  assert.equal(peerDeciding.primaryLabel, "Change layout");
-  assert.equal(peerDeciding.secondaryLabel, "Dismiss");
+  assert.equal(peerDeciding.primaryLabel, null);
+
   assert.equal(displayNoticeCopy("bogus", "Office Windows PC"), null);
 });
 

@@ -1,5 +1,6 @@
 //! Screenshot-excluded overlays, owned entirely by a dedicated Win32 message loop.
 
+use super::Retry;
 use monhop_core::dimming::{Chord, DimLevel};
 use monhop_platform_windows::keymap::set1_from_hid_usage;
 use std::{
@@ -36,13 +37,21 @@ use windows::{
 
 const FADE_TIME: Duration = Duration::from_millis(180);
 const RESPONSE_TIME: Duration = Duration::from_secs(1);
+/// How long the first retry waits after a chord turns out to be taken, and the longest any later
+/// one waits: a chord another app is holding is not an emergency, so the wait doubles up to this.
+const RETRY_FIRST: Duration = Duration::from_secs(5);
+const RETRY_LIMIT: Duration = Duration::from_secs(60);
 const APPLY: u32 = WM_APP + 41;
 const DISPLAYS_CHANGED: u32 = WM_APP + 42;
 const HOTKEY_ID: i32 = 1;
 const FADE_TIMER: usize = 1;
+const RETRY_TIMER: usize = 2;
 const CONTROL_CLASS: PCWSTR = w!("MonHop.Dimming.Control");
 const OVERLAY_CLASS: PCWSTR = w!("MonHop.Dimming.Overlay");
 const UNAVAILABLE: &str = "Screen dimming could not start. Restart MonHop and try again.";
+const HELD: &str =
+    "The dimming shortcut is held by another app. MonHop keeps trying; Dim now still works.";
+const UNUSABLE_KEY: &str = "This key cannot be used for the dimming shortcut.";
 type Press = Arc<dyn Fn() + Send + Sync>;
 static WORKER: OnceLock<Result<Arc<Worker>, String>> = OnceLock::new();
 
@@ -72,6 +81,8 @@ struct Pending {
 struct Registration {
     chord: Chord,
     press: Press,
+    /// Checked before, and reported after, every retry the worker makes for this chord.
+    retry: Retry,
     response: Mutex<Response>,
     ready: Condvar,
 }
@@ -79,6 +90,60 @@ struct Registration {
 struct Response {
     canceled: bool,
     result: Option<Result<(), String>>,
+}
+/// Why a registration did not take. A chord another app holds is worth asking for again; a key
+/// Windows cannot map never becomes registrable, so nothing is gained by asking twice.
+enum Failure {
+    Held(windows::core::Error),
+    Key,
+}
+impl Failure {
+    fn message(&self) -> String {
+        match self {
+            Self::Held(_) => HELD.to_owned(),
+            Self::Key => UNUSABLE_KEY.to_owned(),
+        }
+    }
+    fn chased(&self) -> bool {
+        matches!(self, Self::Held(_))
+    }
+}
+/// What an attempt settled, and so what happens to the chase afterwards.
+enum Settled {
+    /// The chord is in hand: any chase for it is over.
+    Registered,
+    /// Another app holds the chord: ask again on a widening backoff.
+    Held,
+    /// Nothing was installed and nothing was lost, so a chase already running keeps running.
+    Unchanged,
+}
+/// A chord another app holds: one `RegisterHotKey` call per wake, never a thread and never a poll,
+/// with each wake twice as far out as the last up to `RETRY_LIMIT`.
+struct Retrying {
+    request: Arc<Registration>,
+    attempts: u32,
+    started: Instant,
+    delay: Duration,
+}
+impl Retrying {
+    fn new(request: &Arc<Registration>) -> Self {
+        Self {
+            request: Arc::clone(request),
+            attempts: 1,
+            started: Instant::now(),
+            delay: RETRY_FIRST,
+        }
+    }
+    /// Counts the call this wake is about to make.
+    fn attempt(&mut self) -> u32 {
+        self.attempts += 1;
+        self.attempts
+    }
+    /// Moves the next wake twice as far out, to a minute.
+    fn back_off(&mut self) -> Duration {
+        self.delay = self.delay.saturating_mul(2).min(RETRY_LIMIT);
+        self.delay
+    }
 }
 
 impl Registration {
@@ -204,6 +269,7 @@ pub fn set_level(level: DimLevel) {
 pub fn register_hotkey(
     chord: Chord,
     on_press: Box<dyn Fn() + Send + Sync + 'static>,
+    retry: Retry,
 ) -> Result<(), String> {
     let worker = worker()?;
     // SAFETY: querying the calling thread's ID does not access external memory.
@@ -213,6 +279,7 @@ pub fn register_hotkey(
     let request = Arc::new(Registration {
         chord,
         press: Arc::from(on_press),
+        retry,
         response: Mutex::new(Response::default()),
         ready: Condvar::new(),
     });
@@ -273,6 +340,8 @@ struct Native {
     alpha: f64,
     fade: Option<Fade>,
     hotkey: Option<Binding>,
+    /// Set while another app holds the chord and the worker is still asking for it.
+    retrying: Option<Retrying>,
 }
 struct Binding {
     id: i32,
@@ -349,6 +418,7 @@ impl Native {
                 alpha: 0.0,
                 fade: None,
                 hotkey: None,
+                retrying: None,
             })
         }
     }
@@ -369,6 +439,10 @@ impl Native {
                     }
                     WM_TIMER if message.wParam.0 == FADE_TIMER => {
                         self.tick(Instant::now());
+                        continue;
+                    }
+                    WM_TIMER if message.wParam.0 == RETRY_TIMER => {
+                        self.retry();
                         continue;
                     }
                     DISPLAYS_CHANGED => {
@@ -436,7 +510,7 @@ impl Native {
             _ => {}
         }
     }
-    fn prepare_registration(&self, request: &Registration) -> Result<Binding, String> {
+    fn prepare_registration(&self, request: &Registration) -> Result<Binding, Failure> {
         if let Some(binding) = &self.hotkey
             && binding.chord == request.chord
         {
@@ -446,13 +520,12 @@ impl Native {
                 press: Arc::clone(&request.press),
             });
         }
-        let scan = set1_from_hid_usage(request.chord.key)
-            .map_err(|_| "This key cannot be used for the dimming shortcut.".to_owned())?;
+        let scan = set1_from_hid_usage(request.chord.key).map_err(|_| Failure::Key)?;
         let scan = u32::from(scan.make_code) | if scan.is_extended() { 0xe000 } else { 0 };
         // SAFETY: the key mapper consumes only an integer scan code.
         let key = unsafe { MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX) };
         if key == 0 {
-            return Err("This key cannot be used for the dimming shortcut.".into());
+            return Err(Failure::Key);
         }
         let mut modifiers = MOD_NOREPEAT;
         if request.chord.control {
@@ -477,19 +550,18 @@ impl Native {
             HOTKEY_ID
         };
         // SAFETY: the control window belongs to this thread, and the callback stays in Rust state.
-        unsafe { RegisterHotKey(Some(self.control.0), id, modifiers, key) }.map_err(|error| {
-            log::warn!("dimming: RegisterHotKey failed: {error}");
-            "The dimming shortcut is unavailable. Another app may be using it; you can still use Dim now.".to_owned()
-        })?;
+        unsafe { RegisterHotKey(Some(self.control.0), id, modifiers, key) }
+            .map_err(Failure::Held)?;
         Ok(Binding {
             id,
             chord: request.chord,
             press: Arc::clone(&request.press),
         })
     }
-    fn register(&mut self, request: &Registration) {
+    fn register(&mut self, request: &Arc<Registration>) {
         let candidate = self.prepare_registration(request);
         let mut response = lock(&request.response);
+        let mut settled = Settled::Unchanged;
         let release = match candidate {
             Ok(binding) if response.canceled => (!self
                 .hotkey
@@ -500,10 +572,18 @@ impl Native {
                 let id = binding.id;
                 let prior = self.hotkey.replace(binding).filter(|prior| prior.id != id);
                 response.result = Some(Ok(()));
+                settled = Settled::Registered;
                 prior
             }
-            Err(error) => {
-                response.result = Some(Err(error));
+            Err(failure) => {
+                // The only line a taken chord writes to the log: the retries themselves are silent.
+                if let Failure::Held(error) = &failure {
+                    log::warn!("dimming: RegisterHotKey failed: {error}");
+                }
+                if failure.chased() {
+                    settled = Settled::Held;
+                }
+                response.result = Some(Err(failure.message()));
                 None
             }
         };
@@ -511,6 +591,71 @@ impl Native {
         drop(response);
         if let Some(binding) = release {
             self.release(binding);
+        }
+        match settled {
+            Settled::Registered => self.stop_retrying(),
+            // A fresh request restarts the backoff at its first, shortest wait.
+            Settled::Held => self.chase(request),
+            Settled::Unchanged => {}
+        }
+    }
+    /// Asks again for a chord another app holds, one call per wake. Nothing happens once the user
+    /// turns the shortcut off or the app goes away: the gate reads that under the toggle's lock.
+    fn retry(&mut self) {
+        let Some(mut retrying) = self.retrying.take() else {
+            self.kill_retry_timer();
+            return;
+        };
+        if !(retrying.request.retry.wanted)() {
+            self.kill_retry_timer();
+            return;
+        }
+        let attempts = retrying.attempt();
+        match self.prepare_registration(&retrying.request) {
+            Ok(binding) => {
+                self.kill_retry_timer();
+                let id = binding.id;
+                if let Some(prior) = self.hotkey.replace(binding).filter(|prior| prior.id != id) {
+                    self.release(prior);
+                }
+                (retrying.request.retry.recovered)(attempts, retrying.started.elapsed());
+            }
+            Err(failure) if failure.chased() => {
+                let delay = retrying.back_off();
+                self.retrying = Some(retrying);
+                self.arm_retry(delay);
+            }
+            Err(_) => self.kill_retry_timer(),
+        }
+    }
+    fn chase(&mut self, request: &Arc<Registration>) {
+        self.retrying = Some(Retrying::new(request));
+        self.arm_retry(RETRY_FIRST);
+    }
+    fn arm_retry(&mut self, delay: Duration) {
+        // SAFETY: the timer posts messages to our control HWND and has no callback pointer.
+        if unsafe {
+            SetTimer(
+                Some(self.control.0),
+                RETRY_TIMER,
+                delay.as_millis() as u32,
+                None,
+            )
+        } == 0
+        {
+            log::warn!("dimming: the shortcut retry timer could not start");
+            self.stop_retrying();
+        }
+    }
+    fn stop_retrying(&mut self) {
+        if self.retrying.take().is_some() {
+            self.kill_retry_timer();
+        }
+    }
+    fn kill_retry_timer(&self) {
+        // SAFETY: this thread owns the control HWND and its timer ID.
+        unsafe {
+            let _ = KillTimer(Some(self.control.0), RETRY_TIMER);
         }
     }
     fn release(&self, binding: Binding) {
@@ -520,6 +665,7 @@ impl Native {
         }
     }
     fn unregister(&mut self) {
+        self.stop_retrying();
         if let Some(binding) = self.hotkey.take() {
             self.release(binding);
         }
@@ -684,6 +830,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dimming::{DimmingFile, State, view_of};
     use std::sync::mpsc;
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CAPTUREBLT, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
@@ -788,6 +935,21 @@ mod tests {
         alpha
     }
 
+    /// A chord the test expects to win or to fail for good: any chase stops at its first gate.
+    fn unchased() -> Retry {
+        Retry {
+            wanted: Box::new(|| false),
+            recovered: Box::new(|_, _| unreachable!("a chase that never runs cannot recover")),
+        }
+    }
+
+    /// The error Windows reports when another application already owns the chord.
+    fn already_registered() -> Failure {
+        Failure::Held(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8007_0581_u32 as i32,
+        )))
+    }
+
     fn eventually(mut condition: impl FnMut() -> bool) {
         let until = Instant::now() + Duration::from_secs(2);
         while !condition() {
@@ -833,6 +995,7 @@ mod tests {
                 set_level(DimLevel::new(30).unwrap());
                 pressed.send(()).unwrap();
             }),
+            unchased(),
         )
         .unwrap();
         let control = HWND(worker().unwrap().hwnd.load(Ordering::Acquire) as *mut _);
@@ -854,13 +1017,15 @@ mod tests {
         assert!(
             register_hotkey(
                 invalid_chord,
-                Box::new(|| panic!("an invalid shortcut must not replace the callback"))
+                Box::new(|| panic!("an invalid shortcut must not replace the callback")),
+                unchased(),
             )
             .is_err()
         );
         let canceled = Arc::new(Registration {
             chord: invalid_chord,
             press: Arc::new(|| {}),
+            retry: unchased(),
             response: Mutex::new(Response {
                 canceled: true,
                 result: None,
@@ -1014,6 +1179,7 @@ mod tests {
         let request = Registration {
             chord: monhop_core::dimming::DIM_TOGGLE,
             press: Arc::new(|| {}),
+            retry: unchased(),
             response: Mutex::new(Response {
                 canceled: true,
                 result: None,
@@ -1022,5 +1188,47 @@ mod tests {
         };
         assert!(!request.finish(Ok(())));
         assert!(lock(&request.response).result.is_none());
+    }
+
+    #[test]
+    fn a_held_chord_is_chased_on_a_widening_backoff_and_an_unusable_key_is_not() {
+        assert!(already_registered().chased());
+        assert!(!Failure::Key.chased());
+        assert_eq!(Failure::Key.message(), UNUSABLE_KEY);
+        let request = Arc::new(Registration {
+            chord: monhop_core::dimming::DIM_TOGGLE,
+            press: Arc::new(|| {}),
+            retry: unchased(),
+            response: Mutex::new(Response::default()),
+            ready: Condvar::new(),
+        });
+        let mut retrying = Retrying::new(&request);
+        assert_eq!((retrying.attempts, retrying.delay), (1, RETRY_FIRST));
+        let mut schedule = Vec::new();
+        for _ in 0..6 {
+            retrying.attempt();
+            schedule.push(retrying.back_off());
+        }
+        assert_eq!(schedule, [10, 20, 40, 60, 60, 60].map(Duration::from_secs));
+        assert_eq!(retrying.attempts, 7);
+    }
+
+    #[test]
+    fn the_card_says_monhop_keeps_trying_until_the_chord_comes_free() {
+        let mut state = State {
+            file: DimmingFile::default(),
+            dimmed: false,
+            error: None,
+            shortcut_failed: false,
+        };
+        state.fail(Some(already_registered().message()), true);
+        assert_eq!(
+            view_of(&state).error.as_deref(),
+            Some(
+                "The dimming shortcut is held by another app. MonHop keeps trying; Dim now still works."
+            )
+        );
+        state.registered();
+        assert!(view_of(&state).error.is_none());
     }
 }

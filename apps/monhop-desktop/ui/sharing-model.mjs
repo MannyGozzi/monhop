@@ -822,39 +822,55 @@ export function normalizeDisplayNotice(value) {
     : null;
 }
 
+// Only a display change the user has to settle interrupts them with a banner. A change MonHop is
+// already handling, here or on the other computer, is a line on the computer's own card.
 const DISPLAY_NOTICE_COPY = {
   waiting: {
+    presentation: "banner",
     title: "Your displays changed",
-    body: (peerName) => `Arrange them to resume sharing with ${peerName}.`,
+    body: () => "No saved layout fits. Arrange the displays to start sharing.",
     primaryLabel: "Arrange displays",
-    secondaryLabel: "Later",
+    secondaryLabel: "Dismiss",
   },
+  // Raised whenever the rebuilt layout had to drop a crossing, a position or a display, which
+  // includes a monitor that was simply unplugged: nothing was "left out" there, so the copy says
+  // what is true of every case and offers the arrange screen for the ones where it is not enough.
   continued: {
+    presentation: "banner",
     title: "Your displays changed",
     body: () =>
-      "Sharing continues with the previous arrangement. Arrange the displays to include the change.",
+      "Sharing continues with a layout adapted to them. Arrange the displays if you want something different.",
     primaryLabel: "Arrange displays",
     secondaryLabel: "Keep going",
   },
   updating: {
-    title: "Displays changed",
-    body: (peerName) => `Updating the layout for ${peerName}.`,
-    primaryLabel: "Change layout",
-    secondaryLabel: "Dismiss",
+    presentation: "inline",
+    title: null,
+    body: () => "Updating the layout…",
+    primaryLabel: null,
+    secondaryLabel: null,
   },
   peerDeciding: {
-    title: "Displays changed",
+    presentation: "inline",
+    title: null,
     body: (peerName) => `${peerName} is choosing the layout.`,
-    primaryLabel: "Change layout",
-    secondaryLabel: "Dismiss",
+    primaryLabel: null,
+    secondaryLabel: null,
   },
 };
 
-// The banner's copy is a pure function of the notice kind, so Home never re-derives it from the view.
+// Where a notice belongs: "banner" is the card that stops the page, "inline" is the status line
+// on the computer's own card. An unknown kind is drawn nowhere.
+export function noticePresentation(kind) {
+  return DISPLAY_NOTICE_COPY[kind]?.presentation ?? null;
+}
+
+// The notice's copy is a pure function of its kind, so no screen re-derives it from the view.
 export function displayNoticeCopy(kind, peerName) {
   const copy = DISPLAY_NOTICE_COPY[kind];
   return copy
     ? {
+        presentation: copy.presentation,
         title: copy.title,
         body: copy.body(peerName),
         primaryLabel: copy.primaryLabel,

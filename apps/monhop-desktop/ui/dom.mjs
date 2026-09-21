@@ -53,10 +53,13 @@ export function button(
   return node;
 }
 
+// `art` replaces the single icon for a button whose glyph is built by its caller (a state toggle
+// that draws both of its glyphs, say); everything else about the control stays the same.
 export function iconButton({
   id,
   label,
   iconName = "refresh-cw",
+  art = null,
   disabled = false,
   busy = false,
   size,
@@ -67,7 +70,7 @@ export function iconButton({
   node.classList.add("icon-button");
   node.dataset.tooltipDismissed = "false";
   node.setAttribute("aria-label", label);
-  const glyph = icon(iconName);
+  const glyph = art ?? icon(iconName);
   if (busy) glyph.classList.add("spin");
   const tooltip = el("span", {
     className: "tooltip",
@@ -335,6 +338,20 @@ export function swap(key, node, signature, { block = false } = {}) {
   }
   if (!block && entry.fromWidth) morphWidth(wrapper, node, entry.fromWidth, elapsed);
   return wrapper;
+}
+
+// How long ago a keyed value last changed, for a node the next render rebuilds from scratch: a CSS
+// animation started with this as a negative delay continues where it was instead of replaying.
+// Infinity means nothing to play — motion is off, or the value has been settled for a while.
+export function sinceChanged(key, signature) {
+  const now = performance.now();
+  const entry = motionMemory.get(key) ?? { signature, changedAt: -Infinity };
+  if (entry.signature !== signature) {
+    entry.signature = signature;
+    entry.changedAt = now;
+  }
+  motionMemory.set(key, entry);
+  return motionEnabled() ? now - entry.changedAt : Infinity;
 }
 
 function rowGap(node) {

@@ -634,6 +634,16 @@ impl DisplayGeometry {
     }
 }
 
+/// A record rebuilt for the displays connected now, and whether the rebuild had to leave anything
+/// out. Only a rebuild that lost something is worth telling the user about; one where a display
+/// merely moved keeps every crossing and needs no banner.
+pub(crate) struct Adapted {
+    pub(crate) record: SharingPreferences,
+    /// A crossing dropped, a position dropped, or a display left unused, against the record this
+    /// was rebuilt from.
+    pub(crate) left_out: bool,
+}
+
 /// Rebuilds an applied record for the displays connected now. A monitor is the same display
 /// under a new OS id, so ids are rewritten first; then routes, positions, and hidden marks naming
 /// a display that went away are dropped. A display that appeared joins a free arrangement beside
@@ -642,7 +652,7 @@ impl DisplayGeometry {
 pub(crate) fn adapt_to_inspection(
     record: &SharingPreferences,
     inspection: &InspectedPeer,
-) -> Option<SharingPreferences> {
+) -> Option<Adapted> {
     if !record.same_pair(inspection) {
         return None;
     }
@@ -655,18 +665,24 @@ pub(crate) fn adapt_to_inspection(
             .collect();
     let kept: BTreeSet<&str> = pairs.iter().map(|(_, live)| live.id.as_str()).collect();
     let present = |id: &str| kept.contains(id);
+    // Remapping only rewrites ids, so what this basis holds is what the record held: every count
+    // below is measured against it, and what survives the retains is what the user keeps.
     let mut layout = remap_layout(&record.layout, &id_map(pairs.iter()));
     if !present(&layout.source_display) {
         return None;
     }
+    let crossings = layout.links.len();
     layout
         .links
         .retain(|link| present(&link.from_display) && present(&link.to_display));
+    let mut left_out = layout.links.len() != crossings;
     let mut placed_appeared: Vec<String> = Vec::new();
     if let Some(arrangement) = layout.arrangement.as_mut() {
+        let placed = arrangement.positions.len();
         arrangement
             .positions
             .retain(|position| present(&position.display));
+        left_out |= arrangement.positions.len() != placed;
         arrangement.hidden.retain(|id| present(id));
         if arrangement.mode == "free" {
             // Placed in id order, which is the same on both computers, so each display that
@@ -687,7 +703,10 @@ pub(crate) fn adapt_to_inspection(
                         });
                         placed_appeared.push(display.id.clone());
                     }
-                    None => arrangement.hidden.push(display.id.clone()),
+                    None => {
+                        arrangement.hidden.push(display.id.clone());
+                        left_out = true;
+                    }
                 }
             }
         }
@@ -699,10 +718,10 @@ pub(crate) fn adapt_to_inspection(
         SharingPreferences::from_inspection(&inspected, layout).ok()
     };
     if placed_appeared.is_empty() {
-        return finish(layout);
+        return finish(layout).map(|record| Adapted { record, left_out });
     }
-    if let Some(adapted) = finish(layout.clone()) {
-        return Some(adapted);
+    if let Some(record) = finish(layout.clone()) {
+        return Some(Adapted { record, left_out });
     }
     // A placed newcomer can still break the topology (an edge it shares with a kept crossing),
     // which the rectangle check cannot see; leaving it out is always as valid as before.
@@ -712,7 +731,10 @@ pub(crate) fn adapt_to_inspection(
             .retain(|position| !placed_appeared.contains(&position.display));
         arrangement.hidden.extend(placed_appeared);
     }
-    finish(layout)
+    finish(layout).map(|record| Adapted {
+        record,
+        left_out: true,
+    })
 }
 
 /// A regular file of at most `limit` bytes, or None when absent; symlinks and oversize fail.
@@ -1274,7 +1296,7 @@ pub(crate) mod tests {
         assert_eq!(record.remap_to_inspection(&inspected), None);
         assert!(!record.same_displays_as_inspection(&inspected));
         // The crossing led to the monitor that left; with none left, nothing can continue.
-        assert_eq!(adapt_to_inspection(&record, &inspected), None);
+        assert!(adapt_to_inspection(&record, &inspected).is_none());
     }
 
     #[test]
@@ -1297,7 +1319,7 @@ pub(crate) mod tests {
         live.local_displays[1].monitor = Some("04d9-0001-00000000".into());
         let inspected = inspection(&live);
         assert_eq!(record.remap_to_inspection(&inspected), None);
-        assert_eq!(adapt_to_inspection(&record, &inspected), None);
+        assert!(adapt_to_inspection(&record, &inspected).is_none());
         // The identical monitor that stayed keeps pairing by id.
         let mut still = record.clone();
         still.local_displays[1].monitor = None;
@@ -1322,8 +1344,13 @@ pub(crate) mod tests {
             primary: false,
             monitor: None,
         });
-        let adapted = adapt_to_inspection(&record, &inspection(&changed))
+        let Adapted {
+            record: adapted,
+            left_out,
+        } = adapt_to_inspection(&record, &inspection(&changed))
             .expect("a free layout survives displays that appeared on both computers");
+        // Display 9 ends up unused, so the user is told something was left out.
+        assert!(left_out);
         let (positions, hidden) = arrangement_of(&adapted);
         assert_eq!(hidden, vec!["9".to_owned()]);
         let placed: Vec<(&str, f64, f64)> = positions
@@ -1345,8 +1372,12 @@ pub(crate) mod tests {
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1", "9"]);
         changed.move_local_display_for_test("9", [1920.0, 0.0]);
-        let adapted = adapt_to_inspection(&record, &inspection(&changed))
+        let Adapted {
+            record: adapted,
+            left_out,
+        } = adapt_to_inspection(&record, &inspection(&changed))
             .expect("the layout without the newcomer is as valid as before");
+        assert!(left_out);
         let (positions, hidden) = arrangement_of(&adapted);
         assert_eq!(hidden, vec!["9".to_owned()]);
         assert_eq!(positions.len(), 2);
@@ -1362,8 +1393,13 @@ pub(crate) mod tests {
         let inspected = inspection(&live);
         assert_eq!(record.remap_to_inspection(&inspected), None);
         assert!(record.same_displays_as_inspection(&inspected));
-        let adapted = adapt_to_inspection(&record, &inspected)
+        let Adapted {
+            record: adapted,
+            left_out,
+        } = adapt_to_inspection(&record, &inspected)
             .expect("a moved monitor keeps the crossings made for it");
+        // Nothing was lost, so this rebuild is silent: no banner follows it.
+        assert!(!left_out);
         assert_eq!(adapted.layout().links.len(), 2);
         assert_eq!(adapted.layout().links[0].to_display, "7");
         assert_eq!(adapted.local_displays()[1].origin, [1920.0, 0.0]);
@@ -1387,8 +1423,13 @@ pub(crate) mod tests {
         let record = preferences();
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1", "3"]);
-        let adapted = adapt_to_inspection(&record, &inspection(&changed))
+        let Adapted {
+            record: adapted,
+            left_out,
+        } = adapt_to_inspection(&record, &inspection(&changed))
             .expect("a grouped layout survives a display that appeared");
+        // A grouped layout moves each computer's displays as one block, so nothing was dropped.
+        assert!(!left_out);
         assert_eq!(adapted.local_displays().len(), 2);
         assert_eq!(adapted.layout(), record.layout());
         assert!(adapted.fits_displays(&inspection(&changed)));
@@ -1433,8 +1474,13 @@ pub(crate) mod tests {
         let mut changed = record.clone();
         // The fixture stacks display 3 directly under display 1, as the OS reports it.
         changed.set_local_displays_for_test(&["1", "3"]);
-        let adapted = adapt_to_inspection(&record, &inspection(&changed))
+        let Adapted {
+            record: adapted,
+            left_out,
+        } = adapt_to_inspection(&record, &inspection(&changed))
             .expect("a free layout survives a display that appeared");
+        // The newcomer was placed rather than left unused, so nothing was left out.
+        assert!(!left_out);
         let (positions, hidden) = arrangement_of(&adapted);
         assert_eq!(hidden, Vec::<String>::new());
         assert_eq!(positions.len(), 3);
@@ -1449,8 +1495,12 @@ pub(crate) mod tests {
         let record = free_record((0.0, 1080.0));
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1", "3"]);
-        let adapted = adapt_to_inspection(&record, &inspection(&changed))
+        let Adapted {
+            record: adapted,
+            left_out,
+        } = adapt_to_inspection(&record, &inspection(&changed))
             .expect("a free layout survives a display that appeared");
+        assert!(left_out);
         let (positions, hidden) = arrangement_of(&adapted);
         assert_eq!(hidden, vec!["3".to_owned()]);
         assert_eq!(positions.len(), 2);
@@ -1467,7 +1517,7 @@ pub(crate) mod tests {
         assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1"]);
-        assert_eq!(adapt_to_inspection(&record, &inspection(&changed)), None);
+        assert!(adapt_to_inspection(&record, &inspection(&changed)).is_none());
     }
 
     #[test]
@@ -1482,7 +1532,7 @@ pub(crate) mod tests {
         assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1"]);
-        assert_eq!(adapt_to_inspection(&record, &inspection(&changed)), None);
+        assert!(adapt_to_inspection(&record, &inspection(&changed)).is_none());
     }
 
     #[test]
@@ -1492,10 +1542,62 @@ pub(crate) mod tests {
         moved.local_displays[0].origin = [0.0, 240.0];
         let inspected = inspection(&moved);
         assert!(!record.fits_displays(&inspected));
-        let adapted = adapt_to_inspection(&record, &inspected)
+        let Adapted {
+            record: adapted,
+            left_out,
+        } = adapt_to_inspection(&record, &inspected)
             .expect("a display that moved keeps the layout");
+        assert!(!left_out);
         assert_eq!(adapted.local_displays()[0].origin, [0.0, 240.0]);
         assert_eq!(adapted.layout(), record.layout());
+        assert!(adapted.fits_displays(&inspected));
+    }
+
+    /// A crossing on part of an edge, so one display can lead to two others on the same side.
+    fn split_link(
+        from: &str,
+        from_edge: &str,
+        from_span: [f64; 2],
+        to: &str,
+        to_edge: &str,
+        to_span: [f64; 2],
+    ) -> crate::sharing::LinkRequest {
+        crate::sharing::LinkRequest {
+            from_display: from.into(),
+            from_edge: from_edge.into(),
+            from_span,
+            to_display: to.into(),
+            to_edge: to_edge.into(),
+            to_span,
+            hysteresis: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_crossing_that_went_away_with_its_display_is_reported_as_left_out() {
+        // The other computer's one display leads to both of this computer's, each over its own
+        // half of the edge. The second one goes away, so sharing continues on what is left.
+        let mut record = preferences();
+        record.set_local_displays_for_test(&["1", "3"]);
+        record.layout.links = vec![
+            split_link("2", "left", [0.0, 0.45], "1", "right", [0.0, 1.0]),
+            split_link("1", "right", [0.0, 1.0], "2", "left", [0.0, 0.45]),
+            split_link("2", "left", [0.55, 1.0], "3", "right", [0.0, 1.0]),
+            split_link("3", "right", [0.0, 1.0], "2", "left", [0.55, 1.0]),
+        ];
+        record.validate().expect("the fixture is a valid record");
+        assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
+        let mut changed = record.clone();
+        changed.set_local_displays_for_test(&["1"]);
+        let inspected = inspection(&changed);
+        let Adapted {
+            record: adapted,
+            left_out,
+        } = adapt_to_inspection(&record, &inspected).expect("the crossings that are left survive");
+        assert!(left_out);
+        // The pair of crossings that named the display that went away is gone; the other pair,
+        // and sharing with it, carries on.
+        assert_eq!(adapted.layout().links.len(), 2);
         assert!(adapted.fits_displays(&inspected));
     }
 

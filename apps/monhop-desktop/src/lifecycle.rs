@@ -476,20 +476,27 @@ impl AppController {
             return Ok(None);
         }
         let library = self.library(path);
-        // The memory that fits exactly wins; otherwise the record is rebuilt from the memory made
-        // with exactly these monitors, so a display that only moved keeps every crossing made for
-        // it, and from the running record when there is no such memory.
+        // The memory that fits exactly wins and loses nothing; otherwise the record is rebuilt
+        // from the memory made with exactly these monitors, so a display that only moved keeps
+        // every crossing made for it, and from the running record when there is no such memory.
+        // A rebuild reports whether it had to leave anything out, which is what Home tells the
+        // user about once both computers hold the new layout.
         let next = library
             .as_ref()
             .and_then(|library| library.automatic_fit(inspection))
+            .map(|record| (record, false))
             .or_else(|| {
                 library
                     .as_ref()
                     .and_then(|library| library.automatic_for_same_displays(inspection))
                     .and_then(|basis| adapt_to_inspection(basis, inspection))
+                    .map(|adapted| (adapted.record, adapted.left_out))
             })
-            .or_else(|| adapt_to_inspection(saved, inspection));
-        let Some(next) = next else {
+            .or_else(|| {
+                adapt_to_inspection(saved, inspection)
+                    .map(|adapted| (adapted.record, adapted.left_out))
+            });
+        let Some((next, left_out)) = next else {
             self.sharing
                 .raise_display_notice(DisplayNotice::Waiting, inspection);
             return Ok(None);
@@ -498,7 +505,7 @@ impl AppController {
         // record and closes the link; the next supervisor pass then starts the session. A
         // proposal that cannot leave this moment must not back the supervisor off. The send
         // records itself and raises the banner under its own lock.
-        if let Err(message) = self.sharing.propose_layout(&next) {
+        if let Err(message) = self.sharing.propose_layout(&next, left_out) {
             log::warn!("supervisor: the layout for the new displays was not sent: {message}");
             self.sharing
                 .raise_display_notice(DisplayNotice::Waiting, inspection);

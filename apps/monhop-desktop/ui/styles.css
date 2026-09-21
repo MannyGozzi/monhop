@@ -298,15 +298,39 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .card[data-tone="error"] { border-color: color-mix(in srgb, var(--destructive) 38%, var(--border)); }
 .card[data-tone="connected"] { border-color: color-mix(in srgb, var(--success) 24%, var(--border)); }
 .computer-details .accordion-trigger, .computer-layouts .accordion-trigger { min-height: 32px; font-size: 12px; }
-.computer-displays { display: grid; gap: 6px; min-width: 0; }
-.computer-displays-note { color: var(--muted-foreground); font-size: 11px; text-transform: uppercase; letter-spacing: .02em; }
-.display-strip-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 8px; min-width: 0; }
-.display-strip-label { display: grid; justify-items: start; gap: 1px; padding-top: 2px; color: var(--muted-foreground); font-size: 12px; white-space: nowrap; }
-.display-strip-chips { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
-.display-strip-chips .badge { min-width: 0; overflow: hidden; }
-.display-chip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.row-leading-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.computer-viewport { display: grid; min-width: 0; border-top: 1px solid var(--border); padding-top: 12px; }
+.notice-line { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted-foreground); font-size: 12.5px; }
+.notice-line span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notice-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--warning); }
+.row-leading-chips { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+.chip-slot { display: inline-block; width: 0; }
+/* An empty strip must not leave the gap its column would take beside the row's name. */
+.row-leading:has(.row-leading-chips[data-empty="true"]) { gap: 0; }
 .home-layout { display: grid; gap: 10px; min-width: 0; border-top: 1px solid var(--border); padding-top: 12px; }
+
+/* Use / pause: one round button whose two glyphs are always drawn, so the state change is a
+   cross-fade in place rather than one control replacing another. */
+.use-toggle { border-radius: 999px; }
+.use-toggle[data-state="sharing"] { border-color: color-mix(in srgb, var(--success) 45%, transparent); }
+.use-glyphs { position: absolute; inset: 0; display: grid; place-items: center; border-radius: inherit; }
+.use-fill { position: absolute; inset: 0; border-radius: inherit; background: var(--success); opacity: 0; }
+.use-toggle[data-state="sharing"] .use-fill { opacity: 1; }
+.use-toggle[data-state="sharing"]:hover:not(:disabled) .use-fill { background: color-mix(in srgb, var(--success) 86%, var(--foreground)); }
+.use-ring { position: absolute; inset: 0; border-radius: inherit; box-shadow: 0 0 0 2px var(--success); opacity: 0; }
+/* Positioned above the fill and the ring: those are absolute, so without this they would paint
+   over an in-flow glyph and the green surface would swallow the stop mark while sharing. */
+.use-glyph { position: relative; z-index: 1; grid-area: 1 / 1; display: grid; place-items: center; opacity: 0; transform: scale(.55) rotate(-32deg); }
+.use-glyph[data-current="true"] { opacity: 1; transform: none; }
+.use-toggle[data-state="sharing"] .use-glyph { color: var(--primary-foreground); }
+@media (prefers-reduced-motion: no-preference) {
+  .use-toggle[data-enter="true"] .use-glyph[data-current="true"] { animation: use-glyph-in 220ms var(--ease-out) var(--motion-delay, 0ms) both; }
+  .use-toggle[data-enter="true"] .use-glyph[data-current="false"] { animation: use-glyph-out 220ms var(--ease-out) var(--motion-delay, 0ms) both; }
+  .use-toggle[data-enter="true"] .use-fill { animation: use-fill-out 220ms var(--ease-out) var(--motion-delay, 0ms) both; }
+  .use-toggle[data-enter="true"][data-state="sharing"] .use-fill { animation-name: use-fill-in; }
+  .use-toggle[data-enter="true"][data-state="sharing"] .use-ring { animation: use-ring 700ms var(--ease-out) var(--motion-delay, 0ms) both; }
+  .computer-layouts .rows[data-enter="true"] .row { animation: fade-up 260ms var(--ease-out) calc(var(--motion-delay, 0ms) + var(--row-index, 0) * 45ms) both; }
+  .notice-dot { animation: notice-dot 1.5s var(--ease-out) infinite; }
+}
 .code-block { position: relative; }
 .code-block .button { position: absolute; top: 6px; right: 6px; }
 .copy-feedback { min-height: 16px; font-size: 12px; }
@@ -412,6 +436,18 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .dashboard-arrangement-canvas .arrangement-group { cursor: default; }
 .dashboard-arrangement-preview figcaption, .dashboard-arrangement-unavailable { margin: 0; color: var(--muted-foreground); font-size: 12px; }
 .dashboard-arrangement-preview[data-state="unavailable"] { min-height: 40px; place-items: center start; border: 1px dashed var(--border); border-radius: var(--radius); padding: 10px; background: var(--muted); }
+.dashboard-arrangement-preview[data-size="compact"] { gap: 5px; }
+.dashboard-arrangement-preview[data-size="compact"] .dashboard-arrangement-canvas { height: 112px; }
+.dashboard-arrangement-preview[data-size="compact"] figcaption { font-size: 11.5px; }
+/* A display that moved is drawn where it belongs and offset back to where it was; clearing the
+   offset one frame later is what this transition runs. The box is the tile's own, so a display
+   growing in scales about its centre rather than about the drawing's origin. */
+.dashboard-arrangement-canvas .arrangement-monitor { transform-box: fill-box; transform-origin: center; }
+@media (prefers-reduced-motion: no-preference) {
+  .dashboard-arrangement-canvas .arrangement-monitor[data-motion="settle"] { transition: transform 320ms var(--ease-out); }
+  .dashboard-arrangement-canvas .arrangement-monitor[data-motion="enter"] { animation: tile-in 320ms var(--ease-out) both; }
+  .dashboard-arrangement-canvas .arrangement-seams[data-motion="enter"] { animation: seam-in 320ms var(--ease-out) both; }
+}
 @media (prefers-reduced-motion: reduce) { .arrangement-group, .arrangement-monitor, .arrangement-monitor rect, .arrangement-control, .segmented-option { transition: none; } }
 
 /* Settings mock tutorial */
@@ -449,6 +485,14 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 @keyframes theme-pop { 0% { transform: rotate(-90deg) scale(.5); opacity: 0; } 100% { transform: none; opacity: 1; } }
 @keyframes dot-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 45%, transparent); } 70%, 100% { box-shadow: 0 0 0 6px transparent; } }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes use-glyph-in { from { opacity: 0; transform: scale(.55) rotate(-32deg); } to { opacity: 1; transform: none; } }
+@keyframes use-glyph-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: scale(.55) rotate(32deg); } }
+@keyframes use-fill-in { from { opacity: 0; transform: scale(.72); } to { opacity: 1; transform: none; } }
+@keyframes use-fill-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes use-ring { from { opacity: .6; transform: scale(1); } to { opacity: 0; transform: scale(1.9); } }
+@keyframes notice-dot { 0%, 100% { opacity: .35; transform: scale(.7); } 50% { opacity: 1; transform: none; } }
+@keyframes tile-in { from { opacity: 0; transform: scale(.94); } to { opacity: 1; transform: none; } }
+@keyframes seam-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes guide-switch { 0%, 30% { transform: translateX(0); } 70%, 100% { transform: translateX(12px); } }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after, ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; scroll-behavior: auto !important; transition: none !important; } .spinner { border-top-color: transparent; } }

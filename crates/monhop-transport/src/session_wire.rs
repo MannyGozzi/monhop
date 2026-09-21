@@ -23,6 +23,9 @@ pub enum SessionWireError {
     Closed,
     Truncated,
     InvalidFrame,
+    /// The peer speaks another protocol version: every frame it sends is refused, so the
+    /// handshake must name a build mismatch rather than retry a malformed frame.
+    UnsupportedVersion,
     TooLarge,
     TimedOut,
     Terminal,
@@ -35,6 +38,7 @@ impl fmt::Display for SessionWireError {
             Self::Closed => "session stream closed before the next frame",
             Self::Truncated => "session stream ended during a frame",
             Self::InvalidFrame => "session stream contained an invalid frame",
+            Self::UnsupportedVersion => "session stream carried another protocol version",
             Self::TooLarge => "session stream declared a frame above the fixed limit",
             Self::TimedOut => "session frame write timed out",
             Self::Terminal => "session framing is terminal",
@@ -186,6 +190,7 @@ impl FrameReader {
         let frame = decode(&self.buffer[..expected_len]).map_err(|error| {
             self.fail(match error {
                 DecodeError::FrameTooLarge => SessionWireError::TooLarge,
+                DecodeError::UnsupportedVersion => SessionWireError::UnsupportedVersion,
                 _ => SessionWireError::InvalidFrame,
             })
         })?;
@@ -238,6 +243,7 @@ pub const fn is_heartbeat(message: &Message) -> bool {
 pub fn decode_datagram(bytes: &[u8]) -> Result<Frame, SessionWireError> {
     let frame = decode(bytes).map_err(|error| match error {
         DecodeError::FrameTooLarge => SessionWireError::TooLarge,
+        DecodeError::UnsupportedVersion => SessionWireError::UnsupportedVersion,
         _ => SessionWireError::InvalidFrame,
     })?;
     if !is_heartbeat(&frame.message) {
@@ -351,6 +357,23 @@ mod tests {
         frame.encode_into(&mut output).expect("valid test frame");
         output
     }
+    #[test]
+    fn a_foreign_protocol_version_is_named_rather_than_treated_as_malformed() {
+        let mut bytes = encoded(&frame(1));
+        // Bytes 4..6 carry the protocol version; any change there is another build's frame.
+        bytes[5] ^= 0x01;
+        let mut reader = FrameReader::new();
+        let header = reader.feed(&bytes).expect("the header alone parses");
+        assert_eq!(header.consumed, HEADER_LEN);
+        assert!(matches!(
+            reader.feed(&bytes[HEADER_LEN..]),
+            Err(SessionWireError::UnsupportedVersion)
+        ));
+        assert!(matches!(
+            decode_datagram(&bytes),
+            Err(SessionWireError::UnsupportedVersion)
+        ));
+    }
 
     fn drain(reader: &mut FrameReader, input: &[u8]) -> Vec<Frame> {
         let mut frames = Vec::new();
@@ -432,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_protocol_version_is_invalid_and_terminal() {
+    fn unsupported_protocol_version_is_named_and_terminal() {
         let mut invalid = encoded(&frame(4));
         let unsupported_version: u16 = if PROTOCOL_VERSION == 0 { 1 } else { 0 };
         invalid[4..6].copy_from_slice(&unsupported_version.to_be_bytes());
@@ -443,7 +466,7 @@ mod tests {
         assert_eq!(header.frame, None);
         let result = reader.feed(&invalid[HEADER_LEN..]);
         assert!(
-            matches!(result, Err(SessionWireError::InvalidFrame)),
+            matches!(result, Err(SessionWireError::UnsupportedVersion)),
             "unexpected parser result: {result:?}"
         );
         assert_eq!(reader.finish(), Err(SessionWireError::Terminal));

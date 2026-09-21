@@ -22,9 +22,9 @@ use crate::{
 /// Bounds the entire control exchange, including stream creation and all six frame operations.
 pub const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(500);
 
-/// A purpose or source disagreement is symmetric, so the peer reaches the same verdict from our
-/// frames; closing before it acknowledges them strands it on [`HandshakeError::Stream`]. Bounded
-/// by this grace and by the handshake deadline, whichever comes first.
+/// A purpose, source or hello disagreement is symmetric, so the peer reaches the same verdict
+/// from our frames; closing before it acknowledges them strands it on [`HandshakeError::Stream`].
+/// Bounded by this grace and by the handshake deadline, whichever comes first.
 const DISAGREEMENT_ACK_GRACE: Duration = Duration::from_millis(150);
 
 const HANDSHAKE_CLOSE_CODE: u32 = 2;
@@ -411,16 +411,25 @@ async fn negotiate_inner(
         .await
         .map_err(|_| HandshakeError::Stream)?;
     let mut reader = FrameReader::new();
-    let frames = [
-        reader.read_frame(&mut recv).await.map_err(map_wire_error)?,
-        reader.read_frame(&mut recv).await.map_err(map_wire_error)?,
-        reader.read_frame(&mut recv).await.map_err(map_wire_error)?,
-    ];
-    let peer = match validate_peer_handshake(config, observed_peer, epoch, &frames) {
+    // Reading and validating share one result: a frame on another protocol version is refused by
+    // the decoder rather than by the checks below, and `map_wire_error` gives it the same verdict,
+    // so it must reach the same arm.
+    let peer = match read_handshake_frames(&mut reader, &mut recv)
+        .await
+        .and_then(|frames| validate_peer_handshake(config, observed_peer, epoch, &frames))
+    {
         Ok(peer) => peer,
         // Only a disagreement waits, and only to let the peer name the same one; a bad certificate,
-        // an invalid frame, or a timeout still closes at once.
-        Err(error @ (HandshakeError::PurposeMismatch | HandshakeError::SourceMismatch)) => {
+        // an invalid frame, or a timeout still closes at once. A hello mismatch is a disagreement
+        // too, whether two builds announced different platforms or features or a frame arrived on
+        // another protocol version: a computer that closed first would leave the other a reset
+        // stream, which reads as transient, so it keeps dialing instead of being told which build
+        // to install.
+        Err(
+            error @ (HandshakeError::PurposeMismatch
+            | HandshakeError::SourceMismatch
+            | HandshakeError::PeerHelloMismatch),
+        ) => {
             acknowledge_disagreement(&mut send, deadline).await;
             return Err(error);
         }
@@ -434,6 +443,18 @@ async fn negotiate_inner(
         recv,
         reader,
     })
+}
+
+/// The peer's complete three-frame proposal, with every read error already in handshake terms.
+async fn read_handshake_frames(
+    reader: &mut FrameReader,
+    recv: &mut quinn::RecvStream,
+) -> Result<[Frame; HANDSHAKE_FRAME_COUNT], HandshakeError> {
+    Ok([
+        reader.read_frame(recv).await.map_err(map_wire_error)?,
+        reader.read_frame(recv).await.map_err(map_wire_error)?,
+        reader.read_frame(recv).await.map_err(map_wire_error)?,
+    ])
 }
 
 /// Waits, bounded, for the peer's transport to have acknowledged the three frames already written
@@ -538,6 +559,7 @@ pub fn validate_peer_handshake(
 
 fn map_wire_error(error: SessionWireError) -> HandshakeError {
     match error {
+        SessionWireError::UnsupportedVersion => HandshakeError::PeerHelloMismatch,
         SessionWireError::InvalidFrame
         | SessionWireError::TooLarge
         | SessionWireError::Truncated => HandshakeError::InvalidFrame,
@@ -585,6 +607,21 @@ mod tests {
     use super::*;
     use crate::crypto::{LOCAL_TLS_SERVER_NAME, SecureQuicConfig};
 
+    /// The loopback fixture cannot speak a foreign protocol version, so the mapping is asserted
+    /// here; `negotiate_inner` reads the frames through one result with validation, so this
+    /// verdict takes the same acknowledge-then-return path a hello mismatch does.
+    #[test]
+    fn a_peer_on_another_protocol_version_is_a_build_mismatch_not_a_retry() {
+        assert_eq!(
+            map_wire_error(SessionWireError::UnsupportedVersion),
+            HandshakeError::PeerHelloMismatch
+        );
+        assert_eq!(
+            map_wire_error(SessionWireError::InvalidFrame),
+            HandshakeError::InvalidFrame
+        );
+    }
+
     fn topology(id: u64) -> DisplayTopology {
         DisplayTopology::new(vec![DisplayDescription {
             id: DisplayId(id),
@@ -618,6 +655,20 @@ mod tests {
     async fn negotiate_both(
         client: (bool, SessionPurpose),
         server: (bool, SessionPurpose),
+    ) -> (
+        Result<NegotiatedSession, HandshakeError>,
+        Result<NegotiatedSession, HandshakeError>,
+    ) {
+        negotiate_both_with(client, server, capabilities()).await
+    }
+
+    /// As `negotiate_both`, with the dialing computer announcing and requiring `client_features`
+    /// while the other announces and requires the fixture's own. A build announces one feature
+    /// set and demands the same of its peer, so this is what two different builds look like.
+    async fn negotiate_both_with(
+        client: (bool, SessionPurpose),
+        server: (bool, SessionPurpose),
+        client_features: Capabilities,
     ) -> (
         Result<NegotiatedSession, HandshakeError>,
         Result<NegotiatedSession, HandshakeError>,
@@ -671,8 +722,8 @@ mod tests {
             &server_pin,
             Platform::Windows,
             Platform::MacOs,
-            capabilities(),
-            capabilities(),
+            client_features,
+            client_features,
             &client_topology,
             device(client.0),
             client.1,
@@ -730,6 +781,27 @@ mod tests {
         .await;
         assert_eq!(client.err(), Some(HandshakeError::SourceMismatch));
         assert_eq!(server.err(), Some(HandshakeError::SourceMismatch));
+    }
+
+    /// Two builds that do not announce the same features: each rejects the other's hello, so both
+    /// must be told so rather than one of them seeing a broken stream and dialing on. The caller
+    /// turns this into "install the same build on both computers".
+    #[tokio::test]
+    async fn two_builds_that_announce_different_features_both_name_the_disagreement() {
+        let newer = Capabilities::new(
+            Capabilities::RELATIVE_MOTION
+                | Capabilities::HORIZONTAL_SCROLL
+                | Capabilities::DISPLAY_TOPOLOGY,
+        )
+        .expect("the wider fixture capabilities are known");
+        let (client, server) = negotiate_both_with(
+            (true, SessionPurpose::Share),
+            (true, SessionPurpose::Share),
+            newer,
+        )
+        .await;
+        assert_eq!(client.err(), Some(HandshakeError::PeerHelloMismatch));
+        assert_eq!(server.err(), Some(HandshakeError::PeerHelloMismatch));
     }
 
     #[tokio::test]

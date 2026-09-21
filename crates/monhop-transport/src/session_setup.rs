@@ -1116,5 +1116,11 @@ mod retry_policy_tests {
             handshake_failure(HandshakeError::SourceMismatch),
             SetupFailure::ChangedSinceInspection
         );
+        // A peer whose hello names another build: the answer says so, and dialing cannot fix it.
+        assert_eq!(
+            handshake_failure(HandshakeError::PeerHelloMismatch),
+            SetupFailure::VersionMismatch
+        );
+        assert!(!is_transient(SetupFailure::VersionMismatch));
     }
 }

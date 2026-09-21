@@ -5,6 +5,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 use monhop_core::dimming::{DIM_TOGGLE, DimLevel};
@@ -87,6 +88,34 @@ struct State {
     dimmed: bool,
     /// The last failure the user should see: a shortcut that could not register, or a save that failed.
     error: Option<String>,
+    /// Whether `error` is the shortcut failure, so a later registration clears only that message.
+    shortcut_failed: bool,
+}
+
+impl State {
+    /// One slot shows one failure. `from_shortcut` marks a registration failure so the message can
+    /// be withdrawn if the chord later comes free.
+    fn fail(&mut self, error: Option<String>, from_shortcut: bool) {
+        self.shortcut_failed = from_shortcut && error.is_some();
+        self.error = error;
+    }
+
+    /// The chord is in hand: drop the registration failure, leave any other failure showing.
+    fn registered(&mut self) {
+        if self.shortcut_failed {
+            self.shortcut_failed = false;
+            self.error = None;
+        }
+    }
+}
+
+/// How a platform chases a chord another application already holds: the gate it checks before
+/// every retry, and the report it makes once one succeeds. Only Windows retries today; macOS
+/// reports its own registration failure and stops, so its build never reads these.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct Retry {
+    wanted: Box<dyn Fn() -> bool + Send + Sync + 'static>,
+    recovered: Box<dyn Fn(u32, Duration) + Send + Sync + 'static>,
 }
 
 pub struct Dimming {
@@ -123,14 +152,20 @@ impl Dimming {
                 file,
                 dimmed: false,
                 error,
+                shortcut_failed: false,
             }),
         });
         if file.enabled && register_shortcut {
-            match platform::register_hotkey(app, DIM_TOGGLE, press_handler(app)) {
+            match platform::register_hotkey(
+                app,
+                DIM_TOGGLE,
+                press_handler(app),
+                retry(app, &dimming),
+            ) {
                 Ok(()) => log::info!("dimming: shortcut registered at startup"),
                 Err(error) => {
                     log::warn!("dimming: shortcut not registered at startup: {error}");
-                    lock(&dimming.state).error = Some(error);
+                    lock(&dimming.state).fail(Some(error), true);
                 }
             }
         }
@@ -142,9 +177,14 @@ impl Dimming {
     }
 
     /// Turns the shortcut on or off; turning it off also lifts a dimmed screen. Main thread only.
-    pub fn set_enabled(&self, app: &AppHandle, enabled: bool) -> Result<DimmingView, String> {
+    /// Turning it off ends any retry in progress; turning it on starts the backoff over.
+    pub fn set_enabled(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        enabled: bool,
+    ) -> Result<DimmingView, String> {
         let outcome = if enabled {
-            platform::register_hotkey(app, DIM_TOGGLE, press_handler(app))
+            platform::register_hotkey(app, DIM_TOGGLE, press_handler(app), retry(app, self))
         } else {
             platform::unregister_hotkey(app)
         };
@@ -156,7 +196,7 @@ impl Dimming {
             Err(error) => log::warn!("dimming: shortcut change failed: {error}"),
         }
         let mut state = lock(&self.state);
-        state.error = outcome.err();
+        state.fail(outcome.err(), true);
         state.file.enabled = enabled;
         if !enabled && state.dimmed {
             state.dimmed = false;
@@ -226,7 +266,10 @@ impl Dimming {
             .ok_or_else(invalid)
             .and_then(|path| state.file.save(path));
         if saved.is_err() {
-            state.error = Some("The dimming preference could not be saved.".to_owned());
+            state.fail(
+                Some("The dimming preference could not be saved.".to_owned()),
+                false,
+            );
         }
     }
 
@@ -260,7 +303,8 @@ fn view_of(state: &State) -> DimmingView {
 }
 
 /// A shortcut press toggles the overlay and tells the window; failures stay in the view.
-/// Only an enabled shortcut acts; read under the state lock that the toggle itself holds.
+/// Only an enabled shortcut acts, and only an enabled shortcut is worth retrying; both read this
+/// under the state lock that the toggle itself holds.
 fn press_applies(state: &State) -> bool {
     state.file.enabled
 }
@@ -271,10 +315,42 @@ fn press_handler(app: &AppHandle) -> Box<dyn Fn() + Send + Sync + 'static> {
         let dimming = app.state::<Arc<Dimming>>().inner().clone();
         if let Err(error) = dimming.toggle_from_shortcut(&app) {
             let mut state = lock(&dimming.state);
-            state.error = Some(error);
+            state.fail(Some(error), false);
             dimming.announce(&app, &state);
         }
     })
+}
+
+/// What the platform needs to chase a chord another application holds: keep asking only while the
+/// user still wants the shortcut and the app is still running, then take the message off the Home
+/// card. Both closures run on the thread that owns the chord, holding no dimming lock.
+fn retry(app: &AppHandle, dimming: &Arc<Dimming>) -> Retry {
+    let (gate_app, gate) = (app.clone(), Arc::downgrade(dimming));
+    let (report_app, report) = (app.clone(), Arc::downgrade(dimming));
+    Retry {
+        wanted: Box::new(move || {
+            let Some(dimming) = gate.upgrade() else {
+                return false;
+            };
+            if !press_applies(&lock(&dimming.state)) {
+                return false;
+            }
+            // An event loop that refuses work is an app on its way out: nothing left to chase for.
+            gate_app.run_on_main_thread(|| {}).is_ok()
+        }),
+        recovered: Box::new(move |attempts, waited| {
+            let Some(dimming) = report.upgrade() else {
+                return;
+            };
+            log::info!(
+                "dimming: shortcut registered after {attempts} attempts, {} s",
+                waited.as_secs()
+            );
+            let mut state = lock(&dimming.state);
+            state.registered();
+            dimming.announce(&report_app, &state);
+        }),
+    }
 }
 
 fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -308,7 +384,9 @@ pub async fn dimming_status(app: AppHandle) -> Result<DimmingView, String> {
 #[tauri::command]
 pub async fn dimming_set_enabled(app: AppHandle, enabled: bool) -> Result<DimmingView, String> {
     on_main_thread(&app, move |app| {
-        app.state::<Arc<Dimming>>().set_enabled(app, enabled)
+        app.state::<Arc<Dimming>>()
+            .inner()
+            .set_enabled(app, enabled)
     })
     .await?
 }
@@ -363,10 +441,12 @@ mod platform {
         on_main(app, move |mtm| super::macos::set_level(mtm, level));
     }
 
+    /// macOS reports a registration failure and stops there, so the retry policy goes unused.
     pub fn register_hotkey(
         _: &AppHandle,
         chord: Chord,
         on_press: Box<dyn Fn() + Send + Sync + 'static>,
+        _: super::Retry,
     ) -> Result<(), String> {
         super::macos::register_hotkey(main_thread()?, chord, on_press)
     }
@@ -398,8 +478,9 @@ mod platform {
         _: &AppHandle,
         chord: Chord,
         on_press: Box<dyn Fn() + Send + Sync + 'static>,
+        retry: super::Retry,
     ) -> Result<(), String> {
-        super::windows::register_hotkey(chord, on_press)
+        super::windows::register_hotkey(chord, on_press, retry)
     }
 
     pub fn unregister_hotkey(_: &AppHandle) -> Result<(), String> {
@@ -427,6 +508,7 @@ mod platform {
         _: &AppHandle,
         _: Chord,
         _: Box<dyn Fn() + Send + Sync + 'static>,
+        _: super::Retry,
     ) -> Result<(), String> {
         Err(UNSUPPORTED.to_owned())
     }
@@ -475,16 +557,41 @@ mod tests {
         assert!(DimmingFile::load(&path).is_err());
     }
 
+    /// Presses and retries share one gate, so turning the switch off cancels a pending retry the
+    /// same way it ignores a press already on its way.
     #[test]
     fn a_shortcut_press_is_ignored_once_the_shortcut_is_off() {
         let mut state = State {
             file: DimmingFile::default(),
             dimmed: false,
             error: None,
+            shortcut_failed: false,
         };
         assert!(press_applies(&state));
         state.file.enabled = false;
         assert!(!press_applies(&state));
+    }
+
+    #[test]
+    fn a_registration_clears_only_the_message_the_shortcut_put_on_the_card() {
+        let mut state = State {
+            file: DimmingFile::default(),
+            dimmed: false,
+            error: None,
+            shortcut_failed: false,
+        };
+        state.fail(Some("held by another app".to_owned()), true);
+        assert_eq!(
+            view_of(&state).error.as_deref(),
+            Some("held by another app")
+        );
+        state.registered();
+        assert!(view_of(&state).error.is_none());
+        state.fail(Some("nowhere to save".to_owned()), false);
+        state.registered();
+        assert_eq!(view_of(&state).error.as_deref(), Some("nowhere to save"));
+        state.fail(None, true);
+        assert!(view_of(&state).error.is_none());
     }
 
     #[test]
@@ -493,6 +600,7 @@ mod tests {
             file: DimmingFile::default(),
             dimmed: true,
             error: None,
+            shortcut_failed: false,
         };
         let view = view_of(&state);
         assert!(view.enabled && view.dimmed);

@@ -1,7 +1,5 @@
-import { formatSize } from "./arrangement-model.mjs";
-
-// Every decision a computer card makes about its display strip and its Layouts list, kept apart
-// from the DOM so the rules are checked without a browser. The card only draws what it returns.
+// Every decision a computer card makes about its arrangement viewport and its Layouts list, kept
+// apart from the DOM so the rules are checked without a browser. The card only draws what it returns.
 
 // Focus is restored by key across a re-render, so two rows of one computer must never share one.
 // The fingerprint's first bytes name the computer and a hash of the whole name names the row.
@@ -24,40 +22,32 @@ export function newestFirst(entries) {
   return Array.isArray(entries) ? entries.toReversed() : [];
 }
 
-// --- display strip ---------------------------------------------------------
+// --- displays --------------------------------------------------------------
 
-// Each side falls back on its own: a link that is up but has not reported the other computer's
-// displays yet still shows what it had last time, said plainly rather than left blank.
-export function displayStripSides(setup) {
-  return {
-    local: sideDisplays(setup?.live?.localDisplays, setup?.localDisplays),
-    peer: sideDisplays(setup?.live?.peerDisplays, setup?.peerDisplays),
-  };
+// The card draws the saved arrangement, so one word under it says whether the link is reporting
+// those same displays right now. Both computers must be reporting before it reads as live.
+export function displaysFreshness(setup) {
+  const live = setup?.live;
+  if (counted(live?.localDisplays) && counted(live?.peerDisplays)) return "Live";
+  return counted(setup?.localDisplays) || counted(setup?.peerDisplays) ? "Last seen" : null;
 }
 
-function sideDisplays(live, saved) {
-  const current = Array.isArray(live) ? live : [];
-  if (current.length) return { displays: current, lastSeen: false };
-  const previous = Array.isArray(saved) ? saved : [];
-  return { displays: previous, lastSeen: previous.length > 0 };
-}
-
-export function hasDisplayStrip(sides) {
-  return sides.local.displays.length > 0 || sides.peer.displays.length > 0;
-}
-
-// Native pixels are what the monitor really shows; the logical size is only the fallback.
-export function displayChipLabel(display) {
-  const size = pair(display?.nativeSize) ?? pair(display?.size);
-  const name = display?.name || "Display";
-  return size ? `${name} · ${formatSize(size[0], size[1])}` : name;
-}
-
-function pair(value) {
-  return Array.isArray(value) && value.length === 2 && value.every(Number.isFinite) ? value : null;
+function counted(value) {
+  return Array.isArray(value) && value.length > 0;
 }
 
 // --- layout history --------------------------------------------------------
+
+// A remembered layout needs no chip: everything in this list is remembered. Only a name the user
+// typed is worth marking, and only an entry that says so is one: Rust always sends the boolean,
+// so a missing or malformed one is a damaged entry, not a saved layout. "Fits now" comes and goes
+// with the displays, so it is its own slot the card can animate in and out while the marks stay put.
+export function layoutChips(entry) {
+  return {
+    marks: entry?.automatic === false ? [{ tone: "neutral", label: "Saved" }] : [],
+    fits: entry?.fits === true ? { tone: "connected", label: "Fits now" } : null,
+  };
+}
 
 const LOAD_BLOCKED = {
   inactive: "Use this computer to load its layouts.",

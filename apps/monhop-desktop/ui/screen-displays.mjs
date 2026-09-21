@@ -20,6 +20,7 @@ import {
 } from "./sharing-model.mjs";
 import { createArrangementView } from "./arrangement-view.mjs";
 import { newestFirst } from "./computer-card-model.mjs";
+import { layoutChipStrip } from "./computer-card.mjs";
 import { createAccordion } from "./accordion.mjs";
 import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
 import { autostartDescription } from "./autostart-model.mjs";
@@ -35,7 +36,6 @@ import {
   row,
   rows,
   stateCard,
-  statusChip,
   switchRow,
 } from "./dom.mjs";
 
@@ -118,6 +118,7 @@ function offLinkCard(ctx) {
           peer: peerName,
           localPlatform: ctx.state.snapshot?.platform ?? ctx.platform,
           peerPlatform: activeComputer.platform,
+          motionKey: `displays-${activeComputer.fingerprint}-layout`,
         }),
       ]
     : [note("No layout saved yet.")];
@@ -420,14 +421,10 @@ function arrangementRow(ctx, entry) {
       void actions.deleteArrangement(entry.name);
     },
   });
-  const chips = [
-    statusChip({ tone: "neutral", label: entry.automatic ? "Remembered" : "Saved" }),
-    entry.fits ? statusChip({ tone: "connected", label: "Fits now" }) : null,
-  ].filter(Boolean);
   return row({
     title: entry.name,
     detail,
-    leading: el("span", { className: "row-leading-chips", children: chips }),
+    leading: layoutChipStrip(key, entry),
     actions: [
       button("Load", {
         variant: "outline",

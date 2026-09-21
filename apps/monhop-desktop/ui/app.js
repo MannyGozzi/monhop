@@ -85,6 +85,7 @@ import {
 } from "./computers-model.mjs";
 import { activeStatus, isLiveStatus } from "./computer-status.mjs";
 import { clearForgetFor, keepForgetArmed, loadGate, pressForget } from "./computer-card-model.mjs";
+import { forgetArrangementMotion } from "./dashboard-arrangement.mjs";
 import {
   applyDimmingView,
   beginDimming,
@@ -1091,6 +1092,10 @@ function applyComputers(next, request) {
     layoutForget,
     computers.items.map((item) => item.fingerprint),
   );
+  // A forgotten computer's drawn positions must not seed a slide if it is ever paired again.
+  const kept = new Set(computers.items.map((item) => item.fingerprint));
+  for (const fingerprint of Object.keys(computerArrangementsStore))
+    if (!kept.has(fingerprint)) forgetArrangementMotion(fingerprint);
   computerArrangementsStore = pruneComputerArrangements(computerArrangementsStore, computers);
   scheduleSharingPoll();
   // The first reply decides where a launch lands: Setup with nothing paired, Home otherwise.

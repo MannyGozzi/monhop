@@ -26,6 +26,26 @@ const MAX_U64 = "18446744073709551615";
 const MAX_COORDINATE = 20_000_000;
 const VIEW = { width: 420, height: 190 };
 const STALE = "Saved arrangement details need a fresh review.";
+// Below this a move is a rounding difference, not a rearrangement worth animating.
+const MOVE_EPSILON = 0.5;
+// Where each viewport last drew each display, so the next drawing can start from there.
+const lastDrawn = new Map();
+
+// A forgotten computer's viewports never draw again, so what they last drew is dead weight and
+// would only make a reused key slide in from a stranger's positions. The key names the screen and
+// the computer, so the computer's fingerprint identifies every viewport that drew it. Returns how
+// many were dropped, which is what a caller can assert on.
+export function forgetArrangementMotion(motionKeyPrefix) {
+  const fragment = String(motionKeyPrefix ?? "");
+  if (!fragment) return 0;
+  let dropped = 0;
+  for (const key of lastDrawn.keys())
+    if (key.includes(fragment)) {
+      lastDrawn.delete(key);
+      dropped += 1;
+    }
+  return dropped;
+}
 
 export function savedDashboardArrangement(setup) {
   if (!setup?.saved) return unavailable("No saved arrangement is available.");
@@ -95,12 +115,68 @@ export function dashboardCaption(arrangement) {
     : "Saved display positions. Not a current display check.";
 }
 
+// What changed between two drawings of one viewport: how far each display moved, as the inverse
+// translate a FLIP transition starts from, and which displays are on screen for the first time.
+export function arrangementMotion(previous, current) {
+  const moved = {};
+  const entered = [];
+  for (const [id, rect] of Object.entries(current ?? {})) {
+    const was = previous?.[id];
+    if (!was) {
+      entered.push(id);
+      continue;
+    }
+    const delta = [was.x - rect.x, was.y - rect.y];
+    if (delta.some((value) => Math.abs(value) >= MOVE_EPSILON)) moved[id] = delta;
+  }
+  return { moved, entered };
+}
+
+function motionEnabled() {
+  return !matchMedia("(prefers-reduced-motion: reduce)").matches && !document.hidden;
+}
+
+// The drawing is rebuilt from nothing every render, so a display that moved is placed where it
+// belongs and then offset back to where it was; clearing the offset a frame later slides it over.
+// A display that vanished left with its node, so only arrivals are faded.
+function playMotion(svg, motion) {
+  const started = [];
+  for (const [id, [dx, dy]] of Object.entries(motion.moved)) {
+    const node = tileNode(svg, id);
+    if (!node) continue;
+    node.style.transform = `translate(${dx}px, ${dy}px)`;
+    started.push(node);
+  }
+  for (const id of motion.entered) {
+    const node = tileNode(svg, id);
+    if (node) node.dataset.motion = "enter";
+  }
+  if (!started.length) return;
+  requestAnimationFrame(() => {
+    // Reading the box lays the offset out, so clearing it below is a change the transition can run.
+    for (const node of started) node.getBoundingClientRect();
+    for (const node of started) {
+      node.dataset.motion = "settle";
+      node.style.transform = "";
+    }
+  });
+}
+
+// Display identifiers are digits only, so they go straight into a selector.
+function tileNode(svg, id) {
+  return svg.querySelector(`.arrangement-monitor[data-display="${id}"]`);
+}
+
 export function createDashboardArrangement(setup, names = {}) {
   const arrangement = savedDashboardArrangement(setup);
   const root = document.createElement("figure");
   root.className = "dashboard-arrangement-preview";
   root.dataset.state = arrangement.available ? "saved" : "unavailable";
+  if (names.compact) root.dataset.size = "compact";
   if (!arrangement.available) {
+    // Nothing is drawn, so the remembered positions would only make the next drawing slide in
+    // from where a different arrangement once sat.
+    if (names.motionKey) lastDrawn.delete(names.motionKey);
     const message = document.createElement("p");
     message.className = "dashboard-arrangement-unavailable";
     message.textContent = arrangement.message;
@@ -157,20 +233,39 @@ export function createDashboardArrangement(setup, names = {}) {
       }),
     );
   }
-  svg.append(groups, createSeamLayer(arrangement.seams, transform));
+  const seams = createSeamLayer(arrangement.seams, transform);
+  svg.append(groups, seams);
 
-  const legend = createLegend([
-    { kind: "group", label: groupLabels.source, side: sides.source },
-    { kind: "group", label: groupLabels.destination, side: sides.destination },
-    { kind: "primary", label: "Primary display" },
-    ...(arrangement.tiles.some((tile) => tile.shared)
-      ? [{ kind: "shared", label: "Cabled to both computers" }]
-      : []),
-    ...(seamCount ? [{ kind: "seam", label: "Pointer crossing" }] : []),
-  ]);
+  const seamSignature = JSON.stringify(arrangement.seams.map((seam) => [seam.start, seam.end]));
+  if (names.motionKey) {
+    const previous = lastDrawn.get(names.motionKey);
+    lastDrawn.set(names.motionKey, { tiles: rects.tiles, seams: seamSignature });
+    const motion = arrangementMotion(previous?.tiles, rects.tiles);
+    if (motionEnabled()) {
+      playMotion(svg, motion);
+      if (previous?.seams !== seamSignature) seams.dataset.motion = "enter";
+    }
+  }
+
+  // The compact viewport rides inside a computer card, where the legend would cost more room
+  // than it explains; the picture and one caption are what that card needs.
+  const legend = names.compact
+    ? null
+    : createLegend([
+        { kind: "group", label: groupLabels.source, side: sides.source },
+        { kind: "group", label: groupLabels.destination, side: sides.destination },
+        { kind: "primary", label: "Primary display" },
+        ...(arrangement.tiles.some((tile) => tile.shared)
+          ? [{ kind: "shared", label: "Cabled to both computers" }]
+          : []),
+        ...(seamCount ? [{ kind: "seam", label: "Pointer crossing" }] : []),
+      ]);
   const caption = document.createElement("figcaption");
-  caption.textContent = dashboardCaption(arrangement);
-  root.append(svg, legend, caption);
+  // A caller's short caption replaces the standing one, except while the arrangement itself has
+  // something to ask for; what is missing outranks how fresh the picture is.
+  caption.textContent =
+    names.caption && !arrangement.noCrossingYet ? names.caption : dashboardCaption(arrangement);
+  root.append(svg, ...(legend ? [legend] : []), caption);
   // Real text metrics need a laid-out canvas, so the estimated truncation is corrected on the next frame.
   if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => refineText(svg));
   return root;

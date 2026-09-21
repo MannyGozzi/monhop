@@ -3,11 +3,10 @@ import test from "node:test";
 
 import {
   clearForgetFor,
-  displayChipLabel,
-  displayStripSides,
-  hasDisplayStrip,
+  displaysFreshness,
   isForgetArmed,
   keepForgetArmed,
+  layoutChips,
   layoutRowKey,
   layoutRows,
   loadGate,
@@ -61,47 +60,46 @@ test("the newest layout leads, and a malformed list is simply empty", () => {
   );
 });
 
-test("each side of the display strip falls back on its own, and says when it did", () => {
+test("one word under the picture says whether both computers are reporting their displays now", () => {
+  const live = {
+    localDisplays: [display("Built-in live")],
+    peerDisplays: [display("LG live", { id: "2" })],
+  };
   const setup = {
     localDisplays: [display("Built-in saved")],
     peerDisplays: [display("LG saved", { id: "2" })],
-    live: { localDisplays: [display("Built-in live")], peerDisplays: [] },
+    live,
   };
-  const sides = displayStripSides(setup);
-  assert.deepEqual(
-    sides.local.displays.map((item) => item.name),
-    ["Built-in live"],
-  );
-  assert.equal(sides.local.lastSeen, false);
-  // The link is up but has not reported the other computer's displays: the saved ones, marked.
-  assert.deepEqual(
-    sides.peer.displays.map((item) => item.name),
-    ["LG saved"],
-  );
-  assert.equal(sides.peer.lastSeen, true);
-  assert.equal(hasDisplayStrip(sides), true);
-
-  const savedOnly = displayStripSides({ ...setup, live: null });
-  assert.equal(savedOnly.local.lastSeen, true);
-  assert.equal(savedOnly.peer.lastSeen, true);
-
-  const nothing = displayStripSides(null);
-  assert.equal(hasDisplayStrip(nothing), false);
+  assert.equal(displaysFreshness(setup), "Live");
+  // The link is up but has not reported the other computer's displays, so the picture is stale.
+  assert.equal(displaysFreshness({ ...setup, live: { ...live, peerDisplays: [] } }), "Last seen");
+  assert.equal(displaysFreshness({ ...setup, live: null }), "Last seen");
   // Nothing known is not "last seen": there is nothing to have seen.
-  assert.equal(nothing.local.lastSeen, false);
+  assert.equal(displaysFreshness(null), null);
+  assert.equal(displaysFreshness({ localDisplays: [], peerDisplays: [], live: null }), null);
 });
 
-test("a display chip reads in native pixels when they are known, logical otherwise", () => {
-  assert.equal(
-    displayChipLabel(display("Built-in", { nativeSize: [3024, 1964], scale: 2 })),
-    "Built-in · 3024 × 1964",
+test("only an entry that says it was named by the user is marked Saved", () => {
+  const fits = { tone: "connected", label: "Fits now" };
+  assert.deepEqual(layoutChips(entry("Desk")), { marks: [], fits });
+  assert.deepEqual(layoutChips(entry("Desk", { automatic: false })), {
+    marks: [{ tone: "neutral", label: "Saved" }],
+    fits,
+  });
+  // Rust always serializes the boolean, so an entry without it is damaged and claims nothing.
+  assert.deepEqual(layoutChips(entry("Desk", { automatic: undefined })), { marks: [], fits });
+  assert.deepEqual(layoutChips({}), { marks: [], fits: null });
+  assert.deepEqual(layoutChips(entry("Desk", { fits: false })), { marks: [], fits: null });
+});
+
+test("no list draws a Remembered chip: every entry in a Layouts list is remembered", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const files = ["computer-card-model.mjs", "computer-card.mjs", "screen-displays.mjs"];
+  const sources = await Promise.all(
+    files.map((file) => readFile(new URL(file, import.meta.url), "utf8")),
   );
-  assert.equal(displayChipLabel(display("Built-in")), "Built-in · 1512 × 982");
-  assert.equal(
-    displayChipLabel(display("Built-in", { nativeSize: [3024, Number.NaN] })),
-    "Built-in · 1512 × 982",
-  );
-  assert.equal(displayChipLabel({ name: "", size: null }), "Display");
+  for (const [index, source] of sources.entries())
+    assert.doesNotMatch(source, /"Remembered"/, files[index]);
 });
 
 test("Load is enabled only when pressing it would really load, and says why when it is not", () => {

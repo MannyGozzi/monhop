@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { placementOffset } from "./arrangement-model.mjs";
-import { dashboardCaption, savedDashboardArrangement } from "./dashboard-arrangement.mjs";
+import {
+  arrangementMotion,
+  dashboardCaption,
+  savedDashboardArrangement,
+} from "./dashboard-arrangement.mjs";
 
 const edges = {
   left: ["right", [-100, 0]],
@@ -227,6 +231,21 @@ test("a layout with no crossing yet still draws both computers' displays, just u
     false,
   );
   assert.equal(savedDashboardArrangement({ ...value, sourceSide: "peer" }).available, false);
+});
+
+test("a redrawn viewport knows which displays moved, and which ones are new on screen", () => {
+  const before = { 1: { x: 0, y: 0 }, 2: { x: 100, y: 0 } };
+  const after = { 1: { x: 0, y: 0.2 }, 2: { x: 140, y: 30 }, 3: { x: 260, y: 0 } };
+  const motion = arrangementMotion(before, after);
+  // A display that stayed put, give or take a rounding difference, is left alone.
+  assert.deepEqual(Object.keys(motion.moved), ["2"]);
+  // The delta is where it was minus where it now is: the offset the move starts from.
+  assert.deepEqual(motion.moved["2"], [-40, -30]);
+  assert.deepEqual(motion.entered, ["3"]);
+  // The first drawing has everything arriving and nothing moving.
+  assert.deepEqual(arrangementMotion(undefined, after), { moved: {}, entered: ["1", "2", "3"] });
+  // A display that vanished left with its node, so it is neither moved nor entering.
+  assert.deepEqual(arrangementMotion(before, {}), { moved: {}, entered: [] });
 });
 
 test("the dashboard preview and the editor draw through one shared renderer", async () => {
