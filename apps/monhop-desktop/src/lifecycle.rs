@@ -179,8 +179,9 @@ impl AppController {
     }
 
     /// Like `load_setup`, but skips the parse when the file's modification stamp still matches
-    /// the last parse. Used only by the once-a-second supervisor tick, which reloads the file
-    /// even when nothing changed.
+    /// the last parse. Used only by the supervisor tick, which reloads the file on every pass
+    /// even when nothing changed. Correctness rests on the temp-file rename moving the
+    /// modification time: an edit that left the stamp alone would be invisible here.
     fn cached_setup(&self, path: &Path, unreadable_message: &str) -> Result<SetupFile, String> {
         let stamp = std::fs::metadata(path).ok().and_then(|metadata| {
             metadata
@@ -261,21 +262,38 @@ impl AppController {
         self.computers_view()
     }
 
-    /// Chooses the computer to share with; None pauses. The supervisor connects within a second.
+    /// Chooses the computer to share with; None pauses. A supervisor pass runs immediately; the
+    /// connection itself follows within a tick, because the worker for the old computer has to
+    /// stop before the port is free.
     pub fn set_active(&self, fingerprint: Option<&str>) -> Result<SharingView, String> {
-        let _lease = self.gate.begin()?;
-        if !self.pairing.shutdown_ready() {
-            return Err("Finish or cancel pairing before changing computers.".into());
-        }
-        let fingerprint = fingerprint.map(parse_fingerprint).transpose()?;
-        match fingerprint {
-            Some(fingerprint) => log::info!("user: chose computer {}", short(fingerprint)),
-            None => log::info!("user: paused sharing"),
-        }
-        let path = self.setup_path()?;
-        let view = self.sharing.set_active(&path, fingerprint)?;
-        *lock(&self.sharing_retry_after) = None;
+        let view = {
+            let _lease = self.gate.begin()?;
+            if !self.pairing.shutdown_ready() {
+                return Err("Finish or cancel pairing before changing computers.".into());
+            }
+            let fingerprint = fingerprint.map(parse_fingerprint).transpose()?;
+            match fingerprint {
+                Some(fingerprint) => log::info!("user: chose computer {}", short(fingerprint)),
+                None => log::info!("user: paused sharing"),
+            }
+            let path = self.setup_path()?;
+            let view = self.sharing.set_active(&path, fingerprint)?;
+            *lock(&self.sharing_retry_after) = None;
+            view
+        };
+        self.nudge();
         Ok(view)
+    }
+
+    /// One supervisor pass, right after a change that makes a different connection the correct
+    /// one. The pass runs immediately, but the connection it wants may still be blocked by the
+    /// previous worker stopping, so it lands on one of the next ticks rather than at once.
+    /// The caller must have released the action gate first: a pass that finds it held does
+    /// nothing, and a pass never nudges, so this can neither block nor recurse.
+    pub fn nudge(&self) {
+        // A user action is behind every nudge, so a failed worker's backoff is spent.
+        self.sharing.clear_failure_backoff();
+        self.supervise_sharing();
     }
 
     /// Makes the computer active and opens the setup link for arranging; a session with it
@@ -300,6 +318,7 @@ impl AppController {
             file.set_interface_id(&interface_id);
         })?;
         *lock(&self.sharing_retry_after) = None;
+        self.sharing.clear_failure_backoff();
         if self.sharing.live_peer() == Some(fingerprint) && !self.sharing.link_is_off() {
             return Ok(self.sharing.begin_editing());
         }
@@ -308,12 +327,17 @@ impl AppController {
         Ok(self.sharing.begin_editing())
     }
 
-    /// Ends arranging; the supervisor resumes the session, or a standing link without a layout.
+    /// Ends arranging. The arranging link closes first, so the session, or a standing link when
+    /// no layout fits, follows within a tick rather than at once.
     pub fn edit_end(&self) -> Result<SharingView, String> {
-        let _lease = self.gate.begin()?;
-        log::info!("user: ended arranging");
-        *lock(&self.sharing_retry_after) = None;
-        Ok(self.sharing.end_editing())
+        let view = {
+            let _lease = self.gate.begin()?;
+            log::info!("user: ended arranging");
+            *lock(&self.sharing_retry_after) = None;
+            self.sharing.end_editing()
+        };
+        self.nudge();
+        Ok(view)
     }
 
     pub fn apply_setup(
@@ -333,7 +357,8 @@ impl AppController {
         self.sharing.apply_setup(&revision, &source, layout)
     }
 
-    /// Runs every second: keeps the active computer connected while nothing else owns the port.
+    /// Runs on every supervisor tick: keeps the active computer connected while nothing else
+    /// owns the port.
     pub fn supervise_sharing(&self) {
         let Ok(_lease) = self.gate.begin() else {
             return;
@@ -389,6 +414,11 @@ impl AppController {
         if !self.sharing.shutdown_ready() || !self.sharing.link_is_off() {
             return Ok(None);
         }
+        // A worker that ended with a real failure waits out its backoff here; relaunching it
+        // every pass would only repeat the failure. Any user choice clears it.
+        if self.sharing.within_failure_backoff(SUPERVISOR_BACKOFF) {
+            return Ok(None);
+        }
         let candidate = saved.filter(|_| !self.sharing.editing() && !self.sharing.holds_link());
         let current = candidate.map(current_local_displays).transpose()?;
         if let Some((saved, current)) = candidate.zip(current.as_ref()) {
@@ -420,52 +450,63 @@ impl AppController {
         }))
     }
 
-    /// The active record no longer fits the connected displays: switch to the arrangement
-    /// remembered for them, keep sharing with what survives of this one, or wait and say so.
-    /// The library is read only here, never while the applied layout still fits.
+    /// The active record no longer fits the connected displays. The computer with the keyboard
+    /// picks what runs next and sends it over the link; the other one only waits for it, so a
+    /// display change can never leave the two computers holding different records. The library
+    /// is read only here, never while the applied layout still fits.
     fn switch_or_continue(
         &self,
         path: &Path,
         saved: &SharingPreferences,
         inspection: &InspectedPeer,
     ) -> Result<Option<&'static str>, String> {
-        if self.sharing.notice_raised_for(inspection) {
+        // Only two answers end this pass: a proposal already in flight for exactly these
+        // displays, and these displays already answered with "nothing fits". A raised banner is
+        // neither, because it survives the link a proposal went down with.
+        if self.sharing.proposal_pending_for(inspection)
+            || self.sharing.waiting_notice_for(inspection)
+        {
+            return Ok(None);
+        }
+        // The saved record says which computer holds the keyboard; the live inspection's source
+        // is only what this connection was opened with and can disagree with the record.
+        if saved.source_side() != "local" {
+            self.sharing
+                .raise_display_notice(DisplayNotice::PeerDeciding, inspection);
             return Ok(None);
         }
         let library = self.library(path);
-        if let Some(remembered) = library
+        // The memory that fits exactly wins; otherwise the record is rebuilt from the memory made
+        // with exactly these monitors, so a display that only moved keeps every crossing made for
+        // it, and from the running record when there is no such memory.
+        let next = library
             .as_ref()
             .and_then(|library| library.automatic_fit(inspection))
-        {
-            self.sharing.write_active_setup(path, remembered.clone())?;
-            *lock(&self.setup_cache) = None;
-            // A reconnected monitor carries a new id; the memory takes it so it fits exactly next time.
-            crate::sharing::remember_applied(path, &remembered);
-            self.sharing.yield_link_when_layout_fits(&remembered);
-            return Ok(Some(
-                "switched to the arrangement remembered for these displays",
-            ));
-        }
-        // Rebuilt from the memory made with exactly these monitors when there is one, so a
-        // display that only moved keeps every crossing; the record that was running is the
-        // fallback, so a memory that no longer validates never costs what still works.
-        let adapted = library
-            .as_ref()
-            .and_then(|library| library.automatic_for_same_displays(inspection))
-            .and_then(|basis| adapt_to_inspection(basis, inspection))
+            .or_else(|| {
+                library
+                    .as_ref()
+                    .and_then(|library| library.automatic_for_same_displays(inspection))
+                    .and_then(|basis| adapt_to_inspection(basis, inspection))
+            })
             .or_else(|| adapt_to_inspection(saved, inspection));
-        let Some(adapted) = adapted else {
+        let Some(next) = next else {
             self.sharing
                 .raise_display_notice(DisplayNotice::Waiting, inspection);
             return Ok(None);
         };
-        self.sharing.write_active_setup(path, adapted.clone())?;
-        *lock(&self.setup_cache) = None;
-        crate::sharing::remember_applied(path, &adapted);
-        self.sharing
-            .raise_display_notice(DisplayNotice::Continued, inspection);
-        self.sharing.yield_link_when_layout_fits(&adapted);
-        Ok(Some("kept sharing with the displays that are still there"))
+        // Both computers write the agreed bytes at the link's commit, which also remembers the
+        // record and closes the link; the next supervisor pass then starts the session. A
+        // proposal that cannot leave this moment must not back the supervisor off. The send
+        // records itself and raises the banner under its own lock.
+        if let Err(message) = self.sharing.propose_layout(&next) {
+            log::warn!("supervisor: the layout for the new displays was not sent: {message}");
+            self.sharing
+                .raise_display_notice(DisplayNotice::Waiting, inspection);
+            return Ok(None);
+        }
+        Ok(Some(
+            "sent the other computer a layout for the displays it shows now",
+        ))
     }
 
     /// An arrangement remembered for the displays this computer shows now; the other computer's
@@ -644,13 +685,47 @@ impl AppController {
         self.sharing.save_arrangement(path, revision, name, layout)
     }
 
-    pub fn delete_arrangement(
+    /// Every arrangement kept for one paired computer, whether or not it is connected. Only a
+    /// live link to that same computer can mark an entry as one that fits right now.
+    pub fn arrangements_for(
         &self,
-        path: &Path,
+        fingerprint: &str,
+    ) -> Result<Vec<crate::arrangement_library::ArrangementView>, String> {
+        let _lease = self.gate.begin()?;
+        self.arrangement_views(fingerprint, None)
+    }
+
+    /// Forgets one of that computer's arrangements and lists what is left; no connection needed.
+    pub fn forget_arrangement(
+        &self,
+        fingerprint: &str,
         name: &str,
     ) -> Result<Vec<crate::arrangement_library::ArrangementView>, String> {
         let _lease = self.gate.begin()?;
-        self.sharing.delete_arrangement(path, name)
+        self.arrangement_views(fingerprint, Some(name))
+    }
+
+    fn arrangement_views(
+        &self,
+        fingerprint: &str,
+        forget: Option<&str>,
+    ) -> Result<Vec<crate::arrangement_library::ArrangementView>, String> {
+        let peer = parse_fingerprint(fingerprint)?;
+        let library_path = self.setup_path()?.with_file_name(ARRANGEMENTS_FILE);
+        // This library is this computer's own, so an entry belongs to whichever computer its
+        // record names; nothing else has to be resolved before listing or forgetting.
+        let peer_hex = peer.full_hex();
+        let mut library = ArrangementLibrary::load(&library_path)
+            .map_err(|_| crate::sharing::ARRANGEMENTS_UNREADABLE.to_owned())?;
+        if let Some(name) = forget {
+            library
+                .remove_for(&peer_hex, name)
+                .map_err(|error| error.message().to_owned())?;
+            crate::sharing::save_library(&library_path, &library)?;
+            log::info!("user: forgot an arrangement for {}", short(peer));
+        }
+        let live = self.sharing.live_inspection();
+        Ok(library.views_for(&peer_hex, live.as_ref().map(|(_, inspection)| inspection)))
     }
 
     pub fn request_shutdown(&self) -> bool {
@@ -763,6 +838,112 @@ mod tests {
         assert_eq!(paused.phase, "off");
         assert_eq!(paused.message, crate::sharing::PAUSED);
         assert!(!paused.editing);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// A fresh, empty setup folder that the test owns and removes.
+    fn folder(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("monhop-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_computer_without_the_keyboard_waits_while_the_other_one_chooses_the_layout() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let controller = AppController::default();
+        let folder = folder("peer-decides");
+        let path = folder.join("sharing.json");
+        let saved = crate::sharing_preferences::tests::preferences();
+        assert_eq!(saved.source_side(), "peer");
+        // The connection was opened naming this computer as the source; the saved record, not
+        // that, says who decides, so this side still waits.
+        let mut inspection = crate::sharing_preferences::tests::inspection(&saved);
+        inspection.source = inspection.local_device;
+        assert!(inspection.source_is_local());
+        assert_eq!(
+            controller
+                .switch_or_continue(&path, &saved, &inspection)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            controller.sharing.status().display_notice,
+            Some(DisplayNotice::PeerDeciding)
+        );
+        // Nothing is promoted, adapted or written on this side; the layout arrives over the link.
+        assert!(!path.exists());
+        assert!(!folder.join(ARRANGEMENTS_FILE).exists());
+        assert_eq!(
+            controller
+                .switch_or_continue(&path, &saved, &inspection)
+                .unwrap(),
+            None
+        );
+
+        // With the keyboard here the record is chosen and sent; no link means it cannot go out,
+        // and the banner asks for arranging instead of backing the supervisor off.
+        let keyboard_here = crate::sharing_preferences::tests::preferences_with_local_source();
+        controller.sharing.clear_display_notice();
+        assert_eq!(
+            controller
+                .switch_or_continue(&path, &keyboard_here, &inspection)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            controller.sharing.status().display_notice,
+            Some(DisplayNotice::Waiting)
+        );
+        // These displays are answered, so the next pass proposes nothing more for them.
+        assert_eq!(
+            controller
+                .switch_or_continue(&path, &keyboard_here, &inspection)
+                .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn a_computers_layout_history_lists_and_forgets_while_it_is_not_connected() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let controller = AppController::default();
+        let folder = folder("layout-history");
+        let setup_path = folder.join("sharing.json");
+        controller.use_setup_path(setup_path.clone());
+        let peer = "B".repeat(64);
+        // An empty library lists nothing; there is no setup file yet either.
+        assert!(controller.arrangements_for(&peer).unwrap().is_empty());
+        assert!(!setup_path.exists());
+
+        let saved = crate::sharing_preferences::tests::preferences();
+        let mut library = ArrangementLibrary::default();
+        library.upsert("Desk", saved).unwrap();
+        library
+            .save(&setup_path.with_file_name(ARRANGEMENTS_FILE))
+            .unwrap();
+
+        // The library is this computer's own, so no setup-file record is needed to claim it.
+        let listed = controller.arrangements_for(&peer.to_lowercase()).unwrap();
+        assert!(!setup_path.exists());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Desk");
+        // Nothing is connected, so nothing fits and nothing offers a layout to load.
+        assert!(!listed[0].fits);
+        assert!(listed[0].layout.is_none());
+        let other = "C".repeat(64);
+        assert!(controller.arrangements_for(&other).unwrap().is_empty());
+        assert!(controller.forget_arrangement(&other, "Desk").is_err());
+        assert!(controller.arrangements_for("not a fingerprint").is_err());
+        assert!(
+            controller
+                .forget_arrangement(&peer, "Desk")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(controller.arrangements_for(&peer).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(folder);
     }
 

@@ -43,6 +43,11 @@ use tauri::{WebviewUrl, WebviewWindowBuilder, webview::NewWindowResponse};
 #[cfg(test)]
 static NATIVE_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// How often the supervisor decides between a session and a setup link. Short enough that a
+/// finished worker, an ended arranging session or a display change is answered without a pause
+/// the user can feel; each pass is a stat of the setup file and a few state checks.
+const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[cfg(any(windows, test))]
 const WEBVIEW2_DEFAULT_BROWSER_ARGS: &str =
     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
@@ -359,16 +364,30 @@ async fn sharing_arrangement_save(
     .await?
 }
 
+/// One paired computer's own layout history, listable while that computer is not connected.
 #[tauri::command]
-async fn sharing_arrangement_delete(
+async fn sharing_arrangements_for(
     app: tauri::AppHandle,
-    name: String,
+    fingerprint: String,
 ) -> Result<Vec<arrangement_library::ArrangementView>, String> {
-    let path = arrangements_path(&app)?;
     let controller = app.state::<Arc<AppController>>().inner().clone();
     spawn_blocking_command(
-        move || controller.delete_arrangement(&path, &name),
-        "The arrangement could not be deleted.",
+        move || controller.arrangements_for(&fingerprint),
+        "The saved arrangements could not be read.",
+    )
+    .await?
+}
+
+#[tauri::command]
+async fn sharing_arrangement_forget(
+    app: tauri::AppHandle,
+    fingerprint: String,
+    name: String,
+) -> Result<Vec<arrangement_library::ArrangementView>, String> {
+    let controller = app.state::<Arc<AppController>>().inner().clone();
+    spawn_blocking_command(
+        move || controller.forget_arrangement(&fingerprint, &name),
+        "The arrangement could not be forgotten.",
     )
     .await?
 }
@@ -693,7 +712,8 @@ fn main() {
             sharing_save_setup,
             sharing_arrangements,
             sharing_arrangement_save,
-            sharing_arrangement_delete,
+            sharing_arrangements_for,
+            sharing_arrangement_forget,
             sharing_dismiss_display_notice,
             sharing_copy_last_drop,
             dimming::dimming_status,
@@ -742,11 +762,15 @@ fn main() {
             let appearance = appearance::Appearance::start(app.handle());
             app.manage(appearance.clone());
             if !check_ui {
-                // The active computer stays connected by itself, even with the window hidden.
+                // The active computer stays connected by itself, even with the window hidden. The
+                // tick is short so a worker that just ended is replaced by the right connection
+                // within it, without a callback that could run a pass under someone else's lock.
                 let supervisor = app.state::<Arc<AppController>>().inner().clone();
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                    let mut tick = tokio::time::interval(SUPERVISOR_TICK);
+                    // A pass that ran long owes no catch-up burst; the next one decides afresh.
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tick.tick().await;
                         let controller = supervisor.clone();
@@ -1040,7 +1064,8 @@ mod tests {
                 "allow-sharing-save-setup",
                 "allow-sharing-arrangements",
                 "allow-sharing-arrangement-save",
-                "allow-sharing-arrangement-delete",
+                "allow-sharing-arrangements-for",
+                "allow-sharing-arrangement-forget",
                 "allow-sharing-dismiss-display-notice",
                 "allow-sharing-copy-last-drop",
                 "allow-dimming-status",

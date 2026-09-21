@@ -13,7 +13,9 @@ use monhop_core::{
 };
 
 pub const MAGIC: [u8; 4] = *b"LKM!";
-pub const PROTOCOL_VERSION: u16 = 7;
+/// Bumped whenever the wire changes shape; both computers must run the same build. Version 8
+/// added the setup link's Arranging frame.
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_LEN: usize = 8_192;
 pub use monhop_core::MAX_DISPLAYS;

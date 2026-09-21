@@ -368,6 +368,10 @@ mod tests {
         assert_eq!(computers[0]["platform"], "macos");
         assert_eq!(computers[0]["setup"]["saved"], true);
         assert!(computers[0]["setup"]["layout"].is_null());
+        // The live displays belong to the one connected computer; every other card has none.
+        assert!(computers[0]["setup"]["live"].is_null());
+        assert_eq!(computers[1]["setup"]["live"]["localDisplays"][0]["id"], "1");
+        assert_eq!(computers[1]["setup"]["live"]["peerDisplays"][0]["id"], "2");
         // The seeded legacy entry carries the other platform's default name on either host.
         let (legacy_name, legacy_platform) = if cfg!(target_os = "macos") {
             ("Windows PC", "windows")

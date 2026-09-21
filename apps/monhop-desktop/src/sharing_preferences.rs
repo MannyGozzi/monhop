@@ -330,6 +330,15 @@ fn source_device(
     }
 }
 
+/// The displays both computers show while one of them is connected, so a card can draw what is
+/// there now instead of what was there at the last Apply.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveDisplays {
+    local_displays: Vec<DisplaySnapshot>,
+    peer_displays: Vec<DisplaySnapshot>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedSetupView {
@@ -340,6 +349,8 @@ pub struct SavedSetupView {
     revision: String,
     layout: Option<LayoutRequest>,
     preview_layout: Option<LayoutRequest>,
+    /// Null unless this computer is the one with a live link or session.
+    live: Option<LiveDisplays>,
     message: &'static str,
 }
 
@@ -372,6 +383,10 @@ impl SavedSetupView {
             revision: revision.to_owned(),
             layout,
             preview_layout: saved.map(|saved| saved.layout.clone()),
+            live: inspection.map(|inspection| LiveDisplays {
+                local_displays: snapshots(&inspection.local_displays),
+                peer_displays: snapshots(&inspection.peer_displays),
+            }),
             message,
         }
     }
@@ -1482,6 +1497,14 @@ pub(crate) mod tests {
         assert_eq!(adapted.local_displays()[0].origin, [0.0, 240.0]);
         assert_eq!(adapted.layout(), record.layout());
         assert!(adapted.fits_displays(&inspected));
+    }
+
+    /// The same setup with the keyboard on this computer; `preferences()` puts it on the peer.
+    pub(crate) fn preferences_with_local_source() -> SharingPreferences {
+        let mut saved = preferences();
+        saved.layout.source_display = "1".into();
+        saved.validate().expect("the flipped fixture stays valid");
+        saved
     }
 
     /// The same setup made with another paired computer.

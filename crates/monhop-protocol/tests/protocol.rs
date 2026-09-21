@@ -622,14 +622,14 @@ fn rate_limiter_is_bounded_and_uses_monotonic_caller_time() {
 }
 
 #[test]
-fn readiness_requires_protocol_seven_and_an_empty_reliable_body() {
+fn readiness_requires_the_current_protocol_and_an_empty_reliable_body() {
     let ready = frame(3, Message::SessionReady);
     let mut bytes = Vec::new();
     ready.encode_into(&mut bytes).unwrap();
-    assert_eq!(PROTOCOL_VERSION, 7);
+    assert_eq!(PROTOCOL_VERSION, 8);
     assert_eq!(ready.delivery(), DeliveryClass::Reliable);
     assert_eq!(decode(&bytes), Ok(ready));
-    for version in [1_u16, 2, 3, 4, 5, 6] {
+    for version in [1_u16, 2, 3, 4, 5, 6, 7] {
         let mut old = bytes.clone();
         old[4..6].copy_from_slice(&version.to_be_bytes());
         assert_eq!(decode(&old), Err(DecodeError::UnsupportedVersion));

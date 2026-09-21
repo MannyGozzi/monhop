@@ -1,6 +1,6 @@
 import { monitorKey } from "./arrangement-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
-import { normalizeStoredLayout } from "./sharing-model.mjs";
+import { normalizeArrangements, normalizeStoredLayout } from "./sharing-model.mjs";
 
 const FINGERPRINT = /^[a-f0-9]{64}$/i;
 const PLATFORM = new Set(["windows", "macos"]);
@@ -10,6 +10,48 @@ const MAX_COMPUTERS = 16;
 
 export function initialComputers() {
   return { loaded: false, items: [], active: null, interfaceId: null };
+}
+
+// --- each computer's layout history, kept outside the polled `computers` reply ------------
+
+const EMPTY_ARRANGEMENTS = Object.freeze({ items: [], loading: false, error: "" });
+
+export function initialComputerArrangements() {
+  return {};
+}
+
+export function computerArrangements(store, fingerprint) {
+  return store[fingerprint] ?? EMPTY_ARRANGEMENTS;
+}
+
+export function beginComputerArrangements(store, fingerprint) {
+  return {
+    ...store,
+    [fingerprint]: { ...computerArrangements(store, fingerprint), loading: true, error: "" },
+  };
+}
+
+export function setComputerArrangements(store, fingerprint, value) {
+  return {
+    ...store,
+    [fingerprint]: { items: normalizeArrangements(value), loading: false, error: "" },
+  };
+}
+
+export function failComputerArrangements(store, fingerprint, error) {
+  return {
+    ...store,
+    [fingerprint]: { ...computerArrangements(store, fingerprint), loading: false, error },
+  };
+}
+
+// A computer that is no longer paired keeps no layout history around to go stale.
+export function pruneComputerArrangements(store, computers) {
+  const known = new Set(computers.items.map((item) => item.fingerprint));
+  const next = {};
+  for (const [fingerprint, entry] of Object.entries(store))
+    if (known.has(fingerprint)) next[fingerprint] = entry;
+  return next;
 }
 
 export function normalizeComputers(value) {
@@ -69,6 +111,7 @@ function normalizeSetup(value) {
     peerDisplays: normalizeDisplays(value.peerDisplays),
     layout: normalizeStoredLayout(value.layout),
     previewLayout: normalizeStoredLayout(value.previewLayout),
+    live: normalizeLive(value.live),
     message: cleanText(value.message, 240),
   };
 }
@@ -81,7 +124,17 @@ function emptySetup() {
     peerDisplays: [],
     layout: null,
     previewLayout: null,
+    live: null,
     message: "",
+  };
+}
+
+// Present only while this computer has a live link or session; the same display shape as `localDisplays`.
+function normalizeLive(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    localDisplays: normalizeDisplays(value.localDisplays),
+    peerDisplays: normalizeDisplays(value.peerDisplays),
   };
 }
 
@@ -90,6 +143,8 @@ function normalizeDisplays(value) {
   return value.map(normalizeDisplay).filter(Boolean).slice(0, 16);
 }
 
+// `nativeSize` and `scale` describe what the monitor really shows behind the logical size; they
+// are optional, and an unusable one is dropped rather than taking the whole display with it.
 function normalizeDisplay(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const origin = coordinate(value.origin);
@@ -101,6 +156,8 @@ function normalizeDisplay(value) {
     name: cleanText(value.name, 80) || "Display",
     origin,
     size,
+    nativeSize: sizePair(value.nativeSize),
+    scale: Number.isFinite(value.scale) && value.scale > 0 ? value.scale : null,
     primary: value.primary === true,
     monitor: monitorKey(value.monitor),
   };

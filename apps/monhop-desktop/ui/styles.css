@@ -297,7 +297,15 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .card[data-tone="active"] { border-color: color-mix(in srgb, var(--success) 38%, var(--border)); }
 .card[data-tone="error"] { border-color: color-mix(in srgb, var(--destructive) 38%, var(--border)); }
 .card[data-tone="connected"] { border-color: color-mix(in srgb, var(--success) 24%, var(--border)); }
-.computer-details .accordion-trigger { min-height: 32px; font-size: 12px; }
+.computer-details .accordion-trigger, .computer-layouts .accordion-trigger { min-height: 32px; font-size: 12px; }
+.computer-displays { display: grid; gap: 6px; min-width: 0; }
+.computer-displays-note { color: var(--muted-foreground); font-size: 11px; text-transform: uppercase; letter-spacing: .02em; }
+.display-strip-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 8px; min-width: 0; }
+.display-strip-label { display: grid; justify-items: start; gap: 1px; padding-top: 2px; color: var(--muted-foreground); font-size: 12px; white-space: nowrap; }
+.display-strip-chips { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.display-strip-chips .badge { min-width: 0; overflow: hidden; }
+.display-chip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.row-leading-chips { display: inline-flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
 .home-layout { display: grid; gap: 10px; min-width: 0; border-top: 1px solid var(--border); padding-top: 12px; }
 .code-block { position: relative; }
 .code-block .button { position: absolute; top: 6px; right: 6px; }

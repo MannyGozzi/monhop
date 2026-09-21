@@ -1,8 +1,16 @@
-import { createAccordion } from "./accordion.mjs";
+import { ACCORDION_TOGGLE, createAccordion } from "./accordion.mjs";
 import { computerStatus } from "./computer-status.mjs";
-import { displayName } from "./computers-model.mjs";
+import { computerArrangements, displayName } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
+import { isConnected } from "./sharing-model.mjs";
 import {
+  displayChipLabel,
+  displayStripSides,
+  hasDisplayStrip,
+  layoutRows,
+} from "./computer-card-model.mjs";
+import {
+  badge,
   button,
   card,
   el,
@@ -10,6 +18,8 @@ import {
   note,
   platformGlyph,
   presence,
+  row,
+  rows,
   statusChip,
   swap,
   switchRow,
@@ -66,12 +76,14 @@ export function computerCard(ctx, computer, { scope, extras = [], details = [] }
       ],
     }),
     swap(`${key}-detail`, note(status.detail), status.detail, { block: true }),
+    presence(`${key}-displays`, displayStrip(computer)),
     presence(
       `${key}-extras`,
       extras.some(Boolean)
         ? el("div", { className: "card-extras", children: extras.filter(Boolean) })
         : null,
     ),
+    layoutsDisclosure(ctx, computer, key),
     createAccordion(
       `${scope}-computer-${fingerprint}`,
       "computer-details",
@@ -185,4 +197,124 @@ function forgetControls(ctx, computer, name) {
       ],
     }),
   ];
+}
+
+// --- display strip ---------------------------------------------------------
+
+// Each side shows its live displays when the link is reporting them and the last saved ones
+// otherwise, so the card is never blank and never claims a stale list is current.
+function displayStrip(computer) {
+  const sides = displayStripSides(computer.setup);
+  if (!hasDisplayStrip(sides)) return null;
+  return el("div", {
+    className: "computer-displays",
+    children: [
+      displayStripRow("This computer", sides.local),
+      displayStripRow(displayName(computer), sides.peer),
+    ],
+  });
+}
+
+function displayStripRow(title, side) {
+  if (!side.displays.length) return null;
+  return el("div", {
+    className: "display-strip-row",
+    children: [
+      el("span", {
+        className: "display-strip-label",
+        children: [
+          el("span", { text: title }),
+          side.lastSeen
+            ? el("span", { className: "computer-displays-note", text: "Last seen" })
+            : null,
+        ],
+      }),
+      el("div", {
+        className: "display-strip-chips",
+        children: side.displays.map((item) => displayChip(item)),
+      }),
+    ],
+  });
+}
+
+// The label is its own element so a long monitor name is cut with an ellipsis inside the chip.
+function displayChip(display) {
+  const chip = badge("", "secondary", "monitor");
+  chip.append(el("span", { className: "display-chip-text", text: displayChipLabel(display) }));
+  return chip;
+}
+
+// --- layout history ---------------------------------------------------------
+
+function layoutsDisclosure(ctx, computer, key) {
+  const { actions, active, sharing, busy, layoutForget } = ctx;
+  const fingerprint = computer.fingerprint;
+  const store = computerArrangements(ctx.computerArrangements, fingerprint);
+  const entries = layoutRows({
+    fingerprint,
+    entries: store.items,
+    armed: layoutForget,
+    isActive: fingerprint === active,
+    connected: isConnected(sharing),
+    busy,
+    pending: store.loading,
+  });
+  const content = [];
+  if (store.error) content.push(note(store.error, "danger"));
+  if (!entries.length)
+    content.push(
+      note(
+        store.loading
+          ? "Reading the saved layouts…"
+          : "MonHop remembers each layout applied with this computer.",
+      ),
+    );
+  else content.push(rows(entries.map((item) => layoutRow(ctx, fingerprint, item))));
+  const label = entries.length ? `Layouts (${entries.length})` : "Layouts";
+  const accordion = createAccordion(`${key}-layouts`, "computer-layouts", label, ...content);
+  // The manager toggles the panel first and announces it afterwards, so reading the list here
+  // re-renders the card without the press being lost.
+  accordion.addEventListener(ACCORDION_TOGGLE, (event) => {
+    if (event.detail.open) void actions.loadComputerArrangements(fingerprint);
+  });
+  return accordion;
+}
+
+function layoutRow(ctx, fingerprint, item) {
+  const { actions } = ctx;
+  const { entry, key, armed, disabled, load } = item;
+  const chips = [
+    statusChip({ tone: "neutral", label: entry.automatic ? "Remembered" : "Saved" }),
+    entry.fits ? statusChip({ tone: "connected", label: "Fits now" }) : null,
+  ].filter(Boolean);
+  return row({
+    title: entry.name,
+    detail: `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`,
+    leading: el("span", { className: "row-leading-chips", children: chips }),
+    actions: [
+      loadButton(actions, fingerprint, entry, key, load, disabled),
+      button(armed ? "Confirm forget" : "Forget", {
+        variant: armed ? "destructive" : "ghost",
+        size: "sm",
+        disabled,
+        pressed: armed,
+        focusKey: `layout-forget-${key}`,
+        onClick: () => actions.pressLayoutForget(fingerprint, entry.name),
+      }),
+    ],
+  });
+}
+
+// Always drawn, so a row never changes shape as the connection comes and goes; the title says
+// what is missing while it cannot be pressed.
+function loadButton(actions, fingerprint, entry, key, load, disabled) {
+  const node = button("Load", {
+    variant: "outline",
+    size: "sm",
+    disabled: disabled || !load.enabled,
+    focusKey: `layout-load-${key}`,
+    onClick: () => void actions.loadComputerArrangement(fingerprint, entry.name),
+  });
+  if (load.reason) node.title = load.reason;
+  return node;
 }

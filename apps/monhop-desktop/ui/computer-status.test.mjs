@@ -91,7 +91,7 @@ test("the setup link reads as connected, and says when it is being arranged", ()
 
   const editing = computerStatus(computer, view({ ...base, editing: true }), WINDOWS);
   assert.equal(editing.key, "editing");
-  assert.equal(editing.label, "Connected");
+  assert.equal(editing.label, "Arranging displays");
   assert.match(editing.detail, /Sharing resumes after you apply/);
   assert.equal(isLiveStatus(editing), true);
 });
@@ -127,22 +127,108 @@ test("dialing, stopping and failing each get one honest line", () => {
   );
   assert.equal(stopping.label, "Stopping…");
 
-  for (const phase of ["error", "unknown"]) {
-    const failed = computerStatus(
-      computer,
-      view({ phase, active: WINDOWS, message: "The other computer refused." }),
-      WINDOWS,
-    );
-    assert.equal(failed.label, "Can't connect", phase);
-    assert.equal(failed.tone, "error", phase);
-    assert.equal(failed.detail, "The other computer refused.", phase);
-  }
+  const failed = computerStatus(
+    computer,
+    view({ phase: "error", active: WINDOWS, message: "The other computer refused." }),
+    WINDOWS,
+  );
+  assert.equal(failed.label, "Can't connect");
+  assert.equal(failed.tone, "error");
+  assert.equal(failed.detail, "The other computer refused.");
 });
 
 test("the computer in use with no worker yet is still on its way, never paused", () => {
   const dialing = computerStatus(computer, view({ phase: "off", active: WINDOWS }), WINDOWS);
   assert.equal(dialing.key, "connecting");
   assert.equal(dialing.detail, "Reaching Office Windows PC.");
+});
+
+// Only phase "error" with a message reads as a problem; an error with nothing confirmed yet still
+// reads as ordinary dialing so a transient blip never looks like a failure.
+test("an error with nothing confirmed yet reads as still connecting", () => {
+  const unconfirmed = computerStatus(computer, view({ phase: "error", active: WINDOWS }), WINDOWS);
+  assert.equal(unconfirmed.label, "Connecting…");
+  assert.equal(unconfirmed.tone, "checking");
+  assert.equal(isLiveStatus(unconfirmed), false);
+});
+
+// An unrecognized reply may hide a live worker, so it keeps the backend's own words in front of
+// the user under a label that asks for a look without claiming the connection failed.
+test("an unrecognized reply keeps its message, under a label that is not an alarm", () => {
+  const message = "The connection state was not recognized. Stop, then connect again.";
+  const unknown = computerStatus(
+    computer,
+    view({ phase: "unknown", active: WINDOWS, message }),
+    WINDOWS,
+  );
+  assert.equal(unknown.label, "Needs attention");
+  assert.equal(unknown.detail, message);
+  assert.notEqual(unknown.tone, "error");
+  assert.equal(isLiveStatus(unknown), false);
+  // The peer is still named while the phase is unrecognized, and that changes nothing.
+  assert.equal(
+    computerStatus(
+      computer,
+      view({ phase: "unknown", peerFingerprint: WINDOWS, active: WINDOWS, message }),
+      WINDOWS,
+    ).label,
+    "Needs attention",
+  );
+  // With nothing to say, it is simply still dialing.
+  assert.equal(
+    computerStatus(computer, view({ phase: "unknown", active: WINDOWS }), WINDOWS).label,
+    "Connecting…",
+  );
+});
+
+// Every message the backend sends with the link down, in its own words: a pause is the user's own
+// doing, a reconnect or a started session is on its way back, and the rest is simply not connected.
+test("each reason the link is down gets the label that reason deserves", () => {
+  const cases = [
+    ["Paused. Input is local.", "Paused", "paused"],
+    ["Not connected. Input is local.", "Not connected", "paused"],
+    ["Switching computers.", "Connecting…", "connecting"],
+    ["The other computer left. Reconnecting.", "Connecting…", "connecting"],
+    ["Arranging ended. Reconnecting.", "Connecting…", "connecting"],
+    [
+      "Arranging ended after 15 minutes without changes. Reconnecting.",
+      "Connecting…",
+      "connecting",
+    ],
+    ["Layout applied on both computers. Sharing is on.", "Connecting…", "connecting"],
+    [
+      "The displays changed since the layout was applied. Connecting to arrange them.",
+      "Connecting…",
+      "connecting",
+    ],
+  ];
+  for (const [message, label, key] of cases) {
+    const status = computerStatus(
+      computer,
+      view({ phase: "off", active: WINDOWS, message }),
+      WINDOWS,
+    );
+    assert.equal(status.label, label, message);
+    assert.equal(status.key, key, message);
+    assert.equal(status.detail, message, message);
+    assert.notEqual(status.tone, "error", message);
+    assert.equal(isLiveStatus(status), false, message);
+  }
+});
+
+// The status view is null until the first reply lands, and stays null when that call fails.
+test("a computer renders before anything is known about the connection", () => {
+  const waiting = computerStatus(computer, null, WINDOWS);
+  assert.equal(waiting.label, "Connecting…");
+  assert.equal(waiting.detail, "Reaching Office Windows PC.");
+  assert.equal(isLiveStatus(waiting), false);
+  assert.equal(isSessionStatus(waiting), false);
+
+  const idle = computerStatus(computer, null, null);
+  assert.equal(idle.key, "standby");
+  assert.equal(idle.label, "Paired");
+  assert.equal(computerStatus(other, undefined, WINDOWS).label, "Paired");
+  assert.equal(computerStatus(null, null, null).label, "Connecting…");
 });
 
 test("the header pill names the computer in use, or why there is nothing to report", () => {

@@ -6,6 +6,7 @@ import {
   fitTransform,
   hiddenFromLayout,
   monitorKey,
+  placeGroup,
   placementFromLayout,
   sharedMonitors,
   sideRects,
@@ -31,7 +32,7 @@ export function savedDashboardArrangement(setup) {
   const local = displays(setup.localDisplays);
   const peer = displays(setup.peerDisplays);
   const layout = normalizeStoredLayout(setup.previewLayout);
-  if (!local || !peer || !layout || layout.links.length === 0) return unavailable(STALE);
+  if (!local || !peer || !layout) return unavailable(STALE);
   const all = [...local, ...peer];
   if (new Set(all.map((display) => display.id)).size !== all.length)
     return unavailable("Saved display identifiers are not valid.");
@@ -62,20 +63,36 @@ export function savedDashboardArrangement(setup) {
   );
   const groups = displayGroups(source, destination);
   if (!crossings || !groups) return unavailable(STALE);
-  // Saved positions draw exactly what was applied; a layout without them is rebuilt from its crossings.
-  const placement = placementFromLayout(groups, layout.arrangement ?? null, crossings);
+  // No link was ever recorded: place the two groups the same way a fresh arrangement would, and
+  // draw them unconnected rather than inventing a crossing that was never saved.
+  const noCrossingYet = crossings.length === 0;
+  const placement = noCrossingYet
+    ? placeGroup(groups, "right")
+    : placementFromLayout(groups, layout.arrangement ?? null, crossings);
   const geometry = placement ? arrangementGeometry(groups, placement) : null;
-  if (!geometry?.connected)
+  if (!geometry || (!noCrossingYet && !geometry.connected))
     return unavailable("Saved arrangement cannot be shown without changing its display geometry.");
   return {
     available: true,
     sourceSide,
     destinationSide,
+    noCrossingYet,
     groups: geometry.groups,
     placement: structuredClone(geometry.placement),
     tiles: geometry.tiles.map((tile) => ({ ...tile })),
-    seams: geometry.seams.map((seam) => ({ ...seam, start: [...seam.start], end: [...seam.end] })),
+    seams: noCrossingYet
+      ? []
+      : geometry.seams.map((seam) => ({ ...seam, start: [...seam.start], end: [...seam.end] })),
   };
+}
+
+// A saved layout with no crossing is a real state, not a broken one: the preview says what is
+// missing instead of warning that the details need a review.
+export function dashboardCaption(arrangement) {
+  if (arrangement?.noCrossingYet) return "No crossing yet. Arrange the displays to connect them.";
+  return arrangement?.placement?.mode === "free"
+    ? "Saved display positions, placed one by one. Not a current display check."
+    : "Saved display positions. Not a current display check.";
 }
 
 export function createDashboardArrangement(setup, names = {}) {
@@ -114,7 +131,7 @@ export function createDashboardArrangement(setup, names = {}) {
   svg.setAttribute("role", "img");
   svg.setAttribute(
     "aria-label",
-    `${labels.local} and ${labels.peer}. ${seamCount} saved display seam${seamCount === 1 ? "" : "s"}. ${labels[arrangement.sourceSide]} is the input source.${free ? " Displays were placed one by one." : ""}`,
+    `${labels.local} and ${labels.peer}. ${arrangement.noCrossingYet ? "No crossing yet." : `${seamCount} saved display seam${seamCount === 1 ? "" : "s"}.`} ${labels[arrangement.sourceSide]} is the input source.${free ? " Displays were placed one by one." : ""}`,
   );
 
   const transform = fitTransform(arrangement.tiles, VIEW, VIEW_INSETS);
@@ -149,12 +166,10 @@ export function createDashboardArrangement(setup, names = {}) {
     ...(arrangement.tiles.some((tile) => tile.shared)
       ? [{ kind: "shared", label: "Cabled to both computers" }]
       : []),
-    { kind: "seam", label: "Pointer crossing" },
+    ...(seamCount ? [{ kind: "seam", label: "Pointer crossing" }] : []),
   ]);
   const caption = document.createElement("figcaption");
-  caption.textContent = free
-    ? "Saved display positions, placed one by one. Not a current display check."
-    : "Saved display positions. Not a current display check.";
+  caption.textContent = dashboardCaption(arrangement);
   root.append(svg, legend, caption);
   // Real text metrics need a laid-out canvas, so the estimated truncation is corrected on the next frame.
   if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => refineText(svg));

@@ -31,7 +31,7 @@ export const MAX_ARRANGEMENT_NAME = 64;
 const PLATFORMS = new Set(["macos", "windows"]);
 const SIDES = new Set(["local", "peer"]);
 const ARRANGEMENT_SIDES = new Set(["source", "destination"]);
-const DISPLAY_NOTICE_KINDS = new Set(["continued", "waiting"]);
+const DISPLAY_NOTICE_KINDS = new Set(["continued", "waiting", "updating", "peerDeciding"]);
 const PHASES = new Set([
   "off",
   "connecting",
@@ -739,6 +739,7 @@ export function normalizeArrangements(value) {
       crossings,
       layout: normalizeStoredLayout(source.layout),
       automatic: source.automatic === true,
+      fits: source.fits === true,
     });
   }
   return entries;
@@ -783,7 +784,13 @@ export function loadArrangement(state, name) {
       ...state,
       message: "Choose the input computer this arrangement was saved with, then load it again.",
     };
-  const proposal = draftFromStoredLayout(entry.layout, state);
+  return loadArrangementLayout(state, entry.layout);
+}
+
+// The one place a stored layout becomes the draft. The connected editor arrives here by name and
+// a computer card by the entry it listed, so a layout that no longer fits says so either way.
+export function loadArrangementLayout(state, layout) {
+  const proposal = layout ? draftFromStoredLayout(layout, state) : null;
   if (!proposal || !proposal.placement || !validateLayout(state, proposal).ok)
     return {
       ...state,
@@ -828,6 +835,18 @@ const DISPLAY_NOTICE_COPY = {
       "Sharing continues with the previous arrangement. Arrange the displays to include the change.",
     primaryLabel: "Arrange displays",
     secondaryLabel: "Keep going",
+  },
+  updating: {
+    title: "Displays changed",
+    body: (peerName) => `Updating the layout for ${peerName}.`,
+    primaryLabel: "Change layout",
+    secondaryLabel: "Dismiss",
+  },
+  peerDeciding: {
+    title: "Displays changed",
+    body: (peerName) => `${peerName} is choosing the layout.`,
+    primaryLabel: "Change layout",
+    secondaryLabel: "Dismiss",
   },
 };
 

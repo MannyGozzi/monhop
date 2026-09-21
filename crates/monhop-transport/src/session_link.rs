@@ -93,6 +93,10 @@ pub enum LinkEvent {
         reason: LinkRejectReason,
         sending: bool,
     },
+    /// The other computer's arranging state, sent on connect and on every change.
+    PeerArranging {
+        arranging: bool,
+    },
     Disconnected {
         reason: LinkDisconnect,
     },
@@ -101,7 +105,11 @@ pub enum LinkEvent {
 
 #[derive(Debug)]
 pub enum LinkCommand {
-    Propose { bytes: Vec<u8> },
+    Propose {
+        bytes: Vec<u8>,
+    },
+    /// This computer started or stopped arranging displays; the peer is told either way.
+    Arranging(bool),
     Close,
 }
 
@@ -215,6 +223,9 @@ async fn run_link<C: LinkConnector>(
     commands: &mut UnboundedReceiver<LinkCommand>,
 ) -> Result<(), SetupFailure> {
     let mut attempt = 0_u32;
+    // Survives every reconnect: each fresh connection opens by telling the peer this state, so a
+    // user who was already arranging is never reported as idle after a drop.
+    let mut arranging = false;
     loop {
         if cancel.is_revoked() {
             return Err(SetupFailure::Cancelled);
@@ -222,8 +233,14 @@ async fn run_link<C: LinkConnector>(
         attempt = attempt.saturating_add(1);
         log::debug!("setup link: connecting, attempt {attempt}");
         emit(events, LinkEvent::Connecting { attempt })?;
-        let established =
-            while_idle(connect_once(connector, cancel), cancel, events, commands).await;
+        let established = while_idle(
+            connect_once(connector, cancel),
+            cancel,
+            events,
+            commands,
+            &mut arranging,
+        )
+        .await;
         let established = match established {
             Ok(established) => established,
             Err(IdleExit::Closed) => return closed(connector, events).await,
@@ -245,7 +262,7 @@ async fn run_link<C: LinkConnector>(
                         reason: attempt_reason(error),
                     },
                 )?;
-                match wait_between_attempts(cancel, events, commands).await? {
+                match wait_between_attempts(cancel, events, commands, &mut arranging).await? {
                     Waited::Continue => continue,
                     Waited::Closed => return closed(connector, events).await,
                 }
@@ -260,7 +277,7 @@ async fn run_link<C: LinkConnector>(
                     reason: LinkDisconnect::Handshake,
                 },
             )?;
-            match wait_between_attempts(cancel, events, commands).await? {
+            match wait_between_attempts(cancel, events, commands, &mut arranging).await? {
                 Waited::Continue => continue,
                 Waited::Closed => return closed(connector, events).await,
             }
@@ -277,7 +294,7 @@ async fn run_link<C: LinkConnector>(
                 inspection: inspection.clone(),
             },
         )?;
-        let mut link = Link::new(session, inspection, persist, events, cancel);
+        let mut link = Link::new(session, inspection, &mut arranging, persist, events, cancel);
         let exit = link.run(commands, connector).await;
         drop(link);
         match exit {
@@ -287,7 +304,7 @@ async fn run_link<C: LinkConnector>(
                 log::warn!("setup link: disconnected ({reason:?})");
                 emit(events, LinkEvent::Disconnected { reason })?;
                 if matches!(
-                    wait_between_attempts(cancel, events, commands).await?,
+                    wait_between_attempts(cancel, events, commands, &mut arranging).await?,
                     Waited::Closed
                 ) {
                     return closed(connector, events).await;
@@ -334,12 +351,14 @@ async fn wait_between_attempts(
     cancel: &RevocationSignal,
     events: &UnboundedSender<LinkEvent>,
     commands: &mut UnboundedReceiver<LinkCommand>,
+    arranging: &mut bool,
 ) -> Result<Waited, SetupFailure> {
     match while_idle(
         tokio::time::sleep(LINK_DIAL_INTERVAL),
         cancel,
         events,
         commands,
+        arranging,
     )
     .await
     {
@@ -350,11 +369,13 @@ async fn wait_between_attempts(
 }
 
 /// Runs `work` while the link is down, answering Close immediately and refusing proposals.
+/// Arranging is only recorded here; the next connection opens by sending it.
 async fn while_idle<T>(
     work: impl Future<Output = T>,
     cancel: &RevocationSignal,
     events: &UnboundedSender<LinkEvent>,
     commands: &mut UnboundedReceiver<LinkCommand>,
+    arranging: &mut bool,
 ) -> Result<T, IdleExit> {
     tokio::pin!(work);
     let mut guard = ticker(LINK_GUARD_INTERVAL);
@@ -365,6 +386,7 @@ async fn while_idle<T>(
             command = commands.recv() => match command {
                 // A dropped command channel means the controller is gone: close the link cleanly.
                 Some(LinkCommand::Close) | None => return Err(IdleExit::Closed),
+                Some(LinkCommand::Arranging(value)) => *arranging = value,
                 // No link carries this proposal; the controller must apply again once connected.
                 Some(LinkCommand::Propose { .. }) => {
                     if events
@@ -426,6 +448,8 @@ enum LinkKind {
     Complete,
     Bye,
     Committed,
+    /// One byte, 0 or 1: whether the sender's user is arranging displays right now.
+    Arranging,
 }
 
 impl LinkKind {
@@ -439,6 +463,7 @@ impl LinkKind {
             Self::Complete => 6,
             Self::Bye => 7,
             Self::Committed => 8,
+            Self::Arranging => 9,
         }
     }
 
@@ -452,9 +477,14 @@ impl LinkKind {
             6 => Ok(Self::Complete),
             7 => Ok(Self::Bye),
             8 => Ok(Self::Committed),
+            9 => Ok(Self::Arranging),
             _ => Err(LinkDisconnect::Transport),
         }
     }
+}
+
+const fn arranging_payload(arranging: bool) -> u8 {
+    if arranging { 1 } else { 0 }
 }
 
 const fn reject_wire(reason: LinkRejectReason) -> u8 {
@@ -620,6 +650,11 @@ fn validate_link_frame(frame: &LinkFrame) -> Result<(), LinkDisconnect> {
             frame.reason.is_none() && frame.payload.is_empty()
         }
         LinkKind::Reject => frame.reason.is_some() && frame.payload.is_empty(),
+        LinkKind::Arranging => {
+            frame.reason.is_none()
+                && matches!(frame.payload.as_slice(), [0 | 1])
+                && frame.digest == digest(&frame.payload)
+        }
     };
     if valid {
         Ok(())
@@ -812,6 +847,8 @@ struct Link<'a> {
     /// Digest this computer committed as receiver; a later reject for it means the pair disagrees.
     committed: Option<[u8; 32]>,
     inspection: InspectedPeer,
+    /// Owned by `run_link` so the state outlives this connection and opens the next one.
+    arranging: &'a mut bool,
     persist: &'a LinkPersist,
     events: &'a UnboundedSender<LinkEvent>,
     cancel: &'a RevocationSignal,
@@ -821,6 +858,7 @@ impl<'a> Link<'a> {
     fn new(
         session: NegotiatedSession,
         inspection: InspectedPeer,
+        arranging: &'a mut bool,
         persist: &'a LinkPersist,
         events: &'a UnboundedSender<LinkEvent>,
         cancel: &'a RevocationSignal,
@@ -842,6 +880,7 @@ impl<'a> Link<'a> {
             abandoned: None,
             committed: None,
             inspection,
+            arranging,
             persist,
             events,
             cancel,
@@ -866,6 +905,8 @@ impl<'a> Link<'a> {
         let mut heartbeat = ticker(LINK_HEARTBEAT_INTERVAL);
         let mut topology = ticker(LINK_TOPOLOGY_POLL);
         let mut guard = ticker(LINK_GUARD_INTERVAL);
+        // The peer decides nothing from silence, so every connection opens by naming this state.
+        self.publish_arranging().await?;
         loop {
             while let Some(frame) = self.pending.pop_front() {
                 if let Some(exit) = self.handle_frame(frame).await? {
@@ -895,6 +936,12 @@ impl<'a> Link<'a> {
                     return Ok(LinkExit::Disconnected(reason));
                 }
                 Wake::Command(Some(LinkCommand::Propose { bytes })) => self.propose(bytes).await?,
+                Wake::Command(Some(LinkCommand::Arranging(value))) => {
+                    if *self.arranging != value {
+                        *self.arranging = value;
+                        self.publish_arranging().await?;
+                    }
+                }
                 // A dropped command channel means the controller is gone: close the link cleanly.
                 Wake::Command(Some(LinkCommand::Close) | None) => {
                     self.close_transaction(LinkRejectReason::Cancelled)?;
@@ -977,6 +1024,10 @@ impl<'a> Link<'a> {
             LinkKind::Complete => self.accept_completion(&frame).await?,
             LinkKind::Committed => self.accept_confirmation(&frame).await?,
             LinkKind::Reject => self.accept_rejection(&frame)?,
+            // Validation bounds the payload to one 0-or-1 byte.
+            LinkKind::Arranging => self.emit(LinkEvent::PeerArranging {
+                arranging: frame.payload[0] == 1,
+            })?,
             LinkKind::Bye => {
                 self.close_transaction(LinkRejectReason::Cancelled)?;
                 return Ok(Some(LinkExit::Disconnected(LinkDisconnect::PeerClosed)));
@@ -1212,6 +1263,16 @@ impl<'a> Link<'a> {
             // A reject for a transaction already unwound locally carries no further state.
             _ => Ok(()),
         }
+    }
+
+    async fn publish_arranging(&mut self) -> Result<(), LinkExit> {
+        let payload = vec![arranging_payload(*self.arranging)];
+        self.write(LinkFrame::with_payload(
+            LinkKind::Arranging,
+            self.epoch,
+            payload,
+        ))
+        .await
     }
 
     async fn reject(&mut self, digest: [u8; 32], reason: LinkRejectReason) -> Result<(), LinkExit> {
@@ -1623,6 +1684,10 @@ mod tests {
                 })
                 .unwrap();
         }
+
+        fn arranging(&self, value: bool) {
+            self.commands.send(LinkCommand::Arranging(value)).unwrap();
+        }
     }
 
     struct Driver {
@@ -1743,7 +1808,7 @@ mod tests {
                 "header byte {index} must be validated"
             );
         }
-        for kind in [0_u8, 9] {
+        for kind in [0_u8, 10] {
             let mut invalid = header;
             invalid[8] = kind;
             assert_eq!(
@@ -2139,6 +2204,40 @@ mod tests {
                 .await;
                 // A dropped link would have produced a reconnect before the proposal landed.
                 assert_eq!(driver.listener.recorder.counts(), (1, 1, 0));
+                driver.dialer.close();
+                driver.listener.close();
+                driver
+            })
+            .await;
+        assert_eq!(dialer, Ok(()));
+        assert_eq!(listener, Ok(()));
+    }
+
+    /// Waits for the next arranging report, so the state the peer holds is never inferred.
+    async fn next_arranging(inbox: &mut UnboundedReceiver<LinkEvent>) -> bool {
+        let event = wait_for(inbox, |event| {
+            matches!(event, LinkEvent::PeerArranging { .. })
+        })
+        .await;
+        let LinkEvent::PeerArranging { arranging } = event else {
+            unreachable!("filtered above");
+        };
+        arranging
+    }
+
+    #[tokio::test]
+    async fn arranging_on_one_computer_is_reported_to_the_other_and_withdrawn_again() {
+        let (dialer, listener) =
+            with_link((Duration::ZERO, Duration::ZERO), |mut driver| async move {
+                wait_connected(&mut driver.dialer.inbox).await;
+                wait_connected(&mut driver.listener.inbox).await;
+                // Each side opens by naming its own state, so neither has to infer idleness.
+                assert!(!next_arranging(&mut driver.dialer.inbox).await);
+                assert!(!next_arranging(&mut driver.listener.inbox).await);
+                driver.dialer.arranging(true);
+                assert!(next_arranging(&mut driver.listener.inbox).await);
+                driver.dialer.arranging(false);
+                assert!(!next_arranging(&mut driver.listener.inbox).await);
                 driver.dialer.close();
                 driver.listener.close();
                 driver

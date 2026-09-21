@@ -4,6 +4,28 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+Your computer stays connected while its displays change. The computer with the keyboard chooses the layout and sends it over; the other follows.
+
+### Added
+
+- Every paired computer lists the layouts made for it, remembered and saved, with the ones that fit right now marked. Forget any of them, even while that computer is away.
+- Computer cards show each computer's displays: live while connected, last seen otherwise.
+
+### Changed
+
+- After a display change, the computer with the keyboard picks the remembered or adapted layout and applies it on both computers automatically. The other computer no longer guesses on its own, so the two never disagree.
+- Pausing and choosing a computer act at once instead of waiting for the next check, and a layout that no longer fits no longer costs a ten-second retry delay.
+- Clearer connection words: Connected, Sharing input, Connecting, Arranging displays. Expected transitions no longer read as failures.
+
+### Fixed
+
+- Reconnecting no longer stalls for up to two minutes when one computer is arranging while the other tries to share. Both computers now reach the same conclusion and join the same step.
+- A layout whose crossings were all removed by a display change still shows the computer's displays instead of an empty card.
+
+### Installation notes
+
+- Install this version on both computers. The connection carries an arranging signal that older builds do not understand, and a computer on an older build says so instead of connecting.
+
 ## [0.1.2] - 2026-09-21
 
 ### Fixed

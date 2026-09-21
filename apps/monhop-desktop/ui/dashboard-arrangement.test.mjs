@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { placementOffset } from "./arrangement-model.mjs";
-import { savedDashboardArrangement } from "./dashboard-arrangement.mjs";
+import { dashboardCaption, savedDashboardArrangement } from "./dashboard-arrangement.mjs";
 
 const edges = {
   left: ["right", [-100, 0]],
@@ -184,7 +184,6 @@ test("missing, stale, or malformed saved details get an honest unavailable previ
   const valid = setup();
   const cases = [
     { ...valid, previewLayout: null },
-    { ...valid, previewLayout: { ...valid.previewLayout, links: [] } },
     { ...valid, previewLayout: { ...valid.previewLayout, sourceDisplay: "9" } },
     { ...valid, previewLayout: { ...valid.previewLayout, links: [valid.previewLayout.links[0]] } },
     {
@@ -201,6 +200,33 @@ test("missing, stale, or malformed saved details get an honest unavailable previ
     assert.equal(result.available, false);
     assert.match(result.message, /saved|review/i);
   }
+});
+
+test("a layout with no crossing yet still draws both computers' displays, just unconnected", () => {
+  const value = setup();
+  value.previewLayout = { ...value.previewLayout, links: [] };
+  const result = savedDashboardArrangement(value);
+  assert.equal(result.available, true);
+  assert.equal(result.noCrossingYet, true);
+  assert.equal(result.sourceSide, "local");
+  assert.equal(result.destinationSide, "peer");
+  assert.deepEqual(result.seams, []);
+  assert.deepEqual(result.tiles.map((tile) => tile.id).toSorted(), ["1", "2"]);
+  // The caption says what is missing rather than warning that the saved details need a review.
+  assert.equal(dashboardCaption(result), "No crossing yet. Arrange the displays to connect them.");
+  assert.equal(
+    dashboardCaption(savedDashboardArrangement(setup())),
+    "Saved display positions. Not a current display check.",
+  );
+  // A source display that does not exist, or a source side that contradicts the setup, still bail out.
+  assert.equal(
+    savedDashboardArrangement({
+      ...value,
+      previewLayout: { sourceDisplay: "9", links: [] },
+    }).available,
+    false,
+  );
+  assert.equal(savedDashboardArrangement({ ...value, sourceSide: "peer" }).available, false);
 });
 
 test("the dashboard preview and the editor draw through one shared renderer", async () => {

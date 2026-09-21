@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-arrangement-forget"
+description = "Enables the sharing_arrangement_forget command without any pre-configured scope."
+commands.allow = ["sharing_arrangement_forget"]
+
+[[permission]]
+identifier = "deny-sharing-arrangement-forget"
+description = "Denies the sharing_arrangement_forget command without any pre-configured scope."
+commands.deny = ["sharing_arrangement_forget"]

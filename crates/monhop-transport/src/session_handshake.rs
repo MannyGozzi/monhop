@@ -22,6 +22,11 @@ use crate::{
 /// Bounds the entire control exchange, including stream creation and all six frame operations.
 pub const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(500);
 
+/// A purpose or source disagreement is symmetric, so the peer reaches the same verdict from our
+/// frames; closing before it acknowledges them strands it on [`HandshakeError::Stream`]. Bounded
+/// by this grace and by the handshake deadline, whichever comes first.
+const DISAGREEMENT_ACK_GRACE: Duration = Duration::from_millis(150);
+
 const HANDSHAKE_CLOSE_CODE: u32 = 2;
 const HANDSHAKE_CLOSE_REASON: &[u8] = b"session handshake failed";
 const EPOCH_EXPORT_LABEL: &[u8] = b"monhop/session-epoch/v2";
@@ -284,7 +289,8 @@ pub async fn negotiate(
     config: HandshakeConfig<'_>,
 ) -> Result<NegotiatedSession, HandshakeError> {
     let mut close_guard = CloseConnectionOnDrop::new(&connection);
-    let result = tokio::time::timeout(HANDSHAKE_DEADLINE, negotiate_inner(&connection, &config))
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
+    let result = tokio::time::timeout_at(deadline, negotiate_inner(&connection, &config, deadline))
         .await
         .map_err(|_| HandshakeError::TimedOut);
     let parts = match result.and_then(|inner| inner) {
@@ -348,6 +354,7 @@ struct HandshakeParts {
 async fn negotiate_inner(
     connection: &quinn::Connection,
     config: &HandshakeConfig<'_>,
+    deadline: tokio::time::Instant,
 ) -> Result<HandshakeParts, HandshakeError> {
     config.validate()?;
     let observed_peer = observed_peer_fingerprint(connection)?;
@@ -409,7 +416,16 @@ async fn negotiate_inner(
         reader.read_frame(&mut recv).await.map_err(map_wire_error)?,
         reader.read_frame(&mut recv).await.map_err(map_wire_error)?,
     ];
-    let peer = validate_peer_handshake(config, observed_peer, epoch, &frames)?;
+    let peer = match validate_peer_handshake(config, observed_peer, epoch, &frames) {
+        Ok(peer) => peer,
+        // Only a disagreement waits, and only to let the peer name the same one; a bad certificate,
+        // an invalid frame, or a timeout still closes at once.
+        Err(error @ (HandshakeError::PurposeMismatch | HandshakeError::SourceMismatch)) => {
+            acknowledge_disagreement(&mut send, deadline).await;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
 
     Ok(HandshakeParts {
         epoch,
@@ -418,6 +434,17 @@ async fn negotiate_inner(
         recv,
         reader,
     })
+}
+
+/// Waits, bounded, for the peer's transport to have acknowledged the three frames already written
+/// before the caller returns and the close guard drops what quinn has not yet transmitted.
+/// `stopped()` resolves on that acknowledgement, not on the peer's application having read them.
+async fn acknowledge_disagreement(send: &mut quinn::SendStream, deadline: tokio::time::Instant) {
+    if send.finish().is_err() {
+        return;
+    }
+    let grace = (tokio::time::Instant::now() + DISAGREEMENT_ACK_GRACE).min(deadline);
+    let _ = tokio::time::timeout_at(grace, send.stopped()).await;
 }
 
 fn observed_peer_fingerprint(
@@ -491,11 +518,14 @@ pub fn validate_peer_handshake(
     let Message::SessionSetup(setup) = frames[2].message else {
         return Err(HandshakeError::UnexpectedFrame);
     };
-    if setup.source != config.source {
-        return Err(HandshakeError::SourceMismatch);
-    }
+    // Purpose first: a link meeting a session is a step collision whatever either side believes
+    // about the keyboard, and only its own verdict tells the caller to change step. A source
+    // disagreement is then reachable only between two sessions whose saved records differ.
     if setup.purpose != config.purpose {
         return Err(HandshakeError::PurposeMismatch);
+    }
+    if setup.source != config.source {
+        return Err(HandshakeError::SourceMismatch);
     }
 
     Ok(NegotiatedPeer {
@@ -542,5 +572,171 @@ impl Drop for CloseConnectionOnDrop<'_> {
             self.connection
                 .close(HANDSHAKE_CLOSE_CODE.into(), HANDSHAKE_CLOSE_REASON);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use monhop_core::{DisplayId, Point};
+    use monhop_protocol::DisplayDescription;
+
+    use super::*;
+    use crate::crypto::{LOCAL_TLS_SERVER_NAME, SecureQuicConfig};
+
+    fn topology(id: u64) -> DisplayTopology {
+        DisplayTopology::new(vec![DisplayDescription {
+            id: DisplayId(id),
+            name: "fixture".into(),
+            native_width: 100,
+            native_height: 100,
+            logical_origin: Point::default(),
+            logical_size: Point::new(100.0, 100.0),
+            scale_factor: 1.0,
+            is_primary: true,
+            monitor: None,
+        }])
+        .expect("fixture topology is valid")
+    }
+
+    fn pin(identity: &DeviceIdentity) -> VerifiedPeer {
+        VerifiedPeer::from_certificate_der(
+            identity.certificate_der(),
+            &identity.fingerprint().full_hex(),
+        )
+        .expect("generated identity has a full matching pin")
+    }
+
+    fn capabilities() -> Capabilities {
+        Capabilities::new(Capabilities::RELATIVE_MOTION | Capabilities::DISPLAY_TOPOLOGY)
+            .expect("fixture capabilities are known")
+    }
+
+    /// Negotiates both ends of one loopback connection at once, each side told which computer it
+    /// believes supplies input (`true` for the dialing one) and which purpose it believes it opened.
+    async fn negotiate_both(
+        client: (bool, SessionPurpose),
+        server: (bool, SessionPurpose),
+    ) -> (
+        Result<NegotiatedSession, HandshakeError>,
+        Result<NegotiatedSession, HandshakeError>,
+    ) {
+        let client_identity = DeviceIdentity::generate().expect("client identity");
+        let server_identity = DeviceIdentity::generate().expect("server identity");
+        let server_pin = pin(&server_identity);
+        let client_pin = pin(&client_identity);
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let listener = quinn::Endpoint::server(
+            SecureQuicConfig::server(&server_identity, &client_pin)
+                .expect("server TLS configuration"),
+            loopback,
+        )
+        .expect("loopback server endpoint");
+        let mut dialer = quinn::Endpoint::client(loopback).expect("loopback client endpoint");
+        dialer.set_default_client_config(
+            SecureQuicConfig::client(&client_identity, &server_pin)
+                .expect("client TLS configuration"),
+        );
+        let connecting = dialer
+            .connect(
+                listener.local_addr().expect("server address"),
+                LOCAL_TLS_SERVER_NAME,
+            )
+            .expect("loopback connection");
+        let (client_connection, server_connection) = tokio::join!(
+            async { connecting.await.expect("client TLS connection") },
+            async {
+                listener
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("server TLS connection")
+            },
+        );
+        let client_device = device_id_from_fingerprint(client_identity.fingerprint());
+        let server_device = device_id_from_fingerprint(server_identity.fingerprint());
+        let device = |source_is_dialer: bool| {
+            if source_is_dialer {
+                client_device
+            } else {
+                server_device
+            }
+        };
+        let client_topology = topology(1);
+        let server_topology = topology(2);
+        let client_config = HandshakeConfig::new(
+            &client_identity,
+            &server_pin,
+            Platform::Windows,
+            Platform::MacOs,
+            capabilities(),
+            capabilities(),
+            &client_topology,
+            device(client.0),
+            client.1,
+        )
+        .expect("client handshake configuration");
+        let server_config = HandshakeConfig::new(
+            &server_identity,
+            &client_pin,
+            Platform::MacOs,
+            Platform::Windows,
+            capabilities(),
+            capabilities(),
+            &server_topology,
+            device(server.0),
+            server.1,
+        )
+        .expect("server handshake configuration");
+        let verdicts = tokio::join!(
+            negotiate(client_connection, client_config),
+            negotiate(server_connection, server_config),
+        );
+        dialer.close(0_u32.into(), b"fixture complete");
+        listener.close(0_u32.into(), b"fixture complete");
+        verdicts
+    }
+
+    #[tokio::test]
+    async fn one_computer_arranging_and_one_sharing_both_name_the_purpose_disagreement() {
+        let (client, server) =
+            negotiate_both((true, SessionPurpose::Setup), (true, SessionPurpose::Share)).await;
+        assert_eq!(client.err(), Some(HandshakeError::PurposeMismatch));
+        assert_eq!(server.err(), Some(HandshakeError::PurposeMismatch));
+    }
+
+    /// A setup link names the dialing computer as its source, so a link meeting a session whose
+    /// record puts the keyboard elsewhere disagrees on both fields. Only the purpose verdict tells
+    /// the caller to change step, so it must win.
+    #[tokio::test]
+    async fn a_link_meeting_a_session_names_the_purpose_whoever_holds_the_keyboard() {
+        let (client, server) = negotiate_both(
+            (true, SessionPurpose::Setup),
+            (false, SessionPurpose::Share),
+        )
+        .await;
+        assert_eq!(client.err(), Some(HandshakeError::PurposeMismatch));
+        assert_eq!(server.err(), Some(HandshakeError::PurposeMismatch));
+    }
+
+    #[tokio::test]
+    async fn two_computers_claiming_input_both_name_the_source_disagreement() {
+        let (client, server) = negotiate_both(
+            (true, SessionPurpose::Share),
+            (false, SessionPurpose::Share),
+        )
+        .await;
+        assert_eq!(client.err(), Some(HandshakeError::SourceMismatch));
+        assert_eq!(server.err(), Some(HandshakeError::SourceMismatch));
+    }
+
+    #[tokio::test]
+    async fn agreeing_computers_still_negotiate() {
+        let (client, server) =
+            negotiate_both((true, SessionPurpose::Share), (true, SessionPurpose::Share)).await;
+        assert!(client.is_ok());
+        assert!(server.is_ok());
     }
 }

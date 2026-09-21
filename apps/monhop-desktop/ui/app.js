@@ -43,6 +43,7 @@ import {
   isSessionActive,
   layoutForSave,
   loadArrangement,
+  loadArrangementLayout,
   resetArrangement as resetSharingArrangement,
   sameSharingView,
   setArrangement,
@@ -71,12 +72,19 @@ import {
   snapshotCheckResult,
 } from "./auto-check.mjs";
 import {
+  beginComputerArrangements,
+  computerArrangements,
   displayName,
+  failComputerArrangements,
   findComputer,
+  initialComputerArrangements,
   initialComputers,
   normalizeComputers,
+  pruneComputerArrangements,
+  setComputerArrangements,
 } from "./computers-model.mjs";
 import { activeStatus, isLiveStatus } from "./computer-status.mjs";
+import { clearForgetFor, keepForgetArmed, loadGate, pressForget } from "./computer-card-model.mjs";
 import {
   applyDimmingView,
   beginDimming,
@@ -155,6 +163,12 @@ let computers = initialComputers();
 let computersRequest = 0;
 let computersLoadPending = false;
 let computersLoadFailure = "";
+// Each computer's layout history, kept apart from `computers` so a `computers_load` poll never wipes it.
+let computerArrangementsStore = initialComputerArrangements();
+// The one Layouts row armed to forget, as { fingerprint, name }, and one read or forget per
+// computer at a time so a reply that predates a newer one never lands.
+let layoutForget = null;
+const arrangementRequests = new Map();
 let renaming = null;
 // What the user has typed into the name so far; polls re-render the field and must not erase it.
 let renameDraft = null;
@@ -414,6 +428,8 @@ function context() {
     pairing,
     sharing,
     computers,
+    computerArrangements: computerArrangementsStore,
+    layoutForget,
     active,
     activeComputer,
     status,
@@ -493,6 +509,10 @@ function context() {
       loadSavedArrangement,
       saveArrangement,
       deleteArrangement,
+      loadComputerArrangements,
+      loadComputerArrangement,
+      pressLayoutForget,
+      forgetComputerArrangement,
       revealLogFile,
       hideToTray,
       setUpdatesAutomatic,
@@ -1067,6 +1087,11 @@ function applyComputers(next, request) {
     state = autoSelectInterface(state, next.interfaceId);
   if (renaming && !findComputer(computers, renaming)) renaming = renameDraft = null;
   if (forgetConfirmed && !findComputer(computers, forgetConfirmed)) forgetConfirmed = null;
+  layoutForget = keepForgetArmed(
+    layoutForget,
+    computers.items.map((item) => item.fingerprint),
+  );
+  computerArrangementsStore = pruneComputerArrangements(computerArrangementsStore, computers);
   scheduleSharingPoll();
   // The first reply decides where a launch lands: Setup with nothing paired, Home otherwise.
   if (landed) return;
@@ -1531,19 +1556,31 @@ async function saveArrangement(name) {
 }
 
 async function deleteArrangement(name) {
-  if (!core?.invoke || controlsBusy() || !arrangementByName(sharing, name)) return;
-  await runArrangementCommand("sharing_arrangement_delete", { name });
+  const fingerprint = activeFingerprint();
+  if (!core?.invoke || !fingerprint || controlsBusy() || !arrangementByName(sharing, name)) return;
+  await runArrangementCommand("sharing_arrangement_forget", { fingerprint, name });
 }
 
-// Both library commands answer with the whole list, so one path applies either reply.
+// Both library commands answer with the whole list, so one path applies either reply: to the
+// editor's list and to the computer card's history, which show the same library.
 async function runArrangementCommand(command, payload) {
+  const fingerprint = activeFingerprint();
   sharing = beginPending(sharing, "arrangement");
   const generation = sharing.generation;
+  const request = (arrangementRequests.get(fingerprint) ?? 0) + 1;
+  if (fingerprint) arrangementRequests.set(fingerprint, request);
+  layoutForget = clearForgetFor(layoutForget, fingerprint);
   render();
   try {
     const list = await core.invoke(command, payload);
     if (!isCurrentPending(sharing, generation)) return;
     sharing = setArrangements(settlePending(sharing, generation), list);
+    if (fingerprint && arrangementRequests.get(fingerprint) === request)
+      computerArrangementsStore = setComputerArrangements(
+        computerArrangementsStore,
+        fingerprint,
+        list,
+      );
   } catch (error) {
     sharing = failPending(sharing, generation, nativeError(error));
   }
@@ -1557,6 +1594,106 @@ async function loadSavedArrangement(name) {
   if (entry.sourceSide !== sharing.source) await chooseSource(entry.sourceSide);
   if (!isConnected(sharing) || sharing.source !== entry.sourceSide) return;
   sharing = loadArrangement(sharing, name);
+  touchSetupLink();
+  render();
+}
+
+// ---------- each computer's layout history ----------
+
+// Read on demand (the disclosure opening, or after a forget) rather than polled, since it works
+// disconnected and most cards never open it.
+async function loadComputerArrangements(fingerprint) {
+  if (
+    !core?.invoke ||
+    !fingerprint ||
+    computerArrangements(computerArrangementsStore, fingerprint).loading
+  )
+    return;
+  await readArrangementsFor(fingerprint, () =>
+    core.invoke("sharing_arrangements_for", { fingerprint }),
+  );
+}
+
+// Forget is armed on the first press and runs on the second, one row at a time across the app.
+function pressLayoutForget(fingerprint, name) {
+  const { armed, forget } = pressForget(layoutForget, fingerprint, name);
+  layoutForget = armed;
+  // Drawn first either way: a forget the app is too busy to run must not leave the row armed.
+  render();
+  if (forget) void forgetComputerArrangement(fingerprint, name);
+}
+
+async function forgetComputerArrangement(fingerprint, name) {
+  if (
+    !core?.invoke ||
+    !fingerprint ||
+    controlsBusy() ||
+    computerArrangements(computerArrangementsStore, fingerprint).loading
+  )
+    return;
+  await readArrangementsFor(fingerprint, () =>
+    core.invoke("sharing_arrangement_forget", { fingerprint, name }),
+  );
+}
+
+// One command per computer at a time. Its reply is the whole list, so it lands in that computer's
+// history and, when this is the computer in use, in the connected editor's list as well.
+async function readArrangementsFor(fingerprint, invoke) {
+  const request = (arrangementRequests.get(fingerprint) ?? 0) + 1;
+  arrangementRequests.set(fingerprint, request);
+  // The list is about to be replaced, so a confirm armed against the old one is dropped.
+  layoutForget = clearForgetFor(layoutForget, fingerprint);
+  computerArrangementsStore = beginComputerArrangements(computerArrangementsStore, fingerprint);
+  render();
+  try {
+    const list = await invoke();
+    if (arrangementRequests.get(fingerprint) !== request) return;
+    applyArrangementList(fingerprint, list);
+  } catch (error) {
+    if (arrangementRequests.get(fingerprint) !== request) return;
+    computerArrangementsStore = failComputerArrangements(
+      computerArrangementsStore,
+      fingerprint,
+      nativeError(error),
+    );
+  }
+  render();
+}
+
+// Both surfaces read the same library, so neither may keep showing an entry the other removed.
+function applyArrangementList(fingerprint, list) {
+  computerArrangementsStore = setComputerArrangements(computerArrangementsStore, fingerprint, list);
+  if (fingerprint === activeFingerprint() && isLinkActive(sharing))
+    sharing = setArrangements(sharing, list);
+}
+
+// Loading from a card is gated and run against that card's own list, so an enabled button always
+// does something: it opens the Displays editor and puts the layout into the draft there.
+async function loadComputerArrangement(fingerprint, name) {
+  const store = computerArrangements(computerArrangementsStore, fingerprint);
+  const entry = store.items.find((item) => item.name === name) ?? null;
+  const gate = loadGate({
+    isActive: fingerprint === activeFingerprint(),
+    connected: isConnected(sharing),
+    entry,
+  });
+  if (!gate.enabled || controlsBusy()) {
+    sharing = { ...sharing, message: gate.reason || "The layout could not be loaded." };
+    render();
+    return;
+  }
+  goToPage("setup", () => scrollToSection("displays"));
+  if (entry.sourceSide !== sharing.source) await chooseSource(entry.sourceSide);
+  if (!isConnected(sharing) || sharing.source !== entry.sourceSide) {
+    sharing = {
+      ...sharing,
+      message: "Choose the input computer this layout was saved with, then load it again.",
+    };
+    render();
+    return;
+  }
+  // The listed fit can be older than the displays; the draft decides, and says so when it cannot.
+  sharing = loadArrangementLayout(sharing, entry.layout);
   touchSetupLink();
   render();
 }

@@ -10,6 +10,8 @@ const TONES = {
   sharing: "active",
   reconnecting: "checking",
   stopping: "checking",
+  paused: "neutral",
+  attention: "checking",
   error: "error",
 };
 
@@ -19,41 +21,64 @@ const LIVE_KEYS = new Set(["connected", "editing", "sharing", "reconnecting"]);
 // The session is up: sharing, or waiting out a silence without ending it.
 const SESSION_KEYS = new Set(["sharing", "reconnecting"]);
 
-const RETRYING = "MonHop keeps trying while both computers are on the same network.";
-
+// The view is null until the first status reply lands, and stays null if that call failed, so
+// every read of it here is optional: a card must render before anything is known.
 export function computerStatus(computer, sharingView, active) {
   const fingerprint = computer?.fingerprint ?? null;
   const name = displayName(computer);
   const phase = sharingView?.phase ?? "off";
+  const message = sharingView?.message ?? "";
   const live = Boolean(fingerprint) && sharingView?.peerFingerprint === fingerprint;
+  if (!live && active !== fingerprint)
+    return status("standby", "Paired", "Standby. Use it to share input with it.");
+  // An unrecognized reply may still hide a live worker: say what the backend said, without alarm.
+  if (phase === "unknown")
+    return message ? status("attention", "Needs attention", message) : reaching(name);
   if (!live) {
-    if (active !== fingerprint)
-      return status("standby", "Paired", "Standby. Use it to share input with it.");
-    if (phase === "error" || phase === "unknown")
-      return status("error", "Can't connect", sharingView?.message || RETRYING);
-    return status("connecting", "Connecting…", `Reaching ${name}.`);
+    if (phase === "error" && message) return status("error", "Can't connect", message);
+    if (phase === "off" && message) return offStatus(message);
+    return reaching(name);
   }
   switch (phase) {
     case "sharing":
-      return sharingView.held
+      return sharingView?.held
         ? status(
             "reconnecting",
             "Reconnecting…",
             "Waiting for the network. Input stays on this computer.",
           )
-        : status("sharing", "Sharing input", roleDetail(sharingView.sharingRole, name));
+        : status("sharing", "Sharing input", roleDetail(sharingView?.sharingRole, name));
     case "connected":
-      return sharingView.editing
-        ? status("editing", "Connected", "Arranging displays. Sharing resumes after you apply.")
+      return sharingView?.editing
+        ? status("editing", "Arranging displays", "Sharing resumes after you apply.")
         : status("connected", "Connected", "Arrange the displays to start sharing.");
+    case "off":
+      // The link cleared its peer the instant it closed, so this only fires on a stray poll.
+      return message ? offStatus(message) : reaching(name);
     case "stopping":
       return status("stopping", "Stopping…", "Closing the connection.");
     case "error":
-    case "unknown":
-      return status("error", "Can't connect", sharingView.message || RETRYING);
+      // No message means nothing is confirmed wrong yet; that reads as still connecting, not failed.
+      return message ? status("error", "Can't connect", message) : reaching(name);
     default:
-      return status("connecting", "Connecting…", `Reaching ${name}.`);
+      return reaching(name);
   }
+}
+
+// Every message the backend sends with the link down, in its own words. A pause is the user's
+// own doing; a message that names a reconnect, a connect, or sharing being on is a step on the
+// way back and must never read as a failure; anything else is simply not connected.
+const TRANSITIONS = ["Reconnecting", "Connecting", "Sharing is on", "Switching"];
+
+function offStatus(message) {
+  if (message.startsWith("Paused")) return status("paused", "Paused", message);
+  if (TRANSITIONS.some((word) => message.includes(word)))
+    return status("connecting", "Connecting…", message);
+  return status("paused", "Not connected", message);
+}
+
+function reaching(name) {
+  return status("connecting", "Connecting…", `Reaching ${name}.`);
 }
 
 // The header pill: the computer in use, or why there is nothing to report.

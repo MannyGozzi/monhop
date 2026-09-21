@@ -3,6 +3,9 @@ import { icon } from "./icons.mjs";
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 let sequence = 0;
 
+// Fired on the accordion element when the user toggles it, never when a render reopens it.
+export const ACCORDION_TOGGLE = "accordion-toggle";
+
 class AccordionManager {
   constructor() {
     this.animations = new Map();
@@ -102,7 +105,11 @@ class AccordionManager {
     if (!trigger) return;
     const accordion = trigger.closest("[data-accordion]");
     if (!accordion) return;
-    this.setOpen(accordion, !this.isOpen(accordion));
+    const open = !this.isOpen(accordion);
+    this.setOpen(accordion, open);
+    // Only a press announces itself, and only after the panel has been toggled: a listener may
+    // re-render the card from here, and the fresh node is reopened from its disclosure key.
+    accordion.dispatchEvent(new CustomEvent(ACCORDION_TOGGLE, { detail: { open } }));
   }
 
   handleMotionChange() {

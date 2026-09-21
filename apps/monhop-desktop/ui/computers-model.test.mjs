@@ -2,10 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  beginComputerArrangements,
+  computerArrangements,
   displayName,
+  failComputerArrangements,
   findComputer,
+  initialComputerArrangements,
   initialComputers,
   normalizeComputers,
+  pruneComputerArrangements,
+  setComputerArrangements,
 } from "./computers-model.mjs";
 
 const WINDOWS = "b".repeat(64);
@@ -42,6 +48,10 @@ function setup() {
     previewLayout: savedLayout(),
     message: "Saved layout matches this snapshot.",
   };
+}
+
+function arrangementEntry(name, patch = {}) {
+  return { name, sourceSide: "local", mode: "grouped", crossings: 1, layout: null, ...patch };
 }
 
 test("the computer list is bounded, deduplicated, and lowercased on the way in", () => {
@@ -117,6 +127,89 @@ test("each computer carries its own saved layout, or an honest empty one", () =>
     ],
   });
   assert.equal(broken.items[0].setup.layout, null);
+});
+
+test("live displays win over the saved ones, and a malformed reply drops to none known", () => {
+  const live = {
+    localDisplays: [
+      { id: localId, name: "Built-in (live)", origin: [0, 0], size: [1512, 982], primary: true },
+    ],
+    peerDisplays: [
+      { id: peerId, name: "LG (live)", origin: [0, 0], size: [2560, 1440], primary: true },
+    ],
+  };
+  const view = normalizeComputers({
+    computers: [
+      {
+        fingerprint: WINDOWS,
+        name: "Office Windows PC",
+        platform: "windows",
+        setup: { ...setup(), live },
+      },
+      { fingerprint: MAC, name: "Studio Mac", platform: "macos", setup: setup() },
+    ],
+  });
+  assert.equal(view.items[0].setup.live.localDisplays[0].name, "Built-in (live)");
+  assert.equal(view.items[0].setup.live.peerDisplays[0].name, "LG (live)");
+  // Not connected: no live snapshot, but the saved displays from the last time it was seen remain.
+  assert.equal(view.items[1].setup.live, null);
+  assert.equal(view.items[1].setup.localDisplays.length, 1);
+  for (const value of [null, "connected", 1, []])
+    assert.equal(
+      normalizeComputers({
+        computers: [{ fingerprint: WINDOWS, platform: "windows", setup: { live: value } }],
+      }).items[0].setup.live,
+      null,
+      JSON.stringify(value),
+    );
+  // A live snapshot's own display arrays are held to the same rules as the saved ones: malformed entries drop out.
+  assert.deepEqual(
+    normalizeComputers({
+      computers: [
+        { fingerprint: WINDOWS, platform: "windows", setup: { live: { localDisplays: "nope" } } },
+      ],
+    }).items[0].setup.live,
+    { localDisplays: [], peerDisplays: [] },
+  );
+});
+
+test("each computer's layout history lives apart from the polled computer list", () => {
+  let store = initialComputerArrangements();
+  assert.deepEqual(computerArrangements(store, WINDOWS), { items: [], loading: false, error: "" });
+
+  store = beginComputerArrangements(store, WINDOWS);
+  assert.equal(computerArrangements(store, WINDOWS).loading, true);
+  // A computer nobody has asked about yet is untouched by another computer's load.
+  assert.deepEqual(computerArrangements(store, MAC), { items: [], loading: false, error: "" });
+
+  store = setComputerArrangements(store, WINDOWS, [
+    arrangementEntry("Desk", { automatic: true, fits: true }),
+    arrangementEntry("", { automatic: true }), // dropped: blank names never list
+  ]);
+  const windows = computerArrangements(store, WINDOWS);
+  assert.equal(windows.loading, false);
+  assert.equal(windows.error, "");
+  assert.deepEqual(
+    windows.items.map((item) => item.name),
+    ["Desk"],
+  );
+  assert.equal(windows.items[0].fits, true);
+
+  store = beginComputerArrangements(store, MAC);
+  store = failComputerArrangements(store, MAC, "The saved arrangements could not be read.");
+  const mac = computerArrangements(store, MAC);
+  assert.equal(mac.loading, false);
+  assert.equal(mac.error, "The saved arrangements could not be read.");
+  // A failed read never invents entries.
+  assert.deepEqual(mac.items, []);
+
+  // Forgetting the computer forgets its layout history too, so nothing stale lingers.
+  const computers = normalizeComputers({
+    computers: [{ fingerprint: WINDOWS, name: "Office Windows PC", platform: "windows" }],
+  });
+  store = pruneComputerArrangements(store, computers);
+  assert.equal(Object.hasOwn(store, WINDOWS), true);
+  assert.equal(Object.hasOwn(store, MAC), false);
 });
 
 test("a computer without a name falls back to its platform", () => {

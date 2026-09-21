@@ -490,20 +490,21 @@ fn cancel_or_endpoint_revoked(
 pub(crate) const fn handshake_failure(error: HandshakeError) -> SetupFailure {
     match error {
         HandshakeError::PurposeMismatch => SetupFailure::PurposeMismatch,
+        // Purposes agree, so both sides opened a session and their saved records name different
+        // keyboard sides. Dialing again repeats it; only a fresh agreed record clears it.
+        HandshakeError::SourceMismatch => SetupFailure::ChangedSinceInspection,
         HandshakeError::PeerHelloMismatch => SetupFailure::VersionMismatch,
         _ => SetupFailure::Handshake,
     }
 }
 
-/// Only reach and timing failures are worth another dial; a disagreement repeats itself.
-/// A peer in a different step (setup link versus sharing) will join this step soon, so keep trying.
+/// Only reach and timing failures are worth another dial. A disagreement repeats itself: a peer in
+/// a different step (setup link versus sharing) answers the same way every time, so the caller must
+/// change step rather than dial on, and `PurposeMismatch` is reported at once.
 pub(crate) const fn is_transient(error: SetupFailure) -> bool {
     matches!(
         error,
-        SetupFailure::Connection
-            | SetupFailure::Handshake
-            | SetupFailure::PurposeMismatch
-            | SetupFailure::PortBusy
+        SetupFailure::Connection | SetupFailure::Handshake | SetupFailure::PortBusy
     )
 }
 
@@ -1085,5 +1086,35 @@ mod cancellation_tests {
         cancellation.join().unwrap();
         drop(watch);
         server.close(0_u32.into(), b"fixture complete");
+    }
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::*;
+
+    #[test]
+    fn a_disagreement_ends_the_dial_while_reach_failures_keep_it_going() {
+        assert!(!is_transient(SetupFailure::PurposeMismatch));
+        assert!(!is_transient(SetupFailure::VersionMismatch));
+        assert!(!is_transient(SetupFailure::ChangedSinceInspection));
+        assert!(!is_transient(SetupFailure::Cancelled));
+        assert!(is_transient(SetupFailure::Connection));
+        assert!(is_transient(SetupFailure::Handshake));
+        assert!(is_transient(SetupFailure::PortBusy));
+    }
+
+    #[test]
+    fn a_purpose_disagreement_reaches_the_caller_from_the_handshake() {
+        assert_eq!(
+            handshake_failure(HandshakeError::PurposeMismatch),
+            SetupFailure::PurposeMismatch
+        );
+        // Two sessions whose records name different keyboard sides: the records must be agreed
+        // again, so this is the stale-record answer rather than a retryable reach failure.
+        assert_eq!(
+            handshake_failure(HandshakeError::SourceMismatch),
+            SetupFailure::ChangedSinceInspection
+        );
     }
 }

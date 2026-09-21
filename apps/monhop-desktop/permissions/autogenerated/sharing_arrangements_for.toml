@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sharing-arrangements-for"
+description = "Enables the sharing_arrangements_for command without any pre-configured scope."
+commands.allow = ["sharing_arrangements_for"]
+
+[[permission]]
+identifier = "deny-sharing-arrangements-for"
+description = "Denies the sharing_arrangements_for command without any pre-configured scope."
+commands.deny = ["sharing_arrangements_for"]

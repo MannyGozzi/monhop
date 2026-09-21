@@ -196,6 +196,8 @@ test("native link views reject malformed IDs, coordinates, phases, and empty con
 test("the display notice normalizes to a known kind or drops to null", () => {
   assert.deepEqual(normalizeDisplayNotice({ kind: "waiting" }), { kind: "waiting" });
   assert.deepEqual(normalizeDisplayNotice({ kind: "continued" }), { kind: "continued" });
+  assert.deepEqual(normalizeDisplayNotice({ kind: "updating" }), { kind: "updating" });
+  assert.deepEqual(normalizeDisplayNotice({ kind: "peerDeciding" }), { kind: "peerDeciding" });
   for (const value of [null, undefined, {}, { kind: "confused" }, "waiting", 1, []])
     assert.equal(normalizeDisplayNotice(value), null);
   assert.equal(normalizeSharingView(connectedView).displayNotice, null);
@@ -225,6 +227,16 @@ test("the display notice banner names the peer only for the kind that needs it",
   assert.match(continued.body, /previous arrangement/);
   assert.equal(continued.primaryLabel, "Arrange displays");
   assert.equal(continued.secondaryLabel, "Keep going");
+  const updating = displayNoticeCopy("updating", "Office Windows PC");
+  assert.equal(updating.title, "Displays changed");
+  assert.equal(updating.body, "Updating the layout for Office Windows PC.");
+  assert.equal(updating.primaryLabel, "Change layout");
+  assert.equal(updating.secondaryLabel, "Dismiss");
+  const peerDeciding = displayNoticeCopy("peerDeciding", "Office Windows PC");
+  assert.equal(peerDeciding.title, "Displays changed");
+  assert.equal(peerDeciding.body, "Office Windows PC is choosing the layout.");
+  assert.equal(peerDeciding.primaryLabel, "Change layout");
+  assert.equal(peerDeciding.secondaryLabel, "Dismiss");
   assert.equal(displayNoticeCopy("bogus", "Office Windows PC"), null);
 });
 
@@ -712,6 +724,18 @@ test("an arrangement is automatic only when the native reply says so exactly", (
   assert.equal(remembered.automatic, true);
   assert.equal(named.automatic, false);
   assert.equal(defaulted.automatic, false);
+});
+
+test("an arrangement fits only when the native reply says so exactly", () => {
+  const native = layoutForSave(place(initializeArrangement(connected()), [1920, 300]));
+  const [fits, doesNotFit, defaulted] = normalizeArrangements([
+    { name: "Desk", sourceSide: "peer", mode: "grouped", crossings: 1, layout: native, fits: true },
+    { name: "Couch", sourceSide: "local", mode: "free", crossings: 2, layout: null, fits: false },
+    { name: "Loft", sourceSide: "local", mode: "free", crossings: 2, layout: null },
+  ]);
+  assert.equal(fits.fits, true);
+  assert.equal(doesNotFit.fits, false);
+  assert.equal(defaulted.fits, false);
 });
 
 test("stored layouts carry their arrangement only when it is well-formed", () => {

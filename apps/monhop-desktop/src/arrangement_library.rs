@@ -7,7 +7,9 @@ use monhop_transport::session_setup::{DisplayTopology, InspectedPeer};
 use serde::{Deserialize, Serialize};
 
 use crate::sharing::LayoutRequest;
-use crate::sharing_preferences::{DisplaySnapshot, SharingPreferences, load_bounded, save_bounded};
+use crate::sharing_preferences::{
+    DisplaySnapshot, SharingPreferences, fingerprint_key, load_bounded, save_bounded,
+};
 
 pub const MAX_ARRANGEMENTS: usize = 32;
 pub const MAX_NAME_CHARS: usize = 64;
@@ -53,6 +55,9 @@ pub struct ArrangementView {
     pub layout: Option<LayoutRequest>,
     /// Remembered by MonHop at Apply instead of named by the user.
     pub automatic: bool,
+    /// Loadable right now: this computer is connected to that one and both show the displays
+    /// the entry was made with. Always false while the computer is not connected.
+    pub fits: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,10 +247,12 @@ impl ArrangementLibrary {
         None
     }
 
-    pub fn remove(&mut self, name: &str, inspection: &InspectedPeer) -> Result<(), LibraryError> {
+    /// Forgets one of a paired computer's entries, connected or not. This library is this
+    /// computer's own, so the peer's identity alone says which entries belong to that computer.
+    pub fn remove_for(&mut self, peer: &str, name: &str) -> Result<(), LibraryError> {
         let name = normalize_name(name).ok_or(LibraryError::InvalidName)?;
         let index = self
-            .position(&name, |entry| entry.setup.same_pair(inspection))
+            .position(&name, |entry| same_peer_key(&entry.setup, peer))
             .ok_or(LibraryError::Unknown)?;
         self.arrangements.remove(index);
         Ok(())
@@ -253,25 +260,42 @@ impl ArrangementLibrary {
 
     /// The arrangements made for these two computers, each with its layout when it fits now.
     pub fn views(&self, inspection: &InspectedPeer) -> Vec<ArrangementView> {
+        self.views_for(&inspection.peer_fingerprint.full_hex(), Some(inspection))
+    }
+
+    /// Every arrangement kept for one paired computer, listable while it is not connected.
+    /// `inspection` is the live link's displays; an entry is only marked as fitting when that
+    /// inspection is with that same computer, so one computer's displays never vouch for another's.
+    pub fn views_for(
+        &self,
+        peer: &str,
+        inspection: Option<&InspectedPeer>,
+    ) -> Vec<ArrangementView> {
+        let inspection = inspection.filter(|inspection| {
+            fingerprint_key(&inspection.peer_fingerprint.full_hex()) == fingerprint_key(peer)
+        });
         self.arrangements
             .iter()
-            .filter(|entry| entry.setup.same_pair(inspection))
-            .map(|entry| ArrangementView {
-                name: entry.name.clone(),
-                source_side: entry.setup.source_side(),
-                mode: entry
-                    .setup
-                    .layout()
-                    .arrangement
-                    .as_ref()
-                    .map_or("grouped", |arrangement| arrangement.mode.as_str())
-                    .to_owned(),
-                crossings: entry.setup.layout().links.len() / 2,
-                layout: entry
-                    .setup
-                    .remap_to_inspection(inspection)
-                    .map(|fitted| fitted.layout().clone()),
-                automatic: entry.automatic,
+            .filter(|entry| same_peer_key(&entry.setup, peer))
+            .map(|entry| {
+                let fitted = inspection
+                    .and_then(|inspection| entry.setup.remap_to_inspection(inspection))
+                    .map(|fitted| fitted.layout().clone());
+                ArrangementView {
+                    name: entry.name.clone(),
+                    source_side: entry.setup.source_side(),
+                    mode: entry
+                        .setup
+                        .layout()
+                        .arrangement
+                        .as_ref()
+                        .map_or("grouped", |arrangement| arrangement.mode.as_str())
+                        .to_owned(),
+                    crossings: entry.setup.layout().links.len() / 2,
+                    fits: fitted.is_some(),
+                    layout: fitted,
+                    automatic: entry.automatic,
+                }
             })
             .collect()
     }
@@ -281,6 +305,12 @@ impl ArrangementLibrary {
             .iter()
             .position(|entry| entry.name == name && pair(entry))
     }
+}
+
+/// Identities reach here lowercase from the window and uppercase from a saved record, so one
+/// form decides which computer an entry was made with.
+fn same_peer_key(setup: &SharingPreferences, peer: &str) -> bool {
+    fingerprint_key(setup.peer_fingerprint()) == fingerprint_key(peer)
 }
 
 /// Display names come from the OS; a control character would make an unloadable entry.
@@ -332,6 +362,11 @@ mod tests {
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+    /// The paired computer each fixture record was made with.
+    fn peer_key(letter: char) -> String {
+        letter.to_string().repeat(64)
+    }
+
     fn directory() -> std::path::PathBuf {
         let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -379,9 +414,11 @@ mod tests {
             ["Desk", "Couch"]
         );
         let mut loaded = loaded;
-        let pair = inspection(&preferences());
-        assert_eq!(loaded.remove("Nope", &pair), Err(LibraryError::Unknown));
-        loaded.remove("Desk", &pair).unwrap();
+        assert_eq!(
+            loaded.remove_for(&peer_key('B'), "Nope"),
+            Err(LibraryError::Unknown)
+        );
+        loaded.remove_for(&peer_key('B'), "Desk").unwrap();
         assert_eq!(loaded.arrangements.len(), 1);
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -405,10 +442,61 @@ mod tests {
         let second = inspection(&other);
         assert_eq!(library.views(&first).len(), 2);
         assert_eq!(library.views(&second).len(), MAX_ARRANGEMENTS);
-        assert_eq!(library.remove("Couch", &second), Err(LibraryError::Unknown));
-        library.remove("Desk", &second).unwrap();
+        assert_eq!(
+            library.remove_for(&peer_key('C'), "Couch"),
+            Err(LibraryError::Unknown)
+        );
+        library.remove_for(&peer_key('C'), "Desk").unwrap();
         assert_eq!(library.views(&first).len(), 2);
         assert_eq!(library.views(&second).len(), MAX_ARRANGEMENTS - 1);
+    }
+
+    #[test]
+    fn a_computers_arrangements_list_and_forget_while_it_is_not_connected() {
+        let mut library = ArrangementLibrary::default();
+        library.upsert("Desk", preferences()).unwrap();
+        library.remember_automatically(preferences()).unwrap();
+        library
+            .upsert("Elsewhere", preferences_for_peer('C'))
+            .unwrap();
+        let listed = library.views_for(&peer_key('B'), None);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "Desk");
+        // Nothing fits while nothing is connected, so nothing offers a layout to load.
+        assert!(listed.iter().all(|entry| !entry.fits));
+        assert!(listed.iter().all(|entry| entry.layout.is_none()));
+        // The exact names the window reads, so a change here is a change the window sees.
+        let json = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(json["name"], "Desk");
+        assert_eq!(json["sourceSide"], "peer");
+        assert_eq!(json["mode"], "grouped");
+        assert_eq!(json["crossings"], 1);
+        assert_eq!(json["automatic"], false);
+        assert_eq!(json["fits"], false);
+        assert!(json["layout"].is_null());
+        // The same list with that computer's own live displays marks what fits and carries it.
+        let live = inspection(&preferences());
+        let connected = library.views_for(&peer_key('B'), Some(&live));
+        assert!(connected.iter().all(|entry| entry.fits));
+        assert_eq!(connected[0].layout.as_ref(), Some(preferences().layout()));
+        // Another computer's displays never vouch for this one's entries.
+        let other = inspection(&preferences_for_peer('C'));
+        assert!(
+            library
+                .views_for(&peer_key('B'), Some(&other))
+                .iter()
+                .all(|entry| !entry.fits)
+        );
+        // Identities arrive lowercase from the window and uppercase from a record; both answer.
+        assert_eq!(library.views_for(&peer_key('b'), None).len(), 2);
+        library.remove_for(&peer_key('b'), "Desk").unwrap();
+        assert_eq!(library.views_for(&peer_key('B'), None).len(), 1);
+        // A forget never reaches another computer's entries.
+        assert_eq!(
+            library.remove_for(&peer_key('B'), "Elsewhere"),
+            Err(LibraryError::Unknown)
+        );
+        assert_eq!(library.views_for(&peer_key('C'), None).len(), 1);
     }
 
     #[test]

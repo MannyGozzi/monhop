@@ -19,6 +19,7 @@ import {
   sharedMonitorChoices,
 } from "./sharing-model.mjs";
 import { createArrangementView } from "./arrangement-view.mjs";
+import { newestFirst } from "./computer-card-model.mjs";
 import { createAccordion } from "./accordion.mjs";
 import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
 import { autostartDescription } from "./autostart-model.mjs";
@@ -377,7 +378,8 @@ let pendingDelete = null;
 
 function arrangementsDisclosure(ctx) {
   const { sharing } = ctx;
-  const entries = sharing.arrangements;
+  // The library lists its oldest entry first; here and in every computer card the newest leads.
+  const entries = newestFirst(sharing.arrangements);
   if (pendingDelete && !entries.some((entry) => entry.name === pendingDelete)) pendingDelete = null;
   const content = [];
   if (entries.length) content.push(rows(entries.map((entry) => arrangementRow(ctx, entry))));
@@ -396,8 +398,8 @@ function arrangementRow(ctx, entry) {
   const { sharing, actions, busy, peerName } = ctx;
   const inputName = entry.sourceSide === "local" ? "this computer" : peerName;
   const crossings = `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`;
-  const fit = entry.layout ? "" : " · Does not fit the current displays";
-  const detail = `${MODE_INFO[entry.mode].shortLabel} · ${crossings} · Input: ${inputName}${fit}`;
+  // Whether it fits is the "Fits now" chip's job alone, so the line never says it twice.
+  const detail = `${MODE_INFO[entry.mode].shortLabel} · ${crossings} · Input: ${inputName}`;
   const key = rowKey(entry.name);
   const deleting = pendingDelete === entry.name;
   const remove = button(deleting ? "Confirm delete" : "Delete", {
@@ -418,10 +420,14 @@ function arrangementRow(ctx, entry) {
       void actions.deleteArrangement(entry.name);
     },
   });
+  const chips = [
+    statusChip({ tone: "neutral", label: entry.automatic ? "Remembered" : "Saved" }),
+    entry.fits ? statusChip({ tone: "connected", label: "Fits now" }) : null,
+  ].filter(Boolean);
   return row({
     title: entry.name,
     detail,
-    leading: entry.automatic ? statusChip({ tone: "neutral", label: "Remembered" }) : null,
+    leading: el("span", { className: "row-leading-chips", children: chips }),
     actions: [
       button("Load", {
         variant: "outline",
