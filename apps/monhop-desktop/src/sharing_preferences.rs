@@ -485,10 +485,17 @@ impl SharingPreferences {
             && self.peer_fingerprint == other.peer_fingerprint
     }
 
-    /// The same displays on each side, whatever their geometry, order, or names.
+    /// The same monitors on each side, whatever their geometry, order, names, or OS ids.
     pub(crate) fn same_display_sets(&self, other: &Self) -> bool {
-        same_display_ids(&self.local_displays, &other.local_displays)
-            && same_display_ids(&self.peer_displays, &other.peer_displays)
+        same_displays(&self.local_displays, &other.local_displays).is_some()
+            && same_displays(&self.peer_displays, &other.peer_displays).is_some()
+    }
+
+    /// The same monitors both computers show right now, whatever their geometry or OS ids.
+    pub(crate) fn same_displays_as_inspection(&self, inspection: &InspectedPeer) -> bool {
+        self.same_pair(inspection)
+            && same_displays(&self.local_displays, &snapshots(&inspection.local_displays)).is_some()
+            && same_displays(&self.peer_displays, &snapshots(&inspection.peer_displays)).is_some()
     }
 
     /// The same two computers showing the same displays, whichever side holds the input right now.
@@ -497,6 +504,52 @@ impl SharingPreferences {
             && self.same_pair(inspection)
             && same_display_geometry(&self.local_displays, &snapshots(&inspection.local_displays))
             && same_display_geometry(&self.peer_displays, &snapshots(&inspection.peer_displays))
+    }
+
+    /// This record with its display ids rewritten to the ids the same monitors carry now, when
+    /// both computers show exactly the displays it was made with at the same geometry. An OS id
+    /// is a per-connection number (a reconnected Mac display gets a new one), so a monitor keeps
+    /// its layout through its EDID identity instead.
+    pub(crate) fn remap_to_inspection(&self, inspection: &InspectedPeer) -> Option<Self> {
+        if self.validate().is_err() || !self.same_pair(inspection) {
+            return None;
+        }
+        let local = snapshots(&inspection.local_displays);
+        let peer = snapshots(&inspection.peer_displays);
+        let local_pairs = same_displays(&self.local_displays, &local)?;
+        let peer_pairs = same_displays(&self.peer_displays, &peer)?;
+        if !local_pairs
+            .iter()
+            .chain(&peer_pairs)
+            .all(|(remembered, live)| same_geometry(remembered, live))
+        {
+            return None;
+        }
+        let layout = remap_layout(&self.layout, &id_map(local_pairs.iter().chain(&peer_pairs)));
+        let mut inspected = inspection.clone();
+        inspected.source = source_device(&layout, &local, &peer, inspection)?;
+        Self::from_inspection(&inspected, layout).ok()
+    }
+
+    /// Like `remap_to_inspection` for this computer's displays alone; the other computer's are
+    /// checked when the session connects.
+    pub(crate) fn remap_to_local_displays(&self, current: &DisplayTopology) -> Option<Self> {
+        if self.validate().is_err() {
+            return None;
+        }
+        let local = snapshots(current);
+        let pairs = same_displays(&self.local_displays, &local)?;
+        if !pairs
+            .iter()
+            .all(|(remembered, live)| same_geometry(remembered, live))
+        {
+            return None;
+        }
+        let mut remapped = self.clone();
+        remapped.layout = remap_layout(&self.layout, &id_map(pairs.iter()));
+        remapped.local_displays = local;
+        remapped.validate().ok()?;
+        Some(remapped)
     }
 
     pub fn matches_inspection(&self, inspection: &InspectedPeer) -> bool {
@@ -566,9 +619,11 @@ impl DisplayGeometry {
     }
 }
 
-/// Rebuilds an applied record for the displays connected now: routes, positions, and hidden
-/// marks naming a display that went away are dropped, and a display that appeared is left out
-/// of the routes. None when the starting display went away or nothing valid is left.
+/// Rebuilds an applied record for the displays connected now. A monitor is the same display
+/// under a new OS id, so ids are rewritten first; then routes, positions, and hidden marks naming
+/// a display that went away are dropped. A display that appeared joins a free arrangement beside
+/// its computer's placed display at the OS's own offset when that spot is clear, and is left out
+/// of the routes otherwise. None when the starting display went away or nothing valid is left.
 pub(crate) fn adapt_to_inspection(
     record: &SharingPreferences,
     inspection: &InspectedPeer,
@@ -578,42 +633,71 @@ pub(crate) fn adapt_to_inspection(
     }
     let local = snapshots(&inspection.local_displays);
     let peer = snapshots(&inspection.peer_displays);
-    let present = |id: &str| local.iter().chain(&peer).any(|display| display.id == id);
-    if !present(&record.layout.source_display) {
+    let pairs: Vec<(&DisplaySnapshot, &DisplaySnapshot)> =
+        pair_displays(&record.local_displays, &local)
+            .into_iter()
+            .chain(pair_displays(&record.peer_displays, &peer))
+            .collect();
+    let kept: BTreeSet<&str> = pairs.iter().map(|(_, live)| live.id.as_str()).collect();
+    let present = |id: &str| kept.contains(id);
+    let mut layout = remap_layout(&record.layout, &id_map(pairs.iter()));
+    if !present(&layout.source_display) {
         return None;
     }
-    let mut layout = record.layout.clone();
     layout
         .links
         .retain(|link| present(&link.from_display) && present(&link.to_display));
+    let mut placed_appeared: Vec<String> = Vec::new();
     if let Some(arrangement) = layout.arrangement.as_mut() {
         arrangement
             .positions
             .retain(|position| present(&position.display));
         arrangement.hidden.retain(|id| present(id));
         if arrangement.mode == "free" {
-            let placed: Vec<&str> = arrangement
-                .positions
-                .iter()
-                .map(|position| position.display.as_str())
+            // Placed in id order, which is the same on both computers, so each display that
+            // appeared lands (or is left out) identically on each side without a wire message.
+            let mut appeared: Vec<(&[DisplaySnapshot], &DisplaySnapshot)> = [&local, &peer]
+                .into_iter()
+                .flat_map(|side| side.iter().map(move |display| (side.as_slice(), display)))
+                .filter(|(_, display)| !present(&display.id))
                 .collect();
-            let appeared: Vec<String> = local
-                .iter()
-                .chain(&peer)
-                .filter(|display| {
-                    !placed.contains(&display.id.as_str())
-                        && !arrangement.hidden.contains(&display.id)
-                })
-                .map(|display| display.id.clone())
-                .collect();
-            drop(placed);
-            arrangement.hidden.extend(appeared);
+            appeared.sort_by(|(_, a), (_, b)| a.id.cmp(&b.id));
+            for (own, display) in appeared {
+                match place_beside_sibling(arrangement, display, own, &local, &peer) {
+                    Some((x, y)) => {
+                        arrangement.positions.push(crate::sharing::DisplayPosition {
+                            display: display.id.clone(),
+                            x,
+                            y,
+                        });
+                        placed_appeared.push(display.id.clone());
+                    }
+                    None => arrangement.hidden.push(display.id.clone()),
+                }
+            }
         }
     }
-    // The starting display decides which computer supplies input, as it does at Apply.
-    let mut inspected = inspection.clone();
-    inspected.source = source_device(&layout, &local, &peer, inspection)?;
-    SharingPreferences::from_inspection(&inspected, layout).ok()
+    let finish = |layout: LayoutRequest| {
+        // The starting display decides which computer supplies input, as it does at Apply.
+        let mut inspected = inspection.clone();
+        inspected.source = source_device(&layout, &local, &peer, inspection)?;
+        SharingPreferences::from_inspection(&inspected, layout).ok()
+    };
+    if placed_appeared.is_empty() {
+        return finish(layout);
+    }
+    if let Some(adapted) = finish(layout.clone()) {
+        return Some(adapted);
+    }
+    // A placed newcomer can still break the topology (an edge it shares with a kept crossing),
+    // which the rectangle check cannot see; leaving it out is always as valid as before.
+    if let Some(arrangement) = layout.arrangement.as_mut() {
+        arrangement
+            .positions
+            .retain(|position| !placed_appeared.contains(&position.display));
+        arrangement.hidden.extend(placed_appeared);
+    }
+    finish(layout)
 }
 
 /// A regular file of at most `limit` bytes, or None when absent; symlinks and oversize fail.
@@ -694,11 +778,147 @@ fn same_display_geometry(left: &[DisplaySnapshot], right: &[DisplaySnapshot]) ->
         })
 }
 
-fn same_display_ids(left: &[DisplaySnapshot], right: &[DisplaySnapshot]) -> bool {
-    left.len() == right.len()
-        && left
+/// Everything but the id, name, and monitor identity: what a layout's crossings depend on.
+fn same_geometry(left: &DisplaySnapshot, right: &DisplaySnapshot) -> bool {
+    left.origin == right.origin
+        && left.size == right.size
+        && left.native_size == right.native_size
+        && left.scale == right.scale
+        && left.primary == right.primary
+}
+
+/// The monitor's EDID identity when this list reports it for exactly one display. Two identical
+/// monitors without serial numbers share one, which tells them apart no better than their ids.
+fn usable_monitor<'a>(display: &'a DisplaySnapshot, list: &[DisplaySnapshot]) -> Option<&'a str> {
+    let key = display.monitor.as_deref()?;
+    (list
+        .iter()
+        .filter(|other| other.monitor.as_deref() == Some(key))
+        .count()
+        == 1)
+        .then_some(key)
+}
+
+/// Pairs remembered displays with the live displays that are the same monitor: by EDID identity
+/// where both lists report one for exactly one display, otherwise by OS id. Two displays that
+/// report different identities never pair, even when one has taken the other's id.
+fn pair_displays<'a>(
+    remembered: &'a [DisplaySnapshot],
+    live: &'a [DisplaySnapshot],
+) -> Vec<(&'a DisplaySnapshot, &'a DisplaySnapshot)> {
+    let mut pairs: Vec<(&DisplaySnapshot, &DisplaySnapshot)> = Vec::new();
+    let mut paired = vec![false; remembered.len()];
+    for (index, display) in remembered.iter().enumerate() {
+        let Some(key) = usable_monitor(display, remembered) else {
+            continue;
+        };
+        if let Some(candidate) = live
             .iter()
-            .all(|display| right.iter().any(|other| other.id == display.id))
+            .find(|candidate| usable_monitor(candidate, live) == Some(key))
+        {
+            pairs.push((display, candidate));
+            paired[index] = true;
+        }
+    }
+    for (index, display) in remembered.iter().enumerate() {
+        if paired[index] {
+            continue;
+        }
+        let by_id = live.iter().find(|candidate| {
+            candidate.id == display.id
+                && !pairs.iter().any(|(_, taken)| taken.id == candidate.id)
+                && (display.monitor.is_none()
+                    || candidate.monitor.is_none()
+                    || display.monitor == candidate.monitor)
+        });
+        if let Some(candidate) = by_id {
+            pairs.push((display, candidate));
+        }
+    }
+    pairs
+}
+
+/// Every display on both sides paired with the same monitor on the other, whatever the geometry.
+fn same_displays<'a>(
+    remembered: &'a [DisplaySnapshot],
+    live: &'a [DisplaySnapshot],
+) -> Option<Vec<(&'a DisplaySnapshot, &'a DisplaySnapshot)>> {
+    let pairs = pair_displays(remembered, live);
+    (remembered.len() == live.len() && pairs.len() == remembered.len()).then_some(pairs)
+}
+
+/// Remembered id to live id, for every paired display.
+fn id_map<'a>(
+    pairs: impl Iterator<Item = &'a (&'a DisplaySnapshot, &'a DisplaySnapshot)>,
+) -> BTreeMap<String, String> {
+    pairs
+        .map(|(remembered, live)| (remembered.id.clone(), live.id.clone()))
+        .collect()
+}
+
+/// The layout with every display id it names rewritten through `map`; unmapped ids stand.
+fn remap_layout(layout: &LayoutRequest, map: &BTreeMap<String, String>) -> LayoutRequest {
+    let rename = |id: &String| map.get(id).cloned().unwrap_or_else(|| id.clone());
+    let mut remapped = layout.clone();
+    remapped.source_display = rename(&layout.source_display);
+    for link in &mut remapped.links {
+        link.from_display = rename(&link.from_display);
+        link.to_display = rename(&link.to_display);
+    }
+    if let Some(arrangement) = remapped.arrangement.as_mut() {
+        for position in &mut arrangement.positions {
+            position.display = rename(&position.display);
+        }
+        for hidden in &mut arrangement.hidden {
+            *hidden = rename(hidden);
+        }
+    }
+    remapped
+}
+
+/// Where a display that appeared goes in a free arrangement: beside its computer's primary (or
+/// first placed) display, at the offset the OS puts between them, so the picture follows the OS
+/// arrangement. None when nothing of that computer is placed or the spot overlaps a placed display.
+fn place_beside_sibling(
+    arrangement: &crate::sharing::ArrangementRequest,
+    appeared: &DisplaySnapshot,
+    own: &[DisplaySnapshot],
+    local: &[DisplaySnapshot],
+    peer: &[DisplaySnapshot],
+) -> Option<(f64, f64)> {
+    let placed = |display: &DisplaySnapshot| {
+        arrangement
+            .positions
+            .iter()
+            .find(|position| position.display == display.id)
+    };
+    let (sibling, anchor) = own
+        .iter()
+        .filter(|display| display.primary)
+        .chain(own)
+        .find_map(|display| placed(display).map(|position| (display, position)))?;
+    let x = anchor.x + (appeared.origin[0] - sibling.origin[0]);
+    let y = anchor.y + (appeared.origin[1] - sibling.origin[1]);
+    if !x.is_finite()
+        || !y.is_finite()
+        || x.abs() > crate::sharing::MAX_ARRANGEMENT_COORDINATE
+        || y.abs() > crate::sharing::MAX_ARRANGEMENT_COORDINATE
+    {
+        return None;
+    }
+    let overlaps = arrangement.positions.iter().any(|position| {
+        local
+            .iter()
+            .chain(peer)
+            .find(|display| display.id == position.display)
+            .is_some_and(|display| {
+                x < position.x + display.size[0]
+                    && position.x < x + appeared.size[0]
+                    && y < position.y + display.size[1]
+                    && position.y < y + appeared.size[1]
+            })
+    });
+    (!overlaps).then_some((x, y))
 }
 
 fn snapshots(topology: &DisplayTopology) -> Vec<DisplaySnapshot> {
@@ -939,6 +1159,200 @@ pub(crate) mod tests {
                 display.name = name.to_owned();
             }
         }
+
+        /// Gives this computer's displays, in order, the monitor identities `keys` name.
+        pub(crate) fn set_local_display_monitors_for_test(&mut self, keys: &[&str]) {
+            for (display, key) in self.local_displays.iter_mut().zip(keys) {
+                display.monitor = Some((*key).to_owned());
+            }
+        }
+
+        /// The display list alone with `from` renumbered, as the OS does at a reconnect; the
+        /// layout is left naming the old id.
+        pub(crate) fn set_local_display_id_for_test(&mut self, from: &str, to: &str) {
+            for display in &mut self.local_displays {
+                if display.id == from {
+                    display.id = to.to_owned();
+                }
+            }
+        }
+
+        pub(crate) fn set_peer_fingerprint_for_test(&mut self, fingerprint_char: char) {
+            self.peer_fingerprint = fingerprint_char.to_string().repeat(64);
+        }
+
+        pub(crate) fn move_local_display_for_test(&mut self, id: &str, origin: [f64; 2]) {
+            for display in &mut self.local_displays {
+                if display.id == id {
+                    display.origin = origin;
+                }
+            }
+        }
+    }
+
+    /// The identity `crate::sharing::monitor_key` writes, read back for a test inspection.
+    fn monitor_from_key(key: &str) -> Option<monhop_core::MonitorIdentity> {
+        let mut parts = key.split('-');
+        let vendor = u16::from_str_radix(parts.next()?, 16).ok()?;
+        let product = u16::from_str_radix(parts.next()?, 16).ok()?;
+        let serial = u32::from_str_radix(parts.next()?, 16).ok()?;
+        monhop_core::MonitorIdentity::new(vendor, product, serial)
+    }
+
+    pub(crate) const BUILT_IN: &str = "0610-a050-00000000";
+    pub(crate) const EXTERNAL: &str = "10ac-4173-00000001";
+
+    /// A Mac with its built-in display and one external monitor, crossed to from the other
+    /// computer's display 2; the external is display 3 until the OS renumbers it.
+    pub(crate) fn two_display_record() -> SharingPreferences {
+        let mut record = preferences();
+        record.set_local_displays_for_test(&["1", "3"]);
+        record.set_local_display_monitors_for_test(&[BUILT_IN, EXTERNAL]);
+        record.layout.links = vec![
+            link("2", "left", "3", "right"),
+            link("3", "right", "2", "left"),
+        ];
+        record.validate().expect("the fixture is a valid record");
+        record
+    }
+
+    #[test]
+    fn a_reconnected_monitor_with_a_new_id_fits_through_its_identity() {
+        let record = two_display_record();
+        let mut live = record.clone();
+        live.set_local_display_id_for_test("3", "7");
+        let inspected = inspection(&live);
+        assert!(!record.fits_displays(&inspected));
+        let fitted = record
+            .remap_to_inspection(&inspected)
+            .expect("the same monitors fit under new ids");
+        assert!(fitted.fits_displays(&inspected));
+        assert_eq!(fitted.layout().links[0].to_display, "7");
+        assert_eq!(fitted.layout().links[1].from_display, "7");
+        assert_eq!(fitted.layout().source_display, "2");
+        assert!(record.same_display_sets(&fitted));
+        assert!(record.same_displays_as_inspection(&inspected));
+        let fitted_here = record
+            .remap_to_local_displays(&inspected.local_displays)
+            .expect("this computer's displays alone fit too");
+        assert_eq!(fitted_here.layout(), fitted.layout());
+        assert_eq!(fitted_here.local_displays()[1].id, "7");
+        // Without identities, only the id can tell displays apart, as before.
+        let mut anonymous = record.clone();
+        for display in &mut anonymous.local_displays {
+            display.monitor = None;
+        }
+        assert_eq!(anonymous.remap_to_inspection(&inspected), None);
+        assert!(
+            anonymous
+                .remap_to_inspection(&inspection(&anonymous))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_different_monitor_on_a_reused_id_is_a_new_display() {
+        let record = two_display_record();
+        let mut live = record.clone();
+        live.local_displays[1].monitor = Some("04d9-0001-00000000".into());
+        let inspected = inspection(&live);
+        assert_eq!(record.remap_to_inspection(&inspected), None);
+        assert!(!record.same_displays_as_inspection(&inspected));
+        // The crossing led to the monitor that left; with none left, nothing can continue.
+        assert_eq!(adapt_to_inspection(&record, &inspected), None);
+    }
+
+    #[test]
+    fn identical_monitors_without_serials_are_told_apart_by_id() {
+        let mut record = two_display_record();
+        record.set_local_display_monitors_for_test(&[EXTERNAL, EXTERNAL]);
+        assert!(record.remap_to_inspection(&inspection(&record)).is_some());
+        let mut renumbered = record.clone();
+        renumbered.set_local_display_id_for_test("3", "7");
+        assert_eq!(record.remap_to_inspection(&inspection(&renumbered)), None);
+    }
+
+    #[test]
+    fn a_duplicate_identity_never_pairs_with_a_different_monitor_on_its_id() {
+        // Two identical monitors without serials, then the second swapped for another model
+        // that took over its id: the crossing made for the old one must not carry onto it.
+        let mut record = two_display_record();
+        record.set_local_display_monitors_for_test(&[EXTERNAL, EXTERNAL]);
+        let mut live = record.clone();
+        live.local_displays[1].monitor = Some("04d9-0001-00000000".into());
+        let inspected = inspection(&live);
+        assert_eq!(record.remap_to_inspection(&inspected), None);
+        assert_eq!(adapt_to_inspection(&record, &inspected), None);
+        // The identical monitor that stayed keeps pairing by id.
+        let mut still = record.clone();
+        still.local_displays[1].monitor = None;
+        assert!(record.remap_to_inspection(&inspection(&still)).is_some());
+    }
+
+    #[test]
+    fn displays_that_appear_on_both_computers_are_placed_in_id_order() {
+        let record = free_record((1920.0, 0.0));
+        let mut changed = record.clone();
+        // Display 9 appears under this computer's display 1; display 5 appears on the other
+        // computer where its picture would overlap 9. Id order places 5 and hides 9, whichever
+        // computer runs this.
+        changed.set_local_displays_for_test(&["1", "9"]);
+        changed.peer_displays.push(DisplaySnapshot {
+            id: "5".into(),
+            name: "Second peer display".into(),
+            origin: [-1920.0, 1440.0],
+            size: [1920.0, 1080.0],
+            native_size: [1920, 1080],
+            scale: 1.0,
+            primary: false,
+            monitor: None,
+        });
+        let adapted = adapt_to_inspection(&record, &inspection(&changed))
+            .expect("a free layout survives displays that appeared on both computers");
+        let (positions, hidden) = arrangement_of(&adapted);
+        assert_eq!(hidden, vec!["9".to_owned()]);
+        let placed: Vec<(&str, f64, f64)> = positions
+            .iter()
+            .map(|position| (position.display.as_str(), position.x, position.y))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![("1", 0.0, 0.0), ("2", 1920.0, 0.0), ("5", 0.0, 1440.0)]
+        );
+    }
+
+    #[test]
+    fn a_placed_newcomer_that_breaks_the_topology_is_left_out_instead() {
+        // The crossing leaves display 1's whole right edge, while the picture keeps the other
+        // computer's display far right. Display 9 appears exactly right of 1: its spot is clear,
+        // but its inherited seam would share that edge with the crossing.
+        let record = free_record((5000.0, 0.0));
+        let mut changed = record.clone();
+        changed.set_local_displays_for_test(&["1", "9"]);
+        changed.move_local_display_for_test("9", [1920.0, 0.0]);
+        let adapted = adapt_to_inspection(&record, &inspection(&changed))
+            .expect("the layout without the newcomer is as valid as before");
+        let (positions, hidden) = arrangement_of(&adapted);
+        assert_eq!(hidden, vec!["9".to_owned()]);
+        assert_eq!(positions.len(), 2);
+        assert!(adapted.fits_displays(&inspection(&changed)));
+    }
+
+    #[test]
+    fn a_reconnected_monitor_that_moved_keeps_its_crossings() {
+        let record = two_display_record();
+        let mut live = record.clone();
+        live.set_local_display_id_for_test("3", "7");
+        live.move_local_display_for_test("7", [1920.0, 0.0]);
+        let inspected = inspection(&live);
+        assert_eq!(record.remap_to_inspection(&inspected), None);
+        assert!(record.same_displays_as_inspection(&inspected));
+        let adapted = adapt_to_inspection(&record, &inspected)
+            .expect("a moved monitor keeps the crossings made for it");
+        assert_eq!(adapted.layout().links.len(), 2);
+        assert_eq!(adapted.layout().links[0].to_display, "7");
+        assert_eq!(adapted.local_displays()[1].origin, [1920.0, 0.0]);
+        assert!(adapted.fits_displays(&inspected));
     }
 
     fn link(from: &str, from_edge: &str, to: &str, to_edge: &str) -> crate::sharing::LinkRequest {
@@ -965,8 +1379,7 @@ pub(crate) mod tests {
         assert!(adapted.fits_displays(&inspection(&changed)));
     }
 
-    #[test]
-    fn a_display_that_appeared_in_a_free_arrangement_is_left_out_of_the_routes() {
+    fn free_record(peer_position: (f64, f64)) -> SharingPreferences {
         let mut record = preferences();
         record.layout.arrangement = Some(crate::sharing::ArrangementRequest {
             mode: "free".into(),
@@ -978,25 +1391,54 @@ pub(crate) mod tests {
                 },
                 crate::sharing::DisplayPosition {
                     display: "2".into(),
-                    x: 1920.0,
-                    y: 0.0,
+                    x: peer_position.0,
+                    y: peer_position.1,
                 },
             ],
             hidden: Vec::new(),
         });
         assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
+        record
+    }
+
+    fn arrangement_of(
+        adapted: &SharingPreferences,
+    ) -> (Vec<crate::sharing::DisplayPosition>, Vec<String>) {
+        let arrangement = adapted
+            .layout()
+            .arrangement
+            .as_ref()
+            .expect("the free arrangement survives");
+        (arrangement.positions.clone(), arrangement.hidden.clone())
+    }
+
+    #[test]
+    fn a_display_that_appeared_in_a_free_arrangement_is_placed_where_the_os_puts_it() {
+        let record = free_record((1920.0, 0.0));
+        let mut changed = record.clone();
+        // The fixture stacks display 3 directly under display 1, as the OS reports it.
+        changed.set_local_displays_for_test(&["1", "3"]);
+        let adapted = adapt_to_inspection(&record, &inspection(&changed))
+            .expect("a free layout survives a display that appeared");
+        let (positions, hidden) = arrangement_of(&adapted);
+        assert_eq!(hidden, Vec::<String>::new());
+        assert_eq!(positions.len(), 3);
+        assert_eq!(positions[2].display, "3");
+        assert_eq!((positions[2].x, positions[2].y), (0.0, 1080.0));
+        assert!(adapted.fits_displays(&inspection(&changed)));
+    }
+
+    #[test]
+    fn a_display_that_appeared_where_the_picture_is_taken_is_left_out_of_the_routes() {
+        // The other computer's display was placed under display 1, where the OS puts display 3.
+        let record = free_record((0.0, 1080.0));
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1", "3"]);
         let adapted = adapt_to_inspection(&record, &inspection(&changed))
             .expect("a free layout survives a display that appeared");
-        assert_eq!(
-            adapted
-                .layout()
-                .arrangement
-                .as_ref()
-                .map(|arrangement| arrangement.hidden.clone()),
-            Some(vec!["3".to_owned()])
-        );
+        let (positions, hidden) = arrangement_of(&adapted);
+        assert_eq!(hidden, vec!["3".to_owned()]);
+        assert_eq!(positions.len(), 2);
     }
 
     #[test]
@@ -1122,7 +1564,7 @@ pub(crate) mod tests {
                             logical_size: monhop_core::Point::new(display.size[0], display.size[1]),
                             scale_factor: display.scale,
                             is_primary: display.primary,
-                            monitor: None,
+                            monitor: display.monitor.as_deref().and_then(monitor_from_key),
                         },
                     )
                     .collect(),

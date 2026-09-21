@@ -4,6 +4,12 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- Plugging a monitor back in brings back the layout you arranged for it. MonHop now recognizes a display by the monitor itself rather than the number the operating system assigns it, which changes on every reconnect on Apple silicon Macs.
+- A monitor that appears while you share joins a free arrangement where the operating system places it, instead of being left out until you arrange again.
+- A monitor that only moved in the operating system's arrangement keeps every crossing made for it.
+
 ## [0.1.1] - 2026-09-14
 
 Use one keyboard and mouse across Mac and Windows. Pair once, then switch computers by crossing the screen edge.

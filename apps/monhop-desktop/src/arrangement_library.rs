@@ -157,32 +157,47 @@ impl ArrangementLibrary {
         Ok(true)
     }
 
-    /// The most recently remembered entry that fits both computers' displays right now.
-    pub fn automatic_fit(&self, inspection: &InspectedPeer) -> Option<&SharingPreferences> {
+    /// The most recently remembered entry made with the displays both computers show right now,
+    /// its ids rewritten to theirs: a reconnected monitor carries a new OS id but the same identity.
+    pub fn automatic_fit(&self, inspection: &InspectedPeer) -> Option<SharingPreferences> {
         self.arrangements
             .iter()
             .rev()
-            .find(|entry| entry.automatic && entry.setup.fits_displays(inspection))
-            .map(|entry| &entry.setup)
+            .filter(|entry| entry.automatic)
+            .find_map(|entry| entry.setup.remap_to_inspection(inspection))
     }
 
-    /// The most recently remembered entry for the same pair made with this computer's displays
-    /// as they are now; the other computer's displays are checked when the session connects.
-    pub fn automatic_for_local(
+    /// The most recently remembered entry made with exactly the monitors both computers show
+    /// now, whatever their geometry: what a changed arrangement is rebuilt from, so a display
+    /// that only moved keeps every crossing that was made for it.
+    pub fn automatic_for_same_displays(
         &self,
-        pair: &SharingPreferences,
-        current: &DisplayTopology,
+        inspection: &InspectedPeer,
     ) -> Option<&SharingPreferences> {
         self.arrangements
             .iter()
             .rev()
             .find(|entry| {
                 entry.automatic
-                    && entry.setup.same_pair_as(pair)
                     && entry.setup.validate().is_ok()
-                    && entry.setup.matches_local_displays(current)
+                    && entry.setup.same_displays_as_inspection(inspection)
             })
             .map(|entry| &entry.setup)
+    }
+
+    /// The most recently remembered entry for the same pair made with this computer's displays
+    /// as they are now, its local ids rewritten to theirs; the other computer's displays are
+    /// checked when the session connects.
+    pub fn automatic_for_local(
+        &self,
+        pair: &SharingPreferences,
+        current: &DisplayTopology,
+    ) -> Option<SharingPreferences> {
+        self.arrangements
+            .iter()
+            .rev()
+            .filter(|entry| entry.automatic && entry.setup.same_pair_as(pair))
+            .find_map(|entry| entry.setup.remap_to_local_displays(current))
     }
 
     fn kept_for_pair(&self, setup: &SharingPreferences) -> usize {
@@ -254,8 +269,8 @@ impl ArrangementLibrary {
                 crossings: entry.setup.layout().links.len() / 2,
                 layout: entry
                     .setup
-                    .fits_displays(inspection)
-                    .then(|| entry.setup.layout().clone()),
+                    .remap_to_inspection(inspection)
+                    .map(|fitted| fitted.layout().clone()),
                 automatic: entry.automatic,
             })
             .collect()
@@ -310,7 +325,9 @@ fn invalid() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sharing_preferences::tests::{inspection, preferences, preferences_for_peer};
+    use crate::sharing_preferences::tests::{
+        inspection, preferences, preferences_for_peer, two_display_record,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -526,22 +543,77 @@ mod tests {
         let pair = inspection(&preferences());
         assert_eq!(library.automatic_fit(&pair), None);
         library.remember_automatically(preferences()).unwrap();
-        assert_eq!(library.automatic_fit(&pair), Some(&preferences()));
+        assert_eq!(library.automatic_fit(&pair), Some(preferences()));
         let mut other = preferences();
         other.set_local_displays_for_test(&["1", "3"]);
         library.remember_automatically(other.clone()).unwrap();
         // The entry that fits is chosen, not simply the newest.
-        assert_eq!(library.automatic_fit(&pair), Some(&preferences()));
+        assert_eq!(library.automatic_fit(&pair), Some(preferences()));
         let changed = inspection(&other);
-        assert_eq!(library.automatic_fit(&changed), Some(&other));
+        assert_eq!(library.automatic_fit(&changed), Some(other.clone()));
         assert_eq!(
             library.automatic_for_local(&preferences(), &changed.local_displays),
-            Some(&other)
+            Some(other)
         );
         assert_eq!(
             library.automatic_for_local(&preferences_for_peer('C'), &changed.local_displays),
             None
         );
+    }
+
+    #[test]
+    fn a_reconnected_monitor_is_the_same_remembered_displays_under_its_new_id() {
+        let record = two_display_record();
+        let mut reconnected = record.clone();
+        reconnected.set_local_display_id_for_test("3", "7");
+        let live = inspection(&reconnected);
+        // The memory made before the reconnect is found and comes back naming the new id.
+        let mut library = ArrangementLibrary::default();
+        library.remember_automatically(record.clone()).unwrap();
+        let fitted = library
+            .automatic_fit(&live)
+            .expect("the remembered monitors fit under their new id");
+        assert!(fitted.fits_displays(&live));
+        assert_eq!(fitted.layout().links[0].to_display, "7");
+        assert_eq!(library.automatic_for_same_displays(&live), Some(&record));
+        assert_eq!(
+            library
+                .automatic_for_local(&record, &live.local_displays)
+                .map(|entry| entry.layout().clone()),
+            Some(fitted.layout().clone())
+        );
+        // Remembering the refreshed record replaces the memory instead of adding one.
+        assert_eq!(library.remember_automatically(fitted.clone()), Ok(true));
+        assert_eq!(library.arrangements.len(), 1);
+        assert_eq!(library.automatic_fit(&live), Some(fitted.clone()));
+        // Moved as well, the memory no longer fits exactly but is still the one to rebuild from.
+        let mut moved = reconnected.clone();
+        moved.move_local_display_for_test("7", [1920.0, 0.0]);
+        let moved = inspection(&moved);
+        assert_eq!(library.automatic_fit(&moved), None);
+        assert_eq!(library.automatic_for_same_displays(&moved), Some(&fitted));
+        // A memory made with another pair of computers is never offered.
+        let mut other_pair = ArrangementLibrary::default();
+        let mut other = record.clone();
+        other.set_peer_fingerprint_for_test('C');
+        other_pair.remember_automatically(other).unwrap();
+        assert_eq!(other_pair.automatic_fit(&live), None);
+        assert_eq!(other_pair.automatic_for_same_displays(&live), None);
+    }
+
+    #[test]
+    fn a_named_arrangement_is_offered_with_the_ids_the_monitors_carry_now() {
+        let record = two_display_record();
+        let mut library = ArrangementLibrary::default();
+        library.upsert("Desk", record.clone()).unwrap();
+        let mut reconnected = record.clone();
+        reconnected.set_local_display_id_for_test("3", "7");
+        let listed = library.views(&inspection(&reconnected));
+        let layout = listed[0].layout.as_ref().expect("the arrangement fits");
+        assert_eq!(layout.links[0].to_display, "7");
+        assert_eq!(layout.links[1].from_display, "7");
+        // Named entries are never promoted on their own.
+        assert_eq!(library.automatic_fit(&inspection(&reconnected)), None);
     }
 
     #[test]

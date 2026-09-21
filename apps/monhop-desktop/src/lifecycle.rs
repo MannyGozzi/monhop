@@ -432,18 +432,29 @@ impl AppController {
         if self.sharing.notice_raised_for(inspection) {
             return Ok(None);
         }
-        let remembered = self
-            .library(path)
-            .and_then(|library| library.automatic_fit(inspection).cloned());
-        if let Some(remembered) = remembered {
+        let library = self.library(path);
+        if let Some(remembered) = library
+            .as_ref()
+            .and_then(|library| library.automatic_fit(inspection))
+        {
             self.sharing.write_active_setup(path, remembered.clone())?;
             *lock(&self.setup_cache) = None;
+            // A reconnected monitor carries a new id; the memory takes it so it fits exactly next time.
+            crate::sharing::remember_applied(path, &remembered);
             self.sharing.yield_link_when_layout_fits(&remembered);
             return Ok(Some(
                 "switched to the arrangement remembered for these displays",
             ));
         }
-        let Some(adapted) = adapt_to_inspection(saved, inspection) else {
+        // Rebuilt from the memory made with exactly these monitors when there is one, so a
+        // display that only moved keeps every crossing; the record that was running is the
+        // fallback, so a memory that no longer validates never costs what still works.
+        let adapted = library
+            .as_ref()
+            .and_then(|library| library.automatic_for_same_displays(inspection))
+            .and_then(|basis| adapt_to_inspection(basis, inspection))
+            .or_else(|| adapt_to_inspection(saved, inspection));
+        let Some(adapted) = adapted else {
             self.sharing
                 .raise_display_notice(DisplayNotice::Waiting, inspection);
             return Ok(None);
@@ -466,7 +477,7 @@ impl AppController {
         current: &monhop_transport::session_setup::DisplayTopology,
     ) -> Option<SharingPreferences> {
         self.library(path)
-            .and_then(|library| library.automatic_for_local(saved, current).cloned())
+            .and_then(|library| library.automatic_for_local(saved, current))
     }
 
     fn library(&self, path: &Path) -> Option<ArrangementLibrary> {

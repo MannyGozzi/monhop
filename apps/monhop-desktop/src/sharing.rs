@@ -231,7 +231,7 @@ pub struct DisplayPosition {
 }
 
 pub(crate) const MAX_ARRANGED_DISPLAYS: usize = 32;
-const MAX_ARRANGEMENT_COORDINATE: f64 = 20_000_000.0;
+pub(crate) const MAX_ARRANGEMENT_COORDINATE: f64 = 20_000_000.0;
 
 /// One connected display as the arrangement validator sees it.
 pub(crate) struct ArrangedDisplay<'a> {
