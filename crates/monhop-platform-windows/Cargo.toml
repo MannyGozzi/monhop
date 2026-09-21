@@ -13,7 +13,7 @@ path = "examples/native_window.rs"
 test = true
 
 [dependencies]
-monhop-core = { path = "../monhop-core", version = "=0.1.1" }
+monhop-core = { path = "../monhop-core", version = "=0.1.2" }
 log = "=0.4.34"
 
 [target.'cfg(windows)'.dependencies]

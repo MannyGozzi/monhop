@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-21
+
 ### Fixed
 
 - Plugging a monitor back in brings back the layout you arranged for it. MonHop now recognizes a display by the monitor itself rather than the number the operating system assigns it, which changes on every reconnect on Apple silicon Macs.
@@ -47,5 +49,6 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.2
 [0.1.1]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.1

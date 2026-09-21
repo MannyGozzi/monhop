@@ -214,13 +214,13 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
 | mio | 1.2.3 | MIT |
-| monhop | 0.1.1 | GPL-3.0-or-later |
-| monhop-core | 0.1.1 | GPL-3.0-or-later |
-| monhop-desktop | 0.1.1 | GPL-3.0-or-later |
-| monhop-platform-macos | 0.1.1 | GPL-3.0-or-later |
-| monhop-platform-windows | 0.1.1 | GPL-3.0-or-later |
-| monhop-protocol | 0.1.1 | GPL-3.0-or-later |
-| monhop-transport | 0.1.1 | GPL-3.0-or-later |
+| monhop | 0.1.2 | GPL-3.0-or-later |
+| monhop-core | 0.1.2 | GPL-3.0-or-later |
+| monhop-desktop | 0.1.2 | GPL-3.0-or-later |
+| monhop-platform-macos | 0.1.2 | GPL-3.0-or-later |
+| monhop-platform-windows | 0.1.2 | GPL-3.0-or-later |
+| monhop-protocol | 0.1.2 | GPL-3.0-or-later |
+| monhop-transport | 0.1.2 | GPL-3.0-or-later |
 | muda | 0.19.3 | Apache-2.0 OR MIT |
 | ndk | 0.9.0 | MIT OR Apache-2.0 |
 | ndk-sys | 0.6.0+11769913 | MIT OR Apache-2.0 |

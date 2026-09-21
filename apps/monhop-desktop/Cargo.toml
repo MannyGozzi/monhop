@@ -7,13 +7,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-monhop-core = { path = "../../crates/monhop-core", version = "=0.1.1" }
-monhop-transport = { path = "../../crates/monhop-transport", version = "=0.1.1" }
-monhop-protocol = { path = "../../crates/monhop-protocol", version = "=0.1.1" }
+monhop-core = { path = "../../crates/monhop-core", version = "=0.1.2" }
+monhop-transport = { path = "../../crates/monhop-transport", version = "=0.1.2" }
+monhop-protocol = { path = "../../crates/monhop-protocol", version = "=0.1.2" }
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
-monhop-platform-macos = { path = "../../crates/monhop-platform-macos", version = "=0.1.1" }
-monhop-platform-windows = { path = "../../crates/monhop-platform-windows", version = "=0.1.1" }
+monhop-platform-macos = { path = "../../crates/monhop-platform-macos", version = "=0.1.2" }
+monhop-platform-windows = { path = "../../crates/monhop-platform-windows", version = "=0.1.2" }
 log = "=0.4.34"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
