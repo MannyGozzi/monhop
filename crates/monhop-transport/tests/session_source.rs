@@ -1063,6 +1063,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
                 NormalizedInput::Button {
                     button: MouseButton::Left,
                     pressed,
+                    at: ms(2),
                 },
                 true,
                 1,
@@ -1124,6 +1125,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
             NormalizedInput::Button {
                 button: MouseButton::Left,
                 pressed: false,
+                at: ms(7),
             },
             true,
             1,
@@ -1334,9 +1336,25 @@ fn click(
     button: MouseButton,
     now: Duration,
 ) {
+    click_captured(source, bridge, button, now, now);
+}
+
+/// A click captured at `captured` and drained from the capture queue at `drained`.
+fn click_captured(
+    source: &mut SourceController,
+    bridge: &mut ReceiverBridge,
+    button: MouseButton,
+    captured: Duration,
+    drained: Duration,
+) {
     for pressed in [true, false] {
-        let outcome = capture_on_route(source, NormalizedInput::Button { button, pressed }, now);
-        bridge.pump(source, outcome, now).unwrap();
+        let press = NormalizedInput::Button {
+            button,
+            pressed,
+            at: captured,
+        };
+        let outcome = capture_on_route(source, press, drained);
+        bridge.pump(source, outcome, drained).unwrap();
     }
 }
 
@@ -1375,7 +1393,7 @@ fn quick_presses_far_apart_on_the_peer_are_single_clicks_though_the_pinned_curso
 
 #[test]
 fn a_double_click_with_hand_jitter_inside_the_slop_arrives_as_a_double() {
-    let jitter = f64::from(DOUBLE_CLICK_SLOP) - 1.0;
+    let jitter = DOUBLE_CLICK_SLOP - 1.0;
     let (mut source, mut bridge) = controlling_a_wide_peer_display();
     nudge(&mut source, &mut bridge, Point::new(50.0, 0.0), ms(5));
     click(&mut source, &mut bridge, MouseButton::Left, ms(10));
@@ -1403,6 +1421,62 @@ fn the_source_users_double_click_interval_numbers_its_presses() {
         delivered_clicks(&bridge),
         [LEFT_CLICK, LEFT_DOUBLE, LEFT_CLICK].concat(),
         "151 ms is outside this user's interval, though inside the 500 ms fallback"
+    );
+}
+
+/// Both sides answer each other's health challenges every 100 ms from `from` until `until`.
+fn stay_alive_through(
+    source: &mut SourceController,
+    bridge: &mut ReceiverBridge,
+    from: Duration,
+    until: Duration,
+) {
+    let mut now = from;
+    while now < until {
+        let challenge = source.tick(now);
+        bridge.pump(source, challenge, now).unwrap();
+        if let Some(ping) = bridge.receiver.tick(now, &mut bridge.destination).unwrap() {
+            let frame = bridge.response_frame(ping);
+            let pong = source.on_remote_frame(&frame, now);
+            bridge.pump(source, pong, now).unwrap();
+        }
+        now += ms(100);
+    }
+}
+
+#[test]
+fn presses_are_numbered_by_when_they_were_captured_not_drained() {
+    let (mut source, mut bridge) = controlling_a_wide_peer_display();
+    source.set_double_click_interval(ms(500));
+    click_captured(&mut source, &mut bridge, MouseButton::Left, ms(0), ms(150));
+    stay_alive_through(&mut source, &mut bridge, ms(200), ms(600));
+    click_captured(
+        &mut source,
+        &mut bridge,
+        MouseButton::Left,
+        ms(600),
+        ms(600),
+    );
+    let (mut late, mut late_bridge) = controlling_a_wide_peer_display();
+    late.set_double_click_interval(ms(500));
+    click_captured(&mut late, &mut late_bridge, MouseButton::Left, ms(0), ms(0));
+    stay_alive_through(&mut late, &mut late_bridge, ms(100), ms(600));
+    click_captured(
+        &mut late,
+        &mut late_bridge,
+        MouseButton::Left,
+        ms(450),
+        ms(600),
+    );
+    assert_eq!(
+        delivered_clicks(&bridge),
+        [LEFT_CLICK, LEFT_CLICK].concat(),
+        "captured 600 ms apart though drained 450 ms apart"
+    );
+    assert_eq!(
+        delivered_clicks(&late_bridge),
+        [LEFT_CLICK, LEFT_DOUBLE].concat(),
+        "captured 450 ms apart though drained 600 ms apart, inside the 500 ms interval"
     );
 }
 
@@ -1459,6 +1533,7 @@ fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
             NormalizedInput::Button {
                 button: MouseButton::Left,
                 pressed: true,
+                at: ms(2),
             },
             true,
             1,
@@ -1882,6 +1957,7 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
         NormalizedInput::Button {
             button: MouseButton::Left,
             pressed: true,
+            at: ms(0),
         },
     ] {
         assert!(source.fresh_capture(local(event), ms(0)).effects.is_empty());

@@ -596,12 +596,7 @@ impl InputReceiver {
             .iter()
             .find(|d| d.id == id)
             .ok_or(ReceiverFailure::WrongDisplay)?;
-        if !point.is_finite()
-            || point.x < display.logical_origin.x
-            || point.y < display.logical_origin.y
-            || point.x >= display.logical_origin.x + display.logical_size.x
-            || point.y >= display.logical_origin.y + display.logical_size.y
-        {
+        if !display.logical_bounds().contains_half_open(point) {
             return Err(ReceiverFailure::InvalidPoint);
         }
         Ok(())

@@ -768,13 +768,7 @@ fn drag_in_progress_take_back_withholds_until_release() {
     let mut p = Pair::new();
     p.cross(0);
     p.pump();
-    p.input(
-        0,
-        NormalizedInput::Button {
-            button: monhop_core::MouseButton::Left,
-            pressed: true,
-        },
-    );
+    p.input(0, left(true, ms(0)));
     p.pump();
     let c = &mut p.computers[1];
     let stop = CaptureStop::new();
@@ -809,10 +803,11 @@ fn delivered_clicks(p: &Pair) -> Vec<(bool, u8)> {
         })
         .collect()
 }
-fn left(pressed: bool) -> NormalizedInput {
+fn left(pressed: bool, at: Duration) -> NormalizedInput {
     NormalizedInput::Button {
         button: monhop_core::MouseButton::Left,
         pressed,
+        at,
     }
 }
 #[test]
@@ -823,7 +818,7 @@ fn quick_presses_in_place_reach_the_peer_numbered_on_press_and_release() {
     for t in [10, 20, 30] {
         p.at(t);
         for pressed in [true, false] {
-            p.input(0, left(pressed));
+            p.input(0, left(pressed, ms(t)));
             p.pump();
         }
     }
@@ -843,14 +838,14 @@ fn quick_presses_in_place_reach_the_peer_numbered_on_press_and_release() {
 fn a_press_carried_across_the_edge_is_a_single_click_and_starts_no_sequence() {
     let mut p = Pair::new();
     for pressed in [true, false, true] {
-        p.input(0, left(pressed));
+        p.input(0, left(pressed, ms(0)));
     }
     p.cross(0);
     p.pump();
-    p.input(0, left(false));
+    p.input(0, left(false, ms(0)));
     p.pump();
     assert_eq!(delivered_clicks(&p), [(true, 1), (false, 1)]);
-    p.input(0, left(true));
+    p.input(0, left(true, ms(0)));
     p.pump();
     assert_eq!(
         delivered_clicks(&p).last(),

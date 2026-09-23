@@ -9,7 +9,8 @@ use std::error::Error;
 use std::fmt;
 
 use monhop_core::{
-    DeviceId, DisplayId, HidUsage, ModifierState, MonitorIdentity, MouseButton, Platform, Point,
+    DeviceId, DisplayId, HidUsage, LogicalRect, LogicalSize, ModifierState, MonitorIdentity,
+    MouseButton, Platform, Point,
 };
 
 pub const MAGIC: [u8; 4] = *b"LKM!";
@@ -118,6 +119,15 @@ pub struct DisplayDescription {
     pub is_primary: bool,
     /// Present when the platform read the monitor's EDID identity.
     pub monitor: Option<MonitorIdentity>,
+}
+
+impl DisplayDescription {
+    pub const fn logical_bounds(&self) -> LogicalRect {
+        LogicalRect {
+            origin: self.logical_origin,
+            size: LogicalSize::new(self.logical_size.x, self.logical_size.y),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

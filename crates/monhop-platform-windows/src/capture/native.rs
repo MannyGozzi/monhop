@@ -2429,6 +2429,7 @@ mod tests {
             CaptureEvent::Button {
                 button: MouseButton::Left,
                 pressed: true,
+                at: Duration::ZERO,
             },
             CaptureEvent::Key {
                 usage: monhop_core::HidUsage(0xe0),
@@ -2453,9 +2454,10 @@ mod tests {
                         effects.push(effect);
                         if effects.len() == 1 {
                             let up = match down {
-                                CaptureEvent::Button { button, .. } => CaptureEvent::Button {
+                                CaptureEvent::Button { button, at, .. } => CaptureEvent::Button {
                                     button,
                                     pressed: false,
+                                    at,
                                 },
                                 CaptureEvent::Key { usage, .. } => CaptureEvent::Key {
                                     usage,
@@ -2508,7 +2510,8 @@ mod tests {
         let (mut state, mut consumer) = callback_fixture();
         assert!(!state.event(CaptureEvent::Button {
             button: MouseButton::Left,
-            pressed: true
+            pressed: true,
+            at: Duration::ZERO,
         }));
         consumer.try_pop().unwrap();
         let _guard = install_callback(state);
@@ -2526,11 +2529,13 @@ mod tests {
                     if effects.len() == 1 {
                         assert!(!with_callback(|state| state.event(CaptureEvent::Button {
                             button: MouseButton::Left,
-                            pressed: false
+                            pressed: false,
+                            at: Duration::ZERO,
                         })));
                         assert!(!with_callback(|state| state.event(CaptureEvent::Button {
                             button: MouseButton::Right,
-                            pressed: true
+                            pressed: true,
+                            at: Duration::ZERO,
                         })));
                     }
                     Ok(())
@@ -2569,7 +2574,8 @@ mod tests {
         );
         assert!(with_callback(|state| state.event(CaptureEvent::Button {
             button: MouseButton::Right,
-            pressed: false
+            pressed: false,
+            at: Duration::ZERO,
         })));
     }
 
@@ -2579,7 +2585,8 @@ mod tests {
             let (mut state, _consumer) = callback_fixture();
             assert!(!state.event(CaptureEvent::Button {
                 button: MouseButton::Left,
-                pressed: true
+                pressed: true,
+                at: Duration::ZERO,
             }));
             let _guard = install_callback(state);
             let mut local_down = true;
@@ -2609,6 +2616,7 @@ mod tests {
                                     state.event(CaptureEvent::Button {
                                         button: MouseButton::Left,
                                         pressed,
+                                        at: Duration::ZERO,
                                     })
                                 });
                                 if !suppressed {
@@ -2631,7 +2639,8 @@ mod tests {
             );
             assert!(with_callback(|state| state.event(CaptureEvent::Button {
                 button: MouseButton::Left,
-                pressed: false
+                pressed: false,
+                at: Duration::ZERO,
             })));
         }
     }
@@ -2641,7 +2650,8 @@ mod tests {
         let (mut state, _consumer) = callback_fixture();
         assert!(!state.event(CaptureEvent::Button {
             button: MouseButton::Left,
-            pressed: true
+            pressed: true,
+            at: Duration::ZERO,
         }));
         let _guard = install_callback(state);
         let mut sends = 0;
@@ -2660,6 +2670,7 @@ mod tests {
                                 state.event(CaptureEvent::Button {
                                     button: MouseButton::Left,
                                     pressed,
+                                    at: Duration::ZERO,
                                 })
                             });
                         }
@@ -2694,7 +2705,8 @@ mod tests {
         let (mut state, _consumer) = remote_callback();
         assert!(state.event(CaptureEvent::Button {
             button: MouseButton::Left,
-            pressed: true
+            pressed: true,
+            at: Duration::ZERO,
         }));
         let signal = state.shared.revocation.clone();
         let _guard = install_callback(state);
@@ -2715,6 +2727,7 @@ mod tests {
                                 state.event(CaptureEvent::Button {
                                     button: MouseButton::Left,
                                     pressed,
+                                    at: Duration::ZERO,
                                 })
                             }) {
                                 local_down = pressed;
@@ -2766,7 +2779,8 @@ mod tests {
             let (mut state, _consumer) = remote_callback();
             assert!(state.event(CaptureEvent::Button {
                 button: MouseButton::Left,
-                pressed: true
+                pressed: true,
+                at: Duration::ZERO,
             }));
             let signal = state.shared.revocation.clone();
             let _guard = install_callback(state);

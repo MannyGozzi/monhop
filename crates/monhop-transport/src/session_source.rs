@@ -15,8 +15,8 @@ use std::{fmt, time::Duration};
 
 use monhop_core::{
     DeviceId, DisplayId, Edge, EdgeTransition, FloorOwner, FloorSnapshot, FloorState, HidUsage,
-    ModifierState, MouseButton, Platform, Point, PointerOwnership, PointerTarget, SharedFloor,
-    Topology, TransitionAcknowledgement,
+    LogicalRect, ModifierState, MouseButton, Platform, Point, PointerOwnership, PointerTarget,
+    SharedFloor, Topology, TransitionAcknowledgement,
     clicks::{ClickCounter, SINGLE_CLICK},
 };
 use monhop_protocol::{
@@ -50,6 +50,7 @@ pub const PUSH_THROUGH_RESET: Duration = Duration::from_millis(500);
 /// before constructing this type. Scroll is in signed wheel detents: positive horizontal is right
 /// and positive vertical is up. Windows adapters divide 120-unit detents, while macOS adapters
 /// divide 40-point detents after their horizontal inversion; both preserve fractional values.
+/// A `Button` keeps the capture clock reading it was stamped with when captured.
 #[derive(Clone, Copy, PartialEq)]
 pub enum NormalizedInput {
     Key {
@@ -61,6 +62,7 @@ pub enum NormalizedInput {
     Button {
         button: MouseButton,
         pressed: bool,
+        at: Duration,
     },
     AbsoluteMotion(Point),
     RelativeMotion(Point),
@@ -1394,7 +1396,9 @@ impl SourceController {
                 Some(_) => {}
                 None => self.fail(SourceFailure::InvalidKeyState, effects),
             },
-            NormalizedInput::Button { button, pressed } => {
+            NormalizedInput::Button {
+                button, pressed, ..
+            } => {
                 self.update_button(button, pressed);
             }
             NormalizedInput::AbsoluteMotion(current) => {
@@ -1463,14 +1467,18 @@ impl SourceController {
                     );
                 }
             }
-            NormalizedInput::Button { button, pressed } => {
+            NormalizedInput::Button {
+                button,
+                pressed,
+                at,
+            } => {
                 let change = self.update_button(button, pressed);
                 let State::Remote { position, .. } = self.state else {
                     return;
                 };
                 let index = button.index();
                 if pressed && !change.was_physical {
-                    let click_count = self.clicks.press(button, position, now);
+                    let click_count = self.clicks.press(button, position, at);
                     self.buttons[index].remote = true;
                     self.buttons[index].remote_clicks = click_count;
                     self.push_input(
@@ -2013,10 +2021,7 @@ impl SourceController {
             self.apply_remote_edge(target, return_target, return_position, transition, effects);
             return;
         }
-        let next = Point::new(
-            desired.x.clamp(bounds.origin.x, bounds.max_x().next_down()),
-            desired.y.clamp(bounds.origin.y, bounds.max_y().next_down()),
-        );
+        let next = bounds.clamp_half_open(desired);
         let resting = self.edge_push.is_some_and(|push| {
             push.display == target.display
                 && self
@@ -2450,16 +2455,11 @@ impl SourceController {
             return translated;
         };
         let bounds = display.bounds();
-        Point::new(
-            translated.x.clamp(
-                bounds.origin.x - offset.x,
-                (bounds.max_x() - offset.x).next_down(),
-            ),
-            translated.y.clamp(
-                bounds.origin.y - offset.y,
-                (bounds.max_y() - offset.y).next_down(),
-            ),
-        )
+        LogicalRect {
+            origin: Point::new(bounds.origin.x - offset.x, bounds.origin.y - offset.y),
+            size: bounds.size,
+        }
+        .clamp_half_open(translated)
     }
 
     fn push_input(&mut self, message: Message, effects: &mut SourceEffects) {

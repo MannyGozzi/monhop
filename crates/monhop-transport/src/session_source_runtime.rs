@@ -193,7 +193,15 @@ pub(crate) fn normalize(
             repeat,
             modifiers,
         },
-        CaptureEvent::Button { button, pressed } => NormalizedInput::Button { button, pressed },
+        CaptureEvent::Button {
+            button,
+            pressed,
+            at,
+        } => NormalizedInput::Button {
+            button,
+            pressed,
+            at,
+        },
         CaptureEvent::RouteChanged { remote, revision } => {
             NormalizedInput::RouteChanged { remote, revision }
         }

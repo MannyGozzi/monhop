@@ -259,6 +259,7 @@ fn pointer_buttons_and_scroll_preserve_fractions_in_logical_points() {
         DecodedInput::Event(CaptureEvent::Button {
             button: MouseButton::Forward,
             pressed: true,
+            ..
         })
     ));
     let left = decode_pointer(
@@ -273,6 +274,7 @@ fn pointer_buttons_and_scroll_preserve_fractions_in_logical_points() {
         DecodedInput::Event(CaptureEvent::Button {
             button: MouseButton::Left,
             pressed: true,
+            ..
         })
     ));
     match decode_scroll(-0.015_625, 2.75, true, source, SYNTHETIC_EVENT_MARKER) {

@@ -1,6 +1,7 @@
-//! Pure decoding of low-level Windows hook metadata into capture events.
+//! Decoding of low-level Windows hook metadata into capture events, pure but for a button's
+//! capture-clock stamp.
 
-use monhop_core::{ModifierState, MouseButton};
+use monhop_core::{ModifierState, MouseButton, clicks::capture_clock};
 
 use crate::{
     capture::CaptureEvent,
@@ -124,8 +125,13 @@ fn keyboard_pressed(message: u32) -> Option<bool> {
     }
 }
 
+/// The mouse hook's decode is where a button is stamped on the shared capture clock.
 fn button(button: MouseButton, pressed: bool) -> DecodedInput {
-    DecodedInput::Event(CaptureEvent::Button { button, pressed })
+    DecodedInput::Event(CaptureEvent::Button {
+        button,
+        pressed,
+        at: capture_clock(),
+    })
 }
 
 fn xbutton(mouse_data: u32, pressed: bool) -> DecodedInput {
@@ -182,6 +188,7 @@ mod tests {
             DecodedInput::Event(CaptureEvent::Button {
                 button: actual_button,
                 pressed: actual_pressed,
+                ..
             }) => {
                 assert_eq!(actual_button, button);
                 assert_eq!(actual_pressed, pressed);
@@ -322,6 +329,19 @@ mod tests {
             decode_mouse(WM_XBUTTONDOWN, 0, 0, 3_u32 << 16, 0, 0),
             DecodedInput::Unsupported
         ));
+    }
+
+    #[test]
+    fn a_button_is_stamped_on_the_capture_clock_as_the_hook_decodes_it() {
+        let before = capture_clock();
+        let decoded = decode_mouse(WM_LBUTTONDOWN, 0, 0, 0, 0, 0);
+        let after = capture_clock();
+        match decoded {
+            DecodedInput::Event(CaptureEvent::Button { at, .. }) => {
+                assert!((before..=after).contains(&at));
+            }
+            _ => panic!("expected a button event"),
+        }
     }
 
     #[test]

@@ -74,6 +74,15 @@ impl LogicalRect {
             && point.y >= self.origin.y
             && point.y < self.max_y()
     }
+
+    /// The nearest point [`Self::contains_half_open`] admits; NaN stays NaN. The rect must not be
+    /// empty.
+    pub fn clamp_half_open(self, point: Point) -> Point {
+        Point::new(
+            point.x.clamp(self.origin.x, self.max_x().next_down()),
+            point.y.clamp(self.origin.y, self.max_y().next_down()),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

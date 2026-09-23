@@ -323,7 +323,9 @@ impl PhysicalCapture {
                 }
                 suppress || (withholding && pressed)
             }
-            CaptureEvent::Button { button, pressed } => {
+            CaptureEvent::Button {
+                button, pressed, ..
+            } => {
                 let index = button.index();
                 let previous = self.buttons[index];
                 if let Some(suppress) =
@@ -670,6 +672,7 @@ mod tests {
             CaptureEvent::Button {
                 button: MouseButton::Left,
                 pressed: true,
+                at: Duration::ZERO,
             },
             false,
             Duration::ZERO,
@@ -725,6 +728,7 @@ mod tests {
         CaptureEvent::Button {
             button: MouseButton::Left,
             pressed,
+            at: Duration::ZERO,
         }
     }
 

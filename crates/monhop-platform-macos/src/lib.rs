@@ -5,7 +5,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use monhop_core::{
     DeviceId, Display, DisplayId, HidUsage, LogicalRect, LogicalSize, MouseButton, NativeSize,
-    Point, clicks::SINGLE_CLICK,
+    Point,
 };
 
 pub use monhop_core::{capture, capture_control, capture_physical};
@@ -265,7 +265,8 @@ pub fn drag_button_from_held_buttons(
 pub struct MacInjector {
     destination: backend::PostingDestination,
     held_keys: BTreeSet<HidUsage>,
-    held_buttons: BTreeSet<MouseButton>,
+    /// Each held button's posted click count, which its recovery release repeats.
+    held_buttons: BTreeMap<MouseButton, u8>,
     scroll_residual: ScrollResidual,
     cursor: CursorState,
 }
@@ -291,7 +292,7 @@ impl MacInjector {
         Ok(Self {
             destination,
             held_keys: BTreeSet::new(),
-            held_buttons: BTreeSet::new(),
+            held_buttons: BTreeMap::new(),
             scroll_residual: ScrollResidual::default(),
             cursor,
         })
@@ -302,7 +303,7 @@ impl MacInjector {
     }
 
     pub fn held_buttons(&self) -> impl ExactSizeIterator<Item = MouseButton> + '_ {
-        self.held_buttons.iter().copied()
+        self.held_buttons.keys().copied()
     }
 
     pub fn key(&mut self, usage: HidUsage, is_down: bool) -> Result<(), MacError> {
@@ -334,7 +335,7 @@ impl MacInjector {
         is_down: bool,
         click_count: u8,
     ) -> Result<(), MacError> {
-        if !should_post_held_state_event(is_down, self.held_buttons.contains(&button)) {
+        if !should_post_held_state_event(is_down, self.held_buttons.contains_key(&button)) {
             return Ok(());
         }
         let destination = self.destination;
@@ -351,7 +352,7 @@ impl MacInjector {
             )
         })?;
         if is_down {
-            self.held_buttons.insert(button);
+            self.held_buttons.insert(button, click_count);
         } else {
             self.held_buttons.remove(&button);
         }
@@ -407,7 +408,11 @@ impl MacInjector {
     pub fn release_all(&mut self) -> Result<(), MacError> {
         self.scroll_residual = ScrollResidual::default();
         let keys: Vec<_> = self.held_keys.iter().copied().collect();
-        let buttons: Vec<_> = self.held_buttons.iter().copied().collect();
+        let buttons: Vec<_> = self
+            .held_buttons
+            .iter()
+            .map(|(button, click_count)| (*button, *click_count))
+            .collect();
         let mut first_error = None;
 
         for usage in keys {
@@ -415,8 +420,8 @@ impl MacInjector {
                 first_error.get_or_insert(error);
             }
         }
-        for button in buttons {
-            if let Err(error) = self.button(button, false, SINGLE_CLICK) {
+        for (button, click_count) in buttons {
+            if let Err(error) = self.button(button, false, click_count) {
                 first_error.get_or_insert(error);
             }
         }
@@ -449,7 +454,7 @@ impl MacInjector {
     }
 
     fn drag_button(&self) -> Option<MouseButton> {
-        drag_button_from_held_buttons(self.held_buttons.iter().copied())
+        drag_button_from_held_buttons(self.held_buttons.keys().copied())
     }
 }
 
@@ -613,7 +618,7 @@ fn squared_distance(from: Point, to: Point) -> f64 {
 }
 
 fn clear_cursor_after_button_recovery(
-    held_buttons: &BTreeSet<MouseButton>,
+    held_buttons: &BTreeMap<MouseButton, u8>,
     cursor: &mut CursorState,
 ) {
     if held_buttons.is_empty() {
@@ -693,7 +698,7 @@ const fn mouse_button_index(button: MouseButton) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
 
     use monhop_core::{LogicalRect, LogicalSize, MouseButton, Point};
 
@@ -980,7 +985,7 @@ mod tests {
         cursor
             .post_absolute(Point::new(10.0, 20.0), |_| Ok(()))
             .unwrap();
-        let mut buttons = BTreeSet::from([MouseButton::Left]);
+        let mut buttons = BTreeMap::from([(MouseButton::Left, 2)]);
         clear_cursor_after_button_recovery(&buttons, &mut cursor);
         assert!(cursor.submitted.is_some());
 

@@ -2122,14 +2122,23 @@ mod callback_tests {
             (CG_EVENT_OTHER_MOUSE_DOWN, true),
             (CG_EVENT_OTHER_MOUSE_UP, false),
         ] {
+            let before = monhop_core::clicks::capture_clock();
             assert!(deliver_button(&mut state, event_type, 2).0);
-            assert!(
-                consumer.try_pop().unwrap()
-                    == Some(CaptureEvent::Button {
-                        button: MouseButton::Middle,
-                        pressed,
-                    })
-            );
+            let after = monhop_core::clicks::capture_clock();
+            match consumer.try_pop().unwrap() {
+                Some(CaptureEvent::Button {
+                    button: MouseButton::Middle,
+                    pressed: queued,
+                    at,
+                }) => {
+                    assert_eq!(queued, pressed);
+                    assert!(
+                        (before..=after).contains(&at),
+                        "stamped as the event-tap callback received it"
+                    );
+                }
+                _ => panic!("expected the middle button"),
+            }
         }
     }
 

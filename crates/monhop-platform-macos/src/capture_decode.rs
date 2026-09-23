@@ -1,11 +1,11 @@
-//! Pure Quartz event decoding for explicit macOS capture.
+//! Quartz event decoding for explicit macOS capture, pure but for a button's capture-clock stamp.
 //!
 //! This module does not touch Core Graphics. The owned capture thread supplies copied fields from
 //! its event-tap callback, which keeps the policy testable on non-macOS hosts.
 
 use monhop_core::{
     HidUsage, LogicalRect, ModifierState, MouseButton, Point, TakeBackGate, capture::CaptureEvent,
-    capture_physical::LocalTransfer,
+    capture_physical::LocalTransfer, clicks::capture_clock,
 };
 
 use crate::{MacVirtualKey, mac_modifier_flags_from_held_keys, mac_virtual_key_to_hid};
@@ -38,9 +38,6 @@ pub const CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
 pub const CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
 /// Core Graphics `kCGEventOtherMouseDragged`.
 pub const CG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
-
-/// Core Graphics `kCGMouseEventClickState`, the count macOS apps read to recognize a multi-click.
-pub const CG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
 
 /// Core Graphics `kCGEventSourceStateHIDSystemState`.
 pub const CG_EVENT_SOURCE_STATE_HID_SYSTEM: i64 = 1;
@@ -118,13 +115,9 @@ impl ActiveDisplayBounds {
 
     /// Uses the same half-open desktop convention as the topology and Core Graphics display bounds.
     pub fn contains(&self, point: Point) -> bool {
-        point.is_finite()
-            && self.rectangles.iter().any(|rectangle| {
-                point.x >= rectangle.origin.x
-                    && point.x < rectangle.origin.x + rectangle.size.width
-                    && point.y >= rectangle.origin.y
-                    && point.y < rectangle.origin.y + rectangle.size.height
-            })
+        self.rectangles
+            .iter()
+            .any(|rectangle| rectangle.contains_half_open(point))
     }
 }
 
@@ -417,8 +410,13 @@ pub fn decode_scroll(
     })
 }
 
+/// The event-tap callback's decode is where a button is stamped on the shared capture clock.
 fn button(button: MouseButton, pressed: bool) -> DecodedInput {
-    DecodedInput::Event(CaptureEvent::Button { button, pressed })
+    DecodedInput::Event(CaptureEvent::Button {
+        button,
+        pressed,
+        at: capture_clock(),
+    })
 }
 
 fn mouse_button(button_number: i64, pressed: bool) -> DecodedInput {

@@ -13,7 +13,7 @@ use crate::capture_decode::{
     CG_EVENT_LEFT_MOUSE_DRAGGED, CG_EVENT_LEFT_MOUSE_UP, CG_EVENT_MOUSE_MOVED,
     CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_DRAGGED, CG_EVENT_OTHER_MOUSE_UP,
     CG_EVENT_RIGHT_MOUSE_DOWN, CG_EVENT_RIGHT_MOUSE_DRAGGED, CG_EVENT_RIGHT_MOUSE_UP,
-    CG_EVENT_SCROLL_WHEEL, CG_MOUSE_EVENT_CLICK_STATE,
+    CG_EVENT_SCROLL_WHEEL,
 };
 use crate::event_tap::{
     CFAllocatorRef, CFRelease, CFRunLoopGetCurrent, CFRunLoopRef, CFStringRef,
@@ -69,6 +69,8 @@ struct CGRect {
 const CG_ERROR_SUCCESS: CGError = 0;
 const CG_SCROLL_EVENT_UNIT_PIXEL: CGScrollEventUnit = 0;
 const CG_MOUSE_EVENT_BUTTON_NUMBER: CGEventField = 3;
+/// Core Graphics `kCGMouseEventClickState`, the count macOS apps read to recognize a multi-click.
+const CG_MOUSE_EVENT_CLICK_STATE: CGEventField = 1;
 
 // SAFETY: These declarations match the documented Core Graphics and
 // ApplicationServices C interfaces and are called only from macOS builds.

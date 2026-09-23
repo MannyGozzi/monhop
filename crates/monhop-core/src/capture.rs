@@ -106,7 +106,8 @@ impl fmt::Debug for InjectionPermit {
 ///
 /// `RelativeMotion` is expressed in unscaled raw-input counts. `AbsoluteMotion` is expressed in
 /// physical virtual-desktop pixels. The two coordinate systems are never converted here.
-/// `Scroll` is expressed in Windows wheel units, where one detent is 120 units.
+/// `Scroll` is expressed in Windows wheel units, where one detent is 120 units. A `Button` is
+/// stamped `at` [`crate::clicks::capture_clock`] when the capture thread received it.
 ///
 /// The `Logical*` variants preserve macOS Quartz logical desktop points. `LogicalScroll` is
 /// normalized to logical points by the macOS adapter: continuous point deltas pass through and
@@ -123,6 +124,7 @@ pub enum CaptureEvent {
     Button {
         button: MouseButton,
         pressed: bool,
+        at: Duration,
     },
     AbsoluteMotion {
         x: i32,
@@ -580,9 +582,13 @@ impl From<CaptureEvent> for EncodedEvent {
                 payload: 0,
                 revision: 0,
             },
-            CaptureEvent::Button { button, pressed } => Self {
+            CaptureEvent::Button {
+                button,
+                pressed,
+                at,
+            } => Self {
                 header: EVENT_BUTTON | ((button.index() as u64) << 8) | (u64::from(pressed) << 11),
-                payload: 0,
+                payload: u64::try_from(at.as_nanos()).unwrap_or(u64::MAX),
                 revision: 0,
             },
             CaptureEvent::AbsoluteMotion { x, y } => Self {
@@ -654,6 +660,7 @@ impl CapturedEvent {
             EVENT_BUTTON => CaptureEvent::Button {
                 button: MouseButton::from_index(((header >> 8) & 0x07) as usize)?,
                 pressed: header & (1 << 11) != 0,
+                at: Duration::from_nanos(payload),
             },
             EVENT_ABSOLUTE_MOTION => {
                 let (x, y) = unpack_i32_pair(payload);
@@ -837,6 +844,28 @@ mod tests {
         producer.try_push(key(true)).unwrap();
         producer.try_push(key(false)).unwrap();
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_button_keeps_its_capture_time_through_the_ring() {
+        let (mut producer, mut consumer) = capture_channel(CaptureStop::new());
+        for button in [MouseButton::Left, MouseButton::Forward] {
+            for at in [
+                Duration::ZERO,
+                Duration::from_nanos(1),
+                Duration::from_secs(86_400 * 365),
+            ] {
+                for pressed in [true, false] {
+                    let event = CaptureEvent::Button {
+                        button,
+                        pressed,
+                        at,
+                    };
+                    producer.try_push(event).unwrap();
+                    assert!(consumer.try_pop().unwrap() == Some(event));
+                }
+            }
+        }
     }
 
     #[test]
