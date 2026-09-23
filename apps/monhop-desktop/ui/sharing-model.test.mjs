@@ -33,7 +33,6 @@ import {
   normalizeDisplayNotice,
   normalizeSharingView,
   normalizeStoredLayout,
-  placeArrangement,
   resetArrangement,
   sameSharingView,
   setDisplayInUse,
@@ -428,7 +427,13 @@ test("a crossing on the local computer's own native seam is rejected too", () =>
   };
   const layout = {
     crossings: [
-      { id: "one", fromDisplay: macBottom.id, fromEdge: "top", toDisplay: peerId, toEdge: "bottom" },
+      {
+        id: "one",
+        fromDisplay: macBottom.id,
+        fromEdge: "top",
+        toDisplay: peerId,
+        toEdge: "bottom",
+      },
     ],
   };
   const blocked = validateLayout(connected({ localDisplays: [macTop, macBottom] }), layout);
@@ -602,10 +607,9 @@ test("stored layouts carry their arrangement only when it is well-formed", () =>
     { display: peerId, x: 0, y: 0 },
     { display: localId, x: 1512, y: 0.5 },
   ];
-  assert.deepEqual(
-    normalizeStoredLayout({ ...layout, arrangement: { positions } }).arrangement,
-    { positions },
-  );
+  assert.deepEqual(normalizeStoredLayout({ ...layout, arrangement: { positions } }).arrangement, {
+    positions,
+  });
   assert.deepEqual(
     normalizeStoredLayout({ ...layout, arrangement: { positions, hidden: ["7"] } }).arrangement,
     { positions, hidden: ["7"] },
@@ -966,6 +970,6 @@ test("no input-computer or source wording remains in this model", async () => {
   const source = await readFile(new URL("sharing-model.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(
     source,
-    new RegExp(["source" + "Side", "sharing" + "Role", "choose" + "Source", "input" + "Source"].join("|")),
+    new RegExp(["source[S]ide", "sharing[R]ole", "choose[S]ource", "input[S]ource"].join("|")),
   );
 });

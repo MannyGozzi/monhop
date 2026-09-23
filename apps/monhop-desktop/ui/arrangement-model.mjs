@@ -426,12 +426,13 @@ function touchesAcross(axis, a, b, shift) {
     : Math.min(right(a), right(moved)) - Math.max(a.x, moved.x) > EPSILON;
 }
 
+const isAcceptable = (geometry) => geometry.valid && geometry.connected;
+
 // A drop only commits where it is legal: the two computers' blocks must actually touch.
 export function resolvePlacement(groups, placement, moving) {
   if (!isPlacement(groups, placement)) return null;
   const geometry = arrangementGeometry(groups, placement);
-  const acceptable = (g) => g.valid && g.connected;
-  if (acceptable(geometry)) return placement;
+  if (isAcceptable(geometry)) return placement;
   const ids = new Set(movingIds(groups, moving));
   if (!ids.size) return null;
   const all = tiles(groups, placement);
@@ -456,7 +457,7 @@ export function resolvePlacement(groups, placement, moving) {
     .map((delta) => ({ delta, placement: movePlacement(groups, placement, moving, delta) }))
     .filter(
       (c) =>
-        isPlacement(groups, c.placement) && acceptable(arrangementGeometry(groups, c.placement)),
+        isPlacement(groups, c.placement) && isAcceptable(arrangementGeometry(groups, c.placement)),
     );
   if (!eligible.length) return null;
   eligible.sort((a, b) => Math.hypot(...a.delta) - Math.hypot(...b.delta));

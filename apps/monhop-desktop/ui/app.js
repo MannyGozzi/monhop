@@ -333,11 +333,13 @@ function goToPage(nextPage, after) {
   pageTransition?.skipTransition();
   const transition = document.startViewTransition(commit);
   pageTransition = transition;
-  void transition.finished.catch(() => {}).finally(() => {
-    if (pageTransition !== transition) return;
-    pageTransition = null;
-    finish();
-  });
+  void transition.finished
+    .catch(() => {})
+    .finally(() => {
+      if (pageTransition !== transition) return;
+      pageTransition = null;
+      finish();
+    });
 }
 
 function onPageEntered(nextPage) {
@@ -673,7 +675,8 @@ function renderPageVisibility() {
 function applySharedTransitionNames() {
   for (const node of document.querySelectorAll("[data-shared-transition]")) {
     const pageNode = node.closest(".app-page");
-    node.style.viewTransitionName = pageNode && !pageNode.hidden ? node.dataset.sharedTransition : "none";
+    node.style.viewTransitionName =
+      pageNode && !pageNode.hidden ? node.dataset.sharedTransition : "none";
   }
 }
 
@@ -696,7 +699,12 @@ function renderSections(ctx) {
     const wasPresented = section.dataset.presented === "true";
     section.dataset.collapsed = String(collapsed);
     section.dataset.presented = "true";
-    updateSectionBody(section, body, { collapsed, locked: gate.locked, wasCollapsed, wasPresented });
+    updateSectionBody(section, body, {
+      collapsed,
+      locked: gate.locked,
+      wasCollapsed,
+      wasPresented,
+    });
     const toggle = section.querySelector(".section-toggle");
     const chevron = section.querySelector(".section-chevron");
     toggle.hidden = gate.locked || !gate.done;
@@ -1310,7 +1318,9 @@ async function setControl(fingerprint, direction, allowed) {
 async function applySetup() {
   const layout = layoutForSave(sharing);
   if (!core?.invoke || !layout || !canApplySetup(sharing)) return;
-  await runSharing("apply", () => core.invoke("sharing_apply_setup", { revision: sharing.view.revision, layout }));
+  await runSharing("apply", () =>
+    core.invoke("sharing_apply_setup", { revision: sharing.view.revision, layout }),
+  );
   await loadComputers();
 }
 

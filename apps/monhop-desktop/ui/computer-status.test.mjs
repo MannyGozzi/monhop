@@ -89,7 +89,12 @@ test("one_direction_copy_names_controller_and_controlled", () => {
 
 test("no_input_source_wording", async () => {
   const { readFile } = await import("node:fs/promises");
-  const files = ["computer-status.mjs", "computer-card.mjs", "screen-home.mjs", "screen-displays.mjs"];
+  const files = [
+    "computer-status.mjs",
+    "computer-card.mjs",
+    "screen-home.mjs",
+    "screen-displays.mjs",
+  ];
   const sources = await Promise.all(
     files.map((file) => readFile(new URL(file, import.meta.url), "utf8")),
   );
@@ -97,7 +102,13 @@ test("no_input_source_wording", async () => {
     assert.doesNotMatch(
       source,
       new RegExp(
-        ["input computer", "keyboard computer", "input source", "source" + "Side", "sharing" + "Role"].join("|"),
+        [
+          "input computer",
+          "keyboard computer",
+          "input source",
+          "source[S]ide",
+          "sharing[R]ole",
+        ].join("|"),
         "i",
       ),
       files[index],

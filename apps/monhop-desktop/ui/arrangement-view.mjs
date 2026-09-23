@@ -56,8 +56,12 @@ function emptyPreview() {
 }
 
 export function createArrangementView(options) {
-  const { localPlatform, peerPlatform, localLabel: localOverride, peerLabel: peerOverride } =
-    options;
+  const {
+    localPlatform,
+    peerPlatform,
+    localLabel: localOverride,
+    peerLabel: peerOverride,
+  } = options;
   let arrangement = options.arrangement;
   let shared = Array.isArray(options.shared) ? options.shared : [];
   let inUse = useChoices(options.inUse);
@@ -526,8 +530,7 @@ export function createArrangementView(options) {
     replaceLayer("guideLayer", createGuideLayer(dedupeGuides(guides), stageSize));
     replaceLayer("previewLayer", layer);
     stage.dataset.drop = candidate ? "valid" : "none";
-    if (!candidate)
-      announce("No touching position here. Release to keep the current arrangement.");
+    if (!candidate) announce("No touching position here. Release to keep the current arrangement.");
     else announce(`Drop here. ${describeArrangement(geometry)}`);
   }
 
@@ -614,8 +617,7 @@ export function createArrangementView(options) {
     if (!current) return;
     if (!current.moved || !current.resolved) {
       renderScene();
-      if (current.moved)
-        announce("No touching position there, so the arrangement is unchanged.");
+      if (current.moved) announce("No touching position there, so the arrangement is unchanged.");
       return;
     }
     refitNext = true;

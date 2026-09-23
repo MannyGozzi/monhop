@@ -154,7 +154,8 @@ export function createDashboardArrangement(setup, names = {}) {
   const arrangement = savedDashboardArrangement(setup);
   const root = document.createElement("figure");
   root.className = "dashboard-arrangement-preview";
-  if (typeof names.transitionName === "string") root.dataset.sharedTransition = names.transitionName;
+  if (typeof names.transitionName === "string")
+    root.dataset.sharedTransition = names.transitionName;
   root.dataset.state = arrangement.available ? "saved" : "unavailable";
   if (names.compact) root.dataset.size = "compact";
   if (names.compactLegend) root.dataset.size = "home";
@@ -237,11 +238,12 @@ export function createDashboardArrangement(setup, names = {}) {
     ...(seamCount ? [{ kind: "seam", label: "Pointer crossing" }] : []),
   ];
   const legend = names.compact ? null : createLegend(legendItems);
-  const captionText = names.hideCaption && !arrangement.noCrossingYet
-    ? ""
-    : names.caption && !arrangement.noCrossingYet
-      ? names.caption
-      : dashboardCaption(arrangement);
+  const captionText =
+    names.hideCaption && !arrangement.noCrossingYet
+      ? ""
+      : names.caption && !arrangement.noCrossingYet
+        ? names.caption
+        : dashboardCaption(arrangement);
   const caption = captionText ? document.createElement("figcaption") : null;
   if (caption) caption.textContent = captionText;
   root.append(svg, ...(legend ? [legend] : []), ...(caption ? [caption] : []));

@@ -381,7 +381,10 @@ const shared = () => {
   const key = "10ac-4123-0000abcd";
   return {
     key,
-    local: [monitor("1", 0, 0, 200, 100, true), { ...monitor("2", 200, 0, 100, 100), monitor: key }],
+    local: [
+      monitor("1", 0, 0, 200, 100, true),
+      { ...monitor("2", 200, 0, 100, 100), monitor: key },
+    ],
     peer: [monitor("3", 0, 0, 100, 100, true), { ...monitor("4", 100, 0, 100, 100), monitor: key }],
   };
 };
@@ -465,10 +468,9 @@ test("a stored layout lists what it left out, and an older one shows the copy it
   assert.deepEqual(hiddenFromLayout({ links: [link("1", "3")] }, local, peer), ["4"]);
   assert.deepEqual(hiddenFromLayout({ links: [link("2", "4")] }, local, peer), ["4"]);
   // An unrelated field on the layout object is simply ignored.
-  assert.deepEqual(
-    hiddenFromLayout({ extra: "ignored", links: [link("1", "3")] }, local, peer),
-    ["4"],
-  );
+  assert.deepEqual(hiddenFromLayout({ extra: "ignored", links: [link("1", "3")] }, local, peer), [
+    "4",
+  ]);
   assert.deepEqual(layoutArrangement({ positions: { 1: [0, 0] } }, ["4", "2"]), {
     positions: [{ display: "1", x: 0, y: 0 }],
     hidden: ["2", "4"],

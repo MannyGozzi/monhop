@@ -75,7 +75,9 @@ export function computerCard(
                     ? pending
                       ? "Saving…"
                       : "Enter to save · Esc to cancel"
-                    : [platformLabel(computer.platform), computer.address].filter(Boolean).join(" · "),
+                    : [platformLabel(computer.platform), computer.address]
+                        .filter(Boolean)
+                        .join(" · "),
                 }),
               ],
             }),
@@ -162,7 +164,11 @@ function sharingPill(ctx, fingerprint, name, inUse) {
         children: [
           el("span", { text: "Start sharing", dataset: { current: String(!inUse) } }),
           el("span", { text: "Sharing", dataset: { current: String(inUse) } }),
-          el("span", { className: "sharing-pill-pause", text: "Pause", attrs: { "aria-hidden": "true" } }),
+          el("span", {
+            className: "sharing-pill-pause",
+            text: "Pause",
+            attrs: { "aria-hidden": "true" },
+          }),
         ],
       }),
       el("span", { className: "sharing-pill-spinner", attrs: { "aria-hidden": "true" } }),
@@ -294,16 +300,16 @@ function localName(ctx) {
 function controlSwitches(ctx, computer, peerName, local) {
   const { actions, sharing } = ctx;
   const syncing = sharing.pending?.kind === "control" || sharing.view?.control?.syncing === true;
-  const rows = controlSwitchRows(sharing.view?.control, local, peerName, syncing);
+  const controls = controlSwitchRows(sharing.view?.control, local, peerName, syncing);
   return el("div", {
     className: "control-switches",
-    children: rows.map((row) =>
-      switchRow(row.label, {
-        description: row.hint,
-        checked: row.checked,
-        disabled: row.disabled,
-        focusKey: `control-${computer.fingerprint}-${row.direction}`,
-        onChange: (checked) => actions.setControl(computer.fingerprint, row.direction, checked),
+    children: controls.map((control) =>
+      switchRow(control.label, {
+        description: control.hint,
+        checked: control.checked,
+        disabled: control.disabled,
+        focusKey: `control-${computer.fingerprint}-${control.direction}`,
+        onChange: (checked) => actions.setControl(computer.fingerprint, control.direction, checked),
       }),
     ),
   });

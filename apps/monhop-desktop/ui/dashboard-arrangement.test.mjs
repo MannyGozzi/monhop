@@ -122,10 +122,13 @@ test("saved positions are drawn where they were applied, and a stale save falls 
   };
   const result = savedDashboardArrangement(value);
   assert.equal(result.available, true);
-  assert.deepEqual(result.tiles.map((tile) => [tile.id, tile.x, tile.y]), [
-    ["1", 0, 0],
-    ["2", 100, 0],
-  ]);
+  assert.deepEqual(
+    result.tiles.map((tile) => [tile.id, tile.x, tile.y]),
+    [
+      ["1", 0, 0],
+      ["2", 100, 0],
+    ],
+  );
   assert.equal(result.seams.length, 1);
 
   // A position naming a display that no longer exists cannot cover every connected display, so the
@@ -134,10 +137,13 @@ test("saved positions are drawn where they were applied, and a stale save falls 
   stale.previewLayout.arrangement.positions.push({ display: "9", x: 0, y: 300 });
   const fallback = savedDashboardArrangement(stale);
   assert.equal(fallback.available, true);
-  assert.deepEqual(fallback.tiles.map((tile) => [tile.id, tile.x, tile.y]), [
-    ["1", 0, 0],
-    ["2", 100, 0],
-  ]);
+  assert.deepEqual(
+    fallback.tiles.map((tile) => [tile.id, tile.x, tile.y]),
+    [
+      ["1", 0, 0],
+      ["2", 100, 0],
+    ],
+  );
 });
 
 test("missing, stale, or malformed saved details get an honest unavailable preview", () => {
@@ -157,7 +163,10 @@ test("missing, stale, or malformed saved details get an honest unavailable previ
     {
       ...valid,
       previewLayout: {
-        links: [{ ...valid.previewLayout.links[0], fromDisplay: "9" }, valid.previewLayout.links[1]],
+        links: [
+          { ...valid.previewLayout.links[0], fromDisplay: "9" },
+          valid.previewLayout.links[1],
+        ],
       },
     },
     { ...valid, peerDisplays: [{ ...valid.peerDisplays[0], id: "1" }] },

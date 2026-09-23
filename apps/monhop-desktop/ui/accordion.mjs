@@ -1,4 +1,6 @@
 import { icon } from "./icons.mjs";
+
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 let sequence = 0;
 
 // Fired on the accordion element when the user toggles it, never when a render reopens it.
@@ -6,14 +8,18 @@ export const ACCORDION_TOGGLE = "accordion-toggle";
 
 class AccordionManager {
   constructor() {
+    this.animations = new Map();
     this.handleClick = this.handleClick.bind(this);
+    this.handleMotionChange = this.handleMotionChange.bind(this);
     document.addEventListener("click", this.handleClick);
+    reducedMotion.addEventListener("change", this.handleMotionChange);
   }
 
   mount(root = document) {
+    this.disposeDetached();
     for (const accordion of root.querySelectorAll("[data-accordion]")) {
       const open = accordion.dataset.open === "true";
-      this.setOpen(accordion, open);
+      this.setOpen(accordion, open, { instant: true });
     }
   }
 
@@ -21,12 +27,24 @@ class AccordionManager {
     return accordion?.dataset.open === "true";
   }
 
-  setOpen(accordion, open) {
+  setOpen(accordion, open, { instant = false } = {}) {
     const parts = accordionParts(accordion);
     if (!parts) return;
     const { trigger, content } = parts;
     const target = open === true;
-    if (this.isOpen(accordion) === target && content.hidden === !target) return;
+    const running = this.animations.get(accordion);
+    if (!running && this.isOpen(accordion) === target && content.hidden === !target) return;
+
+    // A press mid-animation reverses from the current height instead of jumping to an end.
+    const start = running
+      ? content.getBoundingClientRect().height
+      : target
+        ? 0
+        : content.getBoundingClientRect().height;
+    if (running) {
+      running.animation.cancel();
+      this.animations.delete(accordion);
+    }
 
     accordion.dataset.open = String(target);
     trigger.setAttribute("aria-expanded", String(target));
@@ -38,6 +56,44 @@ class AccordionManager {
       content.inert = true;
     }
 
+    if (instant || reducedMotion.matches || typeof content.animate !== "function") {
+      this.finish(accordion, target);
+      return;
+    }
+
+    content.style.height = `${Math.max(0, start)}px`;
+    const end = target ? content.scrollHeight : 0;
+    if (start === end) {
+      this.finish(accordion, target);
+      return;
+    }
+    const { duration, easing } = panelMotion();
+    const animation = content.animate(
+      { height: [`${Math.max(0, start)}px`, `${end}px`] },
+      { duration, easing, fill: "both" },
+    );
+    this.animations.set(accordion, { animation, target });
+    animation.onfinish = () => {
+      if (this.animations.get(accordion)?.animation !== animation) return;
+      this.animations.delete(accordion);
+      this.finish(accordion, target);
+      animation.cancel();
+    };
+  }
+
+  disposeDetached() {
+    for (const [accordion, { animation }] of this.animations) {
+      if (accordion.isConnected) continue;
+      animation.cancel();
+      this.animations.delete(accordion);
+    }
+  }
+
+  finish(accordion, open) {
+    const parts = accordionParts(accordion);
+    if (!parts) return;
+    const { content } = parts;
+    content.style.height = "";
     content.hidden = !open;
     content.inert = !open;
   }
@@ -54,6 +110,22 @@ class AccordionManager {
     accordion.dispatchEvent(new CustomEvent(ACCORDION_TOGGLE, { detail: { open } }));
   }
 
+  handleMotionChange() {
+    for (const [accordion, { animation, target }] of this.animations) {
+      animation.cancel();
+      this.animations.delete(accordion);
+      this.finish(accordion, target);
+    }
+  }
+}
+
+// Height is the one layout property animated: a small panel, so content below glides instead of jumping.
+function panelMotion() {
+  const tokens = getComputedStyle(document.documentElement);
+  return {
+    duration: Number.parseFloat(tokens.getPropertyValue("--duration-standard")) || 0,
+    easing: tokens.getPropertyValue("--ease-disclosure").trim() || "ease-out",
+  };
 }
 
 export function createAccordion(key, className, label, ...children) {

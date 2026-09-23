@@ -166,7 +166,12 @@ test("renders_both_switches_on_by_default", () => {
   assert.equal(rows[1].label, "Office Windows PC can control This Mac");
   // A record with both directions on reads exactly like no record at all.
   assert.deepEqual(
-    controlSwitchRows({ localToPeer: true, peerToLocal: true }, "This Mac", "Office Windows PC", false),
+    controlSwitchRows(
+      { localToPeer: true, peerToLocal: true },
+      "This Mac",
+      "Office Windows PC",
+      false,
+    ),
     rows,
   );
 });

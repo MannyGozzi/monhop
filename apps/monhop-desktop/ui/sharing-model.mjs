@@ -449,7 +449,9 @@ export function canResetArrangement(state) {
   const target = arrangementResetTarget(state);
   if (!target) return false;
   const current = arrangementForSharing(state).placement;
-  return !(samePlacement(target.placement, current) && sameIds(target.hidden, hiddenDisplayIds(state)));
+  return !(
+    samePlacement(target.placement, current) && sameIds(target.hidden, hiddenDisplayIds(state))
+  );
 }
 
 // Reset takes the whole applied picture back: placement and hidden copies.
@@ -585,7 +587,10 @@ export function layoutSignature(layout) {
     )
     .toSorted();
   const arrangement = layout.arrangement
-    ? [layout.arrangement.positions.map((p) => [p.display, p.x, p.y]), layout.arrangement.hidden ?? []]
+    ? [
+        layout.arrangement.positions.map((p) => [p.display, p.x, p.y]),
+        layout.arrangement.hidden ?? [],
+      ]
     : null;
   return JSON.stringify([links, arrangement]);
 }
