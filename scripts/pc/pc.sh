@@ -68,6 +68,8 @@ $ErrorActionPreference = 'Continue'
 "building $(git rev-parse --short=9 HEAD)"
 cargo build --workspace --release --locked 2>&1 | Where-Object { "$_" -notmatch '^\s*(Compiling|Downloaded|Downloading)' } | ForEach-Object { "$_" }
 if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+# cargo's progress on stderr marks the pipeline failed in PowerShell 5.1, so success is stated explicitly.
+exit 0
 EOF
     ;;
   install)
