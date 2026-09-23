@@ -1,5 +1,6 @@
 // Small DOM helpers and the shared component vocabulary (button, badge, card, row, icon button with tooltip).
 import { icon } from "./icons.mjs";
+import { usableEasing } from "./motion-model.mjs";
 
 export { icon };
 
@@ -251,8 +252,17 @@ export function motionMs(name) {
   return Number.parseFloat(motionToken(name)) || 0;
 }
 
+const easings = new Map();
+const parsesAsEasing = (value) => CSS.supports("transition-timing-function", value);
+
+// Every Web Animations easing comes through here: an easing token the engine cannot parse falls
+// back to --ease-out, where animate() would throw.
 export function motionEase(name = "--ease-out") {
-  return motionToken(name) || "ease-out";
+  if (easings.has(name)) return easings.get(name);
+  const tokens = [motionToken(name), motionToken("--ease-out")];
+  const easing = usableEasing(tokens, parsesAsEasing);
+  if (tokens[0]) easings.set(name, easing);
+  return easing;
 }
 
 // Motion helpers. Each keyed slot remembers what it showed and when that last changed, so a
@@ -270,8 +280,29 @@ const EXIT_FRAMES = [
   { opacity: 0, transform: "translateY(-2px) scale(.97)" },
 ];
 
-function motionEnabled() {
-  return !matchMedia("(prefers-reduced-motion: reduce)").matches && !document.hidden;
+// The one reduced-motion query all UI motion reads.
+export const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+// UI motion runs only when it is wanted and on screen.
+export function motionEnabled() {
+  return !reducedMotion.matches && !document.hidden;
+}
+
+// Where each container that turned inert sent the focus it held, so focus never drops to <body>.
+const focusHandoffs = new WeakMap();
+
+// Call before `container` turns inert: focus inside moves to `target` now, and a render that finds
+// its old focus inside later sends it there too.
+export function handOffFocus(container, target) {
+  focusHandoffs.set(container, target);
+  if (container.contains(document.activeElement)) target?.focus({ preventScroll: true });
+}
+
+// Where focus a render saw on `node` belongs once an inert container around it handed it off.
+export function handedOffFocus(node) {
+  for (let at = node.closest("[inert]"); at; at = at.parentElement?.closest("[inert]") ?? null)
+    if (focusHandoffs.has(at)) return focusHandoffs.get(at);
+  return null;
 }
 
 // Plays `keyframes` as if they started `elapsed` ms ago, so a re-render continues the motion
@@ -284,7 +315,7 @@ function play(node, keyframes, duration, elapsed, after) {
 }
 
 // A finished fill-both animation is cancelled so it stops counting as running.
-async function settle(animation, after) {
+export async function settle(animation, after) {
   try {
     await animation.finished;
   } catch {
@@ -332,10 +363,9 @@ export function swap(key, node, signature, { block = false } = {}) {
   return wrapper;
 }
 
-// How long ago a keyed value last changed, for a node the next render rebuilds from scratch: a CSS
-// animation started with this as a negative delay continues where it was instead of replaying.
-// Infinity means nothing to play — motion is off, or the value has been settled for a while.
-export function sinceChanged(key, signature) {
+// How long ago a keyed value last changed (Infinity before any change), for a node the next render
+// rebuilds from scratch: a CSS animation delayed by minus this continues instead of replaying.
+export function changedAgo(key, signature) {
   const now = performance.now();
   const entry = motionMemory.get(key) ?? { signature, changedAt: -Infinity };
   if (entry.signature !== signature) {
@@ -343,7 +373,13 @@ export function sinceChanged(key, signature) {
     entry.changedAt = now;
   }
   motionMemory.set(key, entry);
-  return motionEnabled() ? now - entry.changedAt : Infinity;
+  return now - entry.changedAt;
+}
+
+// changedAgo, or Infinity when motion is off, meaning nothing to play.
+export function sinceChanged(key, signature) {
+  const elapsed = changedAgo(key, signature);
+  return motionEnabled() ? elapsed : Infinity;
 }
 
 // Presence changes only fade and translate the visible content. Layout remains synchronous.

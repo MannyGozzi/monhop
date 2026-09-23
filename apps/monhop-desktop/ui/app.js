@@ -65,8 +65,8 @@ import {
   accordionManager,
   glideMove,
   glideResize,
-  retargetPanel,
   setPanelOpen,
+  setRevealOpen,
 } from "./accordion.mjs";
 import {
   canOpenPairingOnEntry,
@@ -98,7 +98,17 @@ import {
   initialDimming,
 } from "./dimming-model.mjs";
 import { setupSectionGates, shouldShowPairing } from "./setup-presentation.mjs";
-import { clear, el, icon, iconButton, nativeError, setLabel } from "./dom.mjs";
+import { setSlotPresent } from "./header-motion.mjs";
+import {
+  clear,
+  el,
+  handedOffFocus,
+  icon,
+  iconButton,
+  nativeError,
+  reducedMotion,
+  setLabel,
+} from "./dom.mjs";
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
 import { normalizeAutostartView } from "./autostart-model.mjs";
 import { renderReady } from "./screen-ready.mjs";
@@ -110,7 +120,6 @@ import { renderSettings } from "./screen-settings.mjs";
 const core = window.__TAURI__?.core;
 const nativeWindow = window.__TAURI__?.window;
 const uiCheck = window.__MONHOP_UI_CHECK__ === true;
-const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const nativePlatform = window.__MONHOP_PLATFORM__ ?? document.documentElement.dataset.platform;
 const platform = ["macos", "windows"].includes(nativePlatform) ? nativePlatform : "other";
 document.documentElement.dataset.platform = platform;
@@ -197,7 +206,8 @@ const nodes = {
   pageLinks: [...document.querySelectorAll("[data-page]")],
   nativeState: document.querySelector("#native-state"),
   headerConnection: document.querySelector("#header-connection"),
-  headerActions: document.querySelector("#header-actions"),
+  headerRefresh: document.querySelector("#header-refresh"),
+  headerButtons: document.querySelector("#header-buttons"),
   primaryNav: document.querySelector("#primary-nav"),
   setupVerdict: document.querySelector("#setup-verdict"),
   setupDetail: document.querySelector("#setup-detail"),
@@ -220,6 +230,7 @@ const nodes = {
   settingsContent: document.querySelector("#settings-content"),
   pageTitle: document.querySelector("#page-title"),
   pageAlert: document.querySelector("#page-alert"),
+  pageAlertPanel: document.querySelector("#page-alert-panel"),
 };
 
 for (const button of nodes.pageLinks)
@@ -404,20 +415,10 @@ function captureInteraction() {
           end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
         }
       : null;
-  const disclosures = [...document.querySelectorAll("[data-accordion][data-disclosure]")]
-    .filter((node) => accordionManager.isOpen(node))
-    .map((node) => node.dataset.disclosure);
-  return { scrollTop: content?.scrollTop ?? 0, focused, disclosures };
+  return { scrollTop: content?.scrollTop ?? 0, focused };
 }
 
 function restoreInteraction(interaction) {
-  for (const key of interaction.disclosures) {
-    const disclosure = [...document.querySelectorAll("[data-accordion][data-disclosure]")].find(
-      (node) => node.dataset.disclosure === key,
-    );
-    if (disclosure && !accordionManager.isOpen(disclosure))
-      accordionManager.setOpen(disclosure, true, { instant: true });
-  }
   const content = document.querySelector(".content-region");
   if (content) content.scrollTop = interaction.scrollTop;
   if (!interaction.focused) return;
@@ -426,10 +427,17 @@ function restoreInteraction(interaction) {
     : [...document.querySelectorAll("[data-focus-key]")].find(
         (node) => node.dataset.focusKey === interaction.focused.focusKey,
       );
-  // A control inside a section that locked itself cannot take focus back.
-  if (!focused || focused.disabled || focused.closest("[inert]")) return;
-  focused.focus({ preventScroll: true });
-  if (interaction.focused.start !== null && typeof focused.setSelectionRange === "function")
+  // A control inside a section that locked itself cannot take focus back; one inside a block that
+  // closed goes where that block handed its focus.
+  if (!focused || focused.disabled) return;
+  const target = focused.closest("[inert]") ? handedOffFocus(focused) : focused;
+  if (!target) return;
+  target.focus({ preventScroll: true });
+  if (
+    target === focused &&
+    interaction.focused.start !== null &&
+    typeof focused.setSelectionRange === "function"
+  )
     focused.setSelectionRange(interaction.focused.start, interaction.focused.end);
 }
 
@@ -593,7 +601,6 @@ function render() {
   renderSettings(nodes, ctx);
   applySharedTransitionNames();
   restoreInteraction(interaction);
-  for (const section of nodes.sections) retargetPanel(section.querySelector(".section-body"));
   pinPendingSection();
   if (previousArrangementView && previousArrangementView !== arrangementView)
     previousArrangementView.destroy();
@@ -602,21 +609,8 @@ function render() {
 
 function renderPageChrome(ctx) {
   renderPageVisibility();
-  clear(nodes.headerActions);
-  // Home's only page-level action lives in the window header, beside the connection status.
-  if (page === "home")
-    nodes.headerActions.append(
-      iconButton({
-        id: "computers-refresh",
-        label: "Check the paired computers again",
-        variant: "ghost",
-        size: "sm",
-        disabled: ctx.computersLoadPending,
-        busy: ctx.computersLoadPending,
-        onClick: loadComputers,
-      }),
-    );
-  nodes.headerActions.append(
+  clear(nodes.headerButtons);
+  nodes.headerButtons.append(
     iconButton({
       id: "settings-gear",
       label: "Settings",
@@ -639,9 +633,9 @@ function renderPageChrome(ctx) {
     themeToggle.dataset.changed = "true";
     themeChanged = false;
   }
-  nodes.headerActions.append(themeToggle);
+  nodes.headerButtons.append(themeToggle);
   if (ctx.core)
-    nodes.headerActions.append(
+    nodes.headerButtons.append(
       iconButton({
         id: "hide-to-tray",
         label: "Hide to the menu bar",
@@ -653,8 +647,8 @@ function renderPageChrome(ctx) {
     );
 }
 
-// The transition callback only flips page visibility and the named tab marker. Full page work
-// resumes after the compositor has captured both pages.
+// The transition callback only flips page visibility, the named tab marker and the header's page
+// action, which moves with the tab. Full page work resumes after the compositor has captured both pages.
 function renderPageVisibility() {
   nodes.pageTitle.textContent = `MonHop · ${PAGE_TITLES[page]}`;
   nodes.homeView.hidden = page !== "home";
@@ -666,7 +660,29 @@ function renderPageVisibility() {
     if (indicator)
       indicator.style.viewTransitionName = button.dataset.page === page ? "nav-active-tab" : "none";
   }
+  renderHeaderRefresh();
   applySharedTransitionNames();
+}
+
+// Home's only page action sits in the header beside the connection status. Its slot outlives
+// renders, so it pops in and out while the status pill glides aside.
+function renderHeaderRefresh() {
+  const home = page === "home";
+  if (home)
+    nodes.headerRefresh.replaceChildren(
+      iconButton({
+        id: "computers-refresh",
+        label: "Check the paired computers again",
+        variant: "ghost",
+        size: "sm",
+        disabled: computersLoadPending,
+        busy: computersLoadPending,
+        onClick: loadComputers,
+      }),
+    );
+  setSlotPresent(nodes.headerRefresh, home, [nodes.headerConnection], {
+    focusTarget: home ? null : pageFocusAnchor(),
+  });
 }
 
 function applySharedTransitionNames() {
@@ -756,6 +772,13 @@ function defaultSetupSection(gates) {
   return "displays";
 }
 
+// Where focus goes when the control holding it leaves the page: the header control of the page
+// on screen, already rebuilt for this render.
+function pageFocusAnchor() {
+  const link = nodes.pageLinks.find((button) => button.dataset.page === page);
+  return link ?? document.getElementById("settings-gear");
+}
+
 function renderPageAlert(ctx) {
   const stateMessages = errorMessages(state);
   const messages = [...stateMessages];
@@ -767,7 +790,11 @@ function renderPageAlert(ctx) {
   if (sharing.message && !displaysOnScreen) messages.push(sharing.message);
   if (computersLoadFailure) messages.push(computersLoadFailure);
   const unique = [...new Set(messages.filter(Boolean))];
-  nodes.pageAlert.hidden = unique.length === 0;
+  // A leaving alert keeps its last words and tone while it glides shut.
+  if (!unique.length) {
+    setRevealOpen(nodes.pageAlertPanel, false, { focusTarget: pageFocusAnchor() });
+    return;
+  }
   nodes.pageAlert.dataset.tone =
     stateMessages.length ||
     computersLoadFailure ||
@@ -804,6 +831,7 @@ function renderPageAlert(ctx) {
         },
       }),
     );
+  setRevealOpen(nodes.pageAlertPanel, true);
 }
 
 // ---------- snapshot / access / network ----------

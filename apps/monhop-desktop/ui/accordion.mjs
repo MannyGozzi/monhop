@@ -1,25 +1,51 @@
-import { motionEase, motionMs, motionToken } from "./dom.mjs";
-import { panelNeedsChange } from "./glide-model.mjs";
+import {
+  changedAgo,
+  handOffFocus,
+  motionEase,
+  motionEnabled,
+  motionMs,
+  motionToken,
+  reducedMotion,
+} from "./dom.mjs";
+import {
+  contentMove,
+  copyPlacement,
+  moved,
+  panelNeedsChange,
+  rebuiltDisclosure,
+  settledBox,
+} from "./glide-model.mjs";
 import { icon } from "./icons.mjs";
 
-const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 let sequence = 0;
 // The running glide of each element it moves; a new glide on that element replaces it from where it is.
 const glides = new Map();
+// Each disclosure key's last asked-for state and current panel. Renders rebuild disclosures, and the
+// fresh node starts from here, so it carries on a running glide instead of landing it.
+const disclosures = new Map();
+// Each watched panel content's last observed box. Content that changes size under a panel moves the
+// panel with it, whatever changed it, so no call site has to remember to.
+const contentBoxes = new WeakMap();
+const watched = new WeakSet();
+const contentObserver =
+  typeof ResizeObserver === "function" ? new ResizeObserver(followContent) : null;
+// Contents sitting out the observer for a frame, see benchAround.
+const benched = new Set();
+// Running chevron turns. A rebuilt chevron starts in its final state and detaching the old one
+// cancels its CSS transitions, so only a script animation can be carried over.
+const turns = new Set();
 reducedMotion.addEventListener("change", () => {
-  for (const [node, entry] of glides) {
-    stopGlide(node);
-    entry.settle?.();
-  }
+  for (const [node, entry] of glides) endGlide(node, entry.settle);
+  for (const turn of turns) turn.finish();
 });
 
 // Fired on the accordion element when the user toggles it, never when a render reopens it.
 export const ACCORDION_TOGGLE = "accordion-toggle";
 
-// Opens or closes a clipping panel by gliding its height between 0 and its content's (its one
-// child), which fades in step. Asking again for the state it has or is heading to does nothing, so a
-// re-render never restarts or cuts a glide; the other state reverses from what is on screen.
+// Glides a clipping panel's height to its one child's, or to 0, with the child fading in step. The
+// state it has or heads to is a no-op, so renders never restart a glide; the other reverses it.
 export function setPanelOpen(panel, open, { instant = false } = {}) {
+  watchContent(panel);
   const target = open === true;
   const running = glides.get(panel);
   const glidingTo = running ? running.target : null;
@@ -28,8 +54,7 @@ export function setPanelOpen(panel, open, { instant = false } = {}) {
     panel.hidden = !target;
   };
   if (instant || !canGlide(panel)) {
-    stopGlide(panel);
-    settle();
+    endGlide(panel, settle);
     return;
   }
   const from = running || !target ? panel.getBoundingClientRect().height : 0;
@@ -37,7 +62,7 @@ export function setPanelOpen(panel, open, { instant = false } = {}) {
   stopGlide(panel);
   panel.hidden = false;
   const to = target ? contentHeight(panel) : 0;
-  if (Math.abs(to - from) < 0.5) {
+  if (!moved(to, from)) {
     settle();
     return;
   }
@@ -45,17 +70,129 @@ export function setPanelOpen(panel, open, { instant = false } = {}) {
   glideHeight(panel, from, to, { target, fade, settle });
 }
 
-// Content that changed height under an opening glide moves where the glide lands, instead of the
-// panel snapping to it once the glide ends.
-export function retargetPanel(panel) {
-  const entry = glides.get(panel);
-  if (entry?.target !== true) return;
-  const to = contentHeight(panel);
-  if (Math.abs(to - entry.to) < 0.5) return;
+// A block that comes and goes in place: a disclosure without its trigger.
+export function revealPanel(content) {
+  const panel = document.createElement("div");
+  panel.className = "glide-panel";
+  panel.hidden = true;
+  panel.inert = true;
+  panel.append(content);
+  return panel;
+}
+
+// Shows or hides a reveal panel. On its way out it turns inert at once, so focus inside first moves
+// to `focusTarget`, as a closing disclosure hands it to its trigger.
+export function setRevealOpen(panel, open, { focusTarget = null } = {}) {
+  if (!open) handOffFocus(panel, focusTarget);
+  panel.inert = !open;
+  setPanelOpen(panel, open);
+}
+
+// Runs after layout and before paint, so a panel drawn at its old height glides from there. An
+// opening glide heads for the new height instead of snapping to it when it lands.
+function followContent(entries) {
+  const view = `${window.innerWidth}x${window.innerHeight}`;
+  // Deepest first: an inner panel that starts gliding benches the contents around it, whose entries
+  // in this same batch are then skipped instead of starting a redundant glide of their own.
+  const ordered = entries
+    .map((entry) => ({ entry, depth: depthOf(entry.target) }))
+    .toSorted((a, b) => b.depth - a.depth);
+  for (const { entry } of ordered) {
+    const { target: content, borderBoxSize, contentRect } = entry;
+    if (benched.has(content)) continue;
+    const panel = content.parentElement;
+    if (!panel || panel.hidden) {
+      contentBoxes.delete(content);
+      continue;
+    }
+    const size = borderBoxSize?.[0];
+    const next = {
+      width: size?.inlineSize ?? contentRect.width,
+      height: size?.blockSize ?? contentRect.height,
+      view,
+      nested: content.querySelector("[data-gliding]") !== null,
+    };
+    if (followBox(content, next) === "glide") benchAround(panel, view);
+  }
+}
+
+// Moves a watched content's panel for its new box and keeps that box for the next comparison.
+function followBox(content, next) {
+  const panel = content.parentElement;
+  const last = contentBoxes.get(content) ?? null;
+  contentBoxes.set(content, next);
+  const glide = glides.get(panel) ?? null;
+  const move = contentMove({ last, next, glide, motion: canGlide(panel) });
+  if (move === "retarget") retargetPanel(panel, glide, next.height);
+  else if (move === "glide") glideHeight(panel, last.height, next.height, { target: true });
+  return move;
+}
+
+function depthOf(node) {
+  let depth = 0;
+  for (let at = node.parentElement; at; at = at.parentElement) depth++;
+  return depth;
+}
+
+// A glide started in the callback holds its panel at the old height, so the watched contents around it
+// sit out the frame instead of raising a "ResizeObserver loop" error, and rejoin on the next.
+function benchAround(panel, view) {
+  for (let at = panel.parentElement; at; at = at.parentElement) {
+    if (!watched.has(at) || benched.has(at)) continue;
+    if (!benched.size) requestAnimationFrame(rejoinBench);
+    benched.add(at);
+    contentObserver.unobserve(at);
+    followBenched(at, view);
+  }
+}
+
+// Measured with the glides inside it held at their old heights, a benched content shows only a change
+// of its own, which glides now rather than being lost with its skipped entry.
+function followBenched(content, view) {
+  if (!content.parentElement || content.parentElement.hidden) return;
+  const { width, height } = content.getBoundingClientRect();
+  followBox(content, { width, height, view, nested: false });
+}
+
+function rejoinBench() {
+  for (const content of benched) if (watched.has(content)) contentObserver.observe(content);
+  benched.clear();
+}
+
+// A glide that ended inside watched contents may not resize them again, which leaves their stored
+// boxes marked mid glide; read them afresh so their next real change glides.
+function settleAround(node) {
+  for (let at = node.parentElement; at; at = at.parentElement) {
+    const box = contentBoxes.get(at);
+    if (!box || at.querySelector("[data-gliding]")) continue;
+    const { width, height } = at.getBoundingClientRect();
+    contentBoxes.set(at, settledBox(box, { width, height }));
+  }
+}
+
+function retargetPanel(panel, entry, to) {
   const from = panel.getBoundingClientRect().height;
   glides.delete(panel);
   entry.animation.cancel();
   glideHeight(panel, from, to, entry);
+}
+
+function watchContent(panel) {
+  const content = panel?.firstElementChild;
+  if (!contentObserver || !content || watched.has(content)) return;
+  watched.add(content);
+  contentObserver.observe(content);
+}
+
+// A rebuilt panel's content inherits what its predecessor last showed, so the change between them
+// glides too; the predecessor is no longer watched.
+function handOverContent(from, to) {
+  const old = from?.firstElementChild;
+  const content = to.firstElementChild;
+  if (!old || !content) return;
+  if (contentBoxes.has(old)) contentBoxes.set(content, contentBoxes.get(old));
+  if (!watched.delete(old)) return;
+  contentObserver.unobserve(old);
 }
 
 // A box whose own layout just changed eases from the height it was drawn at (`from`) to its new one.
@@ -63,7 +200,7 @@ export function glideResize(node, from) {
   stopGlide(node);
   if (!canGlide(node)) return;
   const to = node.getBoundingClientRect().height;
-  if (Math.abs(to - from) >= 0.5) glideHeight(node, from, to);
+  if (moved(to, from)) glideHeight(node, from, to);
 }
 
 // A node that moved within the layout slides over from the client rect it was drawn in (`from`).
@@ -73,7 +210,7 @@ export function glideMove(node, from) {
   const to = node.getBoundingClientRect();
   const x = from.left - to.left;
   const y = from.top - to.top;
-  if (Math.abs(x) < 0.5 && Math.abs(y) < 0.5) return;
+  if (!moved(x, 0) && !moved(y, 0)) return;
   const animation = node.animate(
     { transform: [`translate(${x}px, ${y}px)`, "none"] },
     { duration: motionMs("--motion-slow"), easing: motionEase("--ease-glide") },
@@ -92,13 +229,68 @@ function glideHeight(node, from, to, { target = null, fade = null, settle = null
   track(node, { animation, fade, target, to, settle });
 }
 
+// Moves a running glide onto the node that replaced its panel, at the same point in its timing.
+function transplant(from, to) {
+  const entry = glides.get(from);
+  const content = to.firstElementChild;
+  const animation = copyAnimation(entry.animation, to);
+  const fade = entry.fade && content ? copyAnimation(entry.fade, content) : null;
+  stopGlide(from);
+  to.dataset.gliding = "true";
+  const settle = () => {
+    to.hidden = !entry.target;
+  };
+  track(to, { ...entry, animation, fade, settle });
+}
+
+function copyAnimation(animation, node) {
+  const copy = node.animate(animation.effect.getKeyframes(), animation.effect.getTiming());
+  const placement = copyPlacement(animation);
+  if ("startTime" in placement) copy.startTime = placement.startTime;
+  else copy.currentTime = placement.currentTime;
+  return copy;
+}
+
+// Turns a chevron from the transform it showed (`from`, null when its state did not change, so a
+// running turn keeps going) to the one [data-open] now gives it.
+function turnChevron(chevron, from, { instant }) {
+  if (!chevron || from === null) return;
+  const running = turnOf(chevron);
+  running?.cancel();
+  turns.delete(running);
+  if (instant || !canGlide(chevron)) return;
+  const to = getComputedStyle(chevron).transform;
+  if (to === from) return;
+  const turn = chevron.animate(
+    { transform: [from, to] },
+    { duration: motionMs("--motion-spring"), easing: motionEase("--ease-spring") },
+  );
+  keepTurn(turn);
+}
+
+function keepTurn(turn) {
+  turns.add(turn);
+  turn.onfinish = () => turns.delete(turn);
+}
+
+function turnOf(chevron) {
+  for (const turn of turns) if (turn.effect?.target === chevron) return turn;
+  return null;
+}
+
 function track(node, entry) {
   glides.set(node, entry);
   entry.animation.onfinish = () => {
-    if (glides.get(node) !== entry) return;
-    stopGlide(node);
-    entry.settle?.();
+    if (glides.get(node) === entry) endGlide(node, entry.settle);
   };
+}
+
+// Lands a glide for good. The panel settles first, so the boxes read around it are final.
+function endGlide(node, settle) {
+  const ended = glides.has(node);
+  stopGlide(node);
+  settle?.();
+  if (ended) settleAround(node);
 }
 
 function stopGlide(node) {
@@ -111,7 +303,7 @@ function stopGlide(node) {
 }
 
 function canGlide(node) {
-  return !reducedMotion.matches && typeof node.animate === "function";
+  return motionEnabled() && typeof node.animate === "function";
 }
 
 function contentHeight(panel) {
@@ -170,11 +362,15 @@ class AccordionManager {
     if (!parts) return;
     const { trigger, content } = parts;
     const target = open === true;
-    accordion.dataset.open = String(target);
-    trigger.setAttribute("aria-expanded", String(target));
-    if (!target && content.contains(document.activeElement)) trigger.focus({ preventScroll: true });
-    content.inert = !target;
+    const chevron = chevronOf(trigger);
+    const changed = accordion.dataset.open !== String(target);
+    const shown = chevron && changed ? getComputedStyle(chevron).transform : null;
+    delayFromOpen(accordion, target);
+    if (!target) handOffFocus(content, trigger);
+    markOpen(accordion, parts, target);
+    turnChevron(chevron, shown, { instant });
     setPanelOpen(content, target, { instant });
+    disclosures.set(accordion.dataset.disclosure, { open: target, panel: content, chevron });
   }
 
   handleClick(event) {
@@ -185,7 +381,7 @@ class AccordionManager {
     const open = !this.isOpen(accordion);
     this.setOpen(accordion, open);
     // Only a press announces itself, and only after the panel has been toggled: a listener may
-    // re-render the card from here, and the fresh node is reopened from its disclosure key.
+    // re-render the card from here, and the fresh node carries on from its disclosure key.
     accordion.dispatchEvent(new CustomEvent(ACCORDION_TOGGLE, { detail: { open } }));
   }
 }
@@ -196,7 +392,6 @@ export function createAccordion(key, className, label, ...children) {
   accordion.className = `accordion ${className}`;
   accordion.dataset.accordion = "";
   accordion.dataset.disclosure = key;
-  accordion.dataset.open = "false";
 
   const trigger = document.createElement("button");
   trigger.className = "accordion-trigger";
@@ -204,26 +399,62 @@ export function createAccordion(key, className, label, ...children) {
   trigger.id = `${id}-trigger`;
   trigger.dataset.accordionTrigger = "";
   trigger.dataset.focusKey = `disclosure-${key}`;
-  trigger.setAttribute("aria-expanded", "false");
   trigger.setAttribute("aria-controls", `${id}-content`);
   const title = document.createElement("span");
   title.className = "accordion-label";
   title.textContent = label;
-  trigger.append(title, chevron());
+  trigger.append(title, chevronIcon());
 
   const content = document.createElement("div");
   content.className = "accordion-panel";
   content.id = `${id}-content`;
   content.setAttribute("role", "region");
   content.setAttribute("aria-labelledby", trigger.id);
-  content.hidden = true;
-  content.inert = true;
   const inner = document.createElement("div");
   inner.className = "accordion-panel-inner";
   inner.append(...children.filter(Boolean));
   content.append(inner);
   accordion.append(trigger, content);
+  resume(accordion, { trigger, content });
   return accordion;
+}
+
+// A fresh node picks up where its key's last node was: in the state it asked for, still gliding
+// toward it if it was.
+function resume(accordion, parts) {
+  const key = accordion.dataset.disclosure;
+  const last = disclosures.get(key);
+  const gliding = Boolean(last && glides.has(last.panel));
+  const start = rebuiltDisclosure({ open: last?.open, gliding });
+  markOpen(accordion, parts, start.open);
+  parts.content.hidden = start.hidden;
+  const chevron = chevronOf(parts.trigger);
+  if (start.glide) transplant(last.panel, parts.content);
+  if (last) handOverContent(last.panel, parts.content);
+  const turn = last?.chevron ? turnOf(last.chevron) : null;
+  if (chevron && turn?.playState === "running" && canGlide(chevron))
+    keepTurn(copyAnimation(turn, chevron));
+  delayFromOpen(accordion, start.open);
+  if (!start.hidden) watchContent(parts.content);
+  disclosures.set(key, { open: start.open, panel: parts.content, chevron });
+}
+
+// CSS animations inside a disclosure count from when it opened, so a rebuilt node carries them on.
+function delayFromOpen(accordion, open) {
+  const elapsed = changedAgo(`disclosure-${accordion.dataset.disclosure}`, open);
+  if (Number.isFinite(elapsed))
+    accordion.style.setProperty("--open-delay", `${-Math.round(elapsed)}ms`);
+  else accordion.style.removeProperty("--open-delay");
+}
+
+function markOpen(accordion, { trigger, content }, open) {
+  accordion.dataset.open = String(open);
+  trigger.setAttribute("aria-expanded", String(open));
+  content.inert = !open;
+}
+
+function chevronOf(trigger) {
+  return trigger.querySelector(":scope > .accordion-chevron");
 }
 
 function accordionParts(accordion) {
@@ -232,7 +463,7 @@ function accordionParts(accordion) {
   return trigger && content ? { trigger, content } : null;
 }
 
-function chevron() {
+function chevronIcon() {
   const node = icon("chevron-right", 12);
   node.classList.add("accordion-chevron");
   return node;

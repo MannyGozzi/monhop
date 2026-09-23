@@ -24,7 +24,7 @@
             <span class="status-dot" aria-hidden="true"></span>
             <span id="native-state">Not checked</span>
           </div>
-          <span id="header-actions"></span>
+          <span id="header-actions"><span class="header-slot" id="header-refresh" hidden inert></span><span id="header-buttons"></span></span>
           <div class="window-controls" id="window-controls" aria-label="Window controls" hidden>
             <button class="caption-button" type="button" data-window-action="minimize" aria-label="Minimize window"><svg class="lucide lucide-minus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14" /></svg></button>
             <button class="caption-button" type="button" data-window-action="maximize" aria-label="Maximize or restore window"><svg class="lucide lucide-square" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2" /></svg></button>
@@ -34,7 +34,7 @@
       </header>
 
       <div class="content-region">
-        <div class="page-alert" id="page-alert" role="alert" hidden></div>
+        <div class="glide-panel" id="page-alert-panel" hidden inert><div class="page-alert-slot"><div class="page-alert" id="page-alert" role="alert"></div></div></div>
 
         <section class="app-page" id="home-view" aria-label="Home" hidden>
           <div id="home-content" class="stack"></div>

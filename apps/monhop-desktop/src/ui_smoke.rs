@@ -1,7 +1,10 @@
 //! Bounded webview, accordion and read-only setup checks. No prompts or input hooks run.
 
 use std::{
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -11,9 +14,22 @@ const PENDING: u8 = 0;
 const PASSED: u8 = 1;
 const FAILED: u8 = 2;
 static OUTCOME: AtomicU8 = AtomicU8::new(PENDING);
+// What the check was waiting on last, so a missed deadline names where it stalled.
+static STAGE: Mutex<String> = Mutex::new(String::new());
 
 pub fn exit_code() -> i32 {
     i32::from(OUTCOME.load(Ordering::Acquire) != PASSED)
+}
+
+fn enter_stage(stage: String) {
+    if let Ok(mut current) = STAGE.lock() {
+        *current = stage;
+    }
+}
+
+fn deadline_message(stage: &str) -> String {
+    let stage = if stage.is_empty() { "page load" } else { stage };
+    format!("MonHop UI check: FAIL (render deadline at {stage}).")
 }
 
 fn finish(app: &tauri::AppHandle, passed: bool, message: &str) {
@@ -96,12 +112,22 @@ fn render_flags(value: &str) -> Option<[bool; 9]> {
 pub fn arm_timeout(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(10));
-        finish(&app, false, "MonHop UI check: FAIL (render deadline).");
+        let stage = STAGE.lock().map(|stage| stage.clone()).unwrap_or_default();
+        finish(&app, false, &deadline_message(&stage));
     });
 }
 
 pub fn check(window: WebviewWindow) {
-    // Only the explicit diagnostic requests focus before sampling animation frames.
+    // Only the explicit diagnostic requests focus before sampling animation frames. It also stays
+    // above other apps' windows: WebKit stops drawing an occluded window, which stalls every wait.
+    if window.set_always_on_top(true).is_err() {
+        finish(
+            window.app_handle(),
+            false,
+            "MonHop UI check: FAIL (window always on top).",
+        );
+        return;
+    }
     if window.set_focus().is_err() {
         finish(
             window.app_handle(),
@@ -117,6 +143,7 @@ fn check_at_width(window: WebviewWindow, width: u16) {
     if OUTCOME.load(Ordering::Acquire) != PENDING {
         return;
     }
+    enter_stage(format!("render at width {width}"));
     let retry_window = window.clone();
     let app = window.app_handle().clone();
     let callback_app = app.clone();
@@ -155,6 +182,11 @@ fn check_at_width(window: WebviewWindow, width: u16) {
 
 const ACCORDION_CHECK: &str = r#"(() => {
   window.__MONHOP_ACCORDION_CHECK__ = 'pending:opening';
+  // WebKit stops drawing a hidden or occluded window, so its frame waits would stall silently.
+  window.__MONHOP_WAS_HIDDEN__ = document.hidden;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) window.__MONHOP_WAS_HIDDEN__ = true;
+  });
   (async () => {
     const item = document.querySelector('[data-disclosure="overview-details"]');
     const trigger = item?.querySelector('.accordion-trigger');
@@ -214,7 +246,14 @@ const ACCORDION_CHECK: &str = r#"(() => {
   return 'started';
 })()"#;
 
+// The stage the accordion check waits in, tagged once the window has been hidden since it began.
+const ACCORDION_RECEIPT: &str = r#"(() => {
+  const stage = String(window.__MONHOP_ACCORDION_CHECK__);
+  return stage.startsWith('pending:') && window.__MONHOP_WAS_HIDDEN__ ? `${stage} (window hidden)` : stage;
+})()"#;
+
 fn check_accordion(window: WebviewWindow, width: u16) {
+    enter_stage(format!("accordion start at width {width}"));
     let app = window.app_handle().clone();
     let callback_window = window.clone();
     if window
@@ -242,11 +281,15 @@ fn poll_accordion(window: WebviewWindow, width: u16, previous: String) {
     let app = window.app_handle().clone();
     let callback_window = window.clone();
     if window
-        .eval_with_callback("window.__MONHOP_ACCORDION_CHECK__", move |value| {
+        .eval_with_callback(ACCORDION_RECEIPT, move |value| {
             let app = callback_window.app_handle();
             if value.starts_with("\"pending:") {
                 if value != previous {
                     println!("MonHop accordion progress: width={width} {value}");
+                    enter_stage(format!(
+                        "accordion at width {width}, {}",
+                        value.trim_matches('"')
+                    ));
                 }
                 let callback_window = callback_window.clone();
                 std::thread::spawn(move || {
@@ -279,6 +322,7 @@ fn poll_accordion(window: WebviewWindow, width: u16, previous: String) {
 }
 
 fn check_readonly_status(window: WebviewWindow) {
+    enter_stage("read-only status".into());
     let app = window.app_handle().clone();
     let next = window.clone();
     if window
@@ -373,6 +417,18 @@ mod tests {
         assert_eq!(
             render_flags("\"010101010\""),
             Some([false, true, false, true, false, true, false, true, false])
+        );
+    }
+
+    #[test]
+    fn missed_deadline_names_the_stage_it_stalled_in() {
+        assert_eq!(
+            deadline_message(""),
+            "MonHop UI check: FAIL (render deadline at page load)."
+        );
+        assert_eq!(
+            deadline_message("accordion at width 980, pending:closing (window hidden)"),
+            "MonHop UI check: FAIL (render deadline at accordion at width 980, pending:closing (window hidden))."
         );
     }
 

@@ -26,6 +26,7 @@ import {
   setPosition,
   svgNode,
 } from "./arrangement-render.mjs";
+import { revealPanel, setRevealOpen } from "./accordion.mjs";
 import { switchRow } from "./dom.mjs";
 
 const MIN_STAGE_WIDTH = 280;
@@ -123,12 +124,12 @@ export function createArrangementView(options) {
   // One row per monitor cabled to both computers: which computer shows on it decides which side draws it.
   const sharedRow = document.createElement("div");
   sharedRow.className = "arrangement-shared";
-  sharedRow.hidden = true;
+  const sharedPanel = revealPanel(sharedRow);
 
   // One switch per display each computer reports; off leaves it out of the picture and every route.
   const useBlock = document.createElement("div");
   useBlock.className = "arrangement-use";
-  useBlock.hidden = true;
+  const usePanel = revealPanel(useBlock);
 
   const controls = document.createElement("div");
   controls.className = "arrangement-controls";
@@ -153,7 +154,7 @@ export function createArrangementView(options) {
   });
   controls.append(spacer, reset, fit);
 
-  root.append(heading, instructions, stage, legend, sharedRow, useBlock, controls);
+  root.append(heading, instructions, stage, legend, sharedPanel, usePanel, controls);
 
   if (!arrangement?.groups?.local || !arrangement.groups?.peer || !arrangement.placement) {
     status.textContent = arrangement?.message || "These displays cannot be arranged yet.";
@@ -217,8 +218,8 @@ export function createArrangementView(options) {
       legend.replaceWith(next);
       legend = next;
     }
-    sharedRow.replaceChildren();
-    sharedRow.hidden = !shared.length;
+    // A block on its way out keeps what it last showed while it glides shut.
+    if (shared.length) sharedRow.replaceChildren();
     for (const choice of shared) {
       const copy = document.createElement("span");
       copy.className = "arrangement-shared-copy";
@@ -256,13 +257,15 @@ export function createArrangementView(options) {
       item.append(copy, control);
       sharedRow.append(item);
     }
+    setRevealOpen(sharedPanel, shared.length > 0, { focusTarget: fit });
   }
 
   function renderUse() {
-    useBlock.replaceChildren();
     const withDisplays = SIDES.filter((side) => inUse[side].length);
-    useBlock.hidden = !withDisplays.length;
-    if (useBlock.hidden) return;
+    if (!withDisplays.length) {
+      setRevealOpen(usePanel, false, { focusTarget: fit });
+      return;
+    }
     const useHeading = document.createElement("div");
     useHeading.className = "arrangement-use-heading";
     const useTitle = document.createElement("span");
@@ -309,7 +312,8 @@ export function createArrangementView(options) {
       }
       columns.append(group);
     }
-    useBlock.append(useHeading, columns);
+    useBlock.replaceChildren(useHeading, columns);
+    setRevealOpen(usePanel, true);
   }
 
   function renderScene() {

@@ -227,6 +227,8 @@
   --transition-control: background-color var(--motion-fast) var(--ease-out), color var(--motion-fast) var(--ease-out), border-color var(--motion-fast) var(--ease-out), box-shadow var(--motion-base) var(--ease-out), opacity var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring);
   --transition-press: transform var(--motion-instant) var(--ease-out);
 }
+/* Before Safari 17.2 linear() does not parse and every shorthand using the spring would drop; 4.9% overshoot. */
+@supports not (transition-timing-function: linear(0, 1)) { :root { --ease-spring: cubic-bezier(.33, 1.1, .2, 1.12); } }
 /* The header toggle pins a theme; without it the window follows the system. */
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"] { color-scheme: dark; }
@@ -254,7 +256,10 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 html[data-platform="macos"] .window-header { padding-left: var(--titlebar-inset-macos); }
 .window-heading, .window-header-end { display: flex; align-items: center; min-width: 0; gap: var(--gap-2); }
 .window-header-end { justify-content: flex-end; align-self: stretch; }
-#header-actions { display: flex; align-items: center; gap: var(--gap-half); }
+#header-actions, #header-buttons, .header-slot { display: flex; align-items: center; gap: var(--gap-half); }
+#header-actions { position: relative; }
+/* Out of the row at once, so the status pill glides over; drawn in its old spot while it pops out. */
+.header-slot[data-leaving="true"] { position: absolute; right: calc(100% + var(--gap-half)); }
 .app-mark { display: inline-block; flex: none; width: var(--avatar-glyph); height: var(--avatar-glyph); background: currentColor; -webkit-mask: url("./assets/monhop-mark.svg") center / contain no-repeat; mask: url("./assets/monhop-mark.svg") center / contain no-repeat; color: var(--primary); }
 .window-product { flex: none; margin-right: var(--gap-2); font-size: var(--text-base); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); }
 .window-header-end .status-pill { max-width: var(--status-pill-max); }
@@ -296,7 +301,9 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .app-page { width: min(100%, var(--content-width)); margin: 0 auto; }
 .stack { display: grid; gap: var(--gap-4); min-width: 0; }
 .stack > :empty { display: none; }
-.page-alert { --tone: var(--destructive); display: flex; align-items: flex-start; gap: var(--gap-2); width: min(100%, var(--content-width)); margin: 0 auto var(--gap-4); border-radius: var(--radius-group); padding: var(--gap-3) var(--gap-4); background: color-mix(in oklab, var(--tone) var(--mix-faint), var(--card)); box-shadow: 0 0 0 var(--hairline-width) color-mix(in oklab, var(--tone) var(--mix-edge), var(--hairline)); color: var(--foreground); font-size: var(--text-sm); line-height: var(--leading); animation: fade-up var(--motion-base) var(--ease-out) both; }
+/* Its panel glides it in and out; the slot carries the gap below it. */
+.page-alert-slot { padding-bottom: var(--gap-4); }
+.page-alert { --tone: var(--destructive); display: flex; align-items: flex-start; gap: var(--gap-2); width: min(100%, var(--content-width)); margin: 0 auto; border-radius: var(--radius-group); padding: var(--gap-3) var(--gap-4); background: color-mix(in oklab, var(--tone) var(--mix-faint), var(--card)); box-shadow: 0 0 0 var(--hairline-width) color-mix(in oklab, var(--tone) var(--mix-edge), var(--hairline)); color: var(--foreground); font-size: var(--text-sm); line-height: var(--leading); }
 .page-alert[data-tone="notice"] { background: var(--card); box-shadow: var(--shadow-card); }
 .page-alert-copy { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
 .page-alert .icon-button { margin: calc(var(--gap-1) * -1) calc(var(--gap-1) * -1) calc(var(--gap-1) * -1) 0; }
@@ -333,7 +340,9 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .setup-section[data-collapsed="true"] .section-chevron svg { transform: none; }
 /* app.js glides the body's height (accordion.mjs); its inner carries the open step's extra spacing. */
 .section-body { min-width: 0; transition: opacity var(--motion-base) var(--ease-out); }
-.section-body[data-gliding="true"] { clip-path: inset(calc(var(--glide-bleed) * -1) calc(var(--glide-bleed) * -1) 0); }
+/* Reveal panels (accordion.mjs revealPanel) clip only while they glide, like the section body. */
+.glide-panel { min-width: 0; }
+:is(.section-body, .glide-panel)[data-gliding="true"] { clip-path: inset(calc(var(--glide-bleed) * -1) calc(var(--glide-bleed) * -1) 0); }
 .section-body-inner { display: grid; gap: var(--gap-4); min-width: 0; padding: var(--gap-4) 0 var(--gap-2); }
 .setup-section:last-child .section-body-inner { padding-bottom: 0; }
 .section-body-inner > :empty { display: none; }
@@ -486,12 +495,12 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .launch-attribution { display: grid; gap: var(--gap-1); min-width: 0; color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); }
 .launch-attribution code { overflow-wrap: anywhere; color: var(--foreground); }
 
-/* Disclosure. accordion.mjs animates the panel height and the content's fade. */
+/* Disclosure. accordion.mjs animates the panel height, the content's fade and the chevron's turn. */
 .accordion { min-width: 0; }
 .accordion-trigger { display: flex; align-items: center; justify-content: space-between; gap: var(--gap-3); width: 100%; min-height: var(--row-min-height); border: 0; border-radius: var(--radius-group); padding: var(--gap-2) var(--gap-4); background: transparent; color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-medium); text-align: left; transition: var(--transition-control); }
 .accordion-trigger:hover { background: var(--surface-hover); }
 .accordion-label { min-width: 0; overflow-wrap: anywhere; }
-.accordion-chevron { width: var(--icon-size-sm); height: var(--icon-size-sm); flex: none; color: var(--subtle-foreground); stroke-width: var(--icon-stroke-bold); transition: transform var(--motion-spring) var(--ease-spring); }
+.accordion-chevron { width: var(--icon-size-sm); height: var(--icon-size-sm); flex: none; color: var(--subtle-foreground); stroke-width: var(--icon-stroke-bold); }
 .accordion[data-open="true"] > .accordion-trigger > .accordion-chevron { transform: rotate(var(--rotate-open)); }
 .accordion-panel { overflow: hidden; }
 .accordion-panel-inner { display: grid; gap: var(--gap-3); min-width: 0; padding: var(--gap-1) var(--gap-4) var(--gap-4); }
@@ -622,7 +631,11 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 
 /* Arrangement canvas: the Home preview and the layout editor share one surface. */
 .arrangement-stage, .dashboard-arrangement-canvas { border-radius: var(--radius-group); background-color: var(--surface-inset); background-image: var(--canvas-dots); background-size: var(--canvas-grid) var(--canvas-grid); }
-.arrangement-editor { display: grid; gap: var(--gap-3); min-width: 0; }
+/* Rows space themselves, so a block gliding in or out carries its own gap instead of popping one. */
+.arrangement-editor { display: grid; min-width: 0; }
+.arrangement-editor > :not(:first-child) { margin-top: var(--gap-3); }
+.arrangement-editor > .glide-panel { margin-top: 0; }
+.arrangement-editor > .glide-panel > * { padding-top: var(--gap-3); }
 .arrangement-heading { display: flex; align-items: baseline; justify-content: space-between; gap: var(--gap-4); min-width: 0; }
 .arrangement-heading h3 { flex: none; font-size: var(--text-base); font-weight: var(--weight-semibold); }
 .arrangement-status { min-width: 0; margin: 0; color: var(--muted-foreground); font-size: var(--text-sm); text-align: right; }
@@ -718,9 +731,10 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .mock-row { display: flex; justify-content: space-between; align-items: center; }
 .mock-switch { position: relative; display: inline-block; width: var(--mock-switch-width); height: var(--mock-switch-height); border-radius: var(--radius-pill); background: var(--switch-track-off); }
 .mock-switch::after { content: ""; position: absolute; top: var(--gap-half); left: var(--gap-half); width: var(--mock-knob); height: var(--mock-knob); border-radius: var(--radius-circle); background: var(--thumb); box-shadow: var(--shadow-thumb); }
-.accordion[data-open="true"] .mock-switch { animation: guide-track var(--motion-demo) var(--ease-out) both; }
-.accordion[data-open="true"] .mock-switch::after { animation: guide-switch var(--motion-demo) var(--ease-spring) both; }
-.accordion[data-open="true"] .mock-permission-pane.delayed .mock-switch, .accordion[data-open="true"] .mock-permission-pane.delayed .mock-switch::after { animation-delay: var(--motion-base); }
+/* --open-delay (negative, from accordion.mjs) counts from the opening, so a rebuilt disclosure carries its demo on. */
+.accordion[data-open="true"] .mock-switch { animation: guide-track var(--motion-demo) var(--ease-out) var(--open-delay, 0ms) both; }
+.accordion[data-open="true"] .mock-switch::after { animation: guide-switch var(--motion-demo) var(--ease-spring) var(--open-delay, 0ms) both; }
+.accordion[data-open="true"] .mock-permission-pane.delayed .mock-switch, .accordion[data-open="true"] .mock-permission-pane.delayed .mock-switch::after { animation-delay: calc(var(--motion-base) + var(--open-delay, 0ms)); }
 
 /* Focus: every control rings in the accent. Last, so no component rule can hide it. */
 :is(button, textarea, input:not(.slider), [tabindex]):focus-visible { box-shadow: var(--shadow-focus); }
@@ -728,6 +742,9 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 
 /* Page changes: only compositor properties move, and the header stays live. */
 :root[data-theme-switch="true"] .content-region { view-transition-name: none; }
+/* The header runs its own page motion; a cross-fade would ghost the stale copy over it. */
+:root:not([data-theme-switch="true"])::view-transition-old(root) { animation: none; opacity: 0; }
+:root:not([data-theme-switch="true"])::view-transition-new(root) { animation: none; }
 :root[data-theme-switch="true"]::view-transition-old(root), :root[data-theme-switch="true"]::view-transition-new(root) { animation-duration: var(--motion-base); animation-timing-function: var(--ease-in-out); }
 ::view-transition-old(content) { animation: page-out var(--motion-fast) var(--ease-out) both; }
 ::view-transition-new(content) { animation: page-in var(--motion-slow) var(--ease-out) both; }
