@@ -13,6 +13,7 @@ use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
+use tokio::sync::watch;
 
 use super::native::NativeSocket;
 use crate::policy::NetworkLock;
@@ -67,6 +68,9 @@ pub(super) struct GuardedSocket<I> {
     peer: SocketAddrV4,
     interface_index: u32,
     signal: RevocationSignal,
+    /// Dropped with the socket, ending every `lifetime()` wait. Declared after `io`, so the OS
+    /// socket is closed by the time a wait ends.
+    lifetime: watch::Sender<()>,
 }
 
 impl<I> fmt::Debug for GuardedSocket<I> {
@@ -105,7 +109,15 @@ impl GuardedSocket<NativeSocket> {
             peer,
             interface_index: lock.selected().index,
             signal,
+            lifetime: watch::Sender::new(()),
         })
+    }
+}
+
+impl<I> GuardedSocket<I> {
+    /// Never changes; `changed()` errs once the socket is dropped and its OS socket closed.
+    pub(super) fn lifetime(&self) -> watch::Receiver<()> {
+        self.lifetime.subscribe()
     }
 }
 

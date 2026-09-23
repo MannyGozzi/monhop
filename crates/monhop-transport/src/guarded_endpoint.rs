@@ -6,6 +6,7 @@ mod socket;
 use std::{io, marker::PhantomData, net::SocketAddrV4, rc::Rc, sync::Arc};
 
 use monhop_core::revocation::RevocationSignal;
+use tokio::sync::watch;
 
 use crate::{
     crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig, VerifiedPeer},
@@ -60,6 +61,7 @@ pub struct GuardedEndpoint {
     endpoint: quinn::Endpoint,
     signal: RevocationSignal,
     peer: SocketAddrV4,
+    socket_lifetime: watch::Receiver<()>,
     _watch: native::Watch,
     _owner_thread: PhantomData<Rc<()>>,
 }
@@ -115,6 +117,7 @@ impl GuardedEndpoint {
             selection.peer,
             signal.clone(),
         )?;
+        let socket_lifetime = socket.lifetime();
         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             Some(server),
@@ -130,6 +133,7 @@ impl GuardedEndpoint {
             endpoint,
             signal,
             peer: selection.peer,
+            socket_lifetime,
             _watch: prepared.watch,
             _owner_thread: PhantomData,
         })
@@ -191,6 +195,13 @@ impl GuardedEndpoint {
     pub async fn close_and_wait_idle(&self) -> io::Result<()> {
         self.endpoint.close(0_u32.into(), b"exchange complete");
         wait_idle_or_revoked(self.endpoint.wait_idle(), &self.signal).await
+    }
+
+    /// Resolves once the OS socket is closed. Quinn holds it until its endpoint and connection
+    /// tasks have run to completion, which is after the last handle drops, not at that drop.
+    pub fn socket_closed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut lifetime = self.socket_lifetime.clone();
+        async move { while lifetime.changed().await.is_ok() {} }
     }
 
     /// Stops locally without waiting for a peer. This instance can never reconnect.

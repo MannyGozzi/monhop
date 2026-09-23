@@ -248,6 +248,9 @@ impl NativeCapture {
                     }
                     result
                 };
+                if thread_shared.stop.reason() == Some(StopReason::Requested) {
+                    log::info!("native capture stopped as requested");
+                }
                 if wake_after_cleanup.is_revoked() {
                     wake_after_cleanup.revoke();
                 }
@@ -269,12 +272,15 @@ impl NativeCapture {
             control,
             completion: None,
         };
-        match started_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(())) => Ok(owner),
-            Ok(Err(error)) => Err(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(NativeCaptureError::StartupTimeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(NativeCaptureError::StartFailed),
-        }
+        let error = match started_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(())) => return Ok(owner),
+            Ok(Err(error)) => error,
+            Err(mpsc::RecvTimeoutError::Timeout) => NativeCaptureError::StartupTimeout,
+            Err(mpsc::RecvTimeoutError::Disconnected) => NativeCaptureError::StartFailed,
+        };
+        // Recorded before `owner` drops: its own stop reads as requested and keeps the session.
+        owner.shared.stop.stop(stop_reason(error));
+        Err(error)
     }
 
     pub fn try_next_event(&mut self) -> Result<Option<CapturedEvent>, StopReason> {
@@ -507,10 +513,11 @@ fn propagate_capture_stop(shared: &Shared, wake_attempted: &mut bool) {
     if !shared.stop.is_stopped() {
         return;
     }
-    if !shared.revocation.is_stopping() {
+    // CaptureStop already blocks input; this soft stop runs no waker and keeps the close's socket.
+    // A requested stop stays off the signal, which the endpoint reuses for the next session.
+    if let Some(reason) = shared.stop.request_session_stop(&shared.revocation) {
         log::warn!(
-            "native capture stopped: {:?} at {}; callback failure: {:?}; callback sites (active, incoming): {:?}; requesting session stop",
-            shared.stop.reason(),
+            "native capture stopped: {reason:?} at {}; callback failure: {:?}; callback sites (active, incoming): {:?}; requesting session stop",
             shared.stop.origin().map_or_else(
                 || "?".to_owned(),
                 |at| format!("{}:{}", at.file(), at.line())
@@ -519,9 +526,6 @@ fn propagate_capture_stop(shared: &Shared, wake_attempted: &mut bool) {
             CALLBACK_REENTRY.get(),
         );
     }
-    // CaptureStop already blocks forwarding and suppression. Leave the socket alive for its close.
-    // request_stop only sets atomics; it cannot run a waker on this capture thread.
-    shared.revocation.request_stop();
     if shared.revocation.is_revoked() && !*wake_attempted {
         // A hard safety stop must wake observers even while suppressed presses drain.
         *wake_attempted = dispatch_revocation_wake(&shared.revocation);
@@ -1272,8 +1276,10 @@ fn run(
         || shared.stop.reason(),
     ) {
         shared.stop.stop(stop_reason(error));
-        revocation.mark_revoked_without_wake();
-        let _ = dispatch_revocation_wake(&revocation);
+        if shared.stop.ends_session() {
+            revocation.mark_revoked_without_wake();
+            let _ = dispatch_revocation_wake(&revocation);
+        }
         let _ = started.send(Err(error));
         let cleanup = resources.close_with_retries();
         clear_callback();
@@ -2199,6 +2205,18 @@ mod tests {
         assert!(!wake_attempted);
         state.shared.revocation.revoke();
         assert!(state.shared.revocation.is_revoked());
+    }
+
+    #[test]
+    fn a_requested_stop_leaves_the_session_signal_to_the_next_session() {
+        let (state, _consumer) = callback_fixture();
+        state.shared.stop.stop(StopReason::Requested);
+        let mut wake_attempted = false;
+        propagate_capture_stop(&state.shared, &mut wake_attempted);
+        propagate_capture_stop(&state.shared, &mut wake_attempted);
+        assert!(!state.shared.revocation.is_stopping());
+        assert!(state.shared.revocation.origin().is_none());
+        assert!(!wake_attempted);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::{
     task::{Wake, Waker},
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 const LOCAL: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 10), 24800);
 const PEER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 12), 24800);
@@ -162,6 +162,7 @@ fn fixture() -> Arc<GuardedSocket<TestIo>> {
         local: LOCAL,
         peer: PEER,
         interface_index: INDEX,
+        lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
     })
 }
@@ -481,6 +482,7 @@ fn memory_sockets() -> (Arc<GuardedSocket<TestIo>>, Arc<GuardedSocket<TestIo>>) 
         local: LOCAL,
         peer: PEER,
         interface_index: INDEX,
+        lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
     });
     let second = Arc::new(GuardedSocket {
@@ -488,6 +490,7 @@ fn memory_sockets() -> (Arc<GuardedSocket<TestIo>>, Arc<GuardedSocket<TestIo>>) 
         local: PEER,
         peer: LOCAL,
         interface_index: INDEX,
+        lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
     });
     (first, second)
@@ -696,6 +699,120 @@ async fn revocation_wakes_a_pending_handshake_without_waiting_for_its_timeout() 
     );
 }
 
+/// The standing side's connection first, whichever side dials.
+async fn session(
+    standing: &quinn::Endpoint,
+    peer: &quinn::Endpoint,
+    standing_dials: bool,
+) -> (quinn::Connection, quinn::Connection) {
+    if standing_dials {
+        connected_pair(standing, peer, PEER).await
+    } else {
+        let (theirs, ours) = connected_pair(peer, standing, LOCAL).await;
+        (ours, theirs)
+    }
+}
+
+/// Crosses what a session uses: the handshake's bidirectional stream, then an input datagram.
+async fn delivers(from: &quinn::Connection, to: &quinn::Connection) {
+    tokio::time::timeout(DEADLINE, async {
+        let (mut sent, _) = from.open_bi().await.unwrap();
+        sent.write_all(b"hello").await.unwrap();
+        sent.finish().unwrap();
+        let (_, mut received) = to.accept_bi().await.unwrap();
+        assert_eq!(received.read_to_end(64).await.unwrap(), b"hello");
+        from.send_datagram(b"input".to_vec().into()).unwrap();
+        assert_eq!(to.read_datagram().await.unwrap().as_ref(), b"input");
+    })
+    .await
+    .expect("a stream and a datagram crossed within a second");
+}
+
+/// The pausing side closes, revokes its socket and comes back on a fresh one at the same address;
+/// the standing endpoint serves that next session while the ended one's close still drains.
+#[tokio::test]
+async fn a_standing_endpoint_serves_the_next_session_while_the_paused_close_drains() {
+    use crate::session::SESSION_ENDED_REASON;
+    for standing_dials in [true, false] {
+        let (standing_socket, paused_socket) = memory_sockets();
+        let ours_id = DeviceIdentity::generate().unwrap();
+        let theirs_id = DeviceIdentity::generate().unwrap();
+        let standing = endpoint(standing_socket.clone(), &ours_id, &theirs_id);
+        let paused = endpoint(paused_socket.clone(), &theirs_id, &ours_id);
+        let (ours, theirs) = session(&standing, &paused, standing_dials).await;
+        delivers(&theirs, &ours).await;
+
+        theirs.close(0_u32.into(), SESSION_ENDED_REASON);
+        let ended = tokio::time::timeout(DEADLINE, ours.closed()).await.unwrap();
+        assert!(matches!(
+            ended,
+            quinn::ConnectionError::ApplicationClosed(close)
+                if close.reason.as_ref() == SESSION_ENDED_REASON
+        ));
+        drop(ours);
+        paused_socket.signal.revoke();
+        drop((theirs, paused));
+        // One poll before this task yields: the drain timer cannot have run in between.
+        let mut idle = std::pin::pin!(standing.wait_idle());
+        assert!(
+            idle.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "the next attempt starts while the ended session's close still drains"
+        );
+
+        let resumed_socket = Arc::new(GuardedSocket {
+            io: Arc::new(TestIo::new(
+                PEER,
+                paused_socket.io.inbox.clone(),
+                paused_socket.io.target.clone(),
+            )),
+            local: PEER,
+            peer: LOCAL,
+            interface_index: INDEX,
+            lifetime: watch::Sender::new(()),
+            signal: RevocationSignal::default(),
+        });
+        let resumed = endpoint(resumed_socket.clone(), &theirs_id, &ours_id);
+        let (ours, theirs) = session(&standing, &resumed, standing_dials).await;
+        delivers(&theirs, &ours).await;
+        delivers(&ours, &theirs).await;
+        assert!(!standing_socket.signal.is_stopping());
+        standing_socket.signal.revoke();
+        resumed_socket.signal.revoke();
+    }
+}
+
+/// Quinn keeps the socket in its driver tasks past the last handle, so a rebind of the pinned port
+/// waits for the socket itself, not for that drop.
+#[tokio::test]
+async fn the_socket_outlives_its_last_handle_until_the_drivers_run() {
+    let (ours_socket, theirs_socket) = memory_sockets();
+    let mut lifetime = ours_socket.lifetime();
+    let ours_id = DeviceIdentity::generate().unwrap();
+    let theirs_id = DeviceIdentity::generate().unwrap();
+    let ours = endpoint(ours_socket, &ours_id, &theirs_id);
+    let theirs = endpoint(theirs_socket, &theirs_id, &ours_id);
+    let (dialed, accepted) = connected_pair(&ours, &theirs, PEER).await;
+    delivers(&dialed, &accepted).await;
+    ours.close(0_u32.into(), b"exchange complete");
+    tokio::time::timeout(DEADLINE, ours.wait_idle())
+        .await
+        .expect("the closed connection drained");
+
+    drop((dialed, ours));
+    assert!(
+        lifetime.has_changed().is_ok(),
+        "the endpoint driver still holds the socket when the last handle drops"
+    );
+    tokio::time::timeout(DEADLINE, async {
+        while lifetime.changed().await.is_ok() {}
+    })
+    .await
+    .expect("the socket closed once the drivers ran");
+    drop((accepted, theirs));
+}
+
 #[tokio::test]
 #[ignore = "explicit localhost-only guarded QUIC probe; does not authorize a physical network"]
 async fn native_loopback_guarded_quic_delivers_and_revokes() {
@@ -727,6 +844,7 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
         local: local_a,
         peer: local_b,
         interface_index: index,
+        lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
     });
     let second = Arc::new(GuardedSocket {
@@ -734,6 +852,7 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
         local: local_b,
         peer: local_a,
         interface_index: index,
+        lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
     });
     let identity_a = DeviceIdentity::generate().unwrap();
@@ -750,6 +869,7 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
         local: idle_address,
         peer: local_b,
         interface_index: index,
+        lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
     });
     let idle_endpoint = endpoint(idle.clone(), &identity_a, &identity_b);

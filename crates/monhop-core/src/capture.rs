@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{HidUsage, ModifierState, MouseButton};
+use crate::{HidUsage, ModifierState, MouseButton, RevocationSignal};
 
 /// The fixed number of events retained by a capture channel.
 pub const CAPTURE_QUEUE_CAPACITY: usize = 512;
@@ -222,6 +222,11 @@ pub enum StopReason {
 }
 
 impl StopReason {
+    /// False only for `Requested`, whose recorder already decides the session's fate.
+    pub const fn ends_session(self) -> bool {
+        !matches!(self, Self::Requested)
+    }
+
     const fn encoded(self) -> u8 {
         match self {
             Self::Requested => 1,
@@ -310,6 +315,23 @@ impl CaptureStop {
 
     pub fn is_stopped(&self) -> bool {
         self.reason().is_some()
+    }
+
+    /// True once stopped for any reason but `Requested`, which leaves the session to its recorder.
+    pub fn ends_session(&self) -> bool {
+        self.reason().is_some_and(StopReason::ends_session)
+    }
+
+    /// Asks `session` to stop for an end it did not request; returns the reason when this call
+    /// asked. A requested stop leaves `session` alone: its signal can outlive it to serve the next.
+    #[track_caller]
+    pub fn request_session_stop(&self, session: &RevocationSignal) -> Option<StopReason> {
+        let reason = self.reason().filter(|reason| reason.ends_session())?;
+        if session.is_stopping() {
+            return None;
+        }
+        session.request_stop();
+        Some(reason)
     }
 
     fn stopped_or(&self, requested: StopReason) -> StopReason {
@@ -874,5 +896,53 @@ mod tests {
         stop.stop(StopReason::DisplaysChanged);
         stop.stop(StopReason::NativeFailure);
         assert_eq!(stop.reason(), Some(StopReason::DisplaysChanged));
+    }
+
+    #[test]
+    fn only_the_sessions_own_request_leaves_the_session_running() {
+        let reasons: Vec<_> = (1..=u8::MAX).filter_map(StopReason::from_encoded).collect();
+        assert_eq!(reasons.len(), 10);
+        for reason in reasons {
+            assert_eq!(reason.ends_session(), reason != StopReason::Requested);
+            let stop = CaptureStop::new();
+            assert!(!stop.ends_session(), "a running capture ends nothing");
+            stop.stop(reason);
+            assert_eq!(stop.ends_session(), reason.ends_session());
+        }
+    }
+
+    #[test]
+    fn a_requested_stop_leaves_the_session_signal_clean_for_the_next_capture() {
+        let session = RevocationSignal::default();
+        let first = CaptureStop::new();
+        first.stop(StopReason::Requested);
+        assert_eq!(first.request_session_stop(&session), None);
+        assert!(!session.is_stopping());
+        assert!(session.origin().is_none());
+
+        let second = CaptureStop::new();
+        assert_eq!(second.request_session_stop(&session), None);
+        assert!(!second.is_stopped(), "the next capture starts unstopped");
+        second.stop(StopReason::NativeFailure);
+        let asked_at = line!() + 1;
+        let asked = second.request_session_stop(&session);
+        assert_eq!(asked, Some(StopReason::NativeFailure));
+        assert!(session.is_stopping());
+        assert!(
+            !session.is_revoked(),
+            "a soft stop leaves the close its socket"
+        );
+        assert_eq!(session.origin().map(|at| at.line()), Some(asked_at));
+        assert_eq!(second.request_session_stop(&session), None, "asks once");
+    }
+
+    #[test]
+    fn a_session_already_stopping_is_not_asked_again() {
+        let session = RevocationSignal::default();
+        session.request_stop();
+        let stop = CaptureStop::new();
+        stop.stop(StopReason::DisplaysChanged);
+        assert_eq!(stop.request_session_stop(&session), None);
+        assert!(session.is_stopping());
     }
 }

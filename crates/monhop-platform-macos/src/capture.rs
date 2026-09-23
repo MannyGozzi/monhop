@@ -269,19 +269,16 @@ impl NativeCapture {
                 if result.is_err() && !thread_shared.stop.is_stopped() {
                     thread_shared.stop.stop(StopReason::NativeFailure);
                 }
-                let stopped = thread_shared.stop.is_stopped();
                 drop(permit);
                 drop(power_watch);
-                if stopped {
-                    log::warn!("native capture stopped on its own; revoking the session");
-                    // All native guards are gone before an arbitrary observer may wake. Native
-                    // callbacks use the atomic no-wake method during capture and cleanup.
-                    thread_shared.revocation.revoke();
-                }
+                settle_session_after_stop(&thread_shared);
                 result
             }) {
             Ok(worker) => worker,
-            Err(_) => return Err(NativeCaptureError::StartFailed),
+            Err(_) => {
+                shared.revocation.revoke();
+                return Err(NativeCaptureError::StartFailed);
+            }
         };
         let owner = Self {
             shared,
@@ -290,12 +287,15 @@ impl NativeCapture {
             control,
             completion: None,
         };
-        match started_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(())) => Ok(owner),
-            Ok(Err(error)) => Err(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(NativeCaptureError::StartupTimeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(NativeCaptureError::StartFailed),
-        }
+        let error = match started_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(())) => return Ok(owner),
+            Ok(Err(error)) => error,
+            Err(mpsc::RecvTimeoutError::Timeout) => NativeCaptureError::StartupTimeout,
+            Err(mpsc::RecvTimeoutError::Disconnected) => NativeCaptureError::StartFailed,
+        };
+        // Recorded before `owner` drops: its own stop reads as requested and keeps the session.
+        owner.shared.stop.stop(stop_reason(error));
+        Err(error)
     }
 
     pub fn try_next_event(&mut self) -> Result<Option<CapturedEvent>, StopReason> {
@@ -761,8 +761,10 @@ fn with_callback(action: impl FnOnce(&mut CallbackState) -> bool) -> bool {
 }
 
 impl CallbackState {
+    /// A requested stop is the session's own teardown; marking it would shut the socket before
+    /// its QUIC close leaves.
     fn mark_stopped(&self) {
-        if self.shared.stop.is_stopped() {
+        if self.shared.stop.ends_session() {
             self.shared.revocation.mark_revoked_without_wake();
         }
     }
@@ -1244,6 +1246,7 @@ fn run(
     ) {
         Ok(bounds) => bounds,
         Err(error) => {
+            shared.stop.stop(stop_reason(error));
             let _ = started.send(Err(error));
             return Err(error);
         }
@@ -1274,6 +1277,7 @@ fn run(
     ) {
         Ok(resources) => resources,
         Err(error) => {
+            shared.stop.stop(stop_reason(error));
             let _ = started.send(Err(error));
             clear_callback();
             return Err(error);
@@ -1284,6 +1288,7 @@ fn run(
     let mut display_watch = match DisplayWatch::install(&shared) {
         Ok(watch) => watch,
         Err(error) => {
+            shared.stop.stop(stop_reason(error));
             let _ = started.send(Err(error));
             let cleanup = resources.close();
             clear_callback();
@@ -1363,6 +1368,38 @@ fn run(
     shared.remote_active.store(false, Ordering::Release);
     clear_callback();
     cleanup
+}
+
+fn stop_reason(error: NativeCaptureError) -> StopReason {
+    match error {
+        NativeCaptureError::Stopped(reason) => reason,
+        _ => StopReason::NativeFailure,
+    }
+}
+
+/// Runs once every native guard is gone, so waking an arbitrary observer is safe here. A requested
+/// stop keeps the session's socket open: revoking would cut its QUIC close short.
+fn settle_session_after_stop(shared: &Shared) {
+    let shown = |at: Option<&std::panic::Location<'_>>| {
+        at.map_or_else(|| "?".to_owned(), ToString::to_string)
+    };
+    if shared.stop.ends_session() {
+        log::warn!(
+            "native capture stopped on its own: {:?} at {}; revoking the session",
+            shared.stop.reason(),
+            shown(shared.stop.origin()),
+        );
+        shared.revocation.revoke();
+    } else if shared.revocation.is_revoked() {
+        // Callbacks and the power watch mark revocation without waking; this is their wake.
+        log::info!(
+            "native capture stopped with the session already revoked (first stop at {})",
+            shown(shared.revocation.origin()),
+        );
+        shared.revocation.revoke();
+    } else if shared.stop.is_stopped() {
+        log::info!("native capture stopped as requested; the session keeps its socket");
+    }
 }
 
 fn update_progress(shared: &Shared) {
@@ -1739,13 +1776,21 @@ mod callback_tests {
     }
 
     fn callback_fixture_with(take_back: Option<TakeBackGate>) -> (CallbackState, CaptureConsumer) {
+        callback_fixture_on(take_back, RevocationSignal::default())
+    }
+
+    /// `revocation` is the session's, which a standing endpoint hands to every capture it serves.
+    fn callback_fixture_on(
+        take_back: Option<TakeBackGate>,
+        revocation: RevocationSignal,
+    ) -> (CallbackState, CaptureConsumer) {
         let stop = CaptureStop::default();
         let (producer, consumer) = capture_channel(stop.clone());
         let shared = Arc::new(Shared {
             origin: ContinuousInstant::try_now().expect("continuous clock"),
             generation: 1,
             stop: stop.clone(),
-            revocation: RevocationSignal::default(),
+            revocation,
             ready: AtomicBool::new(true),
             remote_active: AtomicBool::new(false),
             interception_failed: AtomicBool::new(false),
@@ -2008,6 +2053,92 @@ mod callback_tests {
         assert!(
             shared.revocation.is_revoked(),
             "the session still fails closed"
+        );
+    }
+
+    #[test]
+    fn a_requested_stop_keeps_the_session_socket_and_every_other_stop_revokes_it() {
+        let (state, _consumer) = callback_fixture();
+        state.shared.stop.stop(StopReason::Requested);
+        state.mark_stopped();
+        settle_session_after_stop(&state.shared);
+        assert!(!state.shared.revocation.is_stopping());
+        assert!(state.shared.revocation.origin().is_none());
+
+        for reason in [
+            StopReason::NativeFailure,
+            StopReason::DisplaysChanged,
+            StopReason::LeaseExpired,
+            StopReason::EmergencyEscape,
+        ] {
+            let (state, _consumer) = callback_fixture();
+            state.shared.stop.stop(reason);
+            // The session's own teardown request follows every end and must not mask it.
+            state.shared.stop.stop(StopReason::Requested);
+            state.mark_stopped();
+            assert!(
+                state.shared.revocation.is_revoked(),
+                "{reason:?} during capture"
+            );
+            settle_session_after_stop(&state.shared);
+            assert!(
+                state.shared.revocation.is_revoked(),
+                "{reason:?} after teardown"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_stop_still_wakes_an_observer_of_a_silent_revocation() {
+        use std::{
+            sync::atomic::AtomicUsize,
+            task::{Context, Wake, Waker},
+        };
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (state, _consumer) = callback_fixture();
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let revocation = &state.shared.revocation;
+        assert!(
+            revocation
+                .poll_revoked(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        // What the power watch does on sleep: stop as requested, revoke without waking.
+        state.shared.stop.stop(StopReason::Requested);
+        revocation.mark_revoked_without_wake();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        settle_session_after_stop(&state.shared);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_next_capture_on_a_session_signal_inherits_only_a_failure() {
+        let session = RevocationSignal::default();
+        let (first, _consumer) = callback_fixture_on(None, session.clone());
+        first.shared.stop.stop(StopReason::Requested);
+        first.mark_stopped();
+        settle_session_after_stop(&first.shared);
+        let (next, _consumer) = callback_fixture_on(None, session.clone());
+        assert_eq!(require_capture_active(&next.shared.stop, &session), Ok(()));
+        next.mark_stopped();
+        assert_eq!(next.shared.stop.reason(), None);
+        assert!(!session.is_stopping());
+
+        let session = RevocationSignal::default();
+        let (failed, _consumer) = callback_fixture_on(None, session.clone());
+        failed.shared.stop.stop(StopReason::NativeFailure);
+        failed.mark_stopped();
+        settle_session_after_stop(&failed.shared);
+        let (next, _consumer) = callback_fixture_on(None, session.clone());
+        assert_eq!(
+            require_capture_active(&next.shared.stop, &session),
+            Err(NativeCaptureError::Stopped(StopReason::Requested))
         );
     }
 

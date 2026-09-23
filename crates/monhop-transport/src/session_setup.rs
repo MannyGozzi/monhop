@@ -145,6 +145,12 @@ impl CancellationWatch {
             worker: Some(worker),
         })
     }
+
+    /// True once the watch has handed a revocation on and exited, which a stopping signal
+    /// reaches within `STOP_GRACE`.
+    fn finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
 }
 
 impl Drop for CancellationWatch {
@@ -200,7 +206,7 @@ pub fn selected_network(interface_id: &str) -> Result<NetworkSelection, SetupFai
 /// from it re-enumerates local displays so a negotiated session never carries stale geometry.
 pub(crate) struct PreparedEndpoint {
     // Intentional endpoint teardown must not feed back into a successful local action.
-    _cancellation: CancellationWatch,
+    cancellation: CancellationWatch,
     identity: DeviceIdentity,
     peer: VerifiedPeer,
     endpoint: GuardedEndpoint,
@@ -268,10 +274,10 @@ pub(crate) fn prepare_endpoint(
     let revoker = endpoint.revoker();
     // Cancellation must still close the socket while native startup blocks its async runtime.
     let revocation = endpoint.revocation_signal();
-    let _cancellation =
+    let cancellation =
         CancellationWatch::start(cancel.clone(), revocation.clone(), move || revoker.revoke())?;
     Ok(PreparedEndpoint {
-        _cancellation,
+        cancellation,
         identity,
         peer,
         endpoint,
@@ -626,9 +632,88 @@ async fn connect_prepared(
     }
 }
 
-/// A revoked endpoint drains this long before its pinned port is rebound; a drain that hangs
-/// leaves the next bind to report the port as busy.
-const REVOKED_ENDPOINT_DRAIN: Duration = Duration::from_secs(3);
+/// The longest a retiring endpoint may hold its pinned port; one that hangs leaves the next bind
+/// to report the port as busy.
+const RETIRED_ENDPOINT_DRAIN: Duration = Duration::from_secs(3);
+
+/// An endpoint a standing share can keep from one session to the next.
+trait Standing: Sized {
+    fn signal(&self) -> &RevocationSignal;
+    /// Lets final packets leave, then returns once the pinned port can be bound again.
+    async fn retire(self);
+}
+
+impl Standing for PreparedEndpoint {
+    fn signal(&self) -> &RevocationSignal {
+        &self.revocation
+    }
+
+    async fn retire(self) {
+        let closed = self.endpoint.socket_closed();
+        let retired = async move {
+            let _ = self.endpoint.close_and_wait_idle().await;
+            // The watch turns this stop into a revoke and cancels the worker; dropping it sooner
+            // would leave that to timing.
+            let mut check = tokio::time::interval(Duration::from_millis(10));
+            while !self.cancellation.finished() {
+                check.tick().await;
+            }
+            drop(self);
+            closed.await;
+        };
+        if tokio::time::timeout(RETIRED_ENDPOINT_DRAIN, retired)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "session setup: a retired endpoint still held its port after {RETIRED_ENDPOINT_DRAIN:?}"
+            );
+        }
+    }
+}
+
+/// The one endpoint a standing share keeps between sessions.
+struct StandingSlot<E> {
+    held: Option<E>,
+}
+
+impl<E: Standing> StandingSlot<E> {
+    const fn new() -> Self {
+        Self { held: None }
+    }
+
+    /// A stop request is permanent on the signal, so the next session on it would end at once.
+    fn serves_again(endpoint: &E) -> bool {
+        !endpoint.signal().is_stopping()
+    }
+
+    /// The pinned port has no address reuse: a retired endpoint lets go of it before `bind` runs.
+    async fn take_or_bind(
+        &mut self,
+        bind: impl FnOnce() -> Result<E, SetupFailure>,
+    ) -> Result<E, SetupFailure> {
+        if let Some(held) = self.held.take() {
+            if Self::serves_again(&held) {
+                return Ok(held);
+            }
+            held.retire().await;
+        }
+        bind()
+    }
+
+    async fn keep(&mut self, endpoint: E) {
+        if Self::serves_again(&endpoint) {
+            self.held = Some(endpoint);
+        } else {
+            endpoint.retire().await;
+        }
+    }
+
+    /// Holds without judging it; the next `take_or_bind` retires it if it cannot serve.
+    fn hold(&mut self, endpoint: E) {
+        self.held = Some(endpoint);
+    }
+}
 
 /// One bound share endpoint kept across attempts and sessions: the protected identity is read
 /// once while the switch stays on, so the OS asks for the Keychain at most once, and a dropped
@@ -637,7 +722,7 @@ pub struct StandingShareEndpoint {
     interface_id: String,
     control: ControlPermissions,
     peer: CertificateFingerprint,
-    prepared: Option<PreparedEndpoint>,
+    slot: StandingSlot<PreparedEndpoint>,
 }
 
 impl StandingShareEndpoint {
@@ -650,42 +735,35 @@ impl StandingShareEndpoint {
             interface_id: interface_id.to_owned(),
             control,
             peer,
-            prepared: None,
+            slot: StandingSlot::new(),
         }
     }
 
-    /// A revoked endpoint (network change or cancellation) is rebound on the next attempt.
+    /// An endpoint whose session was asked to stop (network change, cancellation, a native stop)
+    /// is retired first. Its watch has cancelled this worker by then, so the next worker binds.
     pub async fn connect(
         &mut self,
         cancel: &RevocationSignal,
     ) -> Result<PairedShare, SetupFailure> {
-        let prepared = match self.prepared.take() {
-            Some(prepared) if !prepared.endpoint().is_revoked() => prepared,
-            _ => prepare_endpoint(&self.interface_id, self.control, cancel, self.peer)?,
-        };
+        let prepared = self
+            .slot
+            .take_or_bind(|| prepare_endpoint(&self.interface_id, self.control, cancel, self.peer))
+            .await?;
         match connect_prepared(prepared, cancel, SessionPurpose::Share).await {
             Ok(paired) => Ok(paired),
             Err(failed) => {
                 let (prepared, error) = *failed;
-                self.prepared = Some(prepared);
+                self.slot.hold(prepared);
                 Err(error)
             }
         }
     }
 
-    /// Takes an ended session's endpoint back to serve the next connection, unless the network
-    /// revoked it, in which case it drains before the rebind.
+    /// Takes an ended session's endpoint back to serve the next connection, unless its session was
+    /// asked to stop, in which case it lets go of the port before the rebind.
     pub async fn reclaim(&mut self, lease: EndpointLease) {
         let EndpointLease { prepared } = lease;
-        if prepared.endpoint().is_revoked() {
-            let _ = tokio::time::timeout(
-                REVOKED_ENDPOINT_DRAIN,
-                prepared.endpoint().close_and_wait_idle(),
-            )
-            .await;
-            return;
-        }
-        self.prepared = Some(prepared);
+        self.slot.keep(prepared).await;
     }
 }
 
@@ -991,6 +1069,109 @@ mod cancellation_tests {
         cancellation.join().unwrap();
         drop(watch);
         server.close(0_u32.into(), b"fixture complete");
+    }
+}
+
+#[cfg(test)]
+mod standing_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    /// The pinned port: like the real bind without address reuse, it takes one owner at a time.
+    #[derive(Clone, Default)]
+    struct Port(Arc<AtomicBool>);
+
+    struct Fake {
+        id: usize,
+        signal: RevocationSignal,
+        port: Port,
+        retires: Arc<AtomicUsize>,
+    }
+
+    impl Fake {
+        fn bind(port: &Port, id: usize, retires: &Arc<AtomicUsize>) -> Result<Self, SetupFailure> {
+            if port.0.swap(true, Ordering::SeqCst) {
+                return Err(SetupFailure::PortBusy);
+            }
+            Ok(Self {
+                id,
+                signal: RevocationSignal::default(),
+                port: port.clone(),
+                retires: Arc::clone(retires),
+            })
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.port.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl Standing for Fake {
+        fn signal(&self) -> &RevocationSignal {
+            &self.signal
+        }
+
+        async fn retire(self) {
+            self.retires.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_untouched_endpoint_serves_the_next_session_without_a_rebind() {
+        let (port, retires) = (Port::default(), Arc::default());
+        let mut slot = StandingSlot::new();
+        let first = slot
+            .take_or_bind(|| Fake::bind(&port, 1, &retires))
+            .await
+            .unwrap();
+        slot.keep(first).await;
+        let reused = slot
+            .take_or_bind(|| panic!("an untouched endpoint is never rebound"))
+            .await
+            .unwrap();
+        assert_eq!(reused.id, 1);
+        assert_eq!(retires.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_asked_to_stop_is_retired_by_reclaim_and_connect_before_any_bind() {
+        let stops: [fn(&RevocationSignal); 2] =
+            [RevocationSignal::request_stop, RevocationSignal::revoke];
+        for stop in stops {
+            // Reclaim: an ended session's endpoint whose signal stopped retires and is let go.
+            let (port, retires) = (Port::default(), Arc::default());
+            let mut slot = StandingSlot::new();
+            let ended = Fake::bind(&port, 1, &retires).unwrap();
+            stop(&ended.signal);
+            slot.keep(ended).await;
+            assert!(slot.held.is_none());
+            assert_eq!(retires.load(Ordering::SeqCst), 1);
+            let fresh = slot
+                .take_or_bind(|| Fake::bind(&port, 2, &retires))
+                .await
+                .unwrap();
+            assert_eq!(fresh.id, 2);
+            assert!(!fresh.signal.is_stopping());
+
+            // Connect: a failed attempt handed its endpoint back; it stops before the next attempt.
+            let (port, retires) = (Port::default(), Arc::default());
+            let mut slot = StandingSlot::new();
+            let failed = Fake::bind(&port, 1, &retires).unwrap();
+            let signal = failed.signal.clone();
+            slot.hold(failed);
+            stop(&signal);
+            let fresh = slot
+                .take_or_bind(|| Fake::bind(&port, 2, &retires))
+                .await
+                .expect("the retired endpoint released the port before the bind");
+            assert_eq!(fresh.id, 2);
+            assert_eq!(retires.load(Ordering::SeqCst), 1);
+        }
     }
 }
 

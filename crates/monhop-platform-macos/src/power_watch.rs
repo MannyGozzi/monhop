@@ -70,13 +70,6 @@ impl PowerLatches {
         }
         self.signal.mark_revoked_without_wake();
     }
-
-    fn revoke(&self, reason: StopReason) {
-        if let Some(stop) = &self.stop {
-            stop.stop(reason);
-        }
-        self.signal.revoke();
-    }
 }
 
 struct PowerContext {
@@ -161,7 +154,11 @@ impl PowerWatch {
 
 impl Drop for PowerWatch {
     fn drop(&mut self) {
-        self.latches.revoke(StopReason::Requested);
+        match &self.latches.stop {
+            // The capture owning this watch decides whether its end revokes the session.
+            Some(stop) => stop.stop(StopReason::Requested),
+            None => self.latches.signal.revoke(),
+        }
         if let Some(registration) = self.registration.take() {
             teardown_registration(registration);
         }
@@ -424,6 +421,27 @@ mod tests {
         handle_power_notification(&context, IO_MESSAGE_SYSTEM_WILL_SLEEP, 0, |_, _| -1);
         assert!(signal.is_revoked());
         assert_eq!(stop.reason(), Some(StopReason::Requested));
+    }
+
+    #[test]
+    fn a_capture_watch_drop_stops_its_capture_and_a_network_watch_drop_revokes() {
+        let (context, signal, stop) = test_context();
+        drop(PowerWatch {
+            latches: context.latches.clone(),
+            registration: None,
+        });
+        assert_eq!(stop.reason(), Some(StopReason::Requested));
+        assert!(!signal.is_stopping(), "the capture decides the session");
+
+        let signal = RevocationSignal::default();
+        drop(PowerWatch {
+            latches: PowerLatches {
+                signal: signal.clone(),
+                stop: None,
+            },
+            registration: None,
+        });
+        assert!(signal.is_revoked());
     }
 
     #[test]
