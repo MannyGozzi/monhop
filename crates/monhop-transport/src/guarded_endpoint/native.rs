@@ -241,7 +241,13 @@ fn pinned_check(
     let pinned = Arc::clone(pinned);
     Box::new(move || {
         let current = observe_selected_adapter(&initial, &selection)
-            .and_then(|observed| interface_snapshot(&observed));
+            .and_then(|observed| interface_snapshot(&observed))
+            .inspect_err(|error| {
+                log::warn!(
+                    "network recheck: the selected adapter did not read back ({:?})",
+                    error.kind()
+                );
+            });
         let peer = *selection.peer.ip();
         let route = current.as_ref().ok().map(|current| {
             validate_peer(current, peer)
@@ -260,12 +266,18 @@ fn pinned_facts_hold(
     current: Option<&InterfaceSnapshot>,
     route: Option<io::Result<RouteSnapshot>>,
 ) -> bool {
-    match (lock, current, route) {
-        (Some(lock), Some(current), Some(Ok(route))) => {
-            lock.revalidate(Some(current), route).is_ok()
-        }
-        _ => false,
-    }
+    let failure = match (lock, current, route) {
+        (Some(lock), Some(current), Some(Ok(route))) => match lock.revalidate(Some(current), route)
+        {
+            Ok(()) => return true,
+            Err(error) => format!("{error:?}"),
+        },
+        (None, ..) => "no pinned snapshot yet".to_owned(),
+        (_, _, Some(Err(error))) => error.to_string(),
+        _ => return false,
+    };
+    log::warn!("network recheck failed: {failure}");
+    false
 }
 
 fn observe_selected_adapter(
@@ -357,6 +369,8 @@ fn route_snapshot(selected: &InterfaceSnapshot, peer: Ipv4Addr) -> io::Result<Ro
 }
 
 fn route_check_error(error: io::Error) -> io::Error {
+    // The platform message names the failed rule and carries no addresses; callers see only the kind.
+    log::warn!("network check: the route to the peer failed: {error}");
     io::Error::new(error.kind(), RouteCheckFailure)
 }
 

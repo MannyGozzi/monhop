@@ -146,6 +146,7 @@ pub async fn run_session(
     let mut submitted: Option<(u64, Duration)> = None;
     let mut last_renewed = origin.elapsed();
     let mut last_pointer_poll = origin.elapsed();
+    let mut last_control = None;
     let mut tick = tokio::time::interval(SESSION_POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut gaps = TickGap::new(origin.elapsed());
@@ -413,6 +414,15 @@ pub async fn run_session(
                 gaps.observe(origin.elapsed());
                 // Two quinn lock round trips: the tick, never every captured event, pays for them.
                 io.check()?;
+                let control = (
+                    floor.snapshot().state,
+                    source.mode(),
+                    source.capture_route().0,
+                );
+                if last_control != Some(control) {
+                    last_control = Some(control);
+                    log_control_change(control);
+                }
                 if outbound.is_none() {
                     let capture = workers.capture.as_mut().ok_or(SessionFailure::Native)?;
                     if let Some((ticket, issued)) = submitted {
@@ -559,6 +569,17 @@ pub async fn run_session(
         return Err(SessionFailure::NativeCleanup);
     }
     result
+}
+
+/// One line per control handoff: who holds the floor and where the local pointer sits.
+fn log_control_change((floor, mode, capture_remote): (FloorState, SourceMode, bool)) {
+    let pointer = current_pointer_position().map_or_else(
+        || "unknown".to_owned(),
+        |p| format!("{:.0},{:.0}", p.x, p.y),
+    );
+    log::info!(
+        "control: floor {floor:?}, source {mode:?}, capture remote {capture_remote}, pointer {pointer}"
+    );
 }
 
 /// Only a translation of the peer block is accepted. Wire coordinates stay native on each peer.
