@@ -52,7 +52,7 @@ The 3,577.737-second process lifetime included waiting for Start and is not capt
 
 The final Mac gate for this continuation passed 90 tests with seven opt-in native tests ignored, workspace formatter, warning-free Clippy, release build, vulnerability audit and permissive-license/source/dependency-ban checks. The existing duplicate-getrandom warning remains. Both native example test suites are now part of `cargo test --workspace`; their build targets have distinct names so they cannot overwrite each other. The Windows target all-target check and example Clippy passed on the Mac. Windows linking and runtime tests remain separate.
 
-The final route parser passed the explicit physical direct-route test in 0.02 seconds using the current Mac address and its on-link router. This queries the kernel only and sends no peer packet. It also rejects the VPN-selected route instead of forcing another route. A route diagnostic pass is not network attachment identity, peer authentication or permission to forward input.
+The final route parser passed the explicit physical direct-route test in 0.02 seconds using the current Mac address and its on-link router. This queries the kernel only and sends no peer packet. The lookup is scoped to the selected interface, the same route the `IP_BOUND_IF` sockets use, so a VPN that claims the LAN in the global table neither carries MonHop traffic nor ends the session. Windows still reads the global best route, so there such a VPN ends the session. A route diagnostic pass is not network attachment identity, peer authentication or permission to forward input.
 
 ## Network watcher checkpoint
 

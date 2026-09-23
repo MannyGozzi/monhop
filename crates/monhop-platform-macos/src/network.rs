@@ -47,7 +47,6 @@ const RTF_BLACKHOLE: i32 = 0x1000;
 const RTF_LOCAL: i32 = 0x20_0000;
 const RTF_BROADCAST: i32 = 0x40_0000;
 const RTF_MULTICAST: i32 = 0x80_0000;
-#[cfg(test)]
 const RTF_IFSCOPE: i32 = 0x100_0000;
 pub(crate) const IPPROTO_IP: c_int = 0;
 const IP_RECVIF: c_int = 20;
@@ -320,9 +319,9 @@ fn populate_wifi_attachments(
     }
 }
 
-/// Reads the kernel-selected route without binding, connecting, or sending to
-/// a peer. The requested source is verified after lookup, never used to force
-/// a selected NIC to appear to be the best route.
+/// Reads the route an `IP_BOUND_IF` socket on `source`'s interface uses, without binding,
+/// connecting, or sending to a peer. Scoping matches the pinned sockets, so a VPN that claims the
+/// LAN in the global table does not move this route.
 pub fn best_route(source: Ipv4Addr, peer: Ipv4Addr) -> io::Result<Route> {
     if source.is_unspecified() || peer.is_unspecified() || peer.is_multicast() {
         return Err(io::Error::new(
@@ -330,21 +329,19 @@ pub fn best_route(source: Ipv4Addr, peer: Ipv4Addr) -> io::Result<Route> {
             "an exact unicast IPv4 source and peer are required",
         ));
     }
-    let route = kernel_route_lookup(peer)?;
-    if route.source != source {
+    let scope = enumerate_adapters()?
+        .into_iter()
+        .find(|adapter| adapter.address == source && adapter.physical && adapter.up)
+        .map(|adapter| adapter.index)
+        .ok_or_else(|| {
+            io::Error::other(
+                "the requested source is not a live physical Ethernet or Wi-Fi interface",
+            )
+        })?;
+    let route = kernel_route_lookup(peer, scope)?;
+    if route.interface_index != scope || route.source != source {
         return Err(io::Error::other(
-            "the kernel-selected route does not use the requested source address",
-        ));
-    }
-    let adapters = enumerate_adapters()?;
-    if !adapters.iter().any(|adapter| {
-        adapter.index == route.interface_index
-            && adapter.address == route.source
-            && adapter.physical
-            && adapter.up
-    }) {
-        return Err(io::Error::other(
-            "the kernel-selected route is not a live physical Ethernet or Wi-Fi interface",
+            "the kernel-selected route does not use the requested interface and source address",
         ));
     }
     Ok(route)
@@ -599,7 +596,7 @@ fn adapter_from_record(
     }
 }
 
-fn kernel_route_lookup(peer: Ipv4Addr) -> io::Result<Route> {
+fn kernel_route_lookup(peer: Ipv4Addr, scope: u32) -> io::Result<Route> {
     // SAFETY: this opens the local routing-control plane, never a peer data endpoint.
     let fd = unsafe { socket(PF_ROUTE, SOCK_RAW, 0) };
     if fd < 0 {
@@ -613,8 +610,15 @@ fn kernel_route_lookup(peer: Ipv4Addr) -> io::Result<Route> {
         .map_err(|_| io::Error::other("route request exceeds the macOS message bound"))?;
     header.version = RTM_VERSION;
     header.message_type = RTM_GET;
-    // XNU emits the selected IPv4 interface address only when RTM_GET asks
-    // for interface metadata. These placeholders do not set RTF_IFSCOPE.
+    // RTF_IFSCOPE with the index asks for the route an IP_BOUND_IF socket on that interface uses.
+    header.flags = RTF_IFSCOPE;
+    header.interface_index = u16::try_from(scope).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface index exceeds the route header",
+        )
+    })?;
+    // XNU emits the selected IPv4 interface address only when RTM_GET asks for interface metadata.
     header.addresses = RTA_DST | RTA_IFP | RTA_IFA;
     // SAFETY: getpid has no input and returns this process identifier synchronously.
     let pid = unsafe { getpid() };
@@ -1509,8 +1513,22 @@ mod tests {
     #[test]
     #[ignore = "explicit read-only macOS routing-control diagnostic"]
     fn native_kernel_lookup_receives_and_rejects_loopback() {
-        let error = kernel_route_lookup(Ipv4Addr::LOCALHOST).unwrap_err();
+        // SAFETY: the name is a static NUL-terminated C string.
+        let lo0 = unsafe { if_nametoindex(c"lo0".as_ptr()) };
+        let error = kernel_route_lookup(Ipv4Addr::LOCALHOST, lo0).unwrap_err();
         assert_eq!(error.to_string(), "macOS returned an ineligible route");
+    }
+
+    #[test]
+    #[ignore = "set MONHOP_TEST_SOURCE to this Mac's physical IPv4 address"]
+    fn native_scoped_lookup_rejects_a_route_on_another_interface() {
+        // XNU answers every 127/8 lookup on lo0 regardless of scope, so the interface check must refuse it.
+        let error =
+            best_route(test_ipv4("MONHOP_TEST_SOURCE"), Ipv4Addr::new(127, 0, 0, 2)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the kernel-selected route does not use the requested interface and source address"
+        );
     }
 
     #[test]
