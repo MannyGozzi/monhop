@@ -19,8 +19,8 @@ use monhop_core::{
     Topology, TransitionAcknowledgement,
 };
 use monhop_protocol::{
-    Button, Frame, Key, MAX_LOGICAL_ORIGIN_ABS, Message, Motion, RateLimiter, SequenceGate,
-    SessionEpoch,
+    Button, DeclineReason, Frame, Key, MAX_LOGICAL_ORIGIN_ABS, Message, Motion, RateLimiter,
+    SequenceGate, SessionEpoch,
 };
 
 use crate::session_clock::millis_u64;
@@ -281,6 +281,8 @@ pub struct SourceController {
     capture_ready: bool,
     take_back: bool,
     declined: Option<(DisplayId, DisplayId, Option<Duration>, Duration)>,
+    /// The decline logged for this streak, which ends on an acknowledgement or a pressure pause.
+    decline_logged: Option<(DisplayId, DeclineReason)>,
     /// Display and edge the last crossing entered through, so sensor noise cannot bounce it back.
     entry_guard: Option<(DisplayId, Edge)>,
     peer_offset: Point,
@@ -416,6 +418,7 @@ impl SourceController {
             capture_ready: true,
             take_back: false,
             declined: None,
+            decline_logged: None,
             entry_guard: None,
             peer_offset: Point::default(),
             topology,
@@ -721,7 +724,7 @@ impl SourceController {
                 self.capture_ready = false;
                 self.take_back = false;
                 self.declined = Some((return_target.display, target.display, Some(now), now));
-                log::info!("return: the other computer declined control");
+                log::info!("return: this computer's capture could not take over input yet");
                 self.begin_return_to(return_target, return_position, None, &mut effects);
             }
             _ => self.fail(SourceFailure::NativeControl, &mut effects),
@@ -887,9 +890,16 @@ impl SourceController {
                 ownership_epoch,
                 capture_already_remote,
             } => {
-                let declined = matches!(frame.message, Message::ActivationDeclined { display_id, .. } if display_id == target.display);
+                let decline = match frame.message {
+                    Message::ActivationDeclined { display_id, reason }
+                        if display_id == target.display =>
+                    {
+                        Some(reason)
+                    }
+                    _ => None,
+                };
                 let valid = frame.epoch == self.input_epoch
-                    && (declined
+                    && (decline.is_some()
                         || matches!(frame.message, Message::ActivationAck(display) if display == target.display))
                     && (self.inbound_input_epoch == Some(frame.epoch)
                         || self.activate_input_epoch(frame.epoch))
@@ -901,7 +911,7 @@ impl SourceController {
                     );
                     return self.outcome(effects);
                 }
-                if declined {
+                if let Some(reason) = decline {
                     if !self.recover_ownership_at(return_target) {
                         self.fail(SourceFailure::Ownership, &mut effects);
                         return self.outcome(effects);
@@ -911,7 +921,15 @@ impl SourceController {
                     self.take_back = false;
                     self.entry_guard = None;
                     self.declined = Some((return_target.display, target.display, Some(now), now));
-                    log::info!("return: the other computer declined control");
+                    // A pressed seam retries every DECLINE_RETRY_AFTER: one line per streak.
+                    if self.decline_logged != Some((target.display, reason)) {
+                        self.decline_logged = Some((target.display, reason));
+                        if capture_already_remote {
+                            log::info!("return: the other computer declined control ({reason:?})");
+                        } else {
+                            log::info!("crossing declined by the other computer ({reason:?})");
+                        }
+                    }
                     if capture_already_remote {
                         if let Some(owned) = self.floor_claim {
                             match self.floor.transition(owned, FloorState::Returning) {
@@ -938,6 +956,7 @@ impl SourceController {
                     }
                     return self.outcome(effects);
                 }
+                self.decline_logged = None;
                 if !capture_already_remote {
                     let Some(owned) = self.floor_claim else {
                         self.fail(SourceFailure::Ownership, &mut effects);
@@ -1443,7 +1462,8 @@ impl SourceController {
         let State::Local { target, cursor } = self.state else {
             return;
         };
-        let guarded = cursor.and_then(|cursor| self.guarded_entry_edge(target.display, cursor));
+        // The raw sample, not the pinned cursor: the OS cursor may be on a display not in use.
+        let guarded = self.guarded_entry_edge(target.display, current);
         if let Some((from, to, _, last)) = self.declined {
             let pressing = self.topology.display(from).is_ok_and(|display| {
                 self.topology.links().iter().any(|link| {
@@ -1454,6 +1474,7 @@ impl SourceController {
             });
             if !pressing {
                 self.declined = Some((from, to, None, last));
+                self.decline_logged = None;
             }
         }
         let local_target = match self.local_target_at(current) {
@@ -1751,13 +1772,14 @@ impl SourceController {
         Ok(None)
     }
 
-    /// The entry edge `position` may not cross yet. The guard is dropped for good once the
-    /// pointer is on another display or has been [`ENTRY_GUARD_DISTANCE`] away from that edge.
+    /// The entry edge `position` may not cross yet. The guard is dropped for good once the pointer
+    /// is on another display or has been its release distance from that edge line, on either side.
     fn guarded_entry_edge(&mut self, display_id: DisplayId, position: Point) -> Option<Edge> {
         let (guarded, edge) = self.entry_guard?;
         let holding = guarded == display_id
             && self.topology.display(display_id).is_ok_and(|display| {
-                distance_inside(display.bounds(), position, edge) < ENTRY_GUARD_DISTANCE
+                let bounds = display.bounds();
+                distance_inside(bounds, position, edge).abs() < release_distance(bounds, edge)
             });
         if !holding {
             self.entry_guard = None;
@@ -2451,6 +2473,15 @@ fn distance_inside(bounds: monhop_core::LogicalRect, point: Point, edge: Edge) -
         Edge::Top => point.y - bounds.origin.y,
         Edge::Bottom => bounds.max_y() - point.y,
     }
+}
+
+/// Half the display's depth when that is shorter, or a shallow display could never release.
+fn release_distance(bounds: monhop_core::LogicalRect, edge: Edge) -> f64 {
+    let depth = match edge {
+        Edge::Left | Edge::Right => bounds.size.width,
+        Edge::Top | Edge::Bottom => bounds.size.height,
+    };
+    ENTRY_GUARD_DISTANCE.min(depth / 2.0)
 }
 
 fn project_past_edge(

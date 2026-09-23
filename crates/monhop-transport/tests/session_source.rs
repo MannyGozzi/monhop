@@ -1,11 +1,13 @@
-use std::time::Duration;
+use std::{cell::RefCell, sync::Once, time::Duration};
 
+use monhop_core::capture::DECLINE_RETRY_AFTER;
 use monhop_core::{
     DeviceId, Display, DisplayId, Edge, EdgeLink, HidUsage, LogicalSize, Machine, ModifierState,
     MouseButton, NativeSize, NormalizedSpan, Platform, Point, Topology,
 };
 use monhop_protocol::{
-    DisconnectCode, DisplayDescription, DisplayTopology, Frame, Key, Message, Motion, SessionEpoch,
+    DeclineReason, DisconnectCode, DisplayDescription, DisplayTopology, Frame, Key, Message,
+    Motion, SessionEpoch,
 };
 use monhop_transport::session_health::{
     HOLD_LIMIT, HealthError, PEER_LIVENESS, RETREAT_AFTER, SUPPRESSION_LEASE_CAP,
@@ -436,26 +438,31 @@ fn route_request(
 }
 
 fn activate_remote(source: &mut SourceController) {
+    activate_remote_from(
+        source,
+        Point::new(99.0, 50.0),
+        Point::new(1.0, 0.0),
+        Point::new(1.0, 50.0),
+    );
+}
+
+/// Pushes by `push` from `at` on the local display and completes the activation of display 2,
+/// which the pointer enters at `entry`.
+fn activate_remote_from(source: &mut SourceController, at: Point, push: Point, entry: Point) {
     assert!(
         source
-            .fresh_capture(
-                local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
-                ms(0)
-            )
+            .fresh_capture(local(NormalizedInput::AbsoluteMotion(at)), ms(0))
             .effects
             .is_empty()
     );
-    let edge = source.fresh_capture(
-        local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
-        ms(0),
-    );
+    let edge = source.fresh_capture(local(NormalizedInput::RelativeMotion(push)), ms(0));
     assert_frame(
         edge.effects.iter().next().unwrap(),
         4,
         0,
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
-            position: Point::new(1.0, 50.0),
+            position: entry,
         },
     );
     let acknowledged = source.on_remote_frame(&activation_ack(), ms(0));
@@ -505,8 +512,12 @@ fn move_horizontally(source: &mut SourceController, dx: f64, now: Duration) -> S
 }
 
 /// Acknowledges the ReleaseAll of a return from display 2 and completes the native restore,
-/// yielding where the local pointer landed.
-fn complete_return(source: &mut SourceController, ack_sequence: u64, now: Duration) -> Point {
+/// yielding the display and position the local pointer landed on.
+fn complete_return(
+    source: &mut SourceController,
+    ack_sequence: u64,
+    now: Duration,
+) -> (DisplayId, Point) {
     let restore = source.on_remote_frame(
         &Frame::new(
             SessionEpoch::new(4).unwrap(),
@@ -518,11 +529,11 @@ fn complete_return(source: &mut SourceController, ack_sequence: u64, now: Durati
     assert_eq!(restore.failure, None);
     let Some(SourceEffect::RestoreLocalAt {
         request,
-        display: DisplayId(1),
+        display,
         position,
     }) = restore.effects.iter().next()
     else {
-        panic!("the acknowledgement restores the pointer on display 1");
+        panic!("the acknowledgement restores the local pointer");
     };
     let ticket = source.capture_route().1 + 1;
     assert_eq!(
@@ -542,19 +553,110 @@ fn complete_return(source: &mut SourceController, ack_sequence: u64, now: Durati
     );
     assert_eq!(barrier.failure, None);
     assert_eq!(source.mode(), SourceMode::Local);
-    *position
+    (*display, *position)
+}
+
+/// A local absolute sample that must neither cross nor fail.
+fn move_to(source: &mut SourceController, point: Point, now: Duration) {
+    let moved = capture_on_route(source, NormalizedInput::AbsoluteMotion(point), now);
+    assert_eq!(moved.failure, None);
+    assert!(moved.effects.is_empty());
+}
+
+fn sends(outcome: &SourceOutcome, wanted: fn(&Message) -> bool) -> bool {
+    outcome
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, SourceEffect::RemoteFrame(frame) if wanted(&frame.message)))
 }
 
 fn sends_release_all(outcome: &SourceOutcome) -> bool {
-    outcome.effects.iter().any(|effect| {
-        matches!(
-            effect,
-            SourceEffect::RemoteFrame(Frame {
-                message: Message::ReleaseAll,
-                ..
-            })
-        )
+    sends(outcome, |message| matches!(message, Message::ReleaseAll))
+}
+
+fn sends_activation(outcome: &SourceOutcome) -> bool {
+    sends(outcome, |message| {
+        matches!(message, Message::ActivateDisplayAt { .. })
     })
+}
+
+/// Collects log lines per thread; libtest runs each test on its own thread.
+struct ThreadLog;
+
+thread_local! {
+    static LOG_LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+impl log::Log for ThreadLog {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        LOG_LINES.with(|lines| lines.borrow_mut().push(record.args().to_string()));
+    }
+
+    fn flush(&self) {}
+}
+
+fn capture_log() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        log::set_logger(&ThreadLog).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+    });
+    LOG_LINES.with(|lines| lines.borrow_mut().clear());
+}
+
+fn logged(fragment: &str) -> usize {
+    LOG_LINES.with(|lines| {
+        lines
+            .borrow()
+            .iter()
+            .filter(|line| line.contains(fragment))
+            .count()
+    })
+}
+
+/// A 100 px tall display at `origin`, `width` px wide.
+fn display_at(id: u64, machine: u8, origin: Point, width: u32) -> Display {
+    Display::new(
+        DisplayId(id),
+        device(machine),
+        format!("display-{id}"),
+        NativeSize::new(width, 100),
+        LogicalSize::new(f64::from(width), 100.0),
+        origin,
+        1.0,
+        None,
+        false,
+    )
+}
+
+fn full_link(from: u64, from_edge: Edge, to: u64, to_edge: Edge) -> EdgeLink {
+    let full = NormalizedSpan::new(0.0, 1.0).unwrap();
+    EdgeLink::new(
+        DisplayId(from),
+        from_edge,
+        full,
+        DisplayId(to),
+        to_edge,
+        full,
+        1.0,
+    )
+    .unwrap()
+}
+
+fn two_machine_topology(displays: Vec<Display>, links: Vec<EdgeLink>) -> Topology {
+    Topology::new(
+        vec![
+            Machine::new(device(1), Platform::Windows),
+            Machine::new(device(2), Platform::MacOs),
+        ],
+        displays,
+        links,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -1869,24 +1971,7 @@ fn topology_with_displays_not_in_use() -> Topology {
         None,
         true,
     );
-    let full = || NormalizedSpan::new(0.0, 1.0).unwrap();
-    let link = |from: u64, from_edge: Edge, to: u64, to_edge: Edge| {
-        EdgeLink::new(
-            DisplayId(from),
-            from_edge,
-            full(),
-            DisplayId(to),
-            to_edge,
-            full(),
-            1.0,
-        )
-        .unwrap()
-    };
-    Topology::new(
-        vec![
-            Machine::new(device(1), Platform::Windows),
-            Machine::new(device(2), Platform::MacOs),
-        ],
+    two_machine_topology(
         vec![
             local(1, 0.0, true),
             local(4, 100.0, true),
@@ -1895,13 +1980,12 @@ fn topology_with_displays_not_in_use() -> Topology {
             remote,
         ],
         vec![
-            link(1, Edge::Right, 4, Edge::Left),
-            link(4, Edge::Left, 1, Edge::Right),
-            link(4, Edge::Right, 2, Edge::Left),
-            link(2, Edge::Left, 4, Edge::Right),
+            full_link(1, Edge::Right, 4, Edge::Left),
+            full_link(4, Edge::Left, 1, Edge::Right),
+            full_link(4, Edge::Right, 2, Edge::Left),
+            full_link(2, Edge::Left, 4, Edge::Right),
         ],
     )
-    .unwrap()
 }
 
 fn source_on(topology: Topology, display: DisplayId) -> SourceController {
@@ -2144,7 +2228,7 @@ fn the_entry_edge_crosses_back_once_the_pointer_has_moved_the_guard_distance_awa
     assert_eq!(source.mode(), SourceMode::AwaitRemoteReleaseAcknowledgement);
     assert_eq!(
         complete_return(&mut source, 1, ms(5)),
-        Point::new(99.0, 50.0)
+        (DisplayId(1), Point::new(99.0, 50.0))
     );
 }
 
@@ -2161,13 +2245,8 @@ fn a_return_through_an_edge_guards_that_home_edge_until_the_pointer_moves_away()
         -ENTRY_GUARD_DISTANCE - 3.0,
         ms(2)
     )));
-    let home = complete_return(&mut source, 1, ms(3));
-    assert_eq!(home, Point::new(99.0, 50.0));
-    fn move_to(source: &mut SourceController, point: Point, now: Duration) {
-        let moved = capture_on_route(source, NormalizedInput::AbsoluteMotion(point), now);
-        assert_eq!(moved.failure, None);
-        assert!(moved.effects.is_empty());
-    }
+    let (display, home) = complete_return(&mut source, 1, ms(3));
+    assert_eq!((display, home), (DisplayId(1), Point::new(99.0, 50.0)));
     let wobble = move_horizontally(&mut source, 1.0, ms(4));
     assert_eq!(wobble.failure, None);
     assert!(
@@ -2216,7 +2295,7 @@ fn a_take_back_return_leaves_the_home_edge_unguarded() {
     // The same spot an edge return lands on, but nothing guards it.
     assert_eq!(
         complete_return(&mut source, 2, ms(2)),
-        Point::new(99.0, 50.0)
+        (DisplayId(1), Point::new(99.0, 50.0))
     );
     let push = move_horizontally(&mut source, 1.0, ms(3));
     assert_frame(
@@ -2232,50 +2311,19 @@ fn a_take_back_return_leaves_the_home_edge_unguarded() {
 
 /// The other computer's display 3 sits above its display 2, linked through 2's top edge.
 fn topology_with_a_display_above_the_entered_one() -> Topology {
-    let display = |id: u64, machine: u8, y: f64| {
-        Display::new(
-            DisplayId(id),
-            device(machine),
-            format!("display-{id}"),
-            NativeSize::new(100, 100),
-            LogicalSize::new(100.0, 100.0),
-            Point::new(0.0, y),
-            1.0,
-            None,
-            id != 3,
-        )
-    };
-    let full = || NormalizedSpan::new(0.0, 1.0).unwrap();
-    let link = |from: u64, from_edge: Edge, to: u64, to_edge: Edge| {
-        EdgeLink::new(
-            DisplayId(from),
-            from_edge,
-            full(),
-            DisplayId(to),
-            to_edge,
-            full(),
-            1.0,
-        )
-        .unwrap()
-    };
-    Topology::new(
+    two_machine_topology(
         vec![
-            Machine::new(device(1), Platform::Windows),
-            Machine::new(device(2), Platform::MacOs),
+            display_at(1, 1, Point::new(0.0, 0.0), 100),
+            display_at(2, 2, Point::new(0.0, 0.0), 100),
+            display_at(3, 2, Point::new(0.0, -100.0), 100),
         ],
         vec![
-            display(1, 1, 0.0),
-            display(2, 2, 0.0),
-            display(3, 2, -100.0),
-        ],
-        vec![
-            link(1, Edge::Right, 2, Edge::Left),
-            link(2, Edge::Left, 1, Edge::Right),
-            link(2, Edge::Top, 3, Edge::Bottom),
-            link(3, Edge::Bottom, 2, Edge::Top),
+            full_link(1, Edge::Right, 2, Edge::Left),
+            full_link(2, Edge::Left, 1, Edge::Right),
+            full_link(2, Edge::Top, 3, Edge::Bottom),
+            full_link(3, Edge::Bottom, 2, Edge::Top),
         ],
     )
-    .unwrap()
 }
 
 #[test]
@@ -2316,6 +2364,338 @@ fn an_entry_guard_leaves_the_other_edges_of_the_display_crossable() {
         }))
     ));
     assert_eq!(source.mode(), SourceMode::AwaitActivationAcknowledgement);
+}
+
+/// Enters display 2 by a one px `push` from `at`, moves off the entry edge and crosses back
+/// through it, yielding where the returned pointer landed.
+fn round_trip(
+    source: &mut SourceController,
+    at: Point,
+    push: Point,
+    entry: Point,
+) -> (DisplayId, Point) {
+    activate_remote_from(source, at, push, entry);
+    let along = |by: f64| NormalizedInput::RelativeMotion(Point::new(push.x * by, push.y * by));
+    assert_eq!(
+        capture_on_route(source, along(ENTRY_GUARD_DISTANCE), ms(1)).failure,
+        None
+    );
+    assert!(sends_release_all(&capture_on_route(
+        source,
+        along(-ENTRY_GUARD_DISTANCE - 3.0),
+        ms(2)
+    )));
+    complete_return(source, 1, ms(3))
+}
+
+#[test]
+fn a_guarded_home_edge_releases_once_the_pointer_is_that_far_onto_a_display_not_in_use() {
+    // Display 5, past display 4's right edge line at x = 200, is not in use: the OS cursor moves
+    // onto it while the tracked cursor stays pinned inside display 4.
+    let right_edge = 200.0;
+    for (past, crosses) in [
+        (1.0, false),
+        (ENTRY_GUARD_DISTANCE - 1.0, false),
+        (ENTRY_GUARD_DISTANCE, true),
+        (30.0, true),
+        (60.0, true),
+    ] {
+        let mut source = source_on(topology_with_displays_not_in_use(), DisplayId(4));
+        let landed = round_trip(
+            &mut source,
+            Point::new(199.0, 50.0),
+            Point::new(1.0, 0.0),
+            Point::new(1.0, 50.0),
+        );
+        assert_eq!(landed, (DisplayId(4), Point::new(199.0, 50.0)));
+        let push = capture_on_route(
+            &mut source,
+            NormalizedInput::AbsoluteMotion(Point::new(right_edge + past, 50.0)),
+            ms(4),
+        );
+        assert_eq!(push.failure, None);
+        assert_eq!(sends_activation(&push), crosses, "{past} px past the edge");
+        if !crosses {
+            let further = capture_on_route(
+                &mut source,
+                NormalizedInput::AbsoluteMotion(Point::new(right_edge + 30.0, 50.0)),
+                ms(5),
+            );
+            assert!(
+                sends_activation(&further),
+                "a held pointer still crosses later"
+            );
+        }
+    }
+}
+
+const EDGES: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+
+fn opposite(edge: Edge) -> Edge {
+    match edge {
+        Edge::Left => Edge::Right,
+        Edge::Right => Edge::Left,
+        Edge::Top => Edge::Bottom,
+        Edge::Bottom => Edge::Top,
+    }
+}
+
+/// The middle of `edge` of a 100 px square display at the origin, `inset` px inside it
+/// (negative: past it).
+fn edge_point(edge: Edge, inset: f64) -> Point {
+    match edge {
+        Edge::Left => Point::new(inset, 50.0),
+        Edge::Right => Point::new(100.0 - inset, 50.0),
+        Edge::Top => Point::new(50.0, inset),
+        Edge::Bottom => Point::new(50.0, 100.0 - inset),
+    }
+}
+
+/// A relative motion of `distance` px across `edge`, out of the display.
+fn across(edge: Edge, distance: f64) -> Point {
+    match edge {
+        Edge::Left => Point::new(-distance, 0.0),
+        Edge::Right => Point::new(distance, 0.0),
+        Edge::Top => Point::new(0.0, -distance),
+        Edge::Bottom => Point::new(0.0, distance),
+    }
+}
+
+fn push_across(source: &mut SourceController, edge: Edge, distance: f64, at: u64) -> SourceOutcome {
+    capture_on_route(
+        source,
+        NormalizedInput::RelativeMotion(across(edge, distance)),
+        ms(at),
+    )
+}
+
+/// Each edge of display 1 links to the opposite edge of the other computer's display 2, and back.
+fn topology_linked_on_every_edge() -> Topology {
+    let origin = Point::new(0.0, 0.0);
+    two_machine_topology(
+        vec![display_at(1, 1, origin, 100), display_at(2, 2, origin, 100)],
+        EDGES
+            .into_iter()
+            .flat_map(|edge| {
+                [
+                    full_link(1, edge, 2, opposite(edge)),
+                    full_link(2, opposite(edge), 1, edge),
+                ]
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn every_entry_edge_holds_small_pushes_on_every_motion_path_until_the_pointer_moves_away() {
+    // The remote model clamps into half-open bounds, one ulp short of the right and bottom lines.
+    let last = 100.0_f64.next_down();
+    for entered in EDGES {
+        let home_edge = opposite(entered);
+        let at = edge_point(home_edge, 1.0);
+        let push = across(home_edge, 1.0);
+        let entry = edge_point(entered, 1.0);
+
+        // The modelled pointer on the other computer: a 3 px push back stops on the edge line.
+        let mut remote = source_on(topology_linked_on_every_edge(), DisplayId(1));
+        activate_remote_from(&mut remote, at, push, entry);
+        let held = push_across(&mut remote, entered, 3.0, 1);
+        let line = edge_point(entered, 0.0);
+        assert_frame(
+            held.effects.iter().next().unwrap(),
+            4,
+            1,
+            Message::Motion(Motion::Absolute(Point::new(
+                line.x.min(last),
+                line.y.min(last),
+            ))),
+        );
+        assert_eq!(remote.mode(), SourceMode::Remote, "{entered:?}");
+
+        // Local relative pushes at the home edge hold until the pointer has been 24 px inside.
+        let mut relative = source_on(topology_linked_on_every_edge(), DisplayId(1));
+        assert_eq!(
+            round_trip(&mut relative, at, push, entry),
+            (DisplayId(1), at),
+            "{entered:?}"
+        );
+        let pushed = push_across(&mut relative, home_edge, 3.0, 4);
+        assert_eq!(pushed.failure, None);
+        assert!(pushed.effects.is_empty(), "{entered:?}");
+        move_to(
+            &mut relative,
+            edge_point(home_edge, ENTRY_GUARD_DISTANCE),
+            ms(5),
+        );
+        move_to(&mut relative, at, ms(6));
+        let crossing = push_across(&mut relative, home_edge, 1.0, 7);
+        assert!(sends_activation(&crossing), "{entered:?}");
+
+        // Local absolute samples past the home edge: 3 px is held, 24 px crosses.
+        let mut absolute = source_on(topology_linked_on_every_edge(), DisplayId(1));
+        round_trip(&mut absolute, at, push, entry);
+        move_to(&mut absolute, edge_point(home_edge, -3.0), ms(4));
+        let crossing = capture_on_route(
+            &mut absolute,
+            NormalizedInput::AbsoluteMotion(edge_point(home_edge, -ENTRY_GUARD_DISTANCE)),
+            ms(5),
+        );
+        assert!(sends_activation(&crossing), "{entered:?}");
+    }
+}
+
+#[test]
+fn a_guard_is_dropped_once_the_pointer_is_on_another_display() {
+    let mut source = source();
+    let landed = round_trip(
+        &mut source,
+        Point::new(99.0, 50.0),
+        Point::new(1.0, 0.0),
+        Point::new(1.0, 50.0),
+    );
+    assert_eq!(landed, (DisplayId(1), Point::new(99.0, 50.0)));
+    // 10 px onto display 4 is still within the guard distance of display 1's right edge line.
+    move_to(&mut source, Point::new(110.0, 50.0), ms(4));
+    assert_eq!(source.motion_target().unwrap().target.display, DisplayId(4));
+    // Display 4's own right edge is linked too; display 1's guard must not hold it.
+    move_to(&mut source, Point::new(199.0, 50.0), ms(5));
+    let push = move_horizontally(&mut source, 1.0, ms(6));
+    assert_frame(
+        push.effects.iter().next().unwrap(),
+        5,
+        0,
+        Message::ActivateDisplayAt {
+            display_id: DisplayId(2),
+            position: Point::new(1.0, 50.0),
+        },
+    );
+}
+
+/// The other computer's display 2 is 20 px wide, less than twice the guard distance.
+fn topology_with_a_narrow_entered_display() -> Topology {
+    let origin = Point::new(0.0, 0.0);
+    two_machine_topology(
+        vec![display_at(1, 1, origin, 100), display_at(2, 2, origin, 20)],
+        vec![
+            full_link(1, Edge::Right, 2, Edge::Left),
+            full_link(2, Edge::Left, 1, Edge::Right),
+        ],
+    )
+}
+
+#[test]
+fn a_display_too_narrow_for_the_guard_distance_releases_halfway_across() {
+    let mut source = source_on(topology_with_a_narrow_entered_display(), DisplayId(1));
+    activate_remote(&mut source);
+    // Entered at x = 1: x = 9 is short of half the 20 px width, x = 10 reaches it.
+    assert_eq!(move_horizontally(&mut source, 8.0, ms(1)).failure, None);
+    let held = move_horizontally(&mut source, -12.0, ms(2));
+    assert_frame(
+        held.effects.iter().next().unwrap(),
+        4,
+        2,
+        Message::Motion(Motion::Absolute(Point::new(0.0, 50.0))),
+    );
+    assert_eq!(move_horizontally(&mut source, 10.0, ms(3)).failure, None);
+    let returned = move_horizontally(&mut source, -13.0, ms(4));
+    assert_frame(
+        returned.effects.iter().next().unwrap(),
+        4,
+        4,
+        Message::ReleaseAll,
+    );
+}
+
+#[test]
+fn a_capture_that_cannot_take_over_yet_logs_its_own_return_reason() {
+    capture_log();
+    let mut source = source();
+    move_to(&mut source, Point::new(99.0, 50.0), ms(0));
+    assert!(sends_activation(&move_horizontally(
+        &mut source,
+        1.0,
+        ms(0)
+    )));
+    let acknowledged = source.on_remote_frame(&activation_ack(), ms(0));
+    let refused = source.refuse_capture_activation(route_request(&acknowledged), ms(1));
+    assert_eq!(refused.failure, None);
+    assert!(sends_release_all(&refused));
+    assert_eq!(
+        logged("return: this computer's capture could not take over input yet"),
+        1
+    );
+    assert_eq!(logged("declined"), 0);
+}
+
+#[test]
+fn declines_log_once_per_streak_of_seam_pressure_with_their_reason() {
+    fn press(source: &mut SourceController, at: u64) -> SourceOutcome {
+        move_horizontally(source, 1.0, ms(at))
+    }
+    fn decline(source: &mut SourceController, epoch: u64, reason: DeclineReason, at: u64) {
+        let frame = Frame::new(
+            SessionEpoch::new(epoch).unwrap(),
+            0,
+            Message::ActivationDeclined {
+                display_id: DisplayId(2),
+                reason,
+            },
+        );
+        assert_eq!(source.on_remote_frame(&frame, ms(at)).failure, None);
+        assert_eq!(source.mode(), SourceMode::Local);
+    }
+    capture_log();
+    let retry = u64::try_from(DECLINE_RETRY_AFTER.as_millis()).unwrap();
+    let mut seam = source();
+    move_to(&mut seam, Point::new(99.0, 50.0), ms(0));
+    assert!(sends_activation(&press(&mut seam, 0)));
+    decline(&mut seam, 4, DeclineReason::Busy, 0);
+    // Pressing on retries every DECLINE_RETRY_AFTER; the same answer is not logged again.
+    assert!(press(&mut seam, retry / 2).effects.is_empty());
+    assert!(sends_activation(&press(&mut seam, retry)));
+    decline(&mut seam, 5, DeclineReason::Busy, retry);
+    assert_eq!(logged("crossing declined by the other computer (Busy)"), 1);
+    // A different answer is logged.
+    assert!(press(&mut seam, retry * 3 / 2).effects.is_empty());
+    assert!(sends_activation(&press(&mut seam, retry * 2)));
+    decline(&mut seam, 6, DeclineReason::Disabled, retry * 2);
+    assert_eq!(
+        logged("crossing declined by the other computer (Disabled)"),
+        1
+    );
+    // Letting go of the seam ends the streak.
+    let pause = retry * 2 + 10;
+    move_to(&mut seam, Point::new(50.0, 50.0), ms(pause));
+    move_to(&mut seam, Point::new(99.0, 50.0), ms(pause + 1));
+    assert!(press(&mut seam, pause + 2).effects.is_empty());
+    assert!(sends_activation(&press(&mut seam, pause + 2 + retry)));
+    decline(&mut seam, 7, DeclineReason::Disabled, pause + 2 + retry);
+    assert_eq!(
+        logged("crossing declined by the other computer (Disabled)"),
+        2
+    );
+    assert_eq!(logged("return:"), 0, "control never left this computer");
+
+    // A declined hop between the other computer's displays does bring control home.
+    let mut hop = source();
+    activate_remote(&mut hop);
+    assert_eq!(move_horizontally(&mut hop, 98.0, ms(1)).failure, None);
+    assert!(sends_activation(&move_horizontally(&mut hop, 3.0, ms(2))));
+    let frame = Frame::new(
+        SessionEpoch::new(5).unwrap(),
+        0,
+        Message::ActivationDeclined {
+            display_id: DisplayId(3),
+            reason: DeclineReason::Contended,
+        },
+    );
+    let declined = hop.on_remote_frame(&frame, ms(3));
+    assert_eq!(declined.failure, None);
+    assert!(sends_release_all(&declined));
+    assert_eq!(
+        logged("return: the other computer declined control (Contended)"),
+        1
+    );
 }
 
 trait FreshCapture {
