@@ -189,7 +189,7 @@ export function createAccordion(key, className, label, ...children) {
   content.inert = true;
   const inner = document.createElement("div");
   inner.className = "accordion-panel-inner";
-  inner.append(...children);
+  inner.append(...children.filter(Boolean));
   content.append(inner);
   accordion.append(trigger, content);
   return accordion;
