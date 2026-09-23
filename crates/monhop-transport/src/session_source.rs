@@ -33,6 +33,9 @@ use crate::session_startup::ReadyControl;
 /// remaining slots hold required native control effects. Exceeding this bound fails closed.
 pub const MAX_SOURCE_EFFECTS: usize = 16;
 
+/// Logical px the pointer must move off the edge a crossing entered through to cross it again.
+pub const ENTRY_GUARD_DISTANCE: f64 = 24.0;
+
 /// A platform event converted into source-controller units.
 ///
 /// `AbsoluteMotion` is a topology logical position. `RelativeMotion` is a logical delta in the
@@ -278,6 +281,8 @@ pub struct SourceController {
     capture_ready: bool,
     take_back: bool,
     declined: Option<(DisplayId, DisplayId, Option<Duration>, Duration)>,
+    /// Display and edge the last crossing entered through, so sensor noise cannot bounce it back.
+    entry_guard: Option<(DisplayId, Edge)>,
     peer_offset: Point,
     topology: Topology,
     ownership: PointerOwnership,
@@ -411,6 +416,7 @@ impl SourceController {
             capture_ready: true,
             take_back: false,
             declined: None,
+            entry_guard: None,
             peer_offset: Point::default(),
             topology,
             ownership,
@@ -715,7 +721,8 @@ impl SourceController {
                 self.capture_ready = false;
                 self.take_back = false;
                 self.declined = Some((return_target.display, target.display, Some(now), now));
-                self.begin_return_to(return_target, return_position, &mut effects);
+                log::info!("return: the other computer declined control");
+                self.begin_return_to(return_target, return_position, None, &mut effects);
             }
             _ => self.fail(SourceFailure::NativeControl, &mut effects),
         }
@@ -902,7 +909,9 @@ impl SourceController {
                     self.remote_target = None;
                     self.clear_remote_delivery();
                     self.take_back = false;
+                    self.entry_guard = None;
                     self.declined = Some((return_target.display, target.display, Some(now), now));
+                    log::info!("return: the other computer declined control");
                     if capture_already_remote {
                         if let Some(owned) = self.floor_claim {
                             match self.floor.transition(owned, FloorState::Returning) {
@@ -1029,7 +1038,8 @@ impl SourceController {
             } => (return_target, return_position),
             _ => return self.outcome(effects),
         };
-        self.begin_return_to(local, local_position, &mut effects);
+        log::info!("return: requested on this computer");
+        self.begin_return_to(local, local_position, None, &mut effects);
         self.outcome(effects)
     }
 
@@ -1048,10 +1058,12 @@ impl SourceController {
         }
     }
 
+    /// `entry_guard` is the home edge an edge return lands on; every other return leaves none.
     fn begin_return_to(
         &mut self,
         local: PointerTarget,
         local_position: Point,
+        entry_guard: Option<(DisplayId, Edge)>,
         effects: &mut SourceEffects,
     ) {
         if let Some(owned) = self.floor_claim {
@@ -1068,6 +1080,7 @@ impl SourceController {
         };
         self.push_input(Message::ReleaseAll, effects);
         if self.failure.is_none() {
+            self.entry_guard = entry_guard;
             self.state = State::AwaitReleaseAcknowledgement {
                 local,
                 local_position,
@@ -1430,6 +1443,7 @@ impl SourceController {
         let State::Local { target, cursor } = self.state else {
             return;
         };
+        let guarded = cursor.and_then(|cursor| self.guarded_entry_edge(target.display, cursor));
         if let Some((from, to, _, last)) = self.declined {
             let pressing = self.topology.display(from).is_ok_and(|display| {
                 self.topology.links().iter().any(|link| {
@@ -1466,6 +1480,7 @@ impl SourceController {
         };
         let transition = match previous {
             Some(previous) => {
+                let current = self.held_at_entry_edge(target.display, current, guarded);
                 match self
                     .topology
                     .transition_for_motion(target.display, previous, current)
@@ -1634,20 +1649,13 @@ impl SourceController {
             Err(_) => return,
         }
         self.declined = None;
-        self.begin_remote_activation(
-            target,
-            transition.entry_point,
-            from,
-            return_position,
-            false,
-            effects,
-        );
+        self.begin_remote_activation(target, transition, from, return_position, false, effects);
     }
 
     fn begin_remote_activation(
         &mut self,
         target: PointerTarget,
-        entry: Point,
+        transition: EdgeTransition,
         return_target: PointerTarget,
         return_position: Point,
         capture_already_remote: bool,
@@ -1662,6 +1670,8 @@ impl SourceController {
         };
         self.input_epoch = next_epoch;
         self.outbound_input_sequence = 0;
+        let entry = transition.entry_point;
+        self.entry_guard = Some((target.display, transition.to_edge));
         self.state = State::AwaitActivation {
             target,
             entry,
@@ -1687,7 +1697,9 @@ impl SourceController {
         else {
             return;
         };
-        let transition = match self.relative_edge_transition(target.display, anchor, delta) {
+        let guarded = self.guarded_entry_edge(target.display, anchor);
+        let transition = match self.relative_edge_transition(target.display, anchor, delta, guarded)
+        {
             Ok(transition) => transition,
             Err(()) => {
                 self.fail(SourceFailure::Topology, effects);
@@ -1704,11 +1716,15 @@ impl SourceController {
         display_id: DisplayId,
         anchor: Point,
         delta: Point,
+        guarded: Option<Edge>,
     ) -> Result<Option<EdgeTransition>, ()> {
         let display = self.topology.display(display_id).map_err(|_| ())?;
         let bounds = display.bounds();
         for edge in [Edge::Right, Edge::Left, Edge::Bottom, Edge::Top] {
-            if !outward(edge, delta) || !at_physical_edge(display, anchor, edge) {
+            if guarded == Some(edge)
+                || !outward(edge, delta)
+                || !at_physical_edge(display, anchor, edge)
+            {
                 continue;
             }
             let hysteresis = self
@@ -1733,6 +1749,39 @@ impl SourceController {
             }
         }
         Ok(None)
+    }
+
+    /// The entry edge `position` may not cross yet. The guard is dropped for good once the
+    /// pointer is on another display or has been [`ENTRY_GUARD_DISTANCE`] away from that edge.
+    fn guarded_entry_edge(&mut self, display_id: DisplayId, position: Point) -> Option<Edge> {
+        let (guarded, edge) = self.entry_guard?;
+        let holding = guarded == display_id
+            && self.topology.display(display_id).is_ok_and(|display| {
+                distance_inside(display.bounds(), position, edge) < ENTRY_GUARD_DISTANCE
+            });
+        if !holding {
+            self.entry_guard = None;
+        }
+        holding.then_some(edge)
+    }
+
+    /// Stops `point` on a guarded edge line, so only motion through the other edges can cross.
+    fn held_at_entry_edge(
+        &self,
+        display_id: DisplayId,
+        point: Point,
+        guarded: Option<Edge>,
+    ) -> Point {
+        let (Some(edge), Ok(display)) = (guarded, self.topology.display(display_id)) else {
+            return point;
+        };
+        let bounds = display.bounds();
+        match edge {
+            Edge::Left => Point::new(point.x.max(bounds.origin.x), point.y),
+            Edge::Right => Point::new(point.x.min(bounds.max_x()), point.y),
+            Edge::Top => Point::new(point.x, point.y.max(bounds.origin.y)),
+            Edge::Bottom => Point::new(point.x, point.y.min(bounds.max_y())),
+        }
     }
 
     fn inside_display(&self, display_id: DisplayId, point: Point) -> Option<Point> {
@@ -1771,6 +1820,8 @@ impl SourceController {
             self.fail(SourceFailure::InvalidCapturedInput, effects);
             return;
         }
+        let guarded = self.guarded_entry_edge(target.display, position);
+        let desired = self.held_at_entry_edge(target.display, desired, guarded);
         let transition =
             match self
                 .topology
@@ -1820,11 +1871,17 @@ impl SourceController {
         };
         let target = PointerTarget::new(machine, transition.to_display);
         if target.machine == self.home.machine {
-            self.begin_return_to(target, transition.entry_point, effects);
+            log::info!("return: the pointer crossed back over the edge");
+            self.begin_return_to(
+                target,
+                transition.entry_point,
+                Some((target.display, transition.to_edge)),
+                effects,
+            );
         } else if target.machine == from.machine {
             self.begin_remote_activation(
                 target,
-                transition.entry_point,
+                transition,
                 return_target,
                 return_position,
                 true,
@@ -2242,6 +2299,7 @@ impl SourceController {
         );
         self.failure = Some(failure);
         self.state = State::Failed;
+        self.entry_guard = None;
         let _ = self.ownership.on_timeout();
         if remote_may_hold {
             let sequence = self.outbound_input_sequence;
@@ -2320,7 +2378,8 @@ impl SourceController {
                 } = self.state
                 {
                     self.take_back = false;
-                    self.begin_return_to(return_target, return_position, &mut effects);
+                    log::info!("return: the other computer took control back");
+                    self.begin_return_to(return_target, return_position, None, &mut effects);
                 } else if matches!(self.state, State::Local { .. }) {
                     self.take_back = false;
                 }
@@ -2381,6 +2440,16 @@ fn at_physical_edge(display: &monhop_core::Display, point: Point, edge: Edge) ->
         Edge::Right => point.x >= bounds.max_x() - x_step,
         Edge::Top => point.y <= bounds.origin.y + y_step,
         Edge::Bottom => point.y >= bounds.max_y() - y_step,
+    }
+}
+
+/// Perpendicular distance from `edge`'s line into the display; negative past it.
+fn distance_inside(bounds: monhop_core::LogicalRect, point: Point, edge: Edge) -> f64 {
+    match edge {
+        Edge::Left => point.x - bounds.origin.x,
+        Edge::Right => bounds.max_x() - point.x,
+        Edge::Top => point.y - bounds.origin.y,
+        Edge::Bottom => bounds.max_y() - point.y,
     }
 }
 

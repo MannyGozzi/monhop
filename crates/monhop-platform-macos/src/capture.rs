@@ -5,8 +5,9 @@
 //! fixed queue admission, physical-ledger updates, and atomic failure latching.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_void,
+    fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::{
@@ -37,7 +38,7 @@ use crate::{
         ActiveDisplayBounds, CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
         CG_EVENT_SCROLL_WHEEL, DecodedInput, DecodedPointer, EventSourceMetadata, HidKeyState,
         LocalModifierState, PhysicalModifierLedger, PointerFields, decode_keyboard, decode_pointer,
-        decode_scroll, should_ignore_source, should_keep_quarantine_tap,
+        decode_scroll, is_pointer_motion, should_ignore_source, should_keep_quarantine_tap,
     },
     enumerate_active_displays,
     event_tap::{
@@ -99,6 +100,7 @@ unsafe extern "C" {
         mouse_button: CGMouseButton,
     ) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+    fn CGEventSetLocation(event: CGEventRef, location: CGPoint);
     fn CGEventGetDoubleValueField(event: CGEventRef, field: CGEventField) -> f64;
     fn CGEventSourceKeyState(state_id: CGEventSourceStateID, key: CGKeyCode) -> bool;
     fn CGEventSourceButtonState(state_id: CGEventSourceStateID, button: CGMouseButton) -> bool;
@@ -440,6 +442,225 @@ impl Drop for NativeCapture {
     }
 }
 
+/// Coarse class of one callback record for episode tallies. Key identity is never carried.
+#[derive(Clone, Copy)]
+enum EpisodeEvent {
+    Motion { location: Point, zero_delta: bool },
+    Button { location: Point },
+    Key,
+    Scroll,
+}
+
+impl EpisodeEvent {
+    fn pointer(event_type: CGEventType, location: Point, delta_x: i64, delta_y: i64) -> Self {
+        if is_pointer_motion(event_type) {
+            Self::Motion {
+                location,
+                zero_delta: delta_x == 0 && delta_y == 0,
+            }
+        } else {
+            Self::Button { location }
+        }
+    }
+}
+
+/// Everything the tap receives except keyboard and scroll records, the pointer's motion and buttons.
+const fn is_pointer_record(event_type: CGEventType) -> bool {
+    !matches!(
+        event_type,
+        CG_EVENT_KEY_DOWN | CG_EVENT_KEY_UP | CG_EVENT_FLAGS_CHANGED | CG_EVENT_SCROLL_WHEEL
+    )
+}
+
+/// Monotonic per-thread counts of records `should_ignore_source` skipped; episodes diff them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct IgnoredSources {
+    own: u64,
+    foreign: u64,
+    /// The subset of `foreign` that carries a cursor location.
+    foreign_pointer: u64,
+}
+
+impl IgnoredSources {
+    fn since(self, start: Self) -> Self {
+        Self {
+            own: self.own.wrapping_sub(start.own),
+            foreign: self.foreign.wrapping_sub(start.foreign),
+            foreign_pointer: self.foreign_pointer.wrapping_sub(start.foreign_pointer),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EpisodeEnd {
+    Restored,
+    RestoredWithoutTransfer,
+    Stopped(Option<StopReason>),
+}
+
+impl fmt::Display for EpisodeEnd {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Restored => formatter.write_str("restore"),
+            Self::RestoredWithoutTransfer => formatter.write_str("restore without transfer"),
+            Self::Stopped(Some(reason)) => write!(formatter, "capture stop ({reason:?})"),
+            Self::Stopped(None) => formatter.write_str("capture stop"),
+        }
+    }
+}
+
+struct ShownPoint(Option<Point>);
+
+impl fmt::Display for ShownPoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(point) => write!(formatter, "{:.0},{:.0}", point.x, point.y),
+            None => formatter.write_str("none"),
+        }
+    }
+}
+
+/// One remote-route episode's diagnostics: plain fields updated per event, logged once at its end.
+#[derive(Clone, Copy)]
+struct RemoteEpisode {
+    started: Duration,
+    /// When suppression first read as ended; records after it are not tallied.
+    lapsed: Option<Duration>,
+    pinned: Option<Point>,
+    ignored_at_start: IgnoredSources,
+    handoff_posts: usize,
+    motion_suppressed: u64,
+    motion_passed: u64,
+    motion_passed_zero_delta: u64,
+    key_passed: u64,
+    button_passed: u64,
+    scroll_passed: u64,
+    drift_max: f64,
+    passed_drift_max: f64,
+    last_location: Option<Point>,
+    transfer_posts: u64,
+    cursor_posts: u64,
+    last_post: Option<Point>,
+}
+
+impl RemoteEpisode {
+    fn new(
+        started: Duration,
+        pinned: Option<Point>,
+        ignored_at_start: IgnoredSources,
+        handoff_posts: usize,
+    ) -> Self {
+        Self {
+            started,
+            lapsed: None,
+            pinned,
+            ignored_at_start,
+            handoff_posts,
+            motion_suppressed: 0,
+            motion_passed: 0,
+            motion_passed_zero_delta: 0,
+            key_passed: 0,
+            button_passed: 0,
+            scroll_passed: 0,
+            drift_max: 0.0,
+            passed_drift_max: 0.0,
+            last_location: None,
+            transfer_posts: 0,
+            cursor_posts: 0,
+            last_post: None,
+        }
+    }
+
+    fn drift(&self, location: Point) -> f64 {
+        self.pinned.map_or(0.0, |pinned| {
+            (location.x - pinned.x).hypot(location.y - pinned.y)
+        })
+    }
+
+    fn lapse(&mut self, now: Duration) {
+        self.lapsed.get_or_insert(now);
+    }
+
+    fn record(&mut self, event: EpisodeEvent, withheld: bool) {
+        if self.lapsed.is_some() {
+            return;
+        }
+        match event {
+            EpisodeEvent::Motion {
+                location,
+                zero_delta,
+            } => {
+                let drift = self.drift(location);
+                self.drift_max = self.drift_max.max(drift);
+                self.last_location = Some(location);
+                if withheld {
+                    self.motion_suppressed = self.motion_suppressed.saturating_add(1);
+                } else {
+                    self.motion_passed = self.motion_passed.saturating_add(1);
+                    self.motion_passed_zero_delta = self
+                        .motion_passed_zero_delta
+                        .saturating_add(u64::from(zero_delta));
+                    self.passed_drift_max = self.passed_drift_max.max(drift);
+                }
+            }
+            // A passed button record carries a location the WindowServer can move the cursor to.
+            EpisodeEvent::Button { location } if !withheld => {
+                self.button_passed = self.button_passed.saturating_add(1);
+                self.passed_drift_max = self.passed_drift_max.max(self.drift(location));
+            }
+            EpisodeEvent::Key if !withheld => self.key_passed = self.key_passed.saturating_add(1),
+            EpisodeEvent::Scroll if !withheld => {
+                self.scroll_passed = self.scroll_passed.saturating_add(1);
+            }
+            EpisodeEvent::Button { .. } | EpisodeEvent::Key | EpisodeEvent::Scroll => {}
+        }
+    }
+
+    /// `point` is None for a keyboard transfer, which carries no cursor position.
+    fn record_transfer_post(&mut self, point: Option<Point>) {
+        self.transfer_posts = self.transfer_posts.saturating_add(1);
+        if point.is_some() {
+            self.last_post = point;
+        }
+    }
+
+    fn record_cursor_post(&mut self, point: Point) {
+        self.cursor_posts = self.cursor_posts.saturating_add(1);
+        self.last_post = Some(point);
+    }
+
+    fn summary(&self, now: Duration, ignored: IgnoredSources, end: EpisodeEnd) -> String {
+        format!(
+            "capture episode: {} ms remote, motion {} suppressed / {} passed ({} zero-delta), \
+             other passed key {} button {} scroll {}, ignored-source own {} foreign {} \
+             (pointer {}), location drift max {:.0} px last {}, passed-pointer drift max {:.0} px, \
+             pinned {}, handoff posts {}, transfer posts {} (+{} cursor) last {}, ended by {}",
+            self.lapsed
+                .unwrap_or(now)
+                .saturating_sub(self.started)
+                .as_millis(),
+            self.motion_suppressed,
+            self.motion_passed,
+            self.motion_passed_zero_delta,
+            self.key_passed,
+            self.button_passed,
+            self.scroll_passed,
+            ignored.own,
+            ignored.foreign,
+            ignored.foreign_pointer,
+            self.drift_max,
+            ShownPoint(self.last_location),
+            self.passed_drift_max,
+            ShownPoint(self.pinned),
+            self.handoff_posts,
+            self.transfer_posts,
+            self.cursor_posts,
+            ShownPoint(self.last_post),
+            end,
+        )
+    }
+}
+
 struct CallbackState {
     shared: Arc<Shared>,
     producer: CaptureProducer,
@@ -452,10 +673,14 @@ struct CallbackState {
     local_modifiers: LocalModifierState,
     physical_modifiers: PhysicalModifierLedger,
     unsupported_events: u64,
+    /// Where the cursor holds while remote; owed back to it if the route ends without a restore point.
+    remote_pin: Option<Point>,
+    episode: Option<RemoteEpisode>,
 }
 
 impl Drop for CallbackState {
     fn drop(&mut self) {
+        self.end_episode(EpisodeEnd::Stopped(self.shared.stop.reason()));
         log::info!("ignored {} unsupported events", self.unsupported_events);
     }
 }
@@ -463,6 +688,31 @@ impl Drop for CallbackState {
 thread_local! {
     static CALLBACK: RefCell<Option<CallbackState>> = const { RefCell::new(None) };
     static CALLBACK_SHARED: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
+    // A Cell apart from CALLBACK, so the source filter still never borrows callback state.
+    static IGNORED_SOURCES: Cell<IgnoredSources> = const {
+        Cell::new(IgnoredSources {
+            own: 0,
+            foreign: 0,
+            foreign_pointer: 0,
+        })
+    };
+}
+
+fn count_ignored_source(own: bool, pointer: bool) {
+    let _ = IGNORED_SOURCES.try_with(|tally| {
+        let mut next = tally.get();
+        if own {
+            next.own = next.own.wrapping_add(1);
+        } else {
+            next.foreign = next.foreign.wrapping_add(1);
+            next.foreign_pointer = next.foreign_pointer.wrapping_add(u64::from(pointer));
+        }
+        tally.set(next);
+    });
+}
+
+fn ignored_sources() -> Option<IgnoredSources> {
+    IGNORED_SOURCES.try_with(Cell::get).ok()
 }
 
 fn latch_callback_failure(reason: StopReason) {
@@ -506,8 +756,12 @@ impl CallbackState {
     }
 
     fn remote(&mut self) -> bool {
-        let remote = self.lease.is_suppressing(self.shared.origin.elapsed());
+        let now = self.shared.origin.elapsed();
+        let remote = self.lease.is_suppressing(now);
         self.mark_stopped();
+        if !remote && let Some(episode) = self.episode.as_mut() {
+            episode.lapse(now);
+        }
         remote
     }
 
@@ -537,7 +791,61 @@ impl CallbackState {
         if !self.renew_lease(deadline) {
             return ControlCompletion::Failed;
         }
-        self.publish_route(revision, true)
+        let completion = self.publish_route(revision, true);
+        if completion == ControlCompletion::Applied {
+            self.remote_pin = self.pointer_position.or_else(current_pointer_position);
+            // Handoff posts reach the tap after this, so they land in the episode's own-marker count.
+            self.episode = Some(RemoteEpisode::new(
+                self.shared.origin.elapsed(),
+                self.remote_pin,
+                ignored_sources().unwrap_or_default(),
+                plan.iter().len(),
+            ));
+        }
+        completion
+    }
+
+    /// Owner thread only, never the tap callback. Event locations drift past the held cursor, so a
+    /// route that ends without a restore point re-anchors Quartz at the pin, at most once.
+    fn return_cursor_to_pin(&mut self) {
+        let flags = self.local_modifiers.flags();
+        self.return_cursor_to_pin_with(|pin| {
+            // Best effort: a pin a display change removed, or lost permission, skips the post.
+            current_active_display_bounds().is_ok_and(|bounds| bounds.contains(pin))
+                && post_cursor(pin, flags)
+        });
+    }
+
+    fn return_cursor_to_pin_with(&mut self, post: impl FnOnce(Point) -> bool) {
+        let Some(pin) = self.remote_pin.take() else {
+            return;
+        };
+        if post(pin) {
+            // Stop-time releases post at this position, as they do after restore_local_at.
+            self.pointer_position = Some(pin);
+            if let Some(episode) = self.episode.as_mut() {
+                episode.record_cursor_post(pin);
+            }
+        }
+    }
+
+    fn end_episode(&mut self, end: EpisodeEnd) {
+        if let Some(episode) = self.episode.take() {
+            let ignored = ignored_sources().map_or_else(IgnoredSources::default, |now| {
+                now.since(episode.ignored_at_start)
+            });
+            log::info!(
+                "{}",
+                episode.summary(self.shared.origin.elapsed(), ignored, end)
+            );
+        }
+    }
+
+    fn tally(&mut self, event: EpisodeEvent, withheld: bool) -> bool {
+        if let Some(episode) = self.episode.as_mut() {
+            episode.record(event, withheld);
+        }
+        withheld
     }
 
     fn renew_remote(&mut self, revision: u64, deadline: Duration) -> ControlCompletion {
@@ -563,6 +871,10 @@ impl CallbackState {
             self.mark_stopped();
             return ControlCompletion::Failed;
         }
+        if let Some(episode) = self.episode.as_mut() {
+            episode.record_cursor_post(point);
+        }
+        self.remote_pin = None;
         self.pointer_position = Some(point);
         let plan = self.physical.handoff_plan(false);
         if !self.apply_transfer_plan(plan.iter()) {
@@ -576,7 +888,11 @@ impl CallbackState {
             self.mark_stopped();
             return ControlCompletion::Failed;
         }
-        self.publish_route(revision, false)
+        let completion = self.publish_route(revision, false);
+        if completion == ControlCompletion::Applied {
+            self.end_episode(EpisodeEnd::Restored);
+        }
+        completion
     }
 
     fn restore_local_without_transfer(&mut self, revision: u64) -> ControlCompletion {
@@ -588,7 +904,12 @@ impl CallbackState {
             self.mark_stopped();
             return ControlCompletion::Failed;
         }
-        self.publish_route(revision, false)
+        self.return_cursor_to_pin();
+        let completion = self.publish_route(revision, false);
+        if completion == ControlCompletion::Applied {
+            self.end_episode(EpisodeEnd::RestoredWithoutTransfer);
+        }
+        completion
     }
 
     fn renew_lease(&mut self, deadline: Duration) -> bool {
@@ -620,6 +941,12 @@ impl CallbackState {
             self.physical.apply_transfer_success(transfer);
             self.local_modifiers.apply_transfer_success(transfer);
             self.physical_modifiers.record_posted(transfer);
+            if let Some(episode) = self.episode.as_mut() {
+                episode.record_transfer_post(match transfer {
+                    LocalTransfer::Button { .. } => self.pointer_position,
+                    LocalTransfer::Key { .. } => None,
+                });
+            }
         }
         true
     }
@@ -729,7 +1056,8 @@ impl CallbackState {
                     source,
                     SYNTHETIC_EVENT_MARKER,
                 );
-                self.decoded(decoded)
+                let withheld = self.decoded(decoded);
+                self.tally(EpisodeEvent::Key, withheld)
             }
             CG_EVENT_SCROLL_WHEEL => {
                 // SAFETY: the live callback scroll event exposes the continuous-scroll flag.
@@ -765,13 +1093,14 @@ impl CallbackState {
                         )
                     }
                 };
-                self.decoded(decode_scroll(
+                let withheld = self.decoded(decode_scroll(
                     horizontal,
                     vertical,
                     continuous,
                     source,
                     SYNTHETIC_EVENT_MARKER,
-                ))
+                ));
+                self.tally(EpisodeEvent::Scroll, withheld)
             }
             _ => {
                 // SAFETY: these getters borrow the event, which remains live for the callback.
@@ -784,6 +1113,7 @@ impl CallbackState {
                     )
                 };
                 let remote = self.remote();
+                let location = Point::new(point.x, point.y);
                 let DecodedPointer {
                     local_absolute,
                     input,
@@ -791,7 +1121,7 @@ impl CallbackState {
                 } = decode_pointer(
                     event_type,
                     PointerFields {
-                        location: Point::new(point.x, point.y),
+                        location,
                         delta_x,
                         delta_y,
                         button_number,
@@ -800,7 +1130,14 @@ impl CallbackState {
                     source,
                     SYNTHETIC_EVENT_MARKER,
                 );
-                self.pointer_position = position;
+                // While remote the local cursor stays pinned; event locations keep advancing past it.
+                if !remote {
+                    self.pointer_position = position;
+                }
+                // A sub-pixel move has no delta to forward, but passing it would move this cursor.
+                let stationary_remote = remote
+                    && is_pointer_motion(event_type)
+                    && matches!(input, DecodedInput::Ignored);
                 let mut absolute_withheld = false;
                 if !remote && let Some(absolute) = local_absolute {
                     absolute_withheld = self.event_for_route(absolute, false);
@@ -809,8 +1146,23 @@ impl CallbackState {
                     }
                 }
                 // Either component withholds the record, even when the relative one is ignored.
-                let relative_withheld = self.decoded_for_route(input, remote);
-                absolute_withheld || relative_withheld
+                let relative_withheld = self.decoded_for_route(input, remote) || stationary_remote;
+                let withheld = absolute_withheld || relative_withheld;
+                let mut delivered = location;
+                // A record local apps still receive while remote, such as an extra button, would
+                // otherwise carry the cursor to its drifted location.
+                if remote
+                    && !withheld
+                    && let Some(pin) = self.remote_pin
+                {
+                    // SAFETY: this active tap owns the live event it returns for the callback.
+                    unsafe { CGEventSetLocation(event, CGPoint { x: pin.x, y: pin.y }) };
+                    delivered = pin;
+                }
+                self.tally(
+                    EpisodeEvent::pointer(event_type, delivered, delta_x, delta_y),
+                    withheld,
+                )
             }
         }
     }
@@ -839,6 +1191,10 @@ unsafe extern "C" fn event_callback(
         }
     };
     if should_ignore_source(source, SYNTHETIC_EVENT_MARKER) {
+        count_ignored_source(
+            source.user_data == SYNTHETIC_EVENT_MARKER,
+            is_pointer_record(event_type),
+        );
         return event;
     }
     if with_callback(|state| state.native_event(event_type, event, source)) {
@@ -897,6 +1253,8 @@ fn run(
             local_modifiers: LocalModifierState::default(),
             physical_modifiers: PhysicalModifierLedger::default(),
             unsupported_events: 0,
+            remote_pin: None,
+            episode: None,
         });
     });
 
@@ -970,7 +1328,9 @@ fn run(
         let mut draining = false;
         with_callback(|state| {
             state.physical.tick(shared.origin.elapsed(), &shared.stop);
-            state.remote();
+            if !state.remote() {
+                state.return_cursor_to_pin();
+            }
             draining = state.physical.has_suppressed_presses();
             state.mark_stopped();
             false
@@ -1379,6 +1739,8 @@ mod callback_tests {
             local_modifiers: LocalModifierState::default(),
             physical_modifiers: PhysicalModifierLedger::default(),
             unsupported_events: 0,
+            remote_pin: None,
+            episode: None,
         };
         (state, consumer)
     }
@@ -1390,11 +1752,34 @@ mod callback_tests {
         }
     }
 
+    /// Activates the real remote route. Quartz is warmed first: its first event creation can outlast
+    /// the 120 ms lease. Nothing may be held, so activation never posts to this machine.
     fn route_remote(state: &mut CallbackState, consumer: &mut CaptureConsumer) {
-        let now = state.shared.origin.elapsed();
-        state.lease.renew(1, now, MAX_SUPPRESSION_TTL).unwrap();
-        assert_eq!(state.publish_route(1, true), ControlCompletion::Applied);
-        assert!(consumer.try_pop().unwrap().is_some());
+        // SAFETY: fixed event types and a finite point; both owned events are released, never
+        // posted.
+        unsafe {
+            let motion = CGEventCreateMouseEvent(
+                ptr::null(),
+                CG_EVENT_MOUSE_MOVED,
+                CGPoint { x: 0.0, y: 0.0 },
+                0,
+            );
+            let key = CGEventCreateKeyboardEvent(ptr::null(), 0, true);
+            assert!(!motion.is_null() && !key.is_null());
+            CGEventGetLocation(motion);
+            CFRelease(motion);
+            CFRelease(key);
+        }
+        assert_eq!(state.physical.handoff_plan(true).iter().len(), 0);
+        let deadline = state.shared.origin.elapsed() + MAX_SUPPRESSION_TTL;
+        assert_eq!(
+            state.activate_remote(1, deadline),
+            ControlCompletion::Applied
+        );
+        assert!(matches!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::RouteChanged { remote: true, .. })
+        ));
     }
 
     /// Returns whether the callback withheld one physical key record from local apps.
@@ -1413,8 +1798,13 @@ mod callback_tests {
         suppressed
     }
 
-    /// Returns whether the callback withheld one physical other-button record from local apps.
-    fn deliver_button(state: &mut CallbackState, event_type: CGEventType, number: i64) -> bool {
+    /// Returns whether the callback withheld one physical other-button record from local apps, and
+    /// the location the record carries afterwards. It is created at 10,10.
+    fn deliver_button(
+        state: &mut CallbackState,
+        event_type: CGEventType,
+        number: i64,
+    ) -> (bool, Point) {
         // SAFETY: the event type is a fixed other-button type and the point is finite; the owned
         // event is never posted.
         let event = unsafe {
@@ -1424,9 +1814,11 @@ mod callback_tests {
         // SAFETY: event is owned and non-null until the release below.
         unsafe { CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER, number) };
         let suppressed = state.native_event(event_type, event, physical_source());
+        // SAFETY: event is still owned; it is released right after this read and never transferred.
+        let location = unsafe { CGEventGetLocation(event) };
         // SAFETY: event was created above and never transferred.
         unsafe { CFRelease(event) };
-        suppressed
+        (suppressed, Point::new(location.x, location.y))
     }
 
     /// Returns whether the callback withheld one physical mouse-moved record from local apps.
@@ -1548,17 +1940,47 @@ mod callback_tests {
     }
 
     #[test]
+    fn stationary_motion_is_withheld_while_remote_and_leaves_the_pin() {
+        let (mut state, mut consumer) = callback_fixture();
+        let pinned = Point::new(50.0, 50.0);
+        state.pointer_position = Some(pinned);
+        route_remote(&mut state, &mut consumer);
+        assert!(
+            deliver_motion(&mut state, 0, 0),
+            "a sub-pixel move would otherwise carry this cursor to its location"
+        );
+        assert_capture_untouched(&state, &mut consumer);
+        assert!(deliver_motion(&mut state, 3, 0));
+        assert_eq!(state.pointer_position, Some(pinned));
+    }
+
+    #[test]
+    fn stationary_motion_passes_while_local() {
+        let (mut state, _consumer) = callback_fixture();
+        assert!(!deliver_motion(&mut state, 0, 0));
+        assert_eq!(state.pointer_position, Some(Point::new(10.0, 10.0)));
+    }
+
+    #[test]
     fn extra_mouse_button_never_stops_capture() {
+        let pin = Point::new(50.0, 50.0);
         for remote in [false, true] {
             let (mut state, mut consumer) = callback_fixture();
+            state.pointer_position = Some(pin);
             if remote {
                 route_remote(&mut state, &mut consumer);
             }
+            let expected = if remote { pin } else { Point::new(10.0, 10.0) };
             for number in [5, 7] {
                 for event_type in [CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_UP] {
+                    let (withheld, location) = deliver_button(&mut state, event_type, number);
                     assert!(
-                        !deliver_button(&mut state, event_type, number),
+                        !withheld,
                         "local apps receive extra buttons on either route"
+                    );
+                    assert_eq!(
+                        location, expected,
+                        "while remote it is moved to the pin, never its drifted location"
                     );
                 }
             }
@@ -1566,6 +1988,204 @@ mod callback_tests {
             assert_eq!(state.unsupported_events, 4);
             assert_capture_untouched(&state, &mut consumer);
         }
+    }
+
+    #[test]
+    fn an_expired_lease_passes_stationary_motion_and_stops_capture() {
+        let (mut state, mut consumer) = callback_fixture();
+        let pin = Point::new(50.0, 50.0);
+        state.pointer_position = Some(pin);
+        route_remote(&mut state, &mut consumer);
+        let now = state.shared.origin.elapsed();
+        state.lease.renew(1, now, Duration::from_nanos(1)).unwrap();
+        thread::sleep(Duration::from_millis(1));
+        assert!(
+            !deliver_motion(&mut state, 0, 0),
+            "suppression fails open once its lease is gone"
+        );
+        assert_eq!(state.shared.stop.reason(), Some(StopReason::LeaseExpired));
+        let episode = state.episode.expect("activation opens an episode");
+        assert!(episode.lapsed.is_some(), "the lapse is stamped");
+        assert_eq!(
+            episode.motion_suppressed + episode.motion_passed,
+            0,
+            "nothing after the lapse is tallied"
+        );
+        assert_eq!(state.pointer_position, Some(Point::new(10.0, 10.0)));
+        let mut posted = Vec::new();
+        for _ in 0..2 {
+            state.return_cursor_to_pin_with(|point| {
+                posted.push(point);
+                true
+            });
+        }
+        assert_eq!(
+            posted,
+            [pin],
+            "the pin is owed once, though local events moved the tracked position"
+        );
+        assert_eq!(state.episode.map(|episode| episode.cursor_posts), Some(1));
+        assert_eq!(state.pointer_position, Some(pin));
+    }
+
+    #[test]
+    fn foreign_pointer_records_are_counted_apart_from_other_foreign_records() {
+        let before = ignored_sources().expect("live thread");
+        // SAFETY: fixed event types and a finite point; both owned events are released below and
+        // never posted.
+        let events = unsafe {
+            [
+                (
+                    CG_EVENT_MOUSE_MOVED,
+                    CGEventCreateMouseEvent(
+                        ptr::null(),
+                        CG_EVENT_MOUSE_MOVED,
+                        CGPoint { x: 0.0, y: 0.0 },
+                        0,
+                    ),
+                ),
+                (
+                    CG_EVENT_KEY_DOWN,
+                    CGEventCreateKeyboardEvent(ptr::null(), 0, true),
+                ),
+            ]
+        };
+        for (event_type, event) in events {
+            assert!(!event.is_null());
+            // SAFETY: event is owned and non-null; a non-HID source state makes it foreign.
+            unsafe { CGEventSetIntegerValueField(event, CG_EVENT_SOURCE_STATE_ID, 0) };
+            // SAFETY: event stays live for the call; the source filter returns it untouched.
+            let returned =
+                unsafe { event_callback(ptr::null_mut(), event_type, event, ptr::null_mut()) };
+            assert_eq!(returned, event);
+            // SAFETY: event was created above and never transferred.
+            unsafe { CFRelease(event) };
+        }
+        assert_eq!(
+            ignored_sources().expect("live thread").since(before),
+            IgnoredSources {
+                own: 0,
+                foreign: 2,
+                foreign_pointer: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_local_route_never_returns_the_cursor() {
+        let (mut state, _consumer) = callback_fixture();
+        state.pointer_position = Some(Point::new(50.0, 50.0));
+        assert!(!state.remote());
+        state.return_cursor_to_pin_with(|_| panic!("the owner loop runs this every local tick"));
+    }
+}
+
+#[cfg(test)]
+mod episode_tests {
+    use super::*;
+    use crate::capture_decode::{
+        CG_EVENT_LEFT_MOUSE_DRAGGED, CG_EVENT_MOUSE_MOVED, CG_EVENT_OTHER_MOUSE_DOWN,
+    };
+
+    #[test]
+    fn pointer_records_split_into_motion_and_buttons() {
+        let at = Point::new(1.0, 2.0);
+        assert!(matches!(
+            EpisodeEvent::pointer(CG_EVENT_LEFT_MOUSE_DRAGGED, at, 0, 0),
+            EpisodeEvent::Motion {
+                zero_delta: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            EpisodeEvent::pointer(CG_EVENT_MOUSE_MOVED, at, 0, 1),
+            EpisodeEvent::Motion {
+                zero_delta: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            EpisodeEvent::pointer(CG_EVENT_OTHER_MOUSE_DOWN, at, 0, 0),
+            EpisodeEvent::Button { .. }
+        ));
+    }
+
+    #[test]
+    fn summary_separates_withheld_from_passed_records() {
+        let mut episode = RemoteEpisode::new(
+            Duration::from_millis(100),
+            Some(Point::new(1728.0, 467.0)),
+            IgnoredSources::default(),
+            1,
+        );
+        let motion = |x, y, zero_delta| EpisodeEvent::Motion {
+            location: Point::new(x, y),
+            zero_delta,
+        };
+        episode.record(motion(1728.0, 470.0, false), true);
+        episode.record(motion(1298.0, 529.0, true), false);
+        episode.record(motion(1700.0, 467.0, false), true);
+        episode.record(EpisodeEvent::Key, true);
+        episode.record(EpisodeEvent::Key, false);
+        episode.record(
+            EpisodeEvent::Button {
+                location: Point::new(1728.0, 367.0),
+            },
+            false,
+        );
+        episode.record(EpisodeEvent::Scroll, false);
+        episode.lapse(Duration::from_millis(4_100));
+        episode.lapse(Duration::from_millis(5_000));
+        episode.record(motion(0.0, 0.0, false), false);
+        episode.record(EpisodeEvent::Key, false);
+        episode.record_transfer_post(Some(Point::new(10.0, 20.0)));
+        episode.record_transfer_post(None);
+        let ignored = IgnoredSources {
+            own: 5,
+            foreign: 4,
+            foreign_pointer: 3,
+        }
+        .since(IgnoredSources {
+            own: 3,
+            foreign: 2,
+            foreign_pointer: 2,
+        });
+        assert_eq!(
+            episode.summary(Duration::from_millis(6_100), ignored, EpisodeEnd::Restored),
+            "capture episode: 4000 ms remote, motion 2 suppressed / 1 passed (1 zero-delta), \
+             other passed key 1 button 1 scroll 1, ignored-source own 2 foreign 2 (pointer 1), \
+             location drift max 434 px last 1700,467, passed-pointer drift max 434 px, \
+             pinned 1728,467, handoff posts 1, transfer posts 2 (+0 cursor) last 10,20, \
+             ended by restore"
+        );
+    }
+
+    #[test]
+    fn unknown_pin_reports_no_drift() {
+        let mut episode = RemoteEpisode::new(Duration::ZERO, None, IgnoredSources::default(), 0);
+        episode.record(
+            EpisodeEvent::Motion {
+                location: Point::new(500.0, 500.0),
+                zero_delta: false,
+            },
+            false,
+        );
+        episode.record_cursor_post(Point::new(3.0, 4.0));
+        let line = episode.summary(
+            Duration::ZERO,
+            IgnoredSources::default(),
+            EpisodeEnd::Stopped(Some(StopReason::Requested)),
+        );
+        assert!(
+            line.contains("location drift max 0 px last 500,500"),
+            "{line}"
+        );
+        assert!(line.contains("pinned none"), "{line}");
+        assert!(line.contains("(+1 cursor) last 3,4"), "{line}");
+        assert!(
+            line.ends_with("ended by capture stop (Requested)"),
+            "{line}"
+        );
     }
 }
 

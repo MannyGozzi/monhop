@@ -14,8 +14,8 @@ use monhop_transport::session_receiver::{
     DestinationAction, DestinationFailure, InputDestination, InputReceiver, ReceiverFailure,
 };
 use monhop_transport::session_source::{
-    NormalizedInput, SourceController, SourceEffect, SourceFailure, SourceMode, SourceOutcome,
-    TaggedInput,
+    ENTRY_GUARD_DISTANCE, NormalizedInput, SourceController, SourceEffect, SourceFailure,
+    SourceMode, SourceOutcome, TaggedInput,
 };
 
 fn ms(value: u64) -> Duration {
@@ -486,6 +486,77 @@ fn activate_remote(source: &mut SourceController) {
     assert_eq!(source.mode(), SourceMode::Remote);
 }
 
+/// Tags `event` with the capture route the source is on right now.
+fn capture_on_route(
+    source: &mut SourceController,
+    event: NormalizedInput,
+    now: Duration,
+) -> SourceOutcome {
+    let (remote, revision) = source.capture_route();
+    source.fresh_capture(routed(event, remote, revision), now)
+}
+
+fn move_horizontally(source: &mut SourceController, dx: f64, now: Duration) -> SourceOutcome {
+    capture_on_route(
+        source,
+        NormalizedInput::RelativeMotion(Point::new(dx, 0.0)),
+        now,
+    )
+}
+
+/// Acknowledges the ReleaseAll of a return from display 2 and completes the native restore,
+/// yielding where the local pointer landed.
+fn complete_return(source: &mut SourceController, ack_sequence: u64, now: Duration) -> Point {
+    let restore = source.on_remote_frame(
+        &Frame::new(
+            SessionEpoch::new(4).unwrap(),
+            ack_sequence,
+            Message::ReleaseAck,
+        ),
+        now,
+    );
+    assert_eq!(restore.failure, None);
+    let Some(SourceEffect::RestoreLocalAt {
+        request,
+        display: DisplayId(1),
+        position,
+    }) = restore.effects.iter().next()
+    else {
+        panic!("the acknowledgement restores the pointer on display 1");
+    };
+    let ticket = source.capture_route().1 + 1;
+    assert_eq!(
+        source.bind_capture_route(*request, ticket, now).failure,
+        None
+    );
+    let barrier = source.fresh_capture(
+        routed(
+            NormalizedInput::RouteChanged {
+                remote: false,
+                revision: ticket,
+            },
+            false,
+            ticket,
+        ),
+        now,
+    );
+    assert_eq!(barrier.failure, None);
+    assert_eq!(source.mode(), SourceMode::Local);
+    *position
+}
+
+fn sends_release_all(outcome: &SourceOutcome) -> bool {
+    outcome.effects.iter().any(|effect| {
+        matches!(
+            effect,
+            SourceEffect::RemoteFrame(Frame {
+                message: Message::ReleaseAll,
+                ..
+            })
+        )
+    })
+}
+
 #[test]
 fn edge_activation_uses_input_epoch_while_health_stays_on_base_epoch() {
     let mut source = source();
@@ -775,9 +846,13 @@ fn remote_relative_motion_and_fractional_scroll_keep_logical_units() {
 fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
     let mut returning = source();
     activate_remote(&mut returning);
+    assert_eq!(
+        move_horizontally(&mut returning, ENTRY_GUARD_DISTANCE, ms(1)).failure,
+        None
+    );
     let release = returning.fresh_capture(
         routed(
-            NormalizedInput::RelativeMotion(Point::new(-3.0, 0.0)),
+            NormalizedInput::RelativeMotion(Point::new(-ENTRY_GUARD_DISTANCE - 3.0, 0.0)),
             true,
             1,
         ),
@@ -786,7 +861,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
     assert_frame(
         release.effects.iter().next().unwrap(),
         4,
-        1,
+        2,
         Message::ReleaseAll,
     );
     assert_eq!(
@@ -1388,10 +1463,12 @@ fn real_receiver_pump_crosses_configured_edges_from_windows_and_macos() {
         .pump(&mut windows_source, enter, ms(0))
         .unwrap();
     assert_eq!(windows_source.mode(), SourceMode::Remote);
+    let away = move_horizontally(&mut windows_source, ENTRY_GUARD_DISTANCE, ms(1));
+    mac_receiver.pump(&mut windows_source, away, ms(1)).unwrap();
     let revision = windows_source.capture_route().1;
     let returned = windows_source.fresh_capture(
         routed(
-            NormalizedInput::RelativeMotion(Point::new(-3.0, 0.0)),
+            NormalizedInput::RelativeMotion(Point::new(-ENTRY_GUARD_DISTANCE - 3.0, 0.0)),
             true,
             revision,
         ),
@@ -1428,10 +1505,12 @@ fn real_receiver_pump_crosses_configured_edges_from_windows_and_macos() {
         .pump(&mut mac_source, enter, ms(0))
         .unwrap();
     assert_eq!(mac_source.mode(), SourceMode::Remote);
+    let away = move_horizontally(&mut mac_source, -ENTRY_GUARD_DISTANCE, ms(1));
+    windows_receiver.pump(&mut mac_source, away, ms(1)).unwrap();
     let revision = mac_source.capture_route().1;
     let returned = mac_source.fresh_capture(
         routed(
-            NormalizedInput::RelativeMotion(Point::new(3.0, 0.0)),
+            NormalizedInput::RelativeMotion(Point::new(ENTRY_GUARD_DISTANCE + 3.0, 0.0)),
             true,
             revision,
         ),
@@ -1522,10 +1601,12 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
         })
     )));
 
+    let away = move_horizontally(&mut source, ENTRY_GUARD_DISTANCE, ms(1));
+    bridge.pump(&mut source, away, ms(1)).unwrap();
     let revision = source.capture_route().1;
     let return_edge = source.fresh_capture(
         routed(
-            NormalizedInput::RelativeMotion(Point::new(-3.0, 0.0)),
+            NormalizedInput::RelativeMotion(Point::new(-ENTRY_GUARD_DISTANCE - 3.0, 0.0)),
             true,
             revision,
         ),
@@ -2003,6 +2084,238 @@ fn a_crossing_into_space_outside_the_layout_still_reaches_the_linked_display() {
             position: Point::new(1.0, 50.0),
         },
     );
+}
+
+#[test]
+fn a_stray_pixel_back_toward_the_entry_edge_keeps_the_pointer_on_the_entered_display() {
+    let mut source = source();
+    activate_remote(&mut source);
+    // Entered through display 2's left edge at x = 1: without the guard 3 px left crosses home.
+    let wobble = move_horizontally(&mut source, -3.0, ms(1));
+    assert_frame(
+        wobble.effects.iter().next().unwrap(),
+        4,
+        1,
+        Message::Motion(Motion::Absolute(Point::new(0.0, 50.0))),
+    );
+    // A mostly vertical flick with a pixel of sideways noise slides along the edge.
+    let flick = capture_on_route(
+        &mut source,
+        NormalizedInput::RelativeMotion(Point::new(-1.0, 10.0)),
+        ms(2),
+    );
+    assert_frame(
+        flick.effects.iter().next().unwrap(),
+        4,
+        2,
+        Message::Motion(Motion::Absolute(Point::new(0.0, 60.0))),
+    );
+    let pressed = move_horizontally(&mut source, -2.0, ms(3));
+    assert_eq!(pressed.failure, None);
+    assert!(pressed.effects.is_empty());
+    assert_eq!(source.mode(), SourceMode::Remote);
+    assert_eq!(source.motion_target().unwrap().target.display, DisplayId(2));
+}
+
+#[test]
+fn the_entry_edge_crosses_back_once_the_pointer_has_moved_the_guard_distance_away() {
+    let mut source = source();
+    activate_remote(&mut source);
+    // From the entry at x = 1 this reaches x = 23, one px short of the guard distance.
+    let short = move_horizontally(&mut source, ENTRY_GUARD_DISTANCE - 2.0, ms(1));
+    assert_eq!(short.failure, None);
+    let held = move_horizontally(&mut source, -ENTRY_GUARD_DISTANCE - 3.0, ms(2));
+    assert_frame(
+        held.effects.iter().next().unwrap(),
+        4,
+        2,
+        Message::Motion(Motion::Absolute(Point::new(0.0, 50.0))),
+    );
+    assert_eq!(source.mode(), SourceMode::Remote);
+    let away = move_horizontally(&mut source, ENTRY_GUARD_DISTANCE, ms(3));
+    assert_eq!(away.failure, None);
+    let returned = move_horizontally(&mut source, -ENTRY_GUARD_DISTANCE - 3.0, ms(4));
+    assert_frame(
+        returned.effects.iter().next().unwrap(),
+        4,
+        4,
+        Message::ReleaseAll,
+    );
+    assert_eq!(source.mode(), SourceMode::AwaitRemoteReleaseAcknowledgement);
+    assert_eq!(
+        complete_return(&mut source, 1, ms(5)),
+        Point::new(99.0, 50.0)
+    );
+}
+
+#[test]
+fn a_return_through_an_edge_guards_that_home_edge_until_the_pointer_moves_away() {
+    let mut source = source();
+    activate_remote(&mut source);
+    assert_eq!(
+        move_horizontally(&mut source, ENTRY_GUARD_DISTANCE, ms(1)).failure,
+        None
+    );
+    assert!(sends_release_all(&move_horizontally(
+        &mut source,
+        -ENTRY_GUARD_DISTANCE - 3.0,
+        ms(2)
+    )));
+    let home = complete_return(&mut source, 1, ms(3));
+    assert_eq!(home, Point::new(99.0, 50.0));
+    fn move_to(source: &mut SourceController, point: Point, now: Duration) {
+        let moved = capture_on_route(source, NormalizedInput::AbsoluteMotion(point), now);
+        assert_eq!(moved.failure, None);
+        assert!(moved.effects.is_empty());
+    }
+    let wobble = move_horizontally(&mut source, 1.0, ms(4));
+    assert_eq!(wobble.failure, None);
+    assert!(
+        wobble.effects.is_empty(),
+        "a wobble at the home edge stays home"
+    );
+    // Display 1's right edge line is x = 100: 23 px from it keeps the guard, 24 px rearms it.
+    let right_edge = 100.0;
+    move_to(
+        &mut source,
+        Point::new(right_edge - ENTRY_GUARD_DISTANCE + 1.0, 50.0),
+        ms(5),
+    );
+    move_to(&mut source, home, ms(6));
+    let still_guarded = move_horizontally(&mut source, 1.0, ms(7));
+    assert_eq!(still_guarded.failure, None);
+    assert!(still_guarded.effects.is_empty());
+    assert_eq!(source.mode(), SourceMode::Local);
+    move_to(
+        &mut source,
+        Point::new(right_edge - ENTRY_GUARD_DISTANCE, 50.0),
+        ms(8),
+    );
+    move_to(&mut source, home, ms(9));
+    let crossing = move_horizontally(&mut source, 1.0, ms(10));
+    assert_frame(
+        crossing.effects.iter().next().unwrap(),
+        5,
+        0,
+        Message::ActivateDisplayAt {
+            display_id: DisplayId(2),
+            position: Point::new(1.0, 50.0),
+        },
+    );
+}
+
+#[test]
+fn a_take_back_return_leaves_the_home_edge_unguarded() {
+    let mut source = source();
+    activate_remote(&mut source);
+    let taken = source.on_remote_frame(
+        &Frame::new(SessionEpoch::new(4).unwrap(), 1, Message::TakeBack),
+        ms(1),
+    );
+    assert!(sends_release_all(&taken));
+    // The same spot an edge return lands on, but nothing guards it.
+    assert_eq!(
+        complete_return(&mut source, 2, ms(2)),
+        Point::new(99.0, 50.0)
+    );
+    let push = move_horizontally(&mut source, 1.0, ms(3));
+    assert_frame(
+        push.effects.iter().next().unwrap(),
+        5,
+        0,
+        Message::ActivateDisplayAt {
+            display_id: DisplayId(2),
+            position: Point::new(1.0, 50.0),
+        },
+    );
+}
+
+/// The other computer's display 3 sits above its display 2, linked through 2's top edge.
+fn topology_with_a_display_above_the_entered_one() -> Topology {
+    let display = |id: u64, machine: u8, y: f64| {
+        Display::new(
+            DisplayId(id),
+            device(machine),
+            format!("display-{id}"),
+            NativeSize::new(100, 100),
+            LogicalSize::new(100.0, 100.0),
+            Point::new(0.0, y),
+            1.0,
+            None,
+            id != 3,
+        )
+    };
+    let full = || NormalizedSpan::new(0.0, 1.0).unwrap();
+    let link = |from: u64, from_edge: Edge, to: u64, to_edge: Edge| {
+        EdgeLink::new(
+            DisplayId(from),
+            from_edge,
+            full(),
+            DisplayId(to),
+            to_edge,
+            full(),
+            1.0,
+        )
+        .unwrap()
+    };
+    Topology::new(
+        vec![
+            Machine::new(device(1), Platform::Windows),
+            Machine::new(device(2), Platform::MacOs),
+        ],
+        vec![
+            display(1, 1, 0.0),
+            display(2, 2, 0.0),
+            display(3, 2, -100.0),
+        ],
+        vec![
+            link(1, Edge::Right, 2, Edge::Left),
+            link(2, Edge::Left, 1, Edge::Right),
+            link(2, Edge::Top, 3, Edge::Bottom),
+            link(3, Edge::Bottom, 2, Edge::Top),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_entry_guard_leaves_the_other_edges_of_the_display_crossable() {
+    let mut source = source_on(
+        topology_with_a_display_above_the_entered_one(),
+        DisplayId(1),
+    );
+    activate_remote(&mut source);
+    let up = capture_on_route(
+        &mut source,
+        NormalizedInput::RelativeMotion(Point::new(0.0, -49.0)),
+        ms(1),
+    );
+    assert_frame(
+        up.effects.iter().next().unwrap(),
+        4,
+        1,
+        Message::Motion(Motion::Absolute(Point::new(1.0, 1.0))),
+    );
+    // Unguarded, this diagonal leaves through the left edge first; guarded, its left part stops
+    // on that edge and the rest crosses the top edge.
+    let corner = capture_on_route(
+        &mut source,
+        NormalizedInput::RelativeMotion(Point::new(-3.0, -3.0)),
+        ms(2),
+    );
+    assert_eq!(corner.failure, None);
+    assert!(!sends_release_all(&corner));
+    assert!(matches!(
+        corner.effects.iter().next(),
+        Some(SourceEffect::RemoteFrame(Frame {
+            message: Message::ActivateDisplayAt {
+                display_id: DisplayId(3),
+                ..
+            },
+            ..
+        }))
+    ));
+    assert_eq!(source.mode(), SourceMode::AwaitActivationAcknowledgement);
 }
 
 trait FreshCapture {

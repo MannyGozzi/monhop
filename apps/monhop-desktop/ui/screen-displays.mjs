@@ -169,13 +169,15 @@ function arrangementCard(ctx, reset) {
   if (sharing.message) children.push(note(sharing.message, "danger"));
   const applying = sharing.pending?.kind === "apply" || isSyncing(sharing);
   children.push(
-    switchRow("Start MonHop when you log in", {
-      checked: autostart.view.enabled,
-      description: autostartDescription(platform),
-      disabled: applying || autostart.pending,
-      id: "setup-autostart",
-      onChange: actions.setAutostart,
-    }),
+    rows([
+      switchRow("Start MonHop when you log in", {
+        checked: autostart.view.enabled,
+        description: autostartDescription(platform),
+        disabled: applying || autostart.pending,
+        id: "setup-autostart",
+        onChange: actions.setAutostart,
+      }),
+    ]),
   );
   return {
     element: card({

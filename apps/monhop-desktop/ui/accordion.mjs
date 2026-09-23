@@ -1,3 +1,4 @@
+import { motionEase, motionMs, motionToken } from "./dom.mjs";
 import { icon } from "./icons.mjs";
 
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -41,8 +42,9 @@ class AccordionManager {
       : target
         ? 0
         : content.getBoundingClientRect().height;
+    const opacity = running ? contentOpacity(content) : null;
     if (running) {
-      running.animation.cancel();
+      stop(running);
       this.animations.delete(accordion);
     }
 
@@ -67,24 +69,25 @@ class AccordionManager {
       this.finish(accordion, target);
       return;
     }
-    const { duration, easing } = panelMotion();
+    // Height is the one layout property animated: a small panel, so content below glides instead of jumping.
     const animation = content.animate(
       { height: [`${Math.max(0, start)}px`, `${end}px`] },
-      { duration, easing, fill: "both" },
+      { duration: motionMs("--motion-slow"), easing: motionEase(), fill: "both" },
     );
-    this.animations.set(accordion, { animation, target });
+    const entry = { animation, fade: fadeContent(content, target, opacity), target };
+    this.animations.set(accordion, entry);
     animation.onfinish = () => {
-      if (this.animations.get(accordion)?.animation !== animation) return;
+      if (this.animations.get(accordion) !== entry) return;
       this.animations.delete(accordion);
       this.finish(accordion, target);
-      animation.cancel();
+      stop(entry);
     };
   }
 
   disposeDetached() {
-    for (const [accordion, { animation }] of this.animations) {
+    for (const [accordion, entry] of this.animations) {
       if (accordion.isConnected) continue;
-      animation.cancel();
+      stop(entry);
       this.animations.delete(accordion);
     }
   }
@@ -111,21 +114,49 @@ class AccordionManager {
   }
 
   handleMotionChange() {
-    for (const [accordion, { animation, target }] of this.animations) {
-      animation.cancel();
+    for (const [accordion, entry] of this.animations) {
+      stop(entry);
       this.animations.delete(accordion);
-      this.finish(accordion, target);
+      this.finish(accordion, entry.target);
     }
   }
 }
 
-// Height is the one layout property animated: a small panel, so content below glides instead of jumping.
-function panelMotion() {
-  const tokens = getComputedStyle(document.documentElement);
-  return {
-    duration: Number.parseFloat(tokens.getPropertyValue("--duration-standard")) || 0,
-    easing: tokens.getPropertyValue("--ease-disclosure").trim() || "ease-out",
-  };
+function stop(entry) {
+  entry.animation.cancel();
+  entry.fade?.cancel();
+}
+
+function contentOpacity(content) {
+  const inner = content.firstElementChild;
+  return inner ? Number(getComputedStyle(inner).opacity) : null;
+}
+
+// Opening, the content rises in just after the panel starts to grow; closing, it fades out first.
+// A reversal starts from the opacity the content had, so it never blinks.
+function fadeContent(content, open, from) {
+  const inner = content.firstElementChild;
+  if (!inner) return null;
+  const easing = motionEase();
+  if (!open)
+    return inner.animate([{ opacity: from ?? 1 }, { opacity: 0 }], {
+      duration: motionMs("--motion-fast"),
+      easing,
+      fill: "forwards",
+    });
+  const rise = `translateY(calc(${motionToken("--motion-rise") || "0px"} * -1))`;
+  return inner.animate(
+    [
+      { opacity: from ?? 0, transform: from === null ? rise : "none" },
+      { opacity: 1, transform: "none" },
+    ],
+    {
+      duration: motionMs("--motion-base"),
+      delay: from === null ? motionMs("--motion-stagger") : 0,
+      easing,
+      fill: "backwards",
+    },
+  );
 }
 
 export function createAccordion(key, className, label, ...children) {

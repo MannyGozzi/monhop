@@ -234,13 +234,33 @@ export function stateCard({ tone, iconName, title, detail, actions = [], id }) {
   return node;
 }
 
+// Durations and easings live in styles.css; JS motion reads them there so both run on one system.
+// Cached: they never change at runtime, and reading one mid-render would force a style recalc.
+const motionTokens = new Map();
+
+export function motionToken(name) {
+  if (!motionTokens.has(name)) {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    if (!value) return "";
+    motionTokens.set(name, value);
+  }
+  return motionTokens.get(name);
+}
+
+export function motionMs(name) {
+  return Number.parseFloat(motionToken(name)) || 0;
+}
+
+export function motionEase() {
+  return motionToken("--ease-out") || "ease-out";
+}
+
 // Motion helpers. Each keyed slot remembers what it showed and when that last changed, so a
 // change animates once, keeps playing through the re-renders that happen meanwhile, and is
 // skipped under reduced motion or while the page is hidden.
 const motionMemory = new Map();
-const EASE = "cubic-bezier(.22, 1, .36, 1)";
-const ENTER_MS = 360;
-const EXIT_MS = 240;
+const enterMs = () => motionMs("--motion-base");
+const exitMs = () => motionMs("--motion-fast");
 const ENTER_FRAMES = [
   { opacity: 0, transform: "translateY(3px) scale(.97)" },
   { opacity: 1, transform: "none" },
@@ -257,7 +277,7 @@ function motionEnabled() {
 // Plays `keyframes` as if they started `elapsed` ms ago, so a re-render continues the motion
 // instead of restarting it. The animation is cancelled once it has finished.
 function play(node, keyframes, duration, elapsed, after) {
-  const animation = node.animate(keyframes, { duration, easing: EASE, fill: "both" });
+  const animation = node.animate(keyframes, { duration, easing: motionEase(), fill: "both" });
   animation.currentTime = Math.min(Math.max(elapsed, 0), duration);
   void settle(animation, after);
   return animation;
@@ -302,12 +322,12 @@ export function swap(key, node, signature, { block = false } = {}) {
   const wrapper = el(block ? "div" : "span", { className: "swap", children: [node] });
   if (block) wrapper.dataset.block = "true";
   const elapsed = now - entry.changedAt;
-  if (elapsed >= ENTER_MS || !motionEnabled()) return wrapper;
-  play(node, ENTER_FRAMES, ENTER_MS, elapsed);
-  if (entry.leaving && elapsed < EXIT_MS) {
+  if (elapsed >= enterMs() || !motionEnabled()) return wrapper;
+  play(node, ENTER_FRAMES, enterMs(), elapsed);
+  if (entry.leaving && elapsed < exitMs()) {
     const ghost = ghostOf(entry.leaving);
     wrapper.append(ghost);
-    play(ghost, EXIT_FRAMES, EXIT_MS, elapsed, () => ghost.remove());
+    play(ghost, EXIT_FRAMES, exitMs(), elapsed, () => ghost.remove());
   }
   return wrapper;
 }
@@ -339,18 +359,18 @@ export function presence(key, node) {
   entry.ghost = node ? node.cloneNode(true) : null;
   motionMemory.set(key, entry);
   const elapsed = now - entry.changedAt;
-  const animate = motionEnabled() && elapsed < (present ? ENTER_MS : EXIT_MS);
+  const animate = motionEnabled() && elapsed < (present ? enterMs() : exitMs());
   if (node) {
     const wrapper = el("div", { className: "presence", children: [node] });
     if (!animate) return wrapper;
-    play(node, ENTER_FRAMES, ENTER_MS, elapsed);
+    play(node, ENTER_FRAMES, enterMs(), elapsed);
     return wrapper;
   }
   if (!animate || !entry.leaving) return null;
   const ghost = ghostOf(entry.leaving);
   const wrapper = el("div", { className: "presence", children: [ghost] });
   wrapper.dataset.leave = "true";
-  play(ghost, EXIT_FRAMES, EXIT_MS, elapsed, () => wrapper.remove());
+  play(ghost, EXIT_FRAMES, exitMs(), elapsed, () => wrapper.remove());
   return wrapper;
 }
 
@@ -359,7 +379,7 @@ export function setLabel(node, label) {
   if (node.textContent === label) return;
   node.textContent = label;
   if (!motionEnabled()) return;
-  play(node, ENTER_FRAMES, ENTER_MS, 0);
+  play(node, ENTER_FRAMES, enterMs(), 0);
 }
 
 export function platformGlyph(platform) {
@@ -382,6 +402,15 @@ export function switchRow(
   control.disabled = disabled;
   if (focusKey) control.dataset.focusKey = focusKey;
   if (id) control.id = id;
+  // The row is rebuilt on every state push, so a flip springs across from the old side here.
+  const motionKey = focusKey ?? id;
+  if (motionKey) {
+    const elapsed = sinceChanged(`switch-${motionKey}`, checked === true);
+    if (elapsed < motionMs("--motion-spring")) {
+      control.dataset.enter = "true";
+      control.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+    }
+  }
   control.addEventListener("click", () => onChange?.(checked !== true));
   const copy = el("span", {
     className: "switch-copy",
@@ -421,7 +450,15 @@ export function sliderRow(
   if (focusKey) input.dataset.focusKey = focusKey;
   if (id) input.id = id;
   const readout = el("output", { className: "slider-value", text: format(value) });
+  // The track paints its filled part up to --slider-fill.
+  const fill = () =>
+    input.style.setProperty(
+      "--slider-fill",
+      `${((Number(input.value) - min) / (max - min)) * 100}%`,
+    );
+  fill();
   input.addEventListener("input", () => {
+    fill();
     readout.textContent = format(Number(input.value));
     onInput?.(Number(input.value));
   });

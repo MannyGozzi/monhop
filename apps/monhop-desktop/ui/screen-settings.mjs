@@ -5,7 +5,7 @@ import {
   autostartStatusText,
   showAutostartOpenSettings,
 } from "./autostart-model.mjs";
-import { button, card, clear, el, note, switchRow } from "./dom.mjs";
+import { button, card, clear, el, note, rows, switchRow } from "./dom.mjs";
 
 export function renderSettings(nodes, ctx) {
   clear(nodes.settingsContent);
@@ -17,15 +17,17 @@ function updatesCard(ctx) {
   const { view, pending } = updates;
   const hint = installHint(view);
   const children = [
-    switchRow("Install updates automatically", {
-      checked: view.automatic,
-      description:
-        "Off until you enable it. Checks github.com and downloads signed updates only while sharing is paused. " +
-        "Install by quitting MonHop or pressing Restart to update.",
-      disabled: pending || !core,
-      id: "settings-updates-automatic",
-      onChange: actions.setUpdatesAutomatic,
-    }),
+    rows([
+      switchRow("Install updates automatically", {
+        checked: view.automatic,
+        description:
+          "Off until you enable it. Checks github.com and downloads signed updates only while sharing is paused. " +
+          "Install by quitting MonHop or pressing Restart to update.",
+        disabled: pending || !core,
+        id: "settings-updates-automatic",
+        onChange: actions.setUpdatesAutomatic,
+      }),
+    ]),
     el("p", { className: "note", id: "settings-updates-status", text: updatesStatusText(view) }),
   ];
   if (view.phase === "downloading")
@@ -68,13 +70,15 @@ function startupCard(ctx) {
   const { core, platform, autostart, actions } = ctx;
   const { view, pending } = autostart;
   const children = [
-    switchRow("Start MonHop when you log in", {
-      checked: view.enabled,
-      description: autostartDescription(platform),
-      disabled: pending || !core,
-      id: "settings-autostart",
-      onChange: actions.setAutostart,
-    }),
+    rows([
+      switchRow("Start MonHop when you log in", {
+        checked: view.enabled,
+        description: autostartDescription(platform),
+        disabled: pending || !core,
+        id: "settings-autostart",
+        onChange: actions.setAutostart,
+      }),
+    ]),
     el("p", {
       className: "note",
       id: "settings-autostart-status",

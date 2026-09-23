@@ -288,6 +288,17 @@ pub fn decode_keyboard(
     })
 }
 
+/// Moved and dragged records: the pointer types that carry a relative delta.
+pub const fn is_pointer_motion(event_type: u32) -> bool {
+    matches!(
+        event_type,
+        CG_EVENT_MOUSE_MOVED
+            | CG_EVENT_LEFT_MOUSE_DRAGGED
+            | CG_EVENT_RIGHT_MOUSE_DRAGGED
+            | CG_EVENT_OTHER_MOUSE_DRAGGED
+    )
+}
+
 /// Decodes a physical Quartz pointer record.
 ///
 /// Quartz locations are logical macOS desktop points. Every accepted movement returns a local
@@ -317,10 +328,7 @@ pub fn decode_pointer(
     }
     let position = Some(fields.location);
     let (local_absolute, input) = match event_type {
-        CG_EVENT_MOUSE_MOVED
-        | CG_EVENT_LEFT_MOUSE_DRAGGED
-        | CG_EVENT_RIGHT_MOUSE_DRAGGED
-        | CG_EVENT_OTHER_MOUSE_DRAGGED => {
+        motion if is_pointer_motion(motion) => {
             let Ok(dx) = i32::try_from(fields.delta_x) else {
                 return DecodedPointer {
                     local_absolute: None,

@@ -16,12 +16,14 @@ import {
   el,
   icon,
   iconButton,
+  motionMs,
   note,
   platformGlyph,
   presence,
   row,
   rows,
   sinceChanged,
+  statusChip,
   swap,
   switchRow,
 } from "./dom.mjs";
@@ -119,6 +121,13 @@ export function computerCard(
     ),
   ];
   const node = card({ children: children.filter(Boolean), tone: status.tone });
+  // The live edge fades in only when the computer goes live, not on every re-render while it is.
+  const live = status.tone === "active";
+  const liveElapsed = sinceChanged(`${key}-live`, live);
+  if (live && liveElapsed < USE_MOTION_MS) {
+    node.dataset.liveEnter = "true";
+    node.style.setProperty("--live-delay", `${-Math.round(liveElapsed)}ms`);
+  }
   const identity = node.querySelector(".computer-identity");
   if (inUse && ["home", "setup"].includes(scope) && identity)
     identity.dataset.sharedTransition = "active-computer-identity";
@@ -176,6 +185,9 @@ function sharingPill(ctx, fingerprint, name, inUse) {
   });
   node.disabled = busy;
   node.addEventListener("click", () => actions.useComputer(inUse ? null : fingerprint));
+  // The live ring loops on the document clock, so a rebuilt pill continues it instead of restarting.
+  const loop = motionMs("--loop-live");
+  if (loop) node.style.setProperty("--live-phase", `${-Math.round(performance.now() % loop)}ms`);
   const elapsed = sinceChanged(`home-sharing-state-${fingerprint}`, state);
   if (elapsed < USE_MOTION_MS) {
     node.dataset.enter = "true";
@@ -302,7 +314,7 @@ function controlSwitches(ctx, computer, peerName, local) {
   const syncing = sharing.pending?.kind === "control" || sharing.view?.control?.syncing === true;
   const controls = controlSwitchRows(sharing.view?.control, local, peerName, syncing);
   return el("div", {
-    className: "control-switches",
+    className: "rows control-switches",
     children: controls.map((control) =>
       switchRow(control.label, {
         description: control.hint,
@@ -320,13 +332,15 @@ function forgetControls(ctx, computer, name) {
   const confirmed = forgetConfirmed === computer.fingerprint;
   return [
     note(`Fingerprint ${computer.fingerprint.slice(0, 16)}…`),
-    switchRow(`Forget ${name}`, {
-      description: "Removes the pairing. This computer keeps its own identity.",
-      checked: confirmed,
-      disabled: busy,
-      focusKey: `forget-confirm-${computer.fingerprint}`,
-      onChange: (checked) => actions.confirmForget(computer.fingerprint, checked),
-    }),
+    rows([
+      switchRow(`Forget ${name}`, {
+        description: "Removes the pairing. This computer keeps its own identity.",
+        checked: confirmed,
+        disabled: busy,
+        focusKey: `forget-confirm-${computer.fingerprint}`,
+        onChange: (checked) => actions.confirmForget(computer.fingerprint, checked),
+      }),
+    ]),
     el("div", {
       className: "card-actions",
       attrs: { "data-align": "start" },
