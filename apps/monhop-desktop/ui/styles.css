@@ -274,8 +274,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .button[aria-pressed="true"] { border-color:color-mix(in srgb, var(--success) 70%, var(--border)); background:var(--live-surface); color:var(--success); box-shadow:var(--shadow-live); }
 .button svg { width: 15px; height: 15px; flex: 0 0 auto; stroke-width: 2.25; pointer-events: none; }
 .button[data-size="sm"] svg { width: 13px; height: 13px; }
-.icon-button { position: relative; width: 32px; padding:0; }
-.icon-button[data-size="sm"] { width: 28px; }
+.icon-button, .icon-button[data-size="sm"] { position: relative; width: var(--space-11); height: var(--space-11); border-radius: var(--radius-circle); padding:0; }
 .icon-button .tooltip { position: absolute; z-index: 5; top:calc(100% + var(--space-3)); right:0; width: max-content; max-width: 200px; border: 1px solid var(--border); border-radius: var(--radius-md); padding:var(--space-2-5) var(--space-4-5); background: var(--popover); box-shadow: var(--shadow-md); color: var(--popover-foreground); font-size: 11.5px; font-weight: 400; line-height: 1.3; text-align: left; white-space: normal; opacity: 0; pointer-events: none; transform: scale(.96); transform-origin: top right; transition: opacity var(--duration-fast) var(--ease-quick), transform var(--duration-fast) var(--ease-quick); }
 .icon-button:hover .tooltip, .icon-button:focus-visible .tooltip { opacity: 1; transform: scale(1); }
 .icon-button[data-tooltip-dismissed="true"] .tooltip { opacity: 0; transform: scale(.96); }
