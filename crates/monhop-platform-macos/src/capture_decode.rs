@@ -61,7 +61,11 @@ pub struct EventSourceMetadata {
 
 /// A copied Quartz record that cannot affect the physical-input ledger.
 pub enum DecodedInput {
+    /// Synthetic, or a record MonHop does not track: local apps receive it on either route.
     Ignored,
+    /// A physical record with no delta to forward, such as a sub-pixel move or a scroll phase.
+    /// Withheld while remote, where it would move the pinned cursor or scroll the app under it.
+    Empty,
     /// A physical key or button MonHop cannot forward: counted, and local apps receive it.
     Unsupported,
     /// Field values no physical record carries; capture stops.
@@ -344,7 +348,7 @@ pub fn decode_pointer(
                 };
             };
             let input = if dx == 0 && dy == 0 {
-                DecodedInput::Ignored
+                DecodedInput::Empty
             } else {
                 DecodedInput::Event(CaptureEvent::LogicalRelativeMotion {
                     dx: f64::from(dx),
@@ -410,7 +414,7 @@ pub fn decode_scroll(
         return DecodedInput::Malformed;
     }
     if horizontal == 0.0 && vertical == 0.0 {
-        return DecodedInput::Ignored;
+        return DecodedInput::Empty;
     }
     DecodedInput::Event(CaptureEvent::LogicalScroll {
         horizontal,
@@ -956,5 +960,46 @@ mod tests {
             ),
             DecodedInput::Unsupported
         ));
+    }
+
+    #[test]
+    fn a_record_without_delta_is_empty_unless_its_source_is_ignored() {
+        let still = PointerFields {
+            location: Point::new(1.0, 1.0),
+            delta_x: 0,
+            delta_y: 0,
+            button_number: 0,
+        };
+        let motion = |source| {
+            decode_pointer(
+                CG_EVENT_MOUSE_MOVED,
+                still,
+                None,
+                source,
+                SYNTHETIC_EVENT_MARKER,
+            )
+            .input
+        };
+        for continuous in [true, false] {
+            assert!(matches!(
+                decode_scroll(0.0, -0.0, continuous, physical(), SYNTHETIC_EVENT_MARKER),
+                DecodedInput::Empty
+            ));
+        }
+        assert!(matches!(motion(physical()), DecodedInput::Empty));
+        let foreign = EventSourceMetadata {
+            state_id: 0,
+            ..physical()
+        };
+        for source in [injected(), foreign] {
+            assert!(
+                matches!(
+                    decode_scroll(0.0, 0.0, true, source, SYNTHETIC_EVENT_MARKER),
+                    DecodedInput::Ignored
+                ),
+                "the source filter decides first"
+            );
+            assert!(matches!(motion(source), DecodedInput::Ignored));
+        }
     }
 }

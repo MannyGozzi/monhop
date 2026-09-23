@@ -1004,6 +1004,7 @@ impl CallbackState {
     fn decoded_for_route(&mut self, decoded: DecodedInput, remote: bool) -> bool {
         match decoded {
             DecodedInput::Ignored => false,
+            DecodedInput::Empty => remote,
             DecodedInput::Unsupported => {
                 self.unsupported_events = self.unsupported_events.saturating_add(1);
                 false
@@ -1134,10 +1135,6 @@ impl CallbackState {
                 if !remote {
                     self.pointer_position = position;
                 }
-                // A sub-pixel move has no delta to forward, but passing it would move this cursor.
-                let stationary_remote = remote
-                    && is_pointer_motion(event_type)
-                    && matches!(input, DecodedInput::Ignored);
                 let mut absolute_withheld = false;
                 if !remote && let Some(absolute) = local_absolute {
                     absolute_withheld = self.event_for_route(absolute, false);
@@ -1145,8 +1142,8 @@ impl CallbackState {
                         return false;
                     }
                 }
-                // Either component withholds the record, even when the relative one is ignored.
-                let relative_withheld = self.decoded_for_route(input, remote) || stationary_remote;
+                // Either component withholds the record, even when the relative one is empty.
+                let relative_withheld = self.decoded_for_route(input, remote);
                 let withheld = absolute_withheld || relative_withheld;
                 let mut delivered = location;
                 // A record local apps still receive while remote, such as an extra button, would
@@ -1845,6 +1842,45 @@ mod callback_tests {
         suppressed
     }
 
+    // SAFETY: matches the ApplicationServices SDK declaration.
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreateScrollWheelEvent2(
+            source: *const c_void,
+            units: u32,
+            wheel_count: u32,
+            wheel1: i32,
+            wheel2: i32,
+            wheel3: i32,
+        ) -> CGEventRef;
+    }
+
+    const CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
+
+    /// Returns whether the callback withheld one vertical pixel-scroll record from local apps.
+    fn deliver_scroll(
+        state: &mut CallbackState,
+        source: EventSourceMetadata,
+        vertical: i32,
+    ) -> bool {
+        // SAFETY: a null source requests the default source; the owned event is never posted.
+        let event = unsafe {
+            CGEventCreateScrollWheelEvent2(
+                ptr::null(),
+                CG_SCROLL_EVENT_UNIT_PIXEL,
+                1,
+                vertical,
+                0,
+                0,
+            )
+        };
+        assert!(!event.is_null());
+        let suppressed = state.native_event(CG_EVENT_SCROLL_WHEEL, event, source);
+        // SAFETY: event was created above and never transferred.
+        unsafe { CFRelease(event) };
+        suppressed
+    }
+
     fn assert_capture_untouched(state: &CallbackState, consumer: &mut CaptureConsumer) {
         assert_eq!(state.shared.stop.reason(), None);
         assert!(!state.shared.revocation.is_revoked());
@@ -1959,6 +1995,58 @@ mod callback_tests {
         let (mut state, _consumer) = callback_fixture();
         assert!(!deliver_motion(&mut state, 0, 0));
         assert_eq!(state.pointer_position, Some(Point::new(10.0, 10.0)));
+    }
+
+    #[test]
+    fn scroll_without_delta_is_withheld_while_remote() {
+        let (mut state, mut consumer) = callback_fixture();
+        route_remote(&mut state, &mut consumer);
+        assert!(
+            deliver_scroll(&mut state, physical_source(), 0),
+            "a scroll phase record would otherwise reach the app under the pinned cursor"
+        );
+        assert_capture_untouched(&state, &mut consumer);
+        let episode = state.episode.expect("activation opens an episode");
+        assert_eq!(
+            episode.scroll_passed, 0,
+            "a withheld record never counts as passed"
+        );
+        assert!(deliver_scroll(&mut state, physical_source(), 3));
+        assert!(matches!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::LogicalScroll { .. })
+        ));
+    }
+
+    #[test]
+    fn scroll_without_delta_passes_while_local() {
+        let (mut state, mut consumer) = callback_fixture();
+        assert!(!deliver_scroll(&mut state, physical_source(), 0));
+        assert_capture_untouched(&state, &mut consumer);
+    }
+
+    #[test]
+    fn scroll_from_an_ignored_source_passes_while_remote() {
+        let (mut state, mut consumer) = callback_fixture();
+        route_remote(&mut state, &mut consumer);
+        let own = EventSourceMetadata {
+            user_data: SYNTHETIC_EVENT_MARKER,
+            ..physical_source()
+        };
+        let foreign = EventSourceMetadata {
+            state_id: 0,
+            ..physical_source()
+        };
+        for source in [own, foreign] {
+            for vertical in [0, 3] {
+                assert!(
+                    !deliver_scroll(&mut state, source, vertical),
+                    "the source filter decides before the route"
+                );
+            }
+        }
+        assert!(state.remote());
+        assert_capture_untouched(&state, &mut consumer);
     }
 
     #[test]
