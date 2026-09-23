@@ -20,7 +20,13 @@ const PAUSE_ID: &str = "tray-pause";
 const QUIT_ID: &str = "tray-quit";
 const MAIN_WINDOW: &str = "main";
 const ICON_SIDE: usize = 32;
-const WINDOWS_INACTIVE_BACKPLATE: [u8; 4] = [24, 32, 30, 235];
+/// Drawn under the white glyph on Windows so it stays visible on a pale taskbar.
+const WINDOWS_BACKPLATE: [u8; 4] = [24, 32, 30, 235];
+const GLYPH_WHITE: [u8; 3] = [236, 236, 236];
+/// sRGB of the dark `--destructive` token in ui/styles.css.
+const GLYPH_ERROR: [u8; 3] = [255, 99, 103];
+/// Idle keeps the white glyph and drops it to 40% opacity.
+const IDLE_OPACITY: u8 = 102;
 const TRAY_MASK: &[u8; ICON_SIDE * ICON_SIDE] = include_bytes!("../icons/tray-mask.bin");
 /// Well under the 1 s sharing supervision tick, so a change still reaches the tray promptly.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
@@ -34,9 +40,9 @@ struct TrayState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IconTone {
-    Monochrome,
-    Green,
-    Amber,
+    Active,
+    Idle,
+    Error,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,24 +78,31 @@ fn peer_name(platform: Option<&str>) -> &'static str {
 }
 
 fn presentation_for(input: StatusInput) -> TrayPresentation {
-    let (tone, label) = if input.sharing_active {
-        (IconTone::Green, "Sharing active".to_owned())
-    } else {
-        match input.sharing_phase {
-            "connecting" => (IconTone::Amber, "Connecting".to_owned()),
-            "connected" => (
-                IconTone::Monochrome,
-                format!("Connected to {}", peer_name(input.peer_platform)),
-            ),
-            "reconnecting" => (IconTone::Amber, "Reconnecting".to_owned()),
-            "stopping" => (IconTone::Amber, "Stopping".to_owned()),
-            "starting" => (IconTone::Amber, "Sharing starting".to_owned()),
-            "error" => (IconTone::Monochrome, "Needs attention".to_owned()),
-            _ if input.busy => (IconTone::Amber, "Working".to_owned()),
-            _ => (IconTone::Monochrome, "Not connected".to_owned()),
-        }
+    if input.sharing_phase == "error" {
+        return TrayPresentation {
+            tone: IconTone::Error,
+            label: "Needs attention".to_owned(),
+        };
+    }
+    if input.sharing_active {
+        return TrayPresentation {
+            tone: IconTone::Active,
+            label: "Sharing active".to_owned(),
+        };
+    }
+    let label = match input.sharing_phase {
+        "connecting" => "Connecting".to_owned(),
+        "connected" => format!("Connected to {}", peer_name(input.peer_platform)),
+        "reconnecting" => "Reconnecting".to_owned(),
+        "stopping" => "Stopping".to_owned(),
+        "starting" => "Sharing starting".to_owned(),
+        _ if input.busy => "Working".to_owned(),
+        _ => "Not connected".to_owned(),
     };
-    TrayPresentation { tone, label }
+    TrayPresentation {
+        tone: IconTone::Idle,
+        label,
+    }
 }
 
 fn presentation_from_controller(controller: &AppController) -> TrayPresentation {
@@ -257,8 +270,9 @@ fn icon_for(tone: IconTone) -> Image<'static> {
     Image::new_owned(icon_rgba(tone), ICON_SIDE as u32, ICON_SIDE as u32)
 }
 
+/// macOS tints template glyphs to the menu bar and keeps their alpha, so idle dims natively.
 fn is_template_icon(tone: IconTone) -> bool {
-    tone == IconTone::Monochrome
+    tone != IconTone::Error
 }
 
 #[cfg(test)]
@@ -267,29 +281,29 @@ fn glyph_rgba(tone: IconTone) -> Vec<u8> {
 }
 
 fn icon_rgba(tone: IconTone) -> Vec<u8> {
-    rasterize_icon(tone, needs_windows_inactive_backplate(tone))
+    rasterize_icon(tone, needs_windows_backplate(tone))
 }
 
-fn needs_windows_inactive_backplate(tone: IconTone) -> bool {
-    cfg!(windows) && tone == IconTone::Monochrome
+fn needs_windows_backplate(tone: IconTone) -> bool {
+    cfg!(windows) && tone != IconTone::Error
 }
 
 fn rasterize_icon(tone: IconTone, backplate: bool) -> Vec<u8> {
     let mut rgba = vec![0; ICON_SIDE * ICON_SIDE * 4];
-    let color = match tone {
-        IconTone::Monochrome => [236, 236, 236, 255],
-        IconTone::Green => [92, 201, 139, 255],
-        IconTone::Amber => [230, 166, 76, 255],
+    let (color, opacity) = match tone {
+        IconTone::Active => (GLYPH_WHITE, u8::MAX),
+        IconTone::Idle => (GLYPH_WHITE, IDLE_OPACITY),
+        IconTone::Error => (GLYPH_ERROR, u8::MAX),
     };
     for y in 0..ICON_SIDE {
         for x in 0..ICON_SIDE {
             let offset = (y * ICON_SIDE + x) * 4;
             let background = if backplate && is_backplate_pixel(x, y) {
-                WINDOWS_INACTIVE_BACKPLATE
+                WINDOWS_BACKPLATE
             } else {
                 [0; 4]
             };
-            let alpha = mask_alpha(x, y);
+            let alpha = scale_alpha(mask_alpha(x, y), opacity);
             rgba[offset..offset + 4].copy_from_slice(&source_over(
                 [color[0], color[1], color[2], alpha],
                 background,
@@ -301,6 +315,10 @@ fn rasterize_icon(tone: IconTone, backplate: bool) -> Vec<u8> {
 
 fn mask_alpha(x: usize, y: usize) -> u8 {
     TRAY_MASK[y * ICON_SIDE + x]
+}
+
+fn scale_alpha(alpha: u8, opacity: u8) -> u8 {
+    ((u32::from(alpha) * u32::from(opacity) + 127) / 255) as u8
 }
 
 fn source_over(foreground: [u8; 4], background: [u8; 4]) -> [u8; 4] {
@@ -362,14 +380,14 @@ mod tests {
     }
 
     #[test]
-    fn link_states_are_named_and_only_transitions_are_amber() {
+    fn only_sharing_is_bright_and_only_errors_are_colored() {
         assert_eq!(status(false, false, "off").label, "Not connected");
-        assert_eq!(status(false, false, "off").tone, IconTone::Monochrome);
+        assert_eq!(status(false, false, "off").tone, IconTone::Idle);
         let connecting = status(false, true, "connecting");
         assert_eq!(connecting.label, "Connecting");
-        assert_eq!(connecting.tone, IconTone::Amber);
-        assert_eq!(status(false, true, "reconnecting").tone, IconTone::Amber);
-        assert_eq!(status(false, true, "stopping").tone, IconTone::Amber);
+        assert_eq!(connecting.tone, IconTone::Idle);
+        assert_eq!(status(false, true, "reconnecting").tone, IconTone::Idle);
+        assert_eq!(status(false, true, "stopping").tone, IconTone::Idle);
         let connected = presentation_for(StatusInput {
             sharing_active: false,
             busy: false,
@@ -377,7 +395,7 @@ mod tests {
             peer_platform: Some("macos"),
         });
         assert_eq!(connected.label, "Connected to Mac");
-        assert_eq!(connected.tone, IconTone::Monochrome);
+        assert_eq!(connected.tone, IconTone::Idle);
         let windows_peer = presentation_for(StatusInput {
             sharing_active: false,
             busy: false,
@@ -387,15 +405,19 @@ mod tests {
         assert_eq!(windows_peer.label, "Connected to Windows PC");
         let sharing = status(true, true, "sharing");
         assert_eq!(sharing.label, "Sharing active");
-        assert_eq!(sharing.tone, IconTone::Green);
+        assert_eq!(sharing.tone, IconTone::Active);
+        assert_eq!(status(false, false, "error").tone, IconTone::Error);
     }
 
     #[test]
-    fn green_requires_native_sharing() {
-        assert_ne!(status(false, true, "sharing").tone, IconTone::Green);
+    fn bright_requires_native_sharing_and_an_error_outranks_it() {
+        assert_ne!(status(false, true, "sharing").tone, IconTone::Active);
         let sharing = status(true, true, "sharing");
-        assert_eq!(sharing.tone, IconTone::Green);
+        assert_eq!(sharing.tone, IconTone::Active);
         assert_eq!(sharing.tooltip(), "MonHop — Sharing active");
+        let failed = status(true, false, "error");
+        assert_eq!(failed.tone, IconTone::Error);
+        assert_eq!(failed.label, "Needs attention");
     }
 
     #[test]
@@ -412,33 +434,36 @@ mod tests {
 
     #[test]
     fn mark_uses_the_embedded_antialiased_mask_for_every_status_tone() {
-        let inactive = glyph_rgba(IconTone::Monochrome);
-        let active = glyph_rgba(IconTone::Green);
-        let busy = glyph_rgba(IconTone::Amber);
-        assert_eq!(inactive.len(), ICON_SIDE * ICON_SIDE * 4);
+        let active = glyph_rgba(IconTone::Active);
+        let idle = glyph_rgba(IconTone::Idle);
+        let error = glyph_rgba(IconTone::Error);
+        assert_eq!(active.len(), ICON_SIDE * ICON_SIDE * 4);
         let mut empty = 0;
         let mut antialiased = 0;
         let mut opaque = 0;
 
         for (index, alpha) in TRAY_MASK.iter().copied().enumerate() {
             let offset = index * 4;
-            assert_eq!(inactive[offset + 3], alpha);
             assert_eq!(active[offset + 3], alpha);
-            assert_eq!(busy[offset + 3], alpha);
+            assert_eq!(error[offset + 3], alpha);
+            assert_eq!(idle[offset + 3], scale_alpha(alpha, IDLE_OPACITY));
             match alpha {
                 0 => {
                     empty += 1;
-                    assert_eq!(&inactive[offset..offset + 4], &[0, 0, 0, 0]);
                     assert_eq!(&active[offset..offset + 4], &[0, 0, 0, 0]);
-                    assert_eq!(&busy[offset..offset + 4], &[0, 0, 0, 0]);
+                    assert_eq!(&idle[offset..offset + 4], &[0, 0, 0, 0]);
+                    assert_eq!(&error[offset..offset + 4], &[0, 0, 0, 0]);
                 }
-                255 => opaque += 1,
+                255 => {
+                    opaque += 1;
+                    assert_eq!(idle[offset + 3], IDLE_OPACITY);
+                }
                 _ => antialiased += 1,
             }
             if alpha != 0 {
-                assert_eq!(&inactive[offset..offset + 3], &[236, 236, 236]);
-                assert_eq!(&active[offset..offset + 3], &[92, 201, 139]);
-                assert_eq!(&busy[offset..offset + 3], &[230, 166, 76]);
+                assert_eq!(&active[offset..offset + 3], &GLYPH_WHITE);
+                assert_eq!(&idle[offset..offset + 3], &GLYPH_WHITE);
+                assert_eq!(&error[offset..offset + 3], &GLYPH_ERROR);
             }
         }
         assert!(empty > 0);
@@ -447,9 +472,10 @@ mod tests {
     }
 
     #[test]
-    fn windows_inactive_backplate_keeps_the_glyph_visible_on_pale_and_dark_taskbars() {
-        let macos_inactive = rasterize_icon(IconTone::Monochrome, false);
-        let windows_inactive = rasterize_icon(IconTone::Monochrome, true);
+    fn windows_backplate_keeps_the_glyph_visible_on_pale_and_dark_taskbars() {
+        let macos_active = rasterize_icon(IconTone::Active, false);
+        let windows_active = rasterize_icon(IconTone::Active, true);
+        let windows_idle = rasterize_icon(IconTone::Idle, true);
         let (empty_x, empty_y) = mask_pixel(|x, y, alpha| alpha == 0 && is_backplate_pixel(x, y));
         let (opaque_x, opaque_y) =
             mask_pixel(|x, y, alpha| alpha == 255 && is_backplate_pixel(x, y));
@@ -457,23 +483,22 @@ mod tests {
             mask_pixel(|x, y, alpha| (1..255).contains(&alpha) && is_backplate_pixel(x, y));
         let (exterior_x, exterior_y) =
             mask_pixel(|x, y, alpha| alpha == 0 && !is_backplate_pixel(x, y));
-        let backplate = pixel(&windows_inactive, empty_x, empty_y);
-        let glyph = pixel(&windows_inactive, opaque_x, opaque_y);
-        let edge = pixel(&windows_inactive, edge_x, edge_y);
+        let backplate = pixel(&windows_active, empty_x, empty_y);
+        let glyph = pixel(&windows_active, opaque_x, opaque_y);
+        let idle_glyph = pixel(&windows_idle, opaque_x, opaque_y);
+        let edge = pixel(&windows_active, edge_x, edge_y);
         let edge_alpha = mask_alpha(edge_x, edge_y);
+        let [red, green, blue] = GLYPH_WHITE;
 
-        assert_eq!(pixel(&macos_inactive, empty_x, empty_y), [0, 0, 0, 0]);
-        assert_eq!(
-            pixel(&windows_inactive, exterior_x, exterior_y),
-            [0, 0, 0, 0]
-        );
-        assert_eq!(backplate, WINDOWS_INACTIVE_BACKPLATE);
-        assert_eq!(glyph, [236, 236, 236, 255]);
+        assert_eq!(pixel(&macos_active, empty_x, empty_y), [0, 0, 0, 0]);
+        assert_eq!(pixel(&windows_active, exterior_x, exterior_y), [0, 0, 0, 0]);
+        assert_eq!(backplate, WINDOWS_BACKPLATE);
+        assert_eq!(glyph, [red, green, blue, 255]);
         assert_eq!(
             edge,
-            source_over([236, 236, 236, edge_alpha], WINDOWS_INACTIVE_BACKPLATE)
+            source_over([red, green, blue, edge_alpha], WINDOWS_BACKPLATE)
         );
-        assert!(edge[3] > WINDOWS_INACTIVE_BACKPLATE[3]);
+        assert!(edge[3] > WINDOWS_BACKPLATE[3]);
         assert!(edge[3] < 255);
         assert!(luminance_after_composite(backplate, [240, 240, 240]) < 0.25);
         assert!(luminance_after_composite(glyph, [24, 24, 24]) > 0.85);
@@ -482,27 +507,25 @@ mod tests {
                 - luminance_after_composite(backplate, [240, 240, 240])
                 > 0.5
         );
+        let idle = luminance_after_composite(idle_glyph, [240, 240, 240]);
+        assert!(idle > luminance_after_composite(backplate, [240, 240, 240]) + 0.1);
+        assert!(idle < luminance_after_composite(glyph, [240, 240, 240]) - 0.3);
     }
 
     #[test]
-    fn only_windows_get_the_inactive_backplate() {
-        let expected = if cfg!(windows) {
-            rasterize_icon(IconTone::Monochrome, true)
-        } else {
-            rasterize_icon(IconTone::Monochrome, false)
-        };
-        assert_eq!(icon_rgba(IconTone::Monochrome), expected);
-        assert!(!needs_windows_inactive_backplate(IconTone::Green));
-        assert!(!needs_windows_inactive_backplate(IconTone::Amber));
-        assert_eq!(icon_rgba(IconTone::Green), glyph_rgba(IconTone::Green));
-        assert_eq!(icon_rgba(IconTone::Amber), glyph_rgba(IconTone::Amber));
+    fn only_white_glyphs_on_windows_get_the_backplate() {
+        for tone in [IconTone::Active, IconTone::Idle] {
+            assert_eq!(icon_rgba(tone), rasterize_icon(tone, cfg!(windows)));
+        }
+        assert!(!needs_windows_backplate(IconTone::Error));
+        assert_eq!(icon_rgba(IconTone::Error), glyph_rgba(IconTone::Error));
     }
 
     #[test]
-    fn only_inactive_icons_use_the_native_macos_template_mode() {
-        assert!(is_template_icon(IconTone::Monochrome));
-        assert!(!is_template_icon(IconTone::Green));
-        assert!(!is_template_icon(IconTone::Amber));
+    fn only_the_error_icon_opts_out_of_the_native_macos_template_mode() {
+        assert!(is_template_icon(IconTone::Active));
+        assert!(is_template_icon(IconTone::Idle));
+        assert!(!is_template_icon(IconTone::Error));
     }
 
     fn pixel(rgba: &[u8], x: usize, y: usize) -> [u8; 4] {
