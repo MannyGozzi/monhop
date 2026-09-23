@@ -8,7 +8,8 @@ use monhop_transport::{
     session::SessionScopes,
     session_receiver::{DestinationAction, DestinationFailure, InputDestination, InputReceiver},
     session_source::{
-        NormalizedInput, SourceController, SourceEffect, SourceMode, SourceOutcome, TaggedInput,
+        NormalizedInput, PUSH_THROUGH_DISTANCE, SourceController, SourceEffect, SourceMode,
+        SourceOutcome, TaggedInput,
     },
 };
 use std::{collections::VecDeque, time::Duration};
@@ -302,12 +303,18 @@ impl Coordinator {
         let o = self.source.on_captured(record, self.now);
         self.effects(o)
     }
+    /// Rests on the linked right edge and pushes through it; an arrival's own delta never counts.
     fn cross(&mut self) -> Vec<Frame> {
         let o = self
             .source
             .observe_pointer(Point::new(99.0, 50.0), self.now);
         assert!(self.effects(o).is_empty());
-        self.input(NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)))
+        let mut frames = self.input(NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)));
+        frames.extend(self.input(NormalizedInput::RelativeMotion(Point::new(
+            PUSH_THROUGH_DISTANCE,
+            0.0,
+        ))));
+        frames
     }
     fn drain(&mut self) -> Vec<Frame> {
         let mut frames = Vec::new();
@@ -471,8 +478,12 @@ fn stale_generation_motion_never_crosses() {
     let mut p = Pair::new();
     let c = &mut p.computers[0];
     c.source.observe_pointer(Point::new(99.0, 50.0), ms(0));
+    assert!(
+        c.input(NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)))
+            .is_empty()
+    );
     let record = TaggedInput {
-        event: NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)),
+        event: NormalizedInput::RelativeMotion(Point::new(PUSH_THROUGH_DISTANCE, 0.0)),
         routing_revision: 0,
         remote: false,
         floor_generation: 0,
@@ -554,6 +565,10 @@ fn reanchor_allowed_while_sending_and_receiving() {
     let a = p.computers[0].floor.snapshot();
     let b = p.computers[1].floor.snapshot();
     p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
+    p.input(
+        0,
+        NormalizedInput::RelativeMotion(Point::new(0.0, PUSH_THROUGH_DISTANCE)),
+    );
     p.pump();
     assert_eq!(p.computers[0].floor.snapshot(), a);
     assert_eq!(p.computers[1].floor.snapshot(), b);
@@ -583,6 +598,11 @@ fn take_back_during_reanchor_applies_on_remote() {
     p.cross(0);
     p.pump();
     p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
+    p.pump();
+    p.input(
+        0,
+        NormalizedInput::RelativeMotion(Point::new(0.0, PUSH_THROUGH_DISTANCE)),
+    );
     // Capture takes back before the destination consumes the already queued reanchor.
     p.take_back(1);
     let take = p.pipe.pop_back().unwrap();
@@ -700,8 +720,11 @@ fn crossings_rearm_from_fresh_poll_after_free() {
             .is_empty()
     );
     assert!(
-        !c.input(NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)))
-            .is_empty()
+        !c.input(NormalizedInput::RelativeMotion(Point::new(
+            PUSH_THROUGH_DISTANCE,
+            0.0
+        )))
+        .is_empty()
     );
 }
 #[test]
@@ -1002,6 +1025,11 @@ fn a_take_back_delayed_past_a_reanchor_and_a_hold_is_ignored() {
     p.cross(0);
     p.pump();
     p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
+    p.pump();
+    p.input(
+        0,
+        NormalizedInput::RelativeMotion(Point::new(0.0, PUSH_THROUGH_DISTANCE)),
+    );
     // The peer takes back in the old epoch; a stall delays its TakeBack past the reanchor.
     p.take_back(1);
     let (to, late) = p.pipe.pop_back().unwrap();
@@ -1029,7 +1057,10 @@ fn crossing_straight_back_after_an_own_return_needs_no_fresh_poll() {
     assert_eq!(c.source.mode(), SourceMode::Local);
     assert_eq!(c.floor.snapshot().state, FloorState::Free);
     assert!(
-        !c.input(NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)))
-            .is_empty()
+        !c.input(NormalizedInput::RelativeMotion(Point::new(
+            PUSH_THROUGH_DISTANCE,
+            0.0
+        )))
+        .is_empty()
     );
 }

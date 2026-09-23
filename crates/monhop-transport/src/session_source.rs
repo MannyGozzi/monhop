@@ -36,6 +36,12 @@ pub const MAX_SOURCE_EFFECTS: usize = 16;
 /// Logical px the pointer must move off the edge a crossing entered through to cross it again.
 pub const ENTRY_GUARD_DISTANCE: f64 = 24.0;
 
+/// Logical px of outward push, made while resting on a linked edge, that carries the pointer over.
+pub const PUSH_THROUGH_DISTANCE: f64 = 80.0;
+
+/// A push that pauses this long starts over, so brushing an edge now and then never adds up.
+pub const PUSH_THROUGH_RESET: Duration = Duration::from_millis(500);
+
 /// A platform event converted into source-controller units.
 ///
 /// `AbsoluteMotion` is a topology logical position. `RelativeMotion` is a logical delta in the
@@ -285,6 +291,7 @@ pub struct SourceController {
     decline_logged: Option<(DisplayId, DeclineReason)>,
     /// Display and edge the last crossing entered through, so sensor noise cannot bounce it back.
     entry_guard: Option<(DisplayId, Edge)>,
+    edge_push: Option<EdgePush>,
     peer_offset: Point,
     topology: Topology,
     ownership: PointerOwnership,
@@ -360,6 +367,38 @@ enum State {
     Failed,
 }
 
+/// Outward push held against one linked edge. The motion that reached the edge never counts.
+#[derive(Clone, Copy)]
+struct EdgePush {
+    display: DisplayId,
+    edge: Edge,
+    distance: f64,
+    last: Duration,
+    /// Depth past the edge line that absolute samples measure from; unset, the next one sets it.
+    baseline: Option<f64>,
+    /// The relative half of the absolute sample that arrived is still due, and is arrival too.
+    arrival_delta: bool,
+}
+
+impl EdgePush {
+    fn new(display: DisplayId, edge: Edge, now: Duration) -> Self {
+        Self {
+            display,
+            edge,
+            distance: 0.0,
+            last: now,
+            baseline: None,
+            arrival_delta: false,
+        }
+    }
+
+    fn restart_if_paused(&mut self, now: Duration) {
+        if now.saturating_sub(self.last) >= PUSH_THROUGH_RESET {
+            *self = Self::new(self.display, self.edge, now);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CaptureRoute {
     remote: bool,
@@ -420,6 +459,7 @@ impl SourceController {
             declined: None,
             decline_logged: None,
             entry_guard: None,
+            edge_push: None,
             peer_offset: Point::default(),
             topology,
             ownership,
@@ -488,7 +528,7 @@ impl SourceController {
         let mut effects = SourceEffects::default();
         match record.event {
             NormalizedInput::Key { .. } | NormalizedInput::Button { .. } => {
-                self.apply_local(record.event, &mut effects)
+                self.apply_local(record.event, self.last_now, &mut effects)
             }
             _ => {}
         }
@@ -776,9 +816,9 @@ impl SourceController {
             }
         }
         if self.capture_route.remote {
-            self.apply_remote(record.event, &mut effects);
+            self.apply_remote(record.event, now, &mut effects);
         } else {
-            self.apply_local(record.event, &mut effects);
+            self.apply_local(record.event, now, &mut effects);
         }
         self.outcome(effects)
     }
@@ -920,6 +960,7 @@ impl SourceController {
                     self.clear_remote_delivery();
                     self.take_back = false;
                     self.entry_guard = None;
+                    self.edge_push = None;
                     self.declined = Some((return_target.display, target.display, Some(now), now));
                     // A pressed seam retries every DECLINE_RETRY_AFTER: one line per streak.
                     if self.decline_logged != Some((target.display, reason)) {
@@ -1100,6 +1141,7 @@ impl SourceController {
         self.push_input(Message::ReleaseAll, effects);
         if self.failure.is_none() {
             self.entry_guard = entry_guard;
+            self.edge_push = None;
             self.state = State::AwaitReleaseAcknowledgement {
                 local,
                 local_position,
@@ -1330,7 +1372,7 @@ impl SourceController {
         }
     }
 
-    fn apply_local(&mut self, input: NormalizedInput, effects: &mut SourceEffects) {
+    fn apply_local(&mut self, input: NormalizedInput, now: Duration, effects: &mut SourceEffects) {
         match input {
             NormalizedInput::Key {
                 usage,
@@ -1344,8 +1386,12 @@ impl SourceController {
             NormalizedInput::Button { button, pressed } => {
                 self.update_button(button, pressed);
             }
-            NormalizedInput::AbsoluteMotion(current) => self.apply_local_motion(current, effects),
-            NormalizedInput::RelativeMotion(delta) => self.apply_local_relative(delta, effects),
+            NormalizedInput::AbsoluteMotion(current) => {
+                self.apply_local_motion(current, now, effects)
+            }
+            NormalizedInput::RelativeMotion(delta) => {
+                self.apply_local_relative(delta, now, effects)
+            }
             NormalizedInput::Scroll { .. } => {}
             NormalizedInput::RouteChanged { .. } => {
                 unreachable!("route records are dispatched first")
@@ -1353,7 +1399,7 @@ impl SourceController {
         }
     }
 
-    fn apply_remote(&mut self, input: NormalizedInput, effects: &mut SourceEffects) {
+    fn apply_remote(&mut self, input: NormalizedInput, now: Duration, effects: &mut SourceEffects) {
         let forwarding = matches!(self.state, State::Remote { .. });
         match input {
             NormalizedInput::Key {
@@ -1433,7 +1479,7 @@ impl SourceController {
                 }
             }
             NormalizedInput::RelativeMotion(delta) if forwarding => {
-                self.apply_remote_motion(delta, effects)
+                self.apply_remote_motion(delta, now, effects)
             }
             NormalizedInput::Scroll {
                 horizontal,
@@ -1457,8 +1503,8 @@ impl SourceController {
     /// Local input is anchored on an in-use display. A sample outside every in-use display (a
     /// display the layout marks not in use, or space past a clamped edge) counts as past the
     /// nearest edge of the display the pointer left, at the pointer's lateral position: a linked
-    /// edge there crosses to the other computer, any other edge keeps input local at that edge.
-    fn apply_local_motion(&mut self, current: Point, effects: &mut SourceEffects) {
+    /// edge there is pushed through to the other computer, any other edge keeps input local.
+    fn apply_local_motion(&mut self, current: Point, now: Duration, effects: &mut SourceEffects) {
         let State::Local { target, cursor } = self.state else {
             return;
         };
@@ -1515,14 +1561,36 @@ impl SourceController {
             }
             None => None,
         };
-        match transition {
-            Some(transition) => self.begin_edge_transition(target, transition, effects),
-            None => {
-                self.state = State::Local {
-                    target,
-                    cursor: Some(anchor),
-                };
+        // Reaching another of this computer's displays is no handoff, so it takes no push.
+        if let Some(transition) = transition.filter(|found| self.is_home_display(found.to_display))
+        {
+            self.begin_edge_transition(target, transition, effects);
+            return;
+        }
+        self.state = State::Local {
+            target,
+            cursor: Some(anchor),
+        };
+        let (edge, transition) = match self.linked_edge(target.display, anchor, None, guarded) {
+            Ok(Some(found)) if !self.is_home_display(found.1.to_display) => found,
+            Ok(_) => {
+                self.edge_push = None;
+                return;
             }
+            Err(()) => {
+                self.fail(SourceFailure::Topology, effects);
+                return;
+            }
+        };
+        let Ok(display) = self.topology.display(target.display) else {
+            self.fail(SourceFailure::Topology, effects);
+            return;
+        };
+        // Its relative half is arrival too unless the pointer already rested on this edge.
+        let arrived = !cursor.is_some_and(|was| at_physical_edge(display, was, edge));
+        let depth = -distance_inside(display.bounds(), current, edge);
+        if self.push_to(target.display, edge, depth, arrived, now) {
+            self.begin_edge_transition(target, transition, effects);
         }
     }
 
@@ -1558,8 +1626,9 @@ impl SourceController {
                     };
                 }
                 self.rebase_pointer = false;
+                self.edge_push = None;
             } else if allowed {
-                self.apply_local_motion(point, &mut effects);
+                self.apply_local_motion(point, now, &mut effects);
             }
         }
         self.outcome(effects)
@@ -1606,6 +1675,7 @@ impl SourceController {
             self.fail(SourceFailure::Ownership, effects);
             return;
         }
+        self.edge_push = None;
         self.state = State::Local {
             target,
             cursor: Some(cursor),
@@ -1693,6 +1763,7 @@ impl SourceController {
         self.outbound_input_sequence = 0;
         let entry = transition.entry_point;
         self.entry_guard = Some((target.display, transition.to_edge));
+        self.edge_push = None;
         self.state = State::AwaitActivation {
             target,
             entry,
@@ -1710,7 +1781,7 @@ impl SourceController {
         );
     }
 
-    fn apply_local_relative(&mut self, delta: Point, effects: &mut SourceEffects) {
+    fn apply_local_relative(&mut self, delta: Point, now: Duration, effects: &mut SourceEffects) {
         let State::Local {
             target,
             cursor: Some(anchor),
@@ -1719,31 +1790,43 @@ impl SourceController {
             return;
         };
         let guarded = self.guarded_entry_edge(target.display, anchor);
-        let transition = match self.relative_edge_transition(target.display, anchor, delta, guarded)
+        let (edge, transition) =
+            match self.linked_edge(target.display, anchor, Some(delta), guarded) {
+                Ok(Some(found)) => found,
+                Ok(None) => return,
+                Err(()) => {
+                    self.fail(SourceFailure::Topology, effects);
+                    return;
+                }
+            };
+        if self.is_home_display(transition.to_display)
+            || self.push_by(target.display, edge, outward(edge, delta), now)
         {
-            Ok(transition) => transition,
-            Err(()) => {
-                self.fail(SourceFailure::Topology, effects);
-                return;
-            }
-        };
-        if let Some(transition) = transition {
             self.begin_edge_transition(target, transition, effects);
         }
     }
 
-    fn relative_edge_transition(
+    /// The linked edge `anchor` rests on, the one already pushed against first, with the
+    /// transition its link gives there; `toward` keeps only edges that motion leaves through.
+    fn linked_edge(
         &self,
         display_id: DisplayId,
         anchor: Point,
-        delta: Point,
+        toward: Option<Point>,
         guarded: Option<Edge>,
-    ) -> Result<Option<EdgeTransition>, ()> {
+    ) -> Result<Option<(Edge, EdgeTransition)>, ()> {
         let display = self.topology.display(display_id).map_err(|_| ())?;
         let bounds = display.bounds();
-        for edge in [Edge::Right, Edge::Left, Edge::Bottom, Edge::Top] {
+        let pushed = self
+            .edge_push
+            .filter(|push| push.display == display_id)
+            .map(|push| push.edge);
+        for edge in pushed
+            .into_iter()
+            .chain([Edge::Right, Edge::Left, Edge::Bottom, Edge::Top])
+        {
             if guarded == Some(edge)
-                || !outward(edge, delta)
+                || toward.is_some_and(|delta| outward(edge, delta) <= 0.0)
                 || !at_physical_edge(display, anchor, edge)
             {
                 continue;
@@ -1766,10 +1849,67 @@ impl SourceController {
                 .transition_for_motion(display_id, anchor, projected)
                 .map_err(|_| ())?
             {
-                return Ok(Some(transition));
+                return Ok(Some((edge, transition)));
             }
         }
         Ok(None)
+    }
+
+    fn is_home_display(&self, display_id: DisplayId) -> bool {
+        self.topology
+            .display(display_id)
+            .is_ok_and(|display| display.machine == self.home.machine)
+    }
+
+    fn current_push(&self, display: DisplayId, edge: Edge) -> Option<EdgePush> {
+        self.edge_push
+            .filter(|push| push.display == display && push.edge == edge)
+    }
+
+    /// Adds a relative delta's outward travel to the push on `edge`; true once it is through.
+    fn push_by(&mut self, display: DisplayId, edge: Edge, travel: f64, now: Duration) -> bool {
+        let mut push = self
+            .current_push(display, edge)
+            .unwrap_or(EdgePush::new(display, edge, now));
+        push.restart_if_paused(now);
+        let arrival = std::mem::take(&mut push.arrival_delta);
+        if !arrival {
+            push.distance += travel;
+            push.last = now;
+        }
+        self.edge_push = Some(push);
+        !arrival && push.distance >= PUSH_THROUGH_DISTANCE
+    }
+
+    /// Raises the push on `edge` to how far an absolute sample has gone past where the push
+    /// began. A level, not a sum: that sample and its relative half measure the same travel.
+    fn push_to(
+        &mut self,
+        display: DisplayId,
+        edge: Edge,
+        depth: f64,
+        arrived: bool,
+        now: Duration,
+    ) -> bool {
+        let depth = depth.max(0.0);
+        let Some(mut push) = self.current_push(display, edge) else {
+            self.edge_push = Some(EdgePush {
+                baseline: Some(depth),
+                arrival_delta: arrived,
+                ..EdgePush::new(display, edge, now)
+            });
+            return false;
+        };
+        push.restart_if_paused(now);
+        push.arrival_delta = false;
+        let reached = depth - *push.baseline.get_or_insert(depth);
+        let pushed = reached > push.distance;
+        if pushed {
+            push.distance = reached;
+            push.last = now;
+        }
+        self.edge_push = Some(push);
+        pushed && push.distance >= PUSH_THROUGH_DISTANCE
     }
 
     /// The entry edge `position` may not cross yet. The guard is dropped for good once the pointer
@@ -1819,7 +1959,8 @@ impl SourceController {
         ))
     }
 
-    fn apply_remote_motion(&mut self, delta: Point, effects: &mut SourceEffects) {
+    /// The modelled pointer stops on every edge it reaches; only a push from there carries it on.
+    fn apply_remote_motion(&mut self, delta: Point, now: Duration, effects: &mut SourceEffects) {
         let State::Remote {
             target,
             position,
@@ -1844,18 +1985,16 @@ impl SourceController {
         }
         let guarded = self.guarded_entry_edge(target.display, position);
         let desired = self.held_at_entry_edge(target.display, desired, guarded);
-        let transition =
-            match self
-                .topology
-                .transition_for_motion(target.display, position, desired)
-            {
-                Ok(transition) => transition,
-                Err(_) => {
-                    self.fail(SourceFailure::Topology, effects);
-                    return;
-                }
-            };
-        if let Some(transition) = transition {
+        let pushing = match self.linked_edge(target.display, position, Some(delta), guarded) {
+            Ok(pushing) => pushing,
+            Err(()) => {
+                self.fail(SourceFailure::Topology, effects);
+                return;
+            }
+        };
+        if let Some((edge, transition)) = pushing
+            && self.push_by(target.display, edge, outward(edge, delta), now)
+        {
             self.apply_remote_edge(target, return_target, return_position, transition, effects);
             return;
         }
@@ -1863,6 +2002,16 @@ impl SourceController {
             desired.x.clamp(bounds.origin.x, bounds.max_x().next_down()),
             desired.y.clamp(bounds.origin.y, bounds.max_y().next_down()),
         );
+        let resting = self.edge_push.is_some_and(|push| {
+            push.display == target.display
+                && self
+                    .topology
+                    .display(target.display)
+                    .is_ok_and(|display| at_physical_edge(display, next, push.edge))
+        });
+        if !resting {
+            self.edge_push = None;
+        }
         self.state = State::Remote {
             target,
             position: next,
@@ -2322,6 +2471,7 @@ impl SourceController {
         self.failure = Some(failure);
         self.state = State::Failed;
         self.entry_guard = None;
+        self.edge_push = None;
         let _ = self.ownership.on_timeout();
         if remote_may_hold {
             let sequence = self.outbound_input_sequence;
@@ -2444,12 +2594,13 @@ fn advance_counter(counter: &mut u64) -> Option<u64> {
     Some(current)
 }
 
-fn outward(edge: Edge, delta: Point) -> bool {
+/// `delta` along `edge`'s outward normal; positive leaves the display through it.
+fn outward(edge: Edge, delta: Point) -> f64 {
     match edge {
-        Edge::Left => delta.x < 0.0,
-        Edge::Right => delta.x > 0.0,
-        Edge::Top => delta.y < 0.0,
-        Edge::Bottom => delta.y > 0.0,
+        Edge::Left => -delta.x,
+        Edge::Right => delta.x,
+        Edge::Top => -delta.y,
+        Edge::Bottom => delta.y,
     }
 }
 
