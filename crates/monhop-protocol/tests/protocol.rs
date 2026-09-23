@@ -448,6 +448,13 @@ fn same_geometry_ignores_only_names_and_enumeration_order() {
     ])
     .expect("valid topology");
     assert!(first.same_geometry(&renamed_reordered));
+    assert!(!first.same_labels(&renamed_reordered));
+    let reordered = DisplayTopology::new(vec![
+        first.displays()[1].clone(),
+        first.displays()[0].clone(),
+    ])
+    .expect("valid topology");
+    assert!(first.same_labels(&reordered));
 
     for changed in [
         changed_geometry(&first, |display| display.id = DisplayId(3)),

@@ -162,6 +162,16 @@ impl DisplayTopology {
             })
     }
 
+    /// Every display carries the label of its counterpart with the same id: what a reader shows.
+    pub fn same_labels(&self, other: &Self) -> bool {
+        self.displays.iter().all(|display| {
+            other
+                .displays
+                .iter()
+                .any(|candidate| candidate.id == display.id && candidate.name == display.name)
+        })
+    }
+
     pub fn into_displays(self) -> Vec<DisplayDescription> {
         self.displays
     }

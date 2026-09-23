@@ -5,7 +5,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use monhop_core::{DisplayId, LogicalRect, NativeSize};
+use monhop_core::{DisplayId, NativeSize};
 
 use crate::MacDisplay;
 
@@ -14,7 +14,6 @@ const MAX_DISPLAY_NAME_BYTES: usize = 96;
 #[derive(Clone)]
 struct CachedDisplayName {
     native_size: NativeSize,
-    logical_bounds: LogicalRect,
     name: String,
 }
 
@@ -45,8 +44,8 @@ fn sanitized_display_name(name: &str) -> Option<String> {
     }
 }
 
-/// Replaces labels captured on the main thread. Each label remains valid only for its matching
-/// Core Graphics display snapshot, so a changed arrangement falls back to an unnamed display.
+/// Replaces labels captured on the main thread. A label stays with its display through moves and
+/// other displays coming and going; a new display or a new mode is unnamed until the next refresh.
 pub fn replace_names(displays: &[MacDisplay], names: Vec<(DisplayId, String)>) {
     let mut unique_displays = BTreeMap::<DisplayId, Option<&MacDisplay>>::new();
     for display in displays {
@@ -86,7 +85,6 @@ pub fn replace_names(displays: &[MacDisplay], names: Vec<(DisplayId, String)>) {
             id,
             CachedDisplayName {
                 native_size: display.native_size,
-                logical_bounds: display.logical_bounds,
                 name,
             },
         );
@@ -97,12 +95,11 @@ pub fn replace_names(displays: &[MacDisplay], names: Vec<(DisplayId, String)>) {
     }
 }
 
-/// Returns a cached OS label only when the current display has the same identifier and geometry.
+/// Returns a cached OS label only when the current display has the same identifier and mode.
 pub fn name_for(display: &MacDisplay) -> Option<String> {
     let cached = cache().lock().ok()?;
     let name = cached.get(&display.id)?;
-    (name.native_size == display.native_size && name.logical_bounds == display.logical_bounds)
-        .then(|| name.name.clone())
+    (name.native_size == display.native_size).then(|| name.name.clone())
 }
 
 #[cfg(test)]
@@ -133,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_name_requires_the_same_display_snapshot() {
+    fn a_cached_name_follows_its_display_through_a_move_but_not_a_new_mode() {
         let _guard = TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let source = display(7);
         replace_names(
@@ -142,9 +139,12 @@ mod tests {
         );
 
         assert_eq!(name_for(&source), Some("Studio Display".into()));
-        let mut changed = source;
-        changed.logical_bounds.origin.x = 1.0;
-        assert_eq!(name_for(&changed), None);
+        let mut moved = source.clone();
+        moved.logical_bounds.origin.x = -1_920.0;
+        assert_eq!(name_for(&moved), Some("Studio Display".into()));
+        let mut remoded = source;
+        remoded.native_size = NativeSize::new(2_560, 1_440);
+        assert_eq!(name_for(&remoded), None);
     }
 
     #[test]

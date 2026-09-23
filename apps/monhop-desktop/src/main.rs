@@ -698,6 +698,10 @@ fn main() {
             app.state::<Arc<AppController>>()
                 .use_setup_path(sharing_setup_path(app.handle())?);
             autostart::init(app.handle());
+            #[cfg(target_os = "macos")]
+            if let Some(marker) = objc2::MainThreadMarker::new() {
+                display_labels::watch(marker);
+            }
             app.manage(dimming::Dimming::start(app.handle(), !check_ui));
             app.manage(updates::Updates::start(app.handle(), !check_ui));
             let appearance = appearance::Appearance::start(app.handle());

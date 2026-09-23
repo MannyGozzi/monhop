@@ -2334,6 +2334,9 @@ fn apply_link_event(shared: &Arc<Mutex<State>>, generation: u64, event: LinkEven
                 };
             }
         }
+        LinkEvent::TopologyChanged { inspection } if only_relabeled(&state, &inspection) => {
+            adopt_labels(&mut state, inspection);
+        }
         LinkEvent::TopologyChanged { inspection } => {
             adopt_inspection(&mut state, inspection);
             state.view.synchronized_layout = None;
@@ -2443,6 +2446,22 @@ fn adopt_inspection(state: &mut State, inspection: InspectedPeer) {
     state.view.sync = SyncView::default();
 }
 
+fn only_relabeled(state: &State, inspection: &InspectedPeer) -> bool {
+    state.inspection.as_ref().is_some_and(|seen| {
+        seen.local_displays
+            .same_geometry(&inspection.local_displays)
+            && seen.peer_displays.same_geometry(&inspection.peer_displays)
+    })
+}
+
+/// Labels are cosmetic: the arrangement being made, its authorization and the settle clock stand.
+fn adopt_labels(state: &mut State, inspection: InspectedPeer) {
+    advance_setup_revision(state);
+    state.view.local_displays = display_views(&inspection.local_displays);
+    state.view.peer_displays = display_views(&inspection.peer_displays);
+    state.inspection = Some(inspection);
+}
+
 /// A refusal that follows this computer's own commit means the pair no longer agrees on disk.
 /// Ends the link deliberately once both computers hold the layout; the supervisor then shares.
 fn close_after_apply(state: &mut State) {
@@ -2537,7 +2556,7 @@ fn link_persist(
         stage: Arc::new(move |fresh, bytes| {
             stage_shared_setup(&state, generation, epoch, &path, fresh, bytes)
         }),
-        commit: Arc::new(move |_, _| {
+        commit: Arc::new(move |current, _| {
             // The state lock is released before the write: disk work must never block the UI thread.
             let mut applied = None;
             setup_file.commit(&commit_path, || {
@@ -2546,6 +2565,8 @@ fn link_persist(
                     return Err(LinkRejectReason::Cancelled);
                 }
                 let (staged, left_out) = state.staged.take().ok_or(LinkRejectReason::SaveFailed)?;
+                // A label that caught up after staging is saved; a display that moved unwound this.
+                let staged = staged.relabeled(current);
                 applied = Some((staged.clone(), left_out));
                 Ok(staged)
             })?;
@@ -4952,6 +4973,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_label_that_caught_up_after_staging_is_the_one_committed() {
+        use session_setup::{DisplayDescription, DisplayTopology};
+        let controller = SharingController::default();
+        let (_directory, path) = sync_test_path();
+        let (fresh, bytes) = sync_payload();
+        let persist = link_persist(
+            Arc::clone(&controller.state),
+            0,
+            path.clone(),
+            Arc::clone(&controller.setup_file),
+        );
+        (persist.stage)(&fresh, &bytes).unwrap();
+        let mut named = fresh.clone();
+        named.peer_displays = DisplayTopology::new(
+            fresh
+                .peer_displays
+                .displays()
+                .iter()
+                .map(|display| DisplayDescription {
+                    name: "Studio Display".into(),
+                    ..display.clone()
+                })
+                .collect(),
+        )
+        .unwrap();
+        (persist.commit)(&named, &bytes).unwrap();
+        let file = SetupFile::load(&path).unwrap();
+        let saved = file.active_computer().unwrap();
+        assert!(
+            saved
+                .peer_displays()
+                .iter()
+                .all(|display| display.name() == "Studio Display")
+        );
+    }
+
+    #[test]
     fn the_setup_revision_moves_on_with_each_write_and_commit_and_never_with_a_poll() {
         let controller = SharingController::default();
         let (directory, path) = sync_test_path();
@@ -5009,6 +5067,47 @@ pub(crate) mod tests {
             })
             .unwrap();
         wait_for(&controller, |view| view.setup_revision != connected);
+        controller.stop_with(NOT_CONNECTED);
+        join_finished_worker(&controller);
+    }
+
+    #[test]
+    fn a_relabel_the_link_reports_shows_the_new_name_and_leaves_the_arrangement_alone() {
+        use session_setup::{DisplayDescription, DisplayTopology};
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let (controller, fixture, inspection) = connected_link(Duration::from_secs(600));
+        let before = controller.status();
+        let connected = before.setup_revision;
+        let settled_at = lock(&controller.state).displays_changed_at;
+        let mut relabeled = inspection.clone();
+        relabeled.local_displays = DisplayTopology::new(
+            inspection
+                .local_displays
+                .displays()
+                .iter()
+                .map(|display| DisplayDescription {
+                    name: format!("{} (named)", display.name),
+                    ..display.clone()
+                })
+                .collect(),
+        )
+        .unwrap();
+        fixture
+            .events
+            .send(LinkEvent::TopologyChanged {
+                inspection: relabeled,
+            })
+            .unwrap();
+        let view = wait_for(&controller, |view| view.setup_revision != connected);
+        assert!(
+            view.local_displays
+                .iter()
+                .all(|display| display.name.ends_with(" (named)"))
+        );
+        assert_eq!(view.message, before.message);
+        assert_eq!(view.revision, before.revision);
+        assert_eq!(view.sync.state, before.sync.state);
+        assert_eq!(lock(&controller.state).displays_changed_at, settled_at);
         controller.stop_with(NOT_CONNECTED);
         join_finished_worker(&controller);
     }

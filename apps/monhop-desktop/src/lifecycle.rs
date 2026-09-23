@@ -543,7 +543,7 @@ impl AppController {
         if watch
             .displays
             .as_ref()
-            .is_none_or(|seen| !seen.same_geometry(&now))
+            .is_none_or(|seen| !seen.same_geometry(&now) || !seen.same_labels(&now))
         {
             self.sharing.advance_setup_revision();
         }

@@ -79,6 +79,7 @@ pub enum LinkEvent {
     Connected {
         inspection: InspectedPeer,
     },
+    /// Either computer's displays changed, or only their labels at the same geometry.
     TopologyChanged {
         inspection: InspectedPeer,
     },
@@ -1047,10 +1048,14 @@ impl<'a> Link<'a> {
 
     async fn accept_peer_topology(&mut self, payload: &[u8]) -> Result<(), LinkExit> {
         let topology = decode_topology(payload, self.epoch).map_err(LinkExit::Disconnected)?;
-        if topology.same_geometry(&self.inspection.peer_displays) {
+        let moved = !topology.same_geometry(&self.inspection.peer_displays);
+        if !moved && topology.same_labels(&self.inspection.peer_displays) {
             return Ok(());
         }
-        self.unwind_for_topology().await?;
+        // No record depends on labels, so a rename leaves the transaction in flight alone.
+        if moved {
+            self.unwind_for_topology().await?;
+        }
         self.inspection.peer_displays = topology;
         self.emit(LinkEvent::TopologyChanged {
             inspection: self.inspection.clone(),
@@ -1329,11 +1334,15 @@ impl<'a> Link<'a> {
         let Some(current) = connector.local_displays(&self.inspection) else {
             return Ok(());
         };
-        if current.same_geometry(&self.inspection.local_displays) {
+        let moved = !current.same_geometry(&self.inspection.local_displays);
+        // A label read before the OS named a display catches up later, at the same geometry.
+        if !moved && current.same_labels(&self.inspection.local_displays) {
             return Ok(());
         }
         let payload = encode_topology(&current, self.epoch).map_err(LinkExit::Disconnected)?;
-        self.unwind_for_topology().await?;
+        if moved {
+            self.unwind_for_topology().await?;
+        }
         self.inspection.local_displays = current;
         self.write(LinkFrame::with_payload(
             LinkKind::Topology,
@@ -2308,6 +2317,55 @@ mod tests {
                 };
                 assert!(inspection.peer_displays.same_geometry(&topology(1, 300)));
                 assert_eq!(inspection.peer_device, driver.dialer.device);
+                driver.dialer.close();
+                driver.listener.close();
+                driver
+            })
+            .await;
+        assert_eq!(dialer, Ok(()));
+        assert_eq!(listener, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_relabel_reaches_the_peer_without_unwinding_the_proposal_in_flight() {
+        let (dialer, listener) =
+            with_link((Duration::ZERO, Duration::ZERO), |mut driver| async move {
+                wait_connected(&mut driver.dialer.inbox).await;
+                wait_connected(&mut driver.listener.inbox).await;
+                let (release, held) = std::sync::mpsc::channel();
+                *driver.listener.recorder.stage_hold.lock().unwrap() = Some(held);
+                driver.dialer.propose(b"layout for these displays");
+                wait_for(&mut driver.listener.inbox, |event| {
+                    matches!(event, LinkEvent::SyncStarted { sending: false })
+                })
+                .await;
+                let relabeled = DisplayTopology::new(vec![DisplayDescription {
+                    name: "named late".into(),
+                    ..topology(1, 100).displays()[0].clone()
+                }])
+                .unwrap();
+                *driver.dialer.displays.lock().unwrap() = relabeled.clone();
+                // The receiver is staging and the sender awaits its acknowledgement.
+                assert!(matches!(
+                    next_sync_or_topology(&mut driver.dialer.inbox).await,
+                    LinkEvent::TopologyChanged { .. }
+                ));
+                release.send(()).unwrap();
+                let (mut relabel_seen, mut applied) = (false, false);
+                while !(relabel_seen && applied) {
+                    match next_sync_or_topology(&mut driver.listener.inbox).await {
+                        LinkEvent::TopologyChanged { inspection } => {
+                            assert!(inspection.peer_displays.same_labels(&relabeled));
+                            relabel_seen = true;
+                        }
+                        LinkEvent::SyncCompleted { sending: false, .. } => applied = true,
+                        _ => panic!("a relabel never unwinds the proposal in flight"),
+                    }
+                }
+                assert!(matches!(
+                    next_sync_or_topology(&mut driver.dialer.inbox).await,
+                    LinkEvent::SyncCompleted { sending: true, .. }
+                ));
                 driver.dialer.close();
                 driver.listener.close();
                 driver

@@ -641,6 +641,16 @@ impl SharingPreferences {
             && same_display_geometry(&self.peer_displays, &snapshots(&inspection.peer_displays))
     }
 
+    /// This record carrying the labels `inspection` shows for its displays. Labels are cosmetic,
+    /// so nothing a layout or a fit depends on changes.
+    pub(crate) fn relabeled(&self, inspection: &InspectedPeer) -> Self {
+        Self {
+            local_displays: relabel(&self.local_displays, &inspection.local_displays),
+            peer_displays: relabel(&self.peer_displays, &inspection.peer_displays),
+            ..self.clone()
+        }
+    }
+
     /// This record with its display ids rewritten to the ids the same monitors carry now, when
     /// both computers show exactly the displays it was made with at the same geometry. An OS id
     /// is a per-connection number (a reconnected Mac display gets a new one), so a monitor keeps
@@ -972,6 +982,23 @@ fn same_display_geometry(left: &[DisplaySnapshot], right: &[DisplaySnapshot]) ->
                     && display.primary == candidate.primary
             })
         })
+}
+
+fn relabel(displays: &[DisplaySnapshot], live: &DisplayTopology) -> Vec<DisplaySnapshot> {
+    displays
+        .iter()
+        .map(|display| {
+            let name = live
+                .displays()
+                .iter()
+                .find(|candidate| candidate.id.0.to_string() == display.id)
+                .map_or_else(|| display.name.clone(), |candidate| candidate.name.clone());
+            DisplaySnapshot {
+                name,
+                ..display.clone()
+            }
+        })
+        .collect()
 }
 
 /// Everything but the id, name, and monitor identity: what a layout's crossings depend on.

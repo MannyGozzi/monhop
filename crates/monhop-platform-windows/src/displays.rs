@@ -140,6 +140,11 @@ impl DisplayNameCache {
         geometry: DisplayGeometrySet,
         entries: BTreeMap<String, DisplayNameEntry>,
     ) {
+        // A failed re-read of unchanged displays keeps the labels it would otherwise drop.
+        if entries.is_empty() && self.geometry.as_ref() == Some(&geometry) {
+            self.querying = false;
+            return;
+        }
         self.entries = entries
             .into_iter()
             .filter(|(device_name, _)| geometry.contains_key(device_name))
@@ -148,8 +153,9 @@ impl DisplayNameCache {
         self.querying = false;
     }
 
+    /// Unchanged displays keep their labels while a refresh re-reads them.
     fn entries_for(&self, geometry: &DisplayGeometrySet) -> BTreeMap<String, DisplayNameEntry> {
-        if !self.querying && self.geometry.as_ref() == Some(geometry) {
+        if self.geometry.as_ref() == Some(geometry) {
             self.entries.clone()
         } else {
             BTreeMap::new()
@@ -899,6 +905,30 @@ mod tests {
         cache.finish_query(geometry.clone(), BTreeMap::new());
         cache.request_refresh();
         assert!(cache.begin_query(&geometry));
+    }
+
+    #[test]
+    fn a_refresh_of_unchanged_displays_keeps_serving_their_labels() {
+        let display = display(r"\\.\DISPLAY1", 1_920.0);
+        let geometry = display_geometry_set(std::slice::from_ref(&display)).unwrap();
+        let mut cache = DisplayNameCache::default();
+
+        assert!(cache.begin_query(&geometry));
+        cache.finish_query(
+            geometry.clone(),
+            named_entries([(r"\\.\DISPLAY1", "Dell U2723QE")]),
+        );
+        cache.request_refresh();
+        assert!(cache.begin_query(&geometry));
+        assert_eq!(
+            friendly_name_of(&cache.entries_for(&geometry), r"\\.\DISPLAY1"),
+            Some("Dell U2723QE".into())
+        );
+        cache.finish_query(geometry.clone(), BTreeMap::new());
+        assert_eq!(
+            friendly_name_of(&cache.entries_for(&geometry), r"\\.\DISPLAY1"),
+            Some("Dell U2723QE".into())
+        );
     }
 
     #[test]
