@@ -508,7 +508,7 @@ impl SourceController {
         self.floor.snapshot().generation
     }
 
-    pub(crate) fn set_peer_offset(&mut self, offset: Point) {
+    pub fn set_peer_offset(&mut self, offset: Point) {
         self.peer_offset = offset;
     }
 
@@ -1775,7 +1775,7 @@ impl SourceController {
         self.push_input(
             Message::ActivateDisplayAt {
                 display_id: target.display,
-                position: entry,
+                position: self.peer_point(target.display, entry),
             },
             effects,
         );
@@ -2021,7 +2021,8 @@ impl SourceController {
         // The receiver gets the tracked position itself: a relative echo re-added to its own
         // anchor can round one ulp past the edge this side just clamped to.
         if next != position {
-            self.push_input(Message::Motion(Motion::Absolute(next)), effects);
+            let sent = self.peer_point(target.display, next);
+            self.push_input(Message::Motion(Motion::Absolute(sent)), effects);
         }
     }
 
@@ -2418,15 +2419,28 @@ impl SourceController {
         Some(RouteRequest(request))
     }
 
-    fn push_input(&mut self, mut message: Message, effects: &mut SourceEffects) {
-        match &mut message {
-            Message::ActivateDisplayAt { position, .. }
-            | Message::Motion(Motion::Absolute(position)) => {
-                position.x -= self.peer_offset.x;
-                position.y -= self.peer_offset.y;
-            }
-            _ => {}
-        }
+    /// `point` in the other computer's own coordinates, inside `display` as its receiver checks it.
+    /// A point held one ulp inside a far edge can round onto that edge when translated.
+    fn peer_point(&self, display: DisplayId, point: Point) -> Point {
+        let offset = self.peer_offset;
+        let translated = Point::new(point.x - offset.x, point.y - offset.y);
+        let Ok(display) = self.topology.display(display) else {
+            return translated;
+        };
+        let bounds = display.bounds();
+        Point::new(
+            translated.x.clamp(
+                bounds.origin.x - offset.x,
+                (bounds.max_x() - offset.x).next_down(),
+            ),
+            translated.y.clamp(
+                bounds.origin.y - offset.y,
+                (bounds.max_y() - offset.y).next_down(),
+            ),
+        )
+    }
+
+    fn push_input(&mut self, message: Message, effects: &mut SourceEffects) {
         let Some(sequence) = advance_counter(&mut self.outbound_input_sequence) else {
             self.fail(SourceFailure::SequenceExhausted, effects);
             return;

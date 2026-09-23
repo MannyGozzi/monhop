@@ -1213,6 +1213,71 @@ fn remote_motion_carries_the_tracked_position_so_the_far_edge_is_never_overshot(
 }
 
 #[test]
+fn a_pointer_held_on_a_far_edge_stays_inside_the_receivers_own_coordinates() {
+    // The remote display's bottom edge sits at y = 0 here and at y = 1653 on its own computer:
+    // one ulp inside 0 rounds onto 1653 when translated, which the receiver rejects.
+    let topology = two_machine_topology(
+        vec![
+            display_at(1, 1, Point::new(0.0, 0.0), 100),
+            display_at(2, 2, Point::new(100.0, -100.0), 100),
+        ],
+        vec![
+            full_link(1, Edge::Right, 2, Edge::Left),
+            full_link(2, Edge::Left, 1, Edge::Right),
+        ],
+    );
+    let mut source = SourceController::new(
+        topology,
+        device(1),
+        DisplayId(1),
+        SessionEpoch::new(3).unwrap(),
+        3,
+        Duration::ZERO,
+    )
+    .unwrap();
+    source.set_peer_offset(Point::new(2660.0, -1653.0));
+    let mut bridge = ReceiverBridge::new(
+        DisplayTopology::new(vec![DisplayDescription {
+            id: DisplayId(2),
+            name: "remote".into(),
+            native_width: 100,
+            native_height: 100,
+            logical_origin: Point::new(-2560.0, 1553.0),
+            logical_size: Point::new(100.0, 100.0),
+            scale_factor: 1.0,
+            is_primary: true,
+            monitor: None,
+        }])
+        .unwrap(),
+    );
+    source.fresh_capture(
+        local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
+        ms(0),
+    );
+    let edge = push_through(&mut source, Point::new(1.0, 0.0), ms(0));
+    bridge.pump(&mut source, edge, ms(0)).unwrap();
+    assert_eq!(source.mode(), SourceMode::Remote);
+    for (step, delta) in (1_u64..).zip([Point::new(0.0, 1_000.0), Point::new(1_000.0, 0.0)]) {
+        let motion = capture_on_route(
+            &mut source,
+            NormalizedInput::RelativeMotion(delta),
+            ms(step),
+        );
+        bridge.pump(&mut source, motion, ms(step)).unwrap();
+    }
+    bridge.receiver.flush(&mut bridge.destination).unwrap();
+    let corner = Point::new((-2460.0_f64).next_down(), 1653.0_f64.next_down());
+    assert_eq!(
+        bridge.sent.last().map(|frame| &frame.message),
+        Some(&Message::Motion(Motion::Absolute(corner)))
+    );
+    assert_eq!(
+        bridge.destination.actions.last(),
+        Some(&RecordedAction::Move(corner))
+    );
+}
+
+#[test]
 fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
     let mut source = source();
     activate_remote(&mut source);
