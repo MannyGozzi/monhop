@@ -43,3 +43,36 @@ export function tweenTiming({ part, property, rising }) {
   if (SURFACES.has(part)) return { duration: "--motion-slow", easing: "--ease-out", delay: null };
   return { duration: rising ? "--motion-base" : "--motion-fast", easing: "--ease-out", delay };
 }
+
+// The orbit runs along the capsule's edge at one speed. Its keyframes move a point out from the
+// capsule's centre: straight edges translate, round ends turn, and each keyframe's offset is its share
+// of the perimeter. Translations are in % of the capsule's own width, so the path hugs the edge
+// through a width glide; the offsets are exact once the width settles.
+export function orbitPath({ width, height, inset }) {
+  const radius = height / 2 - inset;
+  const straight = Math.max(width - height, 0);
+  const arc = Math.PI * radius;
+  const perimeter = 2 * (straight + arc);
+  const end = (side) => `translateX(calc(${50 * side}% ${side < 0 ? "+" : "-"} ${height / 2}px))`;
+  const at = (side, turn) => `${end(side)} rotate(${turn}turn) translateY(${-radius}px)`;
+  const marks = [0, straight, straight + arc, 2 * straight + arc, perimeter];
+  const points = [at(-1, 0), at(1, 0), at(1, 0.5), at(-1, 0.5), at(-1, 1)];
+  return {
+    perimeter,
+    keyframes: points.map((transform, index) => ({ offset: marks[index] / perimeter, transform })),
+  };
+}
+
+export const COMET_DOTS = 40;
+const COMET_TAPER = 0.5;
+
+// The comet's dots, head first: each trails the head by an even share of `tail` along the edge and
+// fades and narrows toward the end. `lag` is a fraction of one lap.
+export function cometDot(index, { perimeter, tail }) {
+  const along = index / COMET_DOTS;
+  return {
+    lag: (tail * along) / perimeter,
+    opacity: (1 - along) ** 2,
+    scale: 1 - along * COMET_TAPER,
+  };
+}
