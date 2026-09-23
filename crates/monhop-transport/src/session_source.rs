@@ -37,15 +37,11 @@ pub const MAX_SOURCE_EFFECTS: usize = 16;
 /// Logical px the pointer must move off the edge a crossing entered through to cross it again.
 pub const ENTRY_GUARD_DISTANCE: f64 = 24.0;
 
-/// Outward push against a linked edge counts only once it has lasted this long: a thrown hand has
-/// all but stopped by then, and a deliberate push at 600 px/s still crosses within 350 ms.
-pub const PUSH_THROUGH_SETTLE: Duration = Duration::from_millis(205);
+/// Outward travel from a push's first record that carries the pointer over a linked edge, in the
+/// controlling mouse's own units: above a bump's 50, below the 336 a deliberate push carries.
+pub const PUSH_THROUGH_DISTANCE: f64 = 250.0;
 
-/// Logical px of outward push after the settle that carries the pointer over, well beyond what a
-/// throw's hand still travels after the settle while it slows to a stop.
-pub const PUSH_THROUGH_DISTANCE: f64 = 80.0;
-
-/// A push that pauses this long starts over, settle included, so separate touches never add up.
+/// A push that pauses this long starts over, so separate touches never add up.
 pub const PUSH_THROUGH_RESET: Duration = Duration::from_millis(100);
 
 /// Motion pushes only while its recent heading's outward part is at least this many times its
@@ -62,8 +58,9 @@ pub const PUSH_THROUGH_LOGGED: Duration = Duration::from_millis(50);
 /// A platform event converted into source-controller units.
 ///
 /// `AbsoluteMotion` is a topology logical position. `RelativeMotion` is a logical delta in the
-/// target display's coordinate system. Adapters convert physical desktop pixels and raw counts
-/// before constructing this type. Scroll is in signed wheel detents: positive horizontal is right
+/// target display's coordinate system, or in the capturing mouse's own units while
+/// [`SourceController::motion_target`] is `None`. Adapters convert physical desktop pixels and raw
+/// counts before constructing this type. Scroll is in signed wheel detents: positive horizontal is right
 /// and positive vertical is up. Windows adapters divide 120-unit detents, while macOS adapters
 /// divide 40-point detents after their horizontal inversion; both preserve fractional values.
 /// A `Button` keeps the capture clock reading it was stamped with when captured.
@@ -293,6 +290,18 @@ pub struct MotionTarget {
     pub scale_factor: f64,
 }
 
+impl MotionTarget {
+    /// Target logical units per unit of relative motion a `source` computer captures: Windows raw
+    /// counts shrink onto Mac points, and Mac points grow onto Windows pixels, by the scale.
+    pub fn per_captured_unit(&self, source: Platform) -> f64 {
+        match (source, self.platform) {
+            (Platform::Windows, Platform::MacOs) => self.scale_factor.recip(),
+            (Platform::MacOs, Platform::Windows) => self.scale_factor,
+            _ => 1.0,
+        }
+    }
+}
+
 /// Pure source routing controller.
 pub struct SourceController {
     floor: SharedFloor,
@@ -362,15 +371,19 @@ enum State {
         return_position: Point,
         ownership_epoch: u64,
         capture_already_remote: bool,
-        /// Motion since a hop between the other computer's displays began, which carries on from
-        /// `entry` once it lands.
+        /// Motion since the handover began, in `target`'s units, which carries on from `entry`
+        /// once it lands.
         carried: Point,
-        /// `carried` when a button first changed in flight, where that change lands.
+        /// `carried` when a button first changed in flight between the other computer's
+        /// displays, where that change lands.
         at_button: Option<Point>,
     },
     AwaitRemoteBarrier {
         target: PointerTarget,
         position: Point,
+        /// Motion since the handover began, in `target`'s units, which moves the pointer on from
+        /// `position` once the route is remote.
+        carried: Point,
         return_target: PointerTarget,
         return_position: Point,
         request: RouteRequest,
@@ -385,6 +398,9 @@ enum State {
     AwaitReleaseAcknowledgement {
         local: PointerTarget,
         local_position: Point,
+        /// Motion since an edge return began, which the restore moves on from `local_position`;
+        /// `None` for a return that lands exactly where it was sent.
+        carried: Option<Point>,
         ownership_epoch: Option<u64>,
     },
     AwaitLocalBarrier {
@@ -397,23 +413,21 @@ enum State {
 }
 
 /// Outward push held against one linked edge: a run of pushing motion, arriving included, whose
-/// travel counts only once the run has lasted PUSH_THROUGH_SETTLE.
+/// travel counts from its first record.
 #[derive(Clone, Copy)]
 struct EdgePush {
     display: DisplayId,
     edge: Edge,
     /// When the run began and last pushed; unset until pushing motion starts one.
     run: Option<(Duration, Duration)>,
-    /// Outward relative travel since the run settled.
+    /// Outward relative travel this run, in the controlling mouse's own units.
     travel: f64,
-    /// Depth past the edge line that absolute samples gained since the run settled.
+    /// Depth past the edge line that absolute samples gained this run.
     reach: f64,
     /// The last absolute sample, which the next one's step is measured from.
     sample: Option<Point>,
     /// Where the absolute samples have been heading.
     heading: RecentMotion,
-    /// Outward relative travel before the run settled, for the episode log.
-    unsettled: f64,
     /// Outward records this run that leaned too far sideways to push, for the episode log.
     off_axis: u32,
     /// The run reached the full push since it was last armed; it crossed if the pointer landed.
@@ -430,7 +444,6 @@ impl EdgePush {
             reach: 0.0,
             sample: None,
             heading: RecentMotion::default(),
-            unsettled: 0.0,
             off_axis: 0,
             reached: false,
         }
@@ -447,13 +460,12 @@ impl EdgePush {
         }
         let ended = self.run.is_some().then_some(*self);
         self.rearm();
-        self.unsettled = 0.0;
         self.off_axis = 0;
         self.run = Some((now, now));
         ended
     }
 
-    /// Travel counts from here again; a settled run stays settled.
+    /// Travel counts from here again.
     fn rearm(&mut self) {
         self.travel = 0.0;
         self.reach = 0.0;
@@ -465,18 +477,17 @@ impl EdgePush {
             .is_some_and(|(_, last)| now.saturating_sub(last) < PUSH_THROUGH_RESET)
     }
 
-    fn settled(&self, now: Duration) -> bool {
-        self.run.is_some_and(|(started, last)| {
-            now.saturating_sub(last) < PUSH_THROUGH_RESET
-                && now.saturating_sub(started) >= PUSH_THROUGH_SETTLE
-        })
+    fn through(&self) -> bool {
+        self.counted() >= PUSH_THROUGH_DISTANCE
+    }
+
+    /// How far past the full push a record adding `step` carried it: all of that record's travel
+    /// when a wall or a decline held an earlier full push.
+    fn beyond(&self, step: f64) -> f64 {
+        (self.counted() - PUSH_THROUGH_DISTANCE).min(step)
     }
 
     /// An absolute sample and its relative half measure the same step, so the larger counts.
-    fn through(&self, now: Duration) -> bool {
-        self.settled(now) && self.counted() >= PUSH_THROUGH_DISTANCE
-    }
-
     fn counted(&self) -> f64 {
         self.travel.max(self.reach)
     }
@@ -666,6 +677,27 @@ impl SourceController {
         self.enabled && !self.rebase_pointer
     }
 
+    /// A handover in flight whose captured relative motion the pointer carries on with.
+    fn carries_pending_motion(&self) -> bool {
+        matches!(
+            self.state,
+            State::AwaitActivation {
+                capture_already_remote: false,
+                ..
+            } | State::AwaitRemoteBarrier { .. }
+                | State::AwaitReleaseAcknowledgement {
+                    carried: Some(_),
+                    ..
+                }
+        )
+    }
+
+    /// Captured under this computer's own floor, from the free floor it last left to its claim.
+    fn claimed_generation(&self, generation: u64) -> bool {
+        self.floor_claim
+            .is_some_and(|claim| (self.free_generation..=claim.generation).contains(&generation))
+    }
+
     fn release_floor(&mut self) {
         let anchored = std::mem::take(&mut self.anchored_return);
         if let Some(owned) = self.floor_claim.take() {
@@ -773,7 +805,7 @@ impl SourceController {
     /// Runtime adapters use this only for relative motion tagged with the active route. Local
     /// absolute positions are already in the local topology's coordinate space. A Windows source
     /// divides raw counts for a macOS target by `scale_factor`; a macOS source multiplies logical
-    /// deltas for a Windows target by it.
+    /// deltas for a Windows target by it, as [`MotionTarget::per_captured_unit`] gives.
     pub fn motion_target(&self) -> Option<MotionTarget> {
         let target = match self.state {
             State::Local { target, .. }
@@ -789,6 +821,10 @@ impl SourceController {
             | State::AwaitLocalBarrier { .. }
             | State::Failed => return None,
         };
+        self.motion_target_for(target)
+    }
+
+    fn motion_target_for(&self, target: PointerTarget) -> Option<MotionTarget> {
         let display = self.topology.display(target.display).ok()?;
         let platform = self
             .topology
@@ -932,7 +968,10 @@ impl SourceController {
             NormalizedInput::AbsoluteMotion(_) | NormalizedInput::RelativeMotion(_)
         ) {
             let floor = self.floor.snapshot();
-            let permitted = if self.capture_route.remote {
+            let permitted = if self.carries_pending_motion() {
+                matches!(record.event, NormalizedInput::RelativeMotion(_))
+                    && self.claimed_generation(record.floor_generation)
+            } else if self.capture_route.remote {
                 floor.state == FloorState::Sending && record.floor_generation == floor.generation
             } else {
                 self.local_crossing_allowed() && record.floor_generation == self.free_generation
@@ -1115,6 +1154,7 @@ impl SourceController {
                         self.state = State::AwaitReleaseAcknowledgement {
                             local: return_target,
                             local_position: return_position,
+                            carried: None,
                             ownership_epoch: None,
                         };
                     } else {
@@ -1193,6 +1233,7 @@ impl SourceController {
                     self.state = State::AwaitRemoteBarrier {
                         target,
                         position: entry,
+                        carried,
                         return_target,
                         return_position,
                         request,
@@ -1295,6 +1336,7 @@ impl SourceController {
             self.state = State::AwaitReleaseAcknowledgement {
                 local,
                 local_position,
+                carried: entry_guard.map(|_| Point::default()),
                 ownership_epoch: Some(ownership_epoch),
             };
         }
@@ -1489,20 +1531,27 @@ impl SourceController {
             State::AwaitRemoteBarrier {
                 target,
                 position,
+                carried,
                 return_target,
                 return_position,
                 ticket: Some(expected),
                 ..
             } if remote && revision == expected => {
                 self.capture_route = CaptureRoute { remote, revision };
+                // Held input lands where the handover entered; the hand's motion since moves on.
                 self.transfer_to_remote(effects);
+                let landed = self.carried_on(target.display, position, carried);
                 if self.failure.is_none() {
                     self.state = State::Remote {
                         target,
-                        position,
+                        position: landed,
                         return_target,
                         return_position,
                     };
+                }
+                if self.failure.is_none() && landed != position {
+                    let sent = self.peer_point(target.display, landed);
+                    self.push_input(Message::Motion(Motion::Absolute(sent)), effects);
                 }
             }
             State::AwaitLocalBarrier {
@@ -1543,7 +1592,9 @@ impl SourceController {
                 self.apply_local_motion(current, now, effects)
             }
             NormalizedInput::RelativeMotion(delta) => {
-                self.apply_local_relative(delta, now, effects)
+                if !self.carry_pending(delta) {
+                    self.apply_local_relative(delta, now, effects)
+                }
             }
             NormalizedInput::Scroll { .. } => {}
             NormalizedInput::RouteChanged { .. } => {
@@ -1653,14 +1704,7 @@ impl SourceController {
                 self.apply_remote_motion(delta, now, effects)
             }
             NormalizedInput::RelativeMotion(delta) => {
-                if let State::AwaitActivation {
-                    capture_already_remote: true,
-                    carried,
-                    ..
-                } = &mut self.state
-                {
-                    *carried = Point::new(carried.x + delta.x, carried.y + delta.y);
-                }
+                self.carry_pending(delta);
             }
             NormalizedInput::Scroll {
                 horizontal,
@@ -1776,7 +1820,8 @@ impl SourceController {
         };
         // Measured from the last anchor, the step that reaches the edge can start the push.
         let bounds = display.bounds();
-        if self.push_to(target.display, edge, bounds, cursor, current, now) {
+        if let Some(beyond) = self.push_to(target.display, edge, bounds, cursor, current, now) {
+            let transition = self.carried_into(transition, beyond);
             self.begin_edge_transition(target, transition, effects);
         }
     }
@@ -1951,7 +1996,7 @@ impl SourceController {
         let entry = transition.entry_point;
         self.entry_guard = Some((target.display, transition.to_edge));
         // A local push outlives the request, so pushing on through a prompt decline retries
-        // without settling again.
+        // without starting over.
         if capture_already_remote {
             self.end_pushes(PushEnd::Cleared, |_| true);
         }
@@ -1997,9 +2042,10 @@ impl SourceController {
                     return;
                 }
             };
-        if self.is_home_display(transition.to_display)
-            || self.push_by(target.display, edge, delta, now)
-        {
+        if self.is_home_display(transition.to_display) {
+            self.begin_edge_transition(target, transition, effects);
+        } else if let Some(beyond) = self.push_by(target.display, edge, delta, now) {
+            let transition = self.carried_into(transition, beyond);
             self.begin_edge_transition(target, transition, effects);
         }
     }
@@ -2140,49 +2186,129 @@ impl SourceController {
             "seam-back"
         };
         let platform = self
-            .topology
-            .machine_for_display(self.home.display)
-            .map_or(String::from("unknown"), |machine| {
-                format!("{:?}", machine.platform)
-            });
+            .home_platform()
+            .map_or(String::from("unknown"), |platform| format!("{platform:?}"));
         log::info!(
-            "push-through: edge={edge} platform={platform} run_ms={} before_settle={:.1} \
-             after_settle={:.1} off_axis={} end={end:?}",
+            "push-through: edge={edge} platform={platform} run_ms={} travel={:.1} off_axis={} \
+             end={end:?}",
             ran.as_millis(),
-            push.unsettled,
             push.counted(),
             push.off_axis,
         );
     }
 
-    /// Adds a relative delta's outward part to the push on `edge` while the hand's recent motion
-    /// heads through it; true once it is through. Other motion neither extends nor counts.
-    fn push_by(&mut self, display: DisplayId, edge: Edge, delta: Point, now: Duration) -> bool {
+    fn home_platform(&self) -> Option<Platform> {
+        self.topology
+            .machine_for_display(self.home.display)
+            .ok()
+            .map(|machine| machine.platform)
+    }
+
+    /// Units of relative motion onto `display` per unit the controlling mouse moved.
+    fn captured_scale(&self, display: DisplayId) -> f64 {
+        self.topology
+            .display(display)
+            .ok()
+            .and_then(|found| self.motion_target_for(PointerTarget::new(found.machine, display)))
+            .zip(self.home_platform())
+            .map_or(1.0, |(motion, home)| motion.per_captured_unit(home))
+    }
+
+    /// `transition` entering `beyond` controlling-mouse units further in, converted as relative
+    /// motion onto its display is, so travel past the full push is not lost at the seam.
+    fn carried_into(&self, mut transition: EdgeTransition, beyond: f64) -> EdgeTransition {
+        let by = beyond * self.captured_scale(transition.to_display);
+        let entry = transition.entry_point;
+        let carried = match transition.to_edge {
+            Edge::Left => Point::new(entry.x + by, entry.y),
+            Edge::Right => Point::new(entry.x - by, entry.y),
+            Edge::Top => Point::new(entry.x, entry.y + by),
+            Edge::Bottom => Point::new(entry.x, entry.y - by),
+        };
+        // Only the inward axis moves, and no further than the display's last pixel.
+        if by > 0.0
+            && let Some(inside) = self.inside_display(transition.to_display, carried)
+        {
+            transition.entry_point = match transition.to_edge {
+                Edge::Left | Edge::Right => Point::new(inside.x, entry.y),
+                Edge::Top | Edge::Bottom => Point::new(entry.x, inside.y),
+            };
+        }
+        transition
+    }
+
+    /// Adds relative motion captured mid-handover to what the pointer carries on with once it
+    /// lands; false when no handover carries motion.
+    fn carry_pending(&mut self, delta: Point) -> bool {
+        let onto = match self.state {
+            // Routed remotely, this motion already comes in the landing display's units.
+            State::AwaitActivation {
+                capture_already_remote: true,
+                ..
+            } => None,
+            State::AwaitActivation { target, .. } | State::AwaitRemoteBarrier { target, .. } => {
+                Some(target.display)
+            }
+            State::AwaitReleaseAcknowledgement {
+                local,
+                carried: Some(_),
+                ..
+            } => Some(local.display),
+            _ => return false,
+        };
+        let scale = onto.map_or(1.0, |display| self.captured_scale(display));
+        if let State::AwaitActivation { carried, .. }
+        | State::AwaitRemoteBarrier { carried, .. }
+        | State::AwaitReleaseAcknowledgement {
+            carried: Some(carried),
+            ..
+        } = &mut self.state
+        {
+            *carried = Point::new(carried.x + delta.x * scale, carried.y + delta.y * scale);
+        }
+        true
+    }
+
+    /// `position` moved on by `carried`, kept inside `display` as the carry past a push is.
+    fn carried_on(&self, display: DisplayId, position: Point, carried: Point) -> Point {
+        if carried == Point::default() {
+            return position;
+        }
+        let moved = Point::new(position.x + carried.x, position.y + carried.y);
+        self.inside_display(display, moved).unwrap_or(position)
+    }
+
+    /// Adds a relative delta's outward part, in the controlling mouse's own units, to the push on
+    /// `edge` while the hand's recent motion heads through it. Once it is through, yields how far
+    /// past the full push this delta went. Other motion neither extends nor counts.
+    fn push_by(
+        &mut self,
+        display: DisplayId,
+        edge: Edge,
+        delta: Point,
+        now: Duration,
+    ) -> Option<f64> {
         let mut push = self
             .current_push(display, edge)
             .unwrap_or(EdgePush::new(display, edge));
-        let out = outward(edge, delta);
+        let out = outward(edge, delta) / self.captured_scale(display);
         let pushing = out > 0.0 && pushes(edge, self.recent_motion.sum);
         if pushing {
             if let Some(ended) = push.moved_out(now) {
                 self.log_push(ended, PushEnd::Cleared);
             }
-            if push.settled(now) {
-                push.travel += out;
-            } else {
-                push.unsettled += out;
-            }
+            push.travel += out;
         } else if out > 0.0 && push.live(now) {
             push.off_axis += 1;
         }
-        let through = pushing && push.through(now);
+        let through = pushing && push.through();
         push.reached |= through;
         self.keep_push(push);
-        through
+        through.then(|| push.beyond(out))
     }
 
     /// Records an absolute sample `to` on or past `edge`, stepping from the push's last sample or
-    /// else from `from`; true once it pushes through.
+    /// else from `from`. Once it pushes through, yields how far past the full push this step went.
     fn push_to(
         &mut self,
         display: DisplayId,
@@ -2191,7 +2317,7 @@ impl SourceController {
         from: Option<Point>,
         to: Point,
         now: Duration,
-    ) -> bool {
+    ) -> Option<f64> {
         let depth = |point: Point| (-distance_inside(bounds, point, edge)).max(0.0);
         let mut push = self
             .current_push(display, edge)
@@ -2211,17 +2337,15 @@ impl SourceController {
             if let Some(ended) = push.moved_out(now) {
                 self.log_push(ended, PushEnd::Cleared);
             }
-            if push.settled(now) {
-                push.reach += gained;
-            }
+            push.reach += gained;
         } else {
             // Depth given back stops counting, so a wiggle past the edge never adds up.
             push.reach = (push.reach + gained.min(0.0)).max(0.0);
         }
-        let through = pushing && push.through(now);
+        let through = pushing && push.through();
         push.reached |= through;
         self.keep_push(push);
-        through
+        through.then(|| push.beyond(gained))
     }
 
     /// The entry edge `position` may not cross yet. The guard is dropped for good once the pointer
@@ -2327,8 +2451,9 @@ impl SourceController {
             return;
         }
         if let Some((edge, transition)) = seam
-            && self.push_by(target.display, edge, delta, now)
+            && let Some(beyond) = self.push_by(target.display, edge, delta, now)
         {
+            let transition = self.carried_into(transition, beyond);
             self.apply_remote_edge(target, return_target, return_position, transition, effects);
             return;
         }
@@ -2559,13 +2684,15 @@ impl SourceController {
         let State::AwaitReleaseAcknowledgement {
             local,
             local_position,
+            carried,
             ownership_epoch,
-            ..
         } = self.state
         else {
             self.fail(SourceFailure::InvalidReleaseAcknowledgement, effects);
             return;
         };
+        let local_position =
+            self.carried_on(local.display, local_position, carried.unwrap_or_default());
         if let Some(epoch) = ownership_epoch
             && self
                 .ownership

@@ -218,35 +218,10 @@ pub(crate) fn normalize(
             NormalizedInput::AbsoluteMotion(Point::new(x, y))
         }
         CaptureEvent::RelativeMotion { dx, dy } => {
-            let Some(target) = target else {
-                return Ok(None);
-            };
-            let divisor = if target.platform == Platform::MacOs {
-                target.scale_factor
-            } else {
-                1.0
-            };
-            if !divisor.is_finite() || divisor <= 0.0 {
-                return Err(SessionFailure::InvalidLayout);
-            }
-            NormalizedInput::RelativeMotion(Point::new(
-                f64::from(dx) / divisor,
-                f64::from(dy) / divisor,
-            ))
+            relative(Platform::Windows, f64::from(dx), f64::from(dy), target)?
         }
         CaptureEvent::LogicalRelativeMotion { dx, dy } => {
-            let Some(target) = target else {
-                return Ok(None);
-            };
-            let multiplier = if target.platform == Platform::Windows {
-                target.scale_factor
-            } else {
-                1.0
-            };
-            if !multiplier.is_finite() || multiplier <= 0.0 {
-                return Err(SessionFailure::InvalidLayout);
-            }
-            NormalizedInput::RelativeMotion(Point::new(dx * multiplier, dy * multiplier))
+            relative(Platform::MacOs, dx, dy, target)?
         }
         CaptureEvent::Scroll {
             horizontal,
@@ -269,6 +244,24 @@ pub(crate) fn normalize(
         remote: record.remote,
         floor_generation: record.floor_generation,
     }))
+}
+
+/// Relative motion a `source` computer captured, onto `target`'s display, or in the mouse's own
+/// units while no route is settled so the source can carry it into the one it settles on.
+fn relative(
+    source: Platform,
+    dx: f64,
+    dy: f64,
+    target: Option<MotionTarget>,
+) -> Result<NormalizedInput, SessionFailure> {
+    let per_unit = target.map_or(1.0, |target| target.per_captured_unit(source));
+    if !per_unit.is_finite() || per_unit <= 0.0 {
+        return Err(SessionFailure::InvalidLayout);
+    }
+    Ok(NormalizedInput::RelativeMotion(Point::new(
+        dx * per_unit,
+        dy * per_unit,
+    )))
 }
 
 #[cfg(test)]
@@ -300,6 +293,39 @@ mod tests {
         assert_eq!(
             record.event,
             NormalizedInput::RelativeMotion(Point::new(1.0, 2.0))
+        );
+    }
+    #[test]
+    fn relative_motion_converts_onto_its_target_or_keeps_the_mouses_units_without_one() {
+        let counts = |target: Option<MotionTarget>| {
+            normalize(
+                CapturedEvent {
+                    event: CaptureEvent::RelativeMotion { dx: 6, dy: -4 },
+                    routing_revision: 1,
+                    remote: false,
+                    floor_generation: 1,
+                },
+                target,
+            )
+            .unwrap()
+            .unwrap()
+            .event
+        };
+        let retina_mac = MotionTarget {
+            target: monhop_core::PointerTarget::new(
+                monhop_core::DeviceId([2; 16]),
+                monhop_core::DisplayId(2),
+            ),
+            platform: Platform::MacOs,
+            scale_factor: 2.0,
+        };
+        assert_eq!(
+            counts(Some(retina_mac)),
+            NormalizedInput::RelativeMotion(Point::new(3.0, -2.0))
+        );
+        assert_eq!(
+            counts(None),
+            NormalizedInput::RelativeMotion(Point::new(6.0, -4.0))
         );
     }
     #[test]

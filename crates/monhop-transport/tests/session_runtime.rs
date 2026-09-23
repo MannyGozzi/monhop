@@ -1,4 +1,5 @@
 //! Two deterministic coordinators: manual time, capture FIFO and scoped in-memory frame pipe.
+use monhop_core::capture::DECLINE_RETRY_AFTER;
 use monhop_core::{
     DeviceId, Display, DisplayId, Edge, EdgeLink, FloorState, LogicalSize, Machine, NativeSize,
     NormalizedSpan, Platform, Point, SharedFloor, TakeBackGate, Topology,
@@ -8,17 +9,17 @@ use monhop_transport::{
     session::SessionScopes,
     session_receiver::{DestinationAction, DestinationFailure, InputDestination, InputReceiver},
     session_source::{
-        NormalizedInput, PUSH_THROUGH_DISTANCE, PUSH_THROUGH_SETTLE, SourceController,
-        SourceEffect, SourceMode, SourceOutcome, TaggedInput,
+        NormalizedInput, PUSH_THROUGH_DISTANCE, SourceController, SourceEffect, SourceMode,
+        SourceOutcome, TaggedInput,
     },
 };
 use std::{collections::VecDeque, time::Duration};
 fn ms(t: u64) -> Duration {
     Duration::from_millis(t)
 }
-/// `t` ms after a computer's first [`Coordinator::cross`], which begins at zero.
+/// `t` ms after a computer's first [`Coordinator::cross`], a one-record push at zero.
 fn crossed(t: u64) -> Duration {
-    PUSH_THROUGH_SETTLE + ms(t)
+    ms(t)
 }
 fn device(id: u8) -> DeviceId {
     DeviceId([id; 16])
@@ -310,25 +311,13 @@ impl Coordinator {
         let o = self.source.on_captured(record, self.now);
         self.effects(o)
     }
-    /// Rests on the linked right edge and pushes through it, which takes PUSH_THROUGH_SETTLE.
+    /// Rests on the linked right edge and pushes through it in one record.
     fn cross(&mut self) -> Vec<Frame> {
         let o = self
             .source
             .observe_pointer(Point::new(99.0, 50.0), self.now);
         assert!(self.effects(o).is_empty());
-        self.push_on(Point::new(1.0, 0.0))
-    }
-    /// Pushes along the unit `along` every 10 ms until the push settles, then the full distance.
-    fn push_on(&mut self, along: Point) -> Vec<Frame> {
-        let settled = self.now + PUSH_THROUGH_SETTLE;
-        let mut frames = Vec::new();
-        while self.now < settled {
-            frames.extend(self.input(NormalizedInput::RelativeMotion(along)));
-            self.now += ms(10);
-        }
-        self.now = settled;
-        frames.extend(self.press(along));
-        frames
+        self.press(Point::new(1.0, 0.0))
     }
     /// One full distance more along the unit `along`.
     fn press(&mut self, along: Point) -> Vec<Frame> {
@@ -503,25 +492,13 @@ fn stale_generation_motion_never_crosses() {
     let mut p = Pair::new();
     let c = &mut p.computers[0];
     c.source.observe_pointer(Point::new(99.0, 50.0), ms(0));
-    while c.now < PUSH_THROUGH_SETTLE {
-        assert!(
-            c.input(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0)))
-                .is_empty()
-        );
-        c.now += ms(10);
-    }
     let record = TaggedInput {
         event: NormalizedInput::RelativeMotion(Point::new(PUSH_THROUGH_DISTANCE, 0.0)),
         routing_revision: 0,
         remote: false,
         floor_generation: 0,
     };
-    assert!(
-        c.source
-            .on_captured(record, PUSH_THROUGH_SETTLE)
-            .effects
-            .is_empty()
-    );
+    assert!(c.source.on_captured(record, c.now).effects.is_empty());
     // The push was ready: the same press in the current generation crosses.
     assert!(!c.press(Point::new(1.0, 0.0)).is_empty());
 }
@@ -748,7 +725,7 @@ fn crossings_rearm_from_fresh_poll_after_free() {
             .effects
             .is_empty()
     );
-    assert!(!c.push_on(Point::new(1.0, 0.0)).is_empty());
+    assert!(!c.press(Point::new(1.0, 0.0)).is_empty());
 }
 #[test]
 fn disconnect_mid_transition_releases_both_halves() {
@@ -1030,12 +1007,12 @@ fn a_pause_in_seam_pressure_restarts_the_decline_delay() {
     p.pump();
     p.at(crossed(20));
     p.computers[1].input(NormalizedInput::AbsoluteMotion(Point::new(50.0, 50.0)));
-    // Back on the seam the push settles again; its first retry restarts the decline delay.
-    p.at(crossed(30));
+    // Back on the seam after a pause longer than the retry delay, its first retry restarts it.
+    let pressed = crossed(10) + DECLINE_RETRY_AFTER + ms(10);
+    p.at(pressed);
     p.cross(1);
     p.pump();
     assert_eq!(p.computers[1].source.mode(), SourceMode::Local);
-    let pressed = crossed(30) + PUSH_THROUGH_SETTLE;
     for t in [10, 20, 30, 40] {
         p.at(pressed + ms(t));
         p.press(1);
@@ -1164,5 +1141,5 @@ fn crossing_straight_back_after_an_own_return_needs_no_fresh_poll() {
     let c = &mut p.computers[0];
     assert_eq!(c.source.mode(), SourceMode::Local);
     assert_eq!(c.floor.snapshot().state, FloorState::Free);
-    assert!(!c.push_on(Point::new(1.0, 0.0)).is_empty());
+    assert!(!c.press(Point::new(1.0, 0.0)).is_empty());
 }
