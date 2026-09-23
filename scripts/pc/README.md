@@ -32,7 +32,7 @@ Mac's LAN address, and listens on IPv4 only.
 | `install` | Stops MonHop, copies the release binaries over the installed app, checks their hashes, launches it. |
 | `launch` | Starts the installed MonHop in the signed-in desktop session. |
 | `log [lines]` | Prints the tail of the PC's MonHop log. |
-| `ask <commit> <prompt-file> [model]` | Syncs, then runs the PC's Claude Code headless on the prompt and prints its answer. |
+| `ask <commit> <prompt-file> [model]` | Syncs, then runs the PC's Claude Code headless on the prompt and prints its answer. Read-only by default; `PC_ASK_MODE=bypassPermissions` lets a task run commands. |
 | `tell <file\|->` | Leaves a message in the PC mailbox for the interactive Windows agent. |
 | `listen [seconds]` | Prints every new message the Windows agent posts. Keep it running under a monitor. |
 

@@ -97,6 +97,8 @@ EOF
     commit=${2:?usage: pc.sh ask <commit> <prompt-file> [model]}
     prompt=${3:?usage: pc.sh ask <commit> <prompt-file> [model]}
     model=${4:-claude-sonnet-5}
+    # Read-only unless a task opts in: the agent reads logs and files that could carry injected instructions.
+    mode=${PC_ASK_MODE:-plan}
     sync "$commit"
     name="ask-$(date -u +%Y%m%dT%H%M%SZ).md"
     staged=$(mktemp)
@@ -111,7 +113,7 @@ EOF
     rm -f "$staged"
     ps <<EOF
 \$OutputEncoding = [Text.UTF8Encoding]::new(\$false)
-Get-Content -Raw -LiteralPath '$mail\\$name' | claude -p --model $model --effort xhigh --permission-mode bypassPermissions 2>&1
+Get-Content -Raw -LiteralPath '$mail\\$name' | claude -p --model $model --effort xhigh --permission-mode $mode 2>&1
 "ASK_EXIT=\$LASTEXITCODE"
 EOF
     ;;
@@ -145,22 +147,22 @@ EOF
         misses=0
         python3 - "$copy" "$seen_file" <<'PY'
 import json, sys
+# The cursor counts lines already shown, so a message in any shape is delivered exactly once.
 path, seen_path = sys.argv[1], sys.argv[2]
 try:
     seen = int(open(seen_path).read().strip() or 0)
 except (FileNotFoundError, ValueError):
     seen = 0
-newest = seen
-for raw in open(path, encoding="utf-8-sig"):
-    if not raw.strip():
-        continue
-    message = json.loads(raw)
-    if message["seq"] <= seen:
-        continue
-    print(f"[windows #{message['seq']} {message['at']} @{message.get('commit', '?')}] {message['text']}", flush=True)
-    newest = max(newest, message["seq"])
-if newest != seen:
-    open(seen_path, "w").write(str(newest))
+lines = [line for line in open(path, encoding="utf-8-sig") if line.strip()]
+for raw in lines[seen:]:
+    try:
+        message = json.loads(raw)
+        label = message.get("seq") or message.get("id", "?")
+        print(f"[windows {label} {message.get('at', '?')} @{message.get('commit', '?')}] {message.get('text', raw)}", flush=True)
+    except (ValueError, AttributeError):
+        print(f"[windows raw] {raw.rstrip()}", flush=True)
+if len(lines) != seen:
+    open(seen_path, "w").write(str(len(lines)))
 PY
       fi
       rm -f "$copy"
