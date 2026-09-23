@@ -54,6 +54,7 @@ fn all_messages() -> Vec<Message> {
         Message::Button(Button {
             button: MouseButton::Forward,
             is_down: true,
+            click_count: 2,
         }),
         Message::Scroll(Scroll {
             horizontal: 0.25,
@@ -669,10 +670,10 @@ fn readiness_requires_the_current_protocol_and_an_empty_reliable_body() {
     let ready = frame(3, Message::SessionReady);
     let mut bytes = Vec::new();
     ready.encode_into(&mut bytes).unwrap();
-    assert_eq!(PROTOCOL_VERSION, 9);
+    assert_eq!(PROTOCOL_VERSION, 10);
     assert_eq!(ready.delivery(), DeliveryClass::Reliable);
     assert_eq!(decode(&bytes), Ok(ready));
-    for version in [1_u16, 2, 3, 4, 5, 6, 7, 8] {
+    for version in 1_u16..=9 {
         let mut old = bytes.clone();
         old[4..6].copy_from_slice(&version.to_be_bytes());
         assert_eq!(decode(&old), Err(DecodeError::UnsupportedVersion));
@@ -683,17 +684,63 @@ fn readiness_requires_the_current_protocol_and_an_empty_reliable_body() {
 }
 
 #[test]
-fn version_8_frame_is_unsupported() {
+fn a_version_9_button_without_a_click_count_is_unsupported() {
     let mut encoded = Vec::new();
-    frame(1, Message::ReleaseAll)
+    frame(1, button(MouseButton::Left, true, 1))
         .encode_into(&mut encoded)
         .expect("encode valid frame");
-    encoded[4..6].copy_from_slice(&8_u16.to_be_bytes());
+    encoded[4..6].copy_from_slice(&9_u16.to_be_bytes());
+    encoded[30] = 0;
     assert_eq!(decode(&encoded), Err(DecodeError::UnsupportedVersion));
 }
 
+fn button(button: MouseButton, is_down: bool, click_count: u8) -> Message {
+    Message::Button(Button {
+        button,
+        is_down,
+        click_count,
+    })
+}
+
 #[test]
-fn v9_frame_round_trips_every_scope() {
+fn a_button_carries_its_click_count_in_the_former_padding() {
+    let mut encoded = Vec::new();
+    for (sequence, click_count) in [1_u8, 2, 3, u8::MAX].into_iter().enumerate() {
+        for is_down in [true, false] {
+            let source = frame(
+                sequence as u64,
+                button(MouseButton::Right, is_down, click_count),
+            );
+            source.encode_into(&mut encoded).expect("encode button");
+            assert_eq!(encoded.len(), 32);
+            assert_eq!(&encoded[28..], &[2, u8::from(is_down), click_count, 0]);
+            assert_eq!(decode(&encoded), Ok(source));
+        }
+    }
+}
+
+#[test]
+fn a_zero_click_count_or_nonzero_padding_is_rejected() {
+    assert_eq!(
+        frame(1, button(MouseButton::Left, true, 0)).encode_into(&mut Vec::new()),
+        Err(EncodeError::InvalidClickCount)
+    );
+    let mut encoded = Vec::new();
+    frame(1, button(MouseButton::Left, true, 2))
+        .encode_into(&mut encoded)
+        .expect("encode button");
+
+    let mut zero_count = encoded.clone();
+    zero_count[30] = 0;
+    assert_eq!(decode(&zero_count), Err(DecodeError::InvalidClickCount));
+
+    let mut padded = encoded;
+    padded[31] = 1;
+    assert_eq!(decode(&padded), Err(DecodeError::NonZeroReservedField));
+}
+
+#[test]
+fn frame_round_trips_every_scope() {
     let mut encoded = Vec::new();
     for (sequence, scope) in [
         FrameScope::Connection,

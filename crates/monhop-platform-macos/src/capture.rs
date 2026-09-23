@@ -36,9 +36,10 @@ use crate::{
     ContinuousInstant, MacError, PowerWatch, SYNTHETIC_EVENT_MARKER,
     capture_decode::{
         ActiveDisplayBounds, CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
-        CG_EVENT_SCROLL_WHEEL, DecodedInput, DecodedPointer, EventSourceMetadata, HidKeyState,
-        LocalModifierState, PhysicalModifierLedger, PointerFields, decode_keyboard, decode_pointer,
-        decode_scroll, is_pointer_motion, should_ignore_source, should_keep_quarantine_tap,
+        CG_EVENT_SCROLL_WHEEL, CG_MOUSE_EVENT_CLICK_STATE, DecodedInput, DecodedPointer,
+        EventSourceMetadata, HidKeyState, LocalModifierState, PhysicalModifierLedger,
+        PointerFields, decode_keyboard, decode_pointer, decode_scroll, is_pointer_motion,
+        should_ignore_source, should_keep_quarantine_tap,
     },
     enumerate_active_displays,
     event_tap::{
@@ -452,11 +453,11 @@ enum EpisodeEvent {
 }
 
 impl EpisodeEvent {
-    fn pointer(event_type: CGEventType, location: Point, delta_x: i64, delta_y: i64) -> Self {
+    fn pointer(event_type: CGEventType, location: Point, delta_x: f64, delta_y: f64) -> Self {
         if is_pointer_motion(event_type) {
             Self::Motion {
                 location,
-                zero_delta: delta_x == 0 && delta_y == 0,
+                zero_delta: delta_x == 0.0 && delta_y == 0.0,
             }
         } else {
             Self::Button { location }
@@ -1105,12 +1106,13 @@ impl CallbackState {
             }
             _ => {
                 // SAFETY: these getters borrow the event, which remains live for the callback.
-                let (point, button_number, delta_x, delta_y) = unsafe {
+                let (point, button_number, click_state, delta_x, delta_y) = unsafe {
                     (
                         CGEventGetLocation(event),
                         CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER),
-                        CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X),
-                        CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y),
+                        CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE),
+                        CGEventGetDoubleValueField(event, CG_MOUSE_EVENT_DELTA_X),
+                        CGEventGetDoubleValueField(event, CG_MOUSE_EVENT_DELTA_Y),
                     )
                 };
                 let remote = self.remote();
@@ -1126,6 +1128,7 @@ impl CallbackState {
                         delta_x,
                         delta_y,
                         button_number,
+                        click_state,
                     },
                     self.pointer_position,
                     source,
@@ -1801,6 +1804,7 @@ mod callback_tests {
         state: &mut CallbackState,
         event_type: CGEventType,
         number: i64,
+        click_state: i64,
     ) -> (bool, Point) {
         // SAFETY: the event type is a fixed other-button type and the point is finite; the owned
         // event is never posted.
@@ -1809,7 +1813,10 @@ mod callback_tests {
         };
         assert!(!event.is_null());
         // SAFETY: event is owned and non-null until the release below.
-        unsafe { CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER, number) };
+        unsafe {
+            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER, number);
+            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, click_state);
+        }
         let suppressed = state.native_event(event_type, event, physical_source());
         // SAFETY: event is still owned; it is released right after this read and never transferred.
         let location = unsafe { CGEventGetLocation(event) };
@@ -2061,7 +2068,7 @@ mod callback_tests {
             let expected = if remote { pin } else { Point::new(10.0, 10.0) };
             for number in [5, 7] {
                 for event_type in [CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_UP] {
-                    let (withheld, location) = deliver_button(&mut state, event_type, number);
+                    let (withheld, location) = deliver_button(&mut state, event_type, number, 1);
                     assert!(
                         !withheld,
                         "local apps receive extra buttons on either route"
@@ -2075,6 +2082,26 @@ mod callback_tests {
             assert_eq!(state.remote(), remote);
             assert_eq!(state.unsupported_events, 4);
             assert_capture_untouched(&state, &mut consumer);
+        }
+    }
+
+    #[test]
+    fn a_remote_press_and_release_carry_the_quartz_click_state() {
+        let (mut state, mut consumer) = callback_fixture();
+        route_remote(&mut state, &mut consumer);
+        for (event_type, pressed) in [
+            (CG_EVENT_OTHER_MOUSE_DOWN, true),
+            (CG_EVENT_OTHER_MOUSE_UP, false),
+        ] {
+            assert!(deliver_button(&mut state, event_type, 2, 2).0);
+            assert!(
+                consumer.try_pop().unwrap()
+                    == Some(CaptureEvent::Button {
+                        button: MouseButton::Middle,
+                        pressed,
+                        click_count: 2,
+                    })
+            );
         }
     }
 
@@ -2179,21 +2206,21 @@ mod episode_tests {
     fn pointer_records_split_into_motion_and_buttons() {
         let at = Point::new(1.0, 2.0);
         assert!(matches!(
-            EpisodeEvent::pointer(CG_EVENT_LEFT_MOUSE_DRAGGED, at, 0, 0),
+            EpisodeEvent::pointer(CG_EVENT_LEFT_MOUSE_DRAGGED, at, 0.0, 0.0),
             EpisodeEvent::Motion {
                 zero_delta: true,
                 ..
             }
         ));
         assert!(matches!(
-            EpisodeEvent::pointer(CG_EVENT_MOUSE_MOVED, at, 0, 1),
+            EpisodeEvent::pointer(CG_EVENT_MOUSE_MOVED, at, 0.0, 0.25),
             EpisodeEvent::Motion {
                 zero_delta: false,
                 ..
             }
         ));
         assert!(matches!(
-            EpisodeEvent::pointer(CG_EVENT_OTHER_MOUSE_DOWN, at, 0, 0),
+            EpisodeEvent::pointer(CG_EVENT_OTHER_MOUSE_DOWN, at, 0.0, 0.0),
             EpisodeEvent::Button { .. }
         ));
     }

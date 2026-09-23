@@ -6,11 +6,11 @@ use monhop_platform_macos::{
     MAC_EVENT_FLAG_CONTROL, MAC_EVENT_FLAG_SHIFT, SYNTHETIC_EVENT_MARKER,
     capture_decode::{
         ActiveDisplayBounds, CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
-        CG_EVENT_LEFT_MOUSE_DOWN, CG_EVENT_MOUSE_MOVED, CG_EVENT_OTHER_MOUSE_DOWN,
-        CG_EVENT_SOURCE_STATE_HID_SYSTEM, DecodedInput, EventSourceMetadata, HidKeyState,
-        LocalModifierState, PhysicalModifierLedger, PointerFields,
-        QUARTZ_POINTS_PER_DISCRETE_SCROLL_LINE, decode_keyboard, decode_pointer, decode_scroll,
-        should_keep_quarantine_tap,
+        CG_EVENT_LEFT_MOUSE_DOWN, CG_EVENT_LEFT_MOUSE_UP, CG_EVENT_MOUSE_MOVED,
+        CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_SOURCE_STATE_HID_SYSTEM, DecodedInput,
+        EventSourceMetadata, HidKeyState, LocalModifierState, PhysicalModifierLedger,
+        PointerFields, QUARTZ_POINTS_PER_DISCRETE_SCROLL_LINE, decode_keyboard, decode_pointer,
+        decode_scroll, should_keep_quarantine_tap,
     },
 };
 
@@ -21,12 +21,13 @@ fn physical_source() -> EventSourceMetadata {
     }
 }
 
-fn pointer(location: Point, delta_x: i64, delta_y: i64, button_number: i64) -> PointerFields {
+fn pointer(location: Point, delta_x: f64, delta_y: f64, button_number: i64) -> PointerFields {
     PointerFields {
         location,
         delta_x,
         delta_y,
         button_number,
+        click_state: 1,
     }
 }
 
@@ -137,7 +138,7 @@ fn local_anchor_precedes_outward_delta_at_a_clamped_edge() {
     let source = physical_source();
     let decoded = decode_pointer(
         CG_EVENT_MOUSE_MOVED,
-        pointer(Point::new(-1440.0, 11.5), 8, -3, 0),
+        pointer(Point::new(-1440.0, 11.5), 8.0, -3.0, 0),
         Some(Point::new(-1440.0, 11.5)),
         source,
         SYNTHETIC_EVENT_MARKER,
@@ -164,7 +165,7 @@ fn remote_motion_keeps_nonzero_delta_when_the_quartz_location_is_constant() {
     let source = physical_source();
     let decoded = decode_pointer(
         CG_EVENT_MOUSE_MOVED,
-        pointer(Point::new(1919.999, 100.0), 6, 0, 0),
+        pointer(Point::new(1919.999, 100.0), 6.0, 0.0, 0),
         Some(Point::new(1919.999, 100.0)),
         source,
         SYNTHETIC_EVENT_MARKER,
@@ -178,6 +179,64 @@ fn remote_motion_keeps_nonzero_delta_when_the_quartz_location_is_constant() {
         DecodedInput::Event(CaptureEvent::LogicalRelativeMotion { dx, dy })
             if dx == 6.0 && dy == 0.0
     ));
+}
+
+#[test]
+fn sub_point_trackpad_deltas_reach_capture_unrounded() {
+    let decoded = decode_pointer(
+        CG_EVENT_MOUSE_MOVED,
+        pointer(Point::new(10.0, 10.0), 0.375, -0.125, 0),
+        None,
+        physical_source(),
+        SYNTHETIC_EVENT_MARKER,
+    );
+    match decoded.input {
+        DecodedInput::Event(CaptureEvent::LogicalRelativeMotion { dx, dy }) => {
+            assert_eq!(dx.to_bits(), 0.375_f64.to_bits());
+            assert_eq!(dy.to_bits(), (-0.125_f64).to_bits());
+        }
+        _ => panic!("a sub-point move is motion, not an empty record"),
+    }
+    for (dx, dy) in [(f64::NAN, 0.0), (0.0, f64::INFINITY)] {
+        let malformed = decode_pointer(
+            CG_EVENT_MOUSE_MOVED,
+            pointer(Point::new(10.0, 10.0), dx, dy, 0),
+            Some(Point::new(1.0, 1.0)),
+            physical_source(),
+            SYNTHETIC_EVENT_MARKER,
+        );
+        assert!(matches!(malformed.input, DecodedInput::Malformed));
+        assert_eq!(malformed.position, Some(Point::new(1.0, 1.0)));
+    }
+}
+
+#[test]
+fn a_press_and_its_release_carry_the_quartz_click_state() {
+    for (click_state, click_count) in [(2, 2), (3, 3), (0, 1), (-4, 1), (300, u8::MAX)] {
+        for (event_type, pressed) in [
+            (CG_EVENT_LEFT_MOUSE_DOWN, true),
+            (CG_EVENT_LEFT_MOUSE_UP, false),
+        ] {
+            let decoded = decode_pointer(
+                event_type,
+                PointerFields {
+                    click_state,
+                    ..pointer(Point::new(4.0, 5.0), 0.0, 0.0, 0)
+                },
+                None,
+                physical_source(),
+                SYNTHETIC_EVENT_MARKER,
+            );
+            assert!(matches!(
+                decoded.input,
+                DecodedInput::Event(CaptureEvent::Button {
+                    button: MouseButton::Left,
+                    pressed: actual,
+                    click_count: actual_count,
+                }) if actual == pressed && actual_count == click_count
+            ));
+        }
+    }
 }
 
 #[test]
@@ -220,7 +279,7 @@ fn pointer_buttons_and_scroll_preserve_fractions_in_logical_points() {
     let source = physical_source();
     let button = decode_pointer(
         CG_EVENT_OTHER_MOUSE_DOWN,
-        pointer(Point::new(4.0, 5.0), 0, 0, 4),
+        pointer(Point::new(4.0, 5.0), 0.0, 0.0, 4),
         None,
         source,
         SYNTHETIC_EVENT_MARKER,
@@ -230,11 +289,12 @@ fn pointer_buttons_and_scroll_preserve_fractions_in_logical_points() {
         DecodedInput::Event(CaptureEvent::Button {
             button: MouseButton::Forward,
             pressed: true,
+            click_count: 1,
         })
     ));
     let left = decode_pointer(
         CG_EVENT_LEFT_MOUSE_DOWN,
-        pointer(Point::new(4.0, 5.0), 0, 0, 0),
+        pointer(Point::new(4.0, 5.0), 0.0, 0.0, 0),
         None,
         source,
         SYNTHETIC_EVENT_MARKER,
@@ -244,6 +304,7 @@ fn pointer_buttons_and_scroll_preserve_fractions_in_logical_points() {
         DecodedInput::Event(CaptureEvent::Button {
             button: MouseButton::Left,
             pressed: true,
+            click_count: 1,
         })
     ));
     match decode_scroll(-0.015_625, 2.75, true, source, SYNTHETIC_EVENT_MARKER) {

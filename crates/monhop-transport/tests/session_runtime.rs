@@ -145,6 +145,7 @@ impl InputDestination for Destination {
             DestinationAction::Button {
                 button,
                 pressed: true,
+                ..
             } => !self.buttons[button.index()],
             _ => false,
         };
@@ -165,7 +166,9 @@ impl InputDestination for Destination {
                 }
                 self.keys[usize::from(usage.0)] = pressed;
             }
-            DestinationAction::Button { button, pressed } => {
+            DestinationAction::Button {
+                button, pressed, ..
+            } => {
                 if !pressed && self.buttons[button.index()] {
                     self.gate.note_injected_up();
                 }
@@ -669,6 +672,7 @@ fn yielding_receiver_injects_nothing() {
         Message::Button(monhop_protocol::Button {
             button: monhop_core::MouseButton::Left,
             is_down: true,
+            click_count: 1,
         }),
     ];
     for (i, message) in messages.into_iter().enumerate() {
@@ -769,6 +773,7 @@ fn drag_in_progress_take_back_withholds_until_release() {
         NormalizedInput::Button {
             button: monhop_core::MouseButton::Left,
             pressed: true,
+            click_count: 1,
         },
     );
     p.pump();
@@ -789,6 +794,109 @@ fn drag_in_progress_take_back_withholds_until_release() {
     assert!(!c.destination.buttons[0]);
     assert!(!c.gate.injected_held());
     assert!(!physical.process(motion, false, ms(1), &mut producer, &stop));
+}
+#[test]
+fn a_double_click_reaches_the_peer_with_its_count_on_press_and_release() {
+    let mut p = Pair::new();
+    p.cross(0);
+    p.pump();
+    let clicks = [
+        (true, 1),
+        (false, 1),
+        (true, 2),
+        (false, 2),
+        (true, 3),
+        (false, 3),
+    ];
+    for (pressed, click_count) in clicks {
+        p.input(
+            0,
+            NormalizedInput::Button {
+                button: monhop_core::MouseButton::Left,
+                pressed,
+                click_count,
+            },
+        );
+        p.pump();
+    }
+    let delivered: Vec<_> = p.computers[1]
+        .destination
+        .actions
+        .iter()
+        .filter_map(|action| match *action {
+            DestinationAction::Button {
+                pressed,
+                click_count,
+                ..
+            } => Some((pressed, click_count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, clicks);
+}
+#[test]
+fn a_held_double_click_carried_across_the_edge_is_one_single_click_on_the_peer() {
+    let mut p = Pair::new();
+    for pressed in [true, false, true] {
+        p.input(
+            0,
+            NormalizedInput::Button {
+                button: monhop_core::MouseButton::Left,
+                pressed,
+                click_count: if pressed { 2 } else { 1 },
+            },
+        );
+    }
+    p.cross(0);
+    p.pump();
+    p.input(
+        0,
+        NormalizedInput::Button {
+            button: monhop_core::MouseButton::Left,
+            pressed: false,
+            click_count: 2,
+        },
+    );
+    p.pump();
+    let delivered: Vec<_> = p.computers[1]
+        .destination
+        .actions
+        .iter()
+        .filter_map(|action| match *action {
+            DestinationAction::Button {
+                pressed,
+                click_count,
+                ..
+            } => Some((pressed, click_count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, [(true, 1), (false, 1)]);
+}
+#[test]
+fn sub_point_motion_accumulates_at_the_peer() {
+    let mut p = Pair::new();
+    p.cross(0);
+    p.pump();
+    let last_move = |p: &Pair| {
+        p.computers[1]
+            .destination
+            .actions
+            .iter()
+            .rev()
+            .find_map(|action| match *action {
+                DestinationAction::MoveTo(point) => Some(point),
+                _ => None,
+            })
+            .expect("the crossing placed the cursor")
+    };
+    let start = last_move(&p);
+    for _ in 0..4 {
+        p.input(0, NormalizedInput::RelativeMotion(Point::new(0.25, -0.125)));
+        p.pump();
+    }
+    let end = last_move(&p);
+    assert_eq!((end.x - start.x, end.y - start.y), (1.0, -0.5));
 }
 #[test]
 fn emergency_escape_on_controlled_computer_ends_session() {

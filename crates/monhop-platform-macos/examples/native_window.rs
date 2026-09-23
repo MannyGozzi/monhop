@@ -22,7 +22,7 @@ mod macos {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use monhop_core::{HidUsage, MouseButton, Point};
+    use monhop_core::{HidUsage, MouseButton, Point, capture::SINGLE_CLICK};
     use monhop_platform_macos::{
         MacError, MacInjector, PassiveDiagnosticCounts, SYNTHETIC_EVENT_MARKER,
         run_passive_diagnostic_with_cancel,
@@ -1093,7 +1093,7 @@ mod macos {
             injector,
             deadline,
             observations,
-            |injector| injector.button(MouseButton::Left, true),
+            |injector| injector.button(MouseButton::Left, true, SINGLE_CLICK),
         )?;
         post_step(
             native_window,
@@ -1107,7 +1107,7 @@ mod macos {
             injector,
             deadline,
             observations,
-            |injector| injector.button(MouseButton::Left, false),
+            |injector| injector.button(MouseButton::Left, false, SINGLE_CLICK),
         )?;
 
         post_step(
@@ -1115,7 +1115,7 @@ mod macos {
             injector,
             deadline,
             observations,
-            |injector| injector.button(MouseButton::Right, true),
+            |injector| injector.button(MouseButton::Right, true, SINGLE_CLICK),
         )?;
         for _ in 0..4 {
             post_step(

@@ -2,13 +2,17 @@
 
 use std::{fmt, time::Duration};
 
-use monhop_core::{HidUsage, MouseButton};
+use monhop_core::{HidUsage, MouseButton, capture::SINGLE_CLICK};
 
 use crate::keymap::KeyMapError;
 
 /// Marker copied into native input metadata so MonHop can ignore its own injected events.
 pub const MONHOP_INJECTED_MARKER: usize = 0x4c4b_4d31;
 pub const MAX_CAPTURE_DURATION: Duration = Duration::from_secs(30);
+
+/// A forwarded multi-click press this close to its button's previous press is injected on it:
+/// a Mac double-tap drifts 2-3 PC px at display scale, and a separate target sits farther away.
+pub const DOUBLE_CLICK_SNAP_PIXELS: i32 = 8;
 
 #[cfg(windows)]
 static RAW_CAPTURE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -125,9 +129,11 @@ pub enum InjectionOperation {
         usage: HidUsage,
         pressed: bool,
     },
+    /// `click_count` is the source OS's multi-click count for this press or release.
     Button {
         button: MouseButton,
         pressed: bool,
+        click_count: u8,
     },
     RelativeMove {
         dx: i32,
@@ -255,6 +261,53 @@ pub fn absolute_send_input_coordinates(
         normalize_absolute_axis(x, desktop.left, desktop.width),
         normalize_absolute_axis(y, desktop.top, desktop.height),
     ))
+}
+
+/// Where injection last put the cursor and each button's last press, so a forwarded multi-click
+/// lands inside Windows' own double-click rectangle, which is 4 px wide by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClickAnchors {
+    cursor: Option<(i32, i32)>,
+    presses: [Option<(i32, i32)>; MouseButton::ALL.len()],
+}
+
+impl ClickAnchors {
+    pub const fn new() -> Self {
+        Self {
+            cursor: None,
+            presses: [None; MouseButton::ALL.len()],
+        }
+    }
+
+    pub fn moved_to(&mut self, x: i32, y: i32) {
+        self.cursor = Some((x, y));
+    }
+
+    pub fn forget_cursor(&mut self) {
+        self.cursor = None;
+    }
+
+    /// The previous press to inject this one on, when the source counted a multi-click nearby.
+    pub fn press_target(&self, button: MouseButton, click_count: u8) -> Option<(i32, i32)> {
+        let cursor = self.cursor?;
+        let previous = self.presses[button.index()]?;
+        let near = |from: i32, to: i32| {
+            (i64::from(from) - i64::from(to)).abs() <= i64::from(DOUBLE_CLICK_SNAP_PIXELS)
+        };
+        (click_count > SINGLE_CLICK
+            && cursor != previous
+            && near(cursor.0, previous.0)
+            && near(cursor.1, previous.1))
+        .then_some(previous)
+    }
+
+    /// Records a press injected at `target`, or at the cursor without one.
+    pub fn pressed(&mut self, button: MouseButton, target: Option<(i32, i32)>) {
+        if target.is_some() {
+            self.cursor = target;
+        }
+        self.presses[button.index()] = self.cursor;
+    }
 }
 
 /// Summarizes a Raw Input mouse event without retaining its payload.
@@ -429,8 +482,8 @@ mod windows {
     };
 
     use super::{
-        CaptureStats, InjectionOperation, InputError, MAX_CAPTURE_DURATION, MONHOP_INJECTED_MARKER,
-        absolute_send_input_coordinates,
+        CaptureStats, ClickAnchors, InjectionOperation, InputError, MAX_CAPTURE_DURATION,
+        MONHOP_INJECTED_MARKER, VirtualDesktop, absolute_send_input_coordinates,
     };
 
     const DIAGNOSTIC_CLASS_NAME: &[u16] = &[
@@ -777,6 +830,9 @@ mod windows {
     pub struct Injector {
         held_keys: BTreeSet<HidUsage>,
         held_buttons: BTreeSet<MouseButton>,
+        anchors: ClickAnchors,
+        /// The desktop of the last absolute move, which is what gave `anchors` its cursor.
+        desktop: Option<VirtualDesktop>,
     }
 
     impl Injector {
@@ -784,6 +840,8 @@ mod windows {
             Self {
                 held_keys: BTreeSet::new(),
                 held_buttons: BTreeSet::new(),
+                anchors: ClickAnchors::new(),
+                desktop: None,
             }
         }
 
@@ -800,12 +858,35 @@ mod windows {
                         self.held_keys.remove(&usage);
                     }
                 }
-                InjectionOperation::Button { button, pressed } => {
+                InjectionOperation::Button {
+                    button,
+                    pressed,
+                    click_count,
+                } => {
                     if !pressed && !self.held_buttons.contains(&button) {
                         return Err(InputError::ButtonNotHeld);
                     }
-                    dispatch_inputs(&[button_input(button, pressed)])?;
+                    let snap = match (pressed, self.desktop) {
+                        (true, Some(desktop)) => self
+                            .anchors
+                            .press_target(button, click_count)
+                            .map(|(x, y)| (x, y, desktop)),
+                        _ => None,
+                    };
+                    let input = button_input(button, pressed);
+                    // One batch, so nothing can land between the move and the press.
+                    let sent = match snap {
+                        Some((x, y, desktop)) => {
+                            dispatch_inputs(&[absolute_move_input(desktop, x, y)?, input])
+                        }
+                        None => dispatch_inputs(&[input]),
+                    };
+                    if let Err(error) = sent {
+                        self.anchors.forget_cursor();
+                        return Err(error);
+                    }
                     if pressed {
+                        self.anchors.pressed(button, snap.map(|(x, y, _)| (x, y)));
                         self.held_buttons.insert(button);
                     } else {
                         self.held_buttons.remove(&button);
@@ -815,17 +896,15 @@ mod windows {
                     if dx == 0 && dy == 0 {
                         return Err(InputError::ZeroRelativeMotion);
                     }
+                    self.anchors.forget_cursor();
                     dispatch_inputs(&[mouse_input(dx, dy, MOUSEEVENTF_MOVE, 0)])?;
                 }
                 InjectionOperation::AbsoluteMove { x, y, desktop } => {
-                    let (normalized_x, normalized_y) =
-                        absolute_send_input_coordinates(desktop, x, y)?;
-                    dispatch_inputs(&[mouse_input(
-                        normalized_x,
-                        normalized_y,
-                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                        0,
-                    )])?;
+                    let input = absolute_move_input(desktop, x, y)?;
+                    self.anchors.forget_cursor();
+                    dispatch_inputs(&[input])?;
+                    self.anchors.moved_to(x, y);
+                    self.desktop = Some(desktop);
                 }
                 InjectionOperation::Scroll {
                     vertical,
@@ -958,6 +1037,16 @@ mod windows {
             (MouseButton::Forward, false) => (MOUSEEVENTF_XUP, u32::from(XBUTTON2)),
         };
         mouse_input(0, 0, flags, mouse_data)
+    }
+
+    fn absolute_move_input(desktop: VirtualDesktop, x: i32, y: i32) -> Result<INPUT, InputError> {
+        let (normalized_x, normalized_y) = absolute_send_input_coordinates(desktop, x, y)?;
+        Ok(mouse_input(
+            normalized_x,
+            normalized_y,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            0,
+        ))
     }
 
     fn mouse_input(dx: i32, dy: i32, flags: u32, mouse_data: u32) -> INPUT {

@@ -1,12 +1,71 @@
 use std::time::Duration;
 
-use monhop_core::{DeviceId, Display, HidUsage};
+use monhop_core::{DeviceId, Display, HidUsage, MouseButton};
 use monhop_platform_windows::{
-    CaptureStats, DisplayError, InputError, KeyMapError, MONHOP_INJECTED_MARKER, Set1Prefix,
-    Set1ScanCode, VirtualDesktop, absolute_send_input_coordinates, capture_counts,
-    display_id_from_device_name, enumerate_displays, hid_usage_from_set1, is_monhop_injected,
-    set1_from_hid_usage, summarize_raw_mouse,
+    CaptureStats, ClickAnchors, DOUBLE_CLICK_SNAP_PIXELS, DisplayError, InputError, KeyMapError,
+    MONHOP_INJECTED_MARKER, Set1Prefix, Set1ScanCode, VirtualDesktop,
+    absolute_send_input_coordinates, capture_counts, display_id_from_device_name,
+    enumerate_displays, hid_usage_from_set1, is_monhop_injected, set1_from_hid_usage,
+    summarize_raw_mouse,
 };
+
+#[test]
+fn a_drifted_multi_click_press_lands_on_the_previous_press() {
+    let mut anchors = ClickAnchors::new();
+    anchors.moved_to(100, 200);
+    assert_eq!(anchors.press_target(MouseButton::Left, 1), None);
+    anchors.pressed(MouseButton::Left, None);
+
+    anchors.moved_to(103, 198);
+    assert_eq!(
+        anchors.press_target(MouseButton::Right, 2),
+        None,
+        "another button has no previous press"
+    );
+    assert_eq!(anchors.press_target(MouseButton::Left, 1), None);
+    let target = anchors.press_target(MouseButton::Left, 2);
+    assert_eq!(target, Some((100, 200)));
+    anchors.pressed(MouseButton::Left, target);
+
+    anchors.moved_to(101, 201);
+    assert_eq!(
+        anchors.press_target(MouseButton::Left, 3),
+        Some((100, 200)),
+        "a triple click keeps the first press's spot"
+    );
+}
+
+#[test]
+fn a_multi_click_press_far_away_or_already_in_place_is_left_alone() {
+    let mut anchors = ClickAnchors::new();
+    anchors.moved_to(0, 0);
+    anchors.pressed(MouseButton::Left, None);
+    for (x, y) in [
+        (DOUBLE_CLICK_SNAP_PIXELS + 1, 0),
+        (0, -DOUBLE_CLICK_SNAP_PIXELS - 1),
+        (i32::MAX, i32::MIN),
+    ] {
+        anchors.moved_to(x, y);
+        assert_eq!(anchors.press_target(MouseButton::Left, 2), None);
+    }
+    anchors.moved_to(DOUBLE_CLICK_SNAP_PIXELS, -DOUBLE_CLICK_SNAP_PIXELS);
+    assert_eq!(anchors.press_target(MouseButton::Left, 2), Some((0, 0)));
+    anchors.moved_to(0, 0);
+    assert_eq!(anchors.press_target(MouseButton::Left, 2), None);
+    anchors.forget_cursor();
+    assert_eq!(
+        anchors.press_target(MouseButton::Left, 2),
+        None,
+        "an unknown cursor is never moved"
+    );
+    anchors.pressed(MouseButton::Left, None);
+    anchors.moved_to(1, 1);
+    assert_eq!(
+        anchors.press_target(MouseButton::Left, 2),
+        None,
+        "a press at an unknown spot anchors nothing"
+    );
+}
 
 #[test]
 fn standard_set1_keys_round_trip_to_hid() {

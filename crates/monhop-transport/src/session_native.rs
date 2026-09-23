@@ -245,7 +245,15 @@ impl NativeDestination {
                     }
                 }
                 DestinationAction::Key { usage, pressed } => Op::Key { usage, pressed },
-                DestinationAction::Button { button, pressed } => Op::Button { button, pressed },
+                DestinationAction::Button {
+                    button,
+                    pressed,
+                    click_count,
+                } => Op::Button {
+                    button,
+                    pressed,
+                    click_count,
+                },
                 DestinationAction::Scroll {
                     horizontal,
                     vertical,
@@ -283,9 +291,11 @@ impl NativeDestination {
             match action {
                 DestinationAction::MoveTo(point) => self.injector.move_to(point),
                 DestinationAction::Key { usage, pressed } => self.injector.key(usage, pressed),
-                DestinationAction::Button { button, pressed } => {
-                    self.injector.button(button, pressed)
-                }
+                DestinationAction::Button {
+                    button,
+                    pressed,
+                    click_count,
+                } => self.injector.button(button, pressed, click_count),
                 DestinationAction::Scroll {
                     horizontal,
                     vertical,
@@ -333,6 +343,7 @@ impl InjectionLedger {
             DestinationAction::Button {
                 button,
                 pressed: true,
+                ..
             } => !self.buttons[button.index()],
             _ => false,
         };
@@ -357,7 +368,9 @@ impl InjectionLedger {
                 }
                 *key = pressed;
             }
-            DestinationAction::Button { button, pressed } => {
+            DestinationAction::Button {
+                button, pressed, ..
+            } => {
                 let held = &mut self.buttons[button.index()];
                 if !pressed && *held {
                     self.gate.note_injected_up();
@@ -460,6 +473,7 @@ mod tests {
             DestinationAction::Button {
                 button: monhop_core::MouseButton::Left,
                 pressed: true,
+                click_count: 2,
             },
             DestinationAction::Scroll {
                 horizontal: 0.5,
@@ -530,7 +544,8 @@ mod admission_tests {
         let mut ledger = InjectionLedger::new(gate.clone());
         assert!(!ledger.begin(DestinationAction::Button {
             button: monhop_core::MouseButton::Left,
-            pressed: true
+            pressed: true,
+            click_count: 1,
         }));
         assert!(!gate.injected_held());
         gate.note_injected_press();

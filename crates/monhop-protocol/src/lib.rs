@@ -14,7 +14,7 @@ use monhop_core::{
 
 pub const MAGIC: [u8; 4] = *b"LKM!";
 /// Bumped whenever the wire changes shape; both computers must run the same build.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_LEN: usize = 8_192;
 pub use monhop_core::MAX_DISPLAYS;
@@ -253,6 +253,8 @@ pub enum Motion {
 pub struct Button {
     pub button: MouseButton,
     pub is_down: bool,
+    /// The source OS's count for this press and its release: 1 single, 2 double, 3 triple; never 0.
+    pub click_count: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -592,6 +594,7 @@ pub enum EncodeError {
     CoordinateOutOfRange,
     InvalidKeyUsage,
     InvalidKeyState,
+    InvalidClickCount,
 }
 
 impl fmt::Display for EncodeError {
@@ -626,6 +629,7 @@ pub enum DecodeError {
     InvalidScope,
     InvalidControl,
     InvalidDeclineReason,
+    InvalidClickCount,
 }
 
 impl fmt::Display for DecodeError {
@@ -913,7 +917,12 @@ fn body_len(message: &Message) -> Result<usize, EncodeError> {
             validate_input_point(*point).map_err(InputPointError::encode_error)?;
             20
         }
-        Message::Button(_) => 4,
+        Message::Button(button) => {
+            if button.click_count == 0 {
+                return Err(EncodeError::InvalidClickCount);
+            }
+            4
+        }
         Message::Scroll(scroll) => {
             if !scroll.horizontal.is_finite() || !scroll.vertical.is_finite() {
                 return Err(EncodeError::NonFiniteCoordinate);
@@ -997,7 +1006,8 @@ fn encode_body(message: &Message, output: &mut Vec<u8>) -> Result<(), EncodeErro
         Message::Button(button) => {
             output.push(button_to_wire(button.button));
             output.push(u8::from(button.is_down));
-            write_u16(output, 0);
+            output.push(button.click_count);
+            output.push(0);
         }
         Message::Scroll(scroll) => {
             write_f64(output, scroll.horizontal);
@@ -1129,8 +1139,16 @@ fn decode_body(kind: MessageKind, body: &mut Cursor<'_>) -> Result<Message, Deco
         MessageKind::Button => {
             let button = button_from_wire(body.read_u8()?)?;
             let is_down = body.read_bool()?;
-            body.require_zero(2)?;
-            Ok(Message::Button(Button { button, is_down }))
+            let click_count = body.read_u8()?;
+            if click_count == 0 {
+                return Err(DecodeError::InvalidClickCount);
+            }
+            body.require_zero(1)?;
+            Ok(Message::Button(Button {
+                button,
+                is_down,
+                click_count,
+            }))
         }
         MessageKind::Scroll => Ok(Message::Scroll(Scroll {
             horizontal: body.read_f64()?,

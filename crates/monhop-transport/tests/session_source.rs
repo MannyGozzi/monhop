@@ -246,7 +246,7 @@ fn destination_topology(displays: &[DisplayId]) -> DisplayTopology {
 enum RecordedAction {
     Move(Point),
     Key(HidUsage, bool),
-    Button(MouseButton, bool),
+    Button(MouseButton, bool, u8),
     Scroll(f64, f64),
     ReleaseAll,
 }
@@ -262,9 +262,11 @@ impl InputDestination for RecordingDestination {
         let recorded = match action {
             DestinationAction::MoveTo(point) => RecordedAction::Move(point),
             DestinationAction::Key { usage, pressed } => RecordedAction::Key(usage, pressed),
-            DestinationAction::Button { button, pressed } => {
-                RecordedAction::Button(button, pressed)
-            }
+            DestinationAction::Button {
+                button,
+                pressed,
+                click_count,
+            } => RecordedAction::Button(button, pressed, click_count),
             DestinationAction::Scroll {
                 horizontal,
                 vertical,
@@ -1059,6 +1061,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
             NormalizedInput::Button {
                 button: MouseButton::Left,
                 pressed: true,
+                click_count: 2,
             },
             true,
             1,
@@ -1119,6 +1122,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
             NormalizedInput::Button {
                 button: MouseButton::Left,
                 pressed: false,
+                click_count: 2,
             },
             true,
             1,
@@ -1132,6 +1136,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
         Message::Button(monhop_protocol::Button {
             button: MouseButton::Left,
             is_down: false,
+            click_count: 2,
         }),
     );
     let resumed = remote_to_remote.fresh_capture(
@@ -1310,6 +1315,7 @@ fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
             NormalizedInput::Button {
                 button: MouseButton::Left,
                 pressed: true,
+                click_count: 1,
             },
             true,
             1,
@@ -1733,6 +1739,7 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
         NormalizedInput::Button {
             button: MouseButton::Left,
             pressed: true,
+            click_count: 2,
         },
     ] {
         assert!(source.fresh_capture(local(event), ms(0)).effects.is_empty());
@@ -1762,7 +1769,8 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
         bridge
             .destination
             .actions
-            .contains(&RecordedAction::Button(MouseButton::Left, true))
+            .contains(&RecordedAction::Button(MouseButton::Left, true, 1)),
+        "a press carried across the edge is a fresh single click on the peer"
     );
     assert!(!bridge.sent.iter().any(|frame| matches!(
         &frame.message,

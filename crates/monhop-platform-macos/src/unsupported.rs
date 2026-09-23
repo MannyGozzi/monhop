@@ -56,6 +56,7 @@ pub fn post_button(
     _: PostingDestination,
     _: MouseButton,
     _: bool,
+    _: u8,
     _: i64,
     _: u64,
     _: Point,

@@ -23,12 +23,12 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-            KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC_EX,
-            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-            MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-            MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-            MapVirtualKeyW, SendInput,
+            GetAsyncKeyState, GetDoubleClickTime, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+            KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+            MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
+            MOUSEINPUT, MapVirtualKeyW, SendInput,
         },
         Input::{
             GetRawInputData, GetRegisteredRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
@@ -48,7 +48,10 @@ use crate::{
         CaptureCommand, ControlCompletion, ControlError, ControlReader, ControlWriter,
         control_channel,
     },
-    capture_decode::{DecodedInput, decode_keyboard, decode_mouse},
+    capture_decode::{
+        ClickCounter, DecodedInput, DoubleClickSettings, WINDOWS_DEFAULT_DOUBLE_CLICK,
+        decode_keyboard, decode_mouse,
+    },
     capture_physical::{LocalTransfer, PhysicalCapture},
     desktop_state::ordinary_desktop_is_active,
     input::{
@@ -429,6 +432,8 @@ struct CallbackState {
     ignored: IgnoredInputCounts,
     held_virtual_keys: [Option<u32>; 256],
     unsupported_presses_seen: [bool; 256],
+    clicks: ClickCounter,
+    double_click: DoubleClickSettings,
 }
 
 #[derive(Default)]
@@ -657,6 +662,16 @@ impl CallbackState {
             }
         }
         let now = self.shared.origin.elapsed();
+        let event = match event {
+            CaptureEvent::Button {
+                button, pressed, ..
+            } => CaptureEvent::Button {
+                button,
+                pressed,
+                click_count: self.clicks.count(button, pressed, now, self.double_click),
+            },
+            event => event,
+        };
         let remote = self.remote();
         let result = self.physical.process_with_travel(
             event,
@@ -782,6 +797,7 @@ impl CallbackState {
         }
         // WM_INPUT arrives too late to withhold; hook_mouse withholds the same movement.
         if mouse.lLastX != 0 || mouse.lLastY != 0 {
+            self.clicks.moved(mouse.lLastX, mouse.lLastY);
             self.event(CaptureEvent::RelativeMotion {
                 dx: mouse.lLastX,
                 dy: mouse.lLastY,
@@ -1212,6 +1228,29 @@ unsafe extern "system" fn window_proc(
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+/// Read once per capture, so a settings change applies from the next session.
+fn double_click_settings() -> DoubleClickSettings {
+    // SAFETY: these reads take no pointers and have no preconditions.
+    let (interval, width, height) = unsafe {
+        (
+            GetDoubleClickTime(),
+            GetSystemMetrics(SM_CXDOUBLECLK),
+            GetSystemMetrics(SM_CYDOUBLECLK),
+        )
+    };
+    let metric = |value: i32, default: u32| {
+        u32::try_from(value)
+            .ok()
+            .filter(|value| *value != 0)
+            .unwrap_or(default)
+    };
+    DoubleClickSettings {
+        interval: Duration::from_millis(u64::from(interval)),
+        width: metric(width, WINDOWS_DEFAULT_DOUBLE_CLICK.width),
+        height: metric(height, WINDOWS_DEFAULT_DOUBLE_CLICK.height),
+    }
+}
+
 /// Registration replays an arrival for every attached device; only a removal is a loss.
 fn device_change_is_loss(wparam: usize) -> bool {
     wparam == GIDC_REMOVAL as usize
@@ -1239,6 +1278,8 @@ fn run(
             held_virtual_keys: [None; 256],
             unsupported_presses_seen: [false; 256],
             press_revision: 0,
+            clicks: ClickCounter::default(),
+            double_click: double_click_settings(),
         })
     });
     if let Some(error) = startup_environment_error(ordinary_desktop_is_active()) {
@@ -1733,6 +1774,8 @@ mod tests {
                 held_virtual_keys: [None; 256],
                 unsupported_presses_seen: [false; 256],
                 press_revision: 0,
+                clicks: ClickCounter::default(),
+                double_click: WINDOWS_DEFAULT_DOUBLE_CLICK,
             },
             consumer,
         )
@@ -1810,6 +1853,36 @@ mod tests {
             consumer.try_pop().unwrap(),
             Some(CaptureEvent::RelativeMotion { dx: 7, dy: -3 })
         ));
+    }
+
+    #[test]
+    fn presses_are_numbered_from_the_users_double_click_settings() {
+        let (mut state, mut consumer) = callback_fixture();
+        let mut click = |state: &mut CallbackState, dx: i32| {
+            let mut raw = raw_motion(true, 0);
+            raw.data.mouse = windows_sys::Win32::UI::Input::RAWMOUSE {
+                lLastX: dx,
+                ..Default::default()
+            };
+            state.raw_mouse(&raw);
+            [WM_LBUTTONDOWN, WM_LBUTTONUP].map(|message| {
+                state.decoded(decode_mouse(message, 0, 0, 0, 0, 0));
+                std::iter::from_fn(|| consumer.try_pop().unwrap())
+                    .find_map(|event| match event {
+                        CaptureEvent::Button { click_count, .. } => Some(click_count),
+                        _ => None,
+                    })
+                    .expect("the button is queued")
+            })
+        };
+        assert_eq!(click(&mut state, 1), [1, 1]);
+        assert_eq!(click(&mut state, 2), [2, 2]);
+        assert_eq!(click(&mut state, -1), [3, 3]);
+        assert_eq!(
+            click(&mut state, 3),
+            [1, 1],
+            "the pointer left the rectangle"
+        );
     }
 
     #[test]
@@ -2422,6 +2495,7 @@ mod tests {
             CaptureEvent::Button {
                 button: MouseButton::Left,
                 pressed: true,
+                click_count: 1,
             },
             CaptureEvent::Key {
                 usage: monhop_core::HidUsage(0xe0),
@@ -2449,6 +2523,7 @@ mod tests {
                                 CaptureEvent::Button { button, .. } => CaptureEvent::Button {
                                     button,
                                     pressed: false,
+                                    click_count: 1,
                                 },
                                 CaptureEvent::Key { usage, .. } => CaptureEvent::Key {
                                     usage,
@@ -2501,7 +2576,8 @@ mod tests {
         let (mut state, mut consumer) = callback_fixture();
         assert!(!state.event(CaptureEvent::Button {
             button: MouseButton::Left,
-            pressed: true
+            pressed: true,
+            click_count: 1,
         }));
         consumer.try_pop().unwrap();
         let _guard = install_callback(state);
@@ -2519,11 +2595,13 @@ mod tests {
                     if effects.len() == 1 {
                         assert!(!with_callback(|state| state.event(CaptureEvent::Button {
                             button: MouseButton::Left,
-                            pressed: false
+                            pressed: false,
+                            click_count: 1,
                         })));
                         assert!(!with_callback(|state| state.event(CaptureEvent::Button {
                             button: MouseButton::Right,
-                            pressed: true
+                            pressed: true,
+                            click_count: 1,
                         })));
                     }
                     Ok(())
@@ -2562,7 +2640,8 @@ mod tests {
         );
         assert!(with_callback(|state| state.event(CaptureEvent::Button {
             button: MouseButton::Right,
-            pressed: false
+            pressed: false,
+            click_count: 1,
         })));
     }
 
@@ -2572,7 +2651,8 @@ mod tests {
             let (mut state, _consumer) = callback_fixture();
             assert!(!state.event(CaptureEvent::Button {
                 button: MouseButton::Left,
-                pressed: true
+                pressed: true,
+                click_count: 1,
             }));
             let _guard = install_callback(state);
             let mut local_down = true;
@@ -2602,6 +2682,7 @@ mod tests {
                                     state.event(CaptureEvent::Button {
                                         button: MouseButton::Left,
                                         pressed,
+                                        click_count: 1,
                                     })
                                 });
                                 if !suppressed {
@@ -2624,7 +2705,8 @@ mod tests {
             );
             assert!(with_callback(|state| state.event(CaptureEvent::Button {
                 button: MouseButton::Left,
-                pressed: false
+                pressed: false,
+                click_count: 1,
             })));
         }
     }
@@ -2634,7 +2716,8 @@ mod tests {
         let (mut state, _consumer) = callback_fixture();
         assert!(!state.event(CaptureEvent::Button {
             button: MouseButton::Left,
-            pressed: true
+            pressed: true,
+            click_count: 1,
         }));
         let _guard = install_callback(state);
         let mut sends = 0;
@@ -2653,6 +2736,7 @@ mod tests {
                                 state.event(CaptureEvent::Button {
                                     button: MouseButton::Left,
                                     pressed,
+                                    click_count: 1,
                                 })
                             });
                         }
@@ -2687,7 +2771,8 @@ mod tests {
         let (mut state, _consumer) = remote_callback();
         assert!(state.event(CaptureEvent::Button {
             button: MouseButton::Left,
-            pressed: true
+            pressed: true,
+            click_count: 1,
         }));
         let signal = state.shared.revocation.clone();
         let _guard = install_callback(state);
@@ -2708,6 +2793,7 @@ mod tests {
                                 state.event(CaptureEvent::Button {
                                     button: MouseButton::Left,
                                     pressed,
+                                    click_count: 1,
                                 })
                             }) {
                                 local_down = pressed;
@@ -2759,7 +2845,8 @@ mod tests {
             let (mut state, _consumer) = remote_callback();
             assert!(state.event(CaptureEvent::Button {
                 button: MouseButton::Left,
-                pressed: true
+                pressed: true,
+                click_count: 1,
             }));
             let signal = state.shared.revocation.clone();
             let _guard = install_callback(state);

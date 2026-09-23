@@ -16,9 +16,20 @@ use std::time::Duration;
 #[derive(Clone, Copy)]
 pub enum DestinationAction {
     MoveTo(Point),
-    Key { usage: HidUsage, pressed: bool },
-    Button { button: MouseButton, pressed: bool },
-    Scroll { horizontal: f64, vertical: f64 },
+    Key {
+        usage: HidUsage,
+        pressed: bool,
+    },
+    /// `click_count` is the source OS's multi-click count; destinations reproduce it natively.
+    Button {
+        button: MouseButton,
+        pressed: bool,
+        click_count: u8,
+    },
+    Scroll {
+        horizontal: f64,
+        vertical: f64,
+    },
     ReleaseAll,
 }
 
@@ -494,6 +505,7 @@ impl InputReceiver {
                         .apply(DestinationAction::Button {
                             button: button.button,
                             pressed: button.is_down,
+                            click_count: button.click_count,
                         })
                         .map_err(|_| ReceiverFailure::NativeDelivery)?;
                 }

@@ -7,16 +7,120 @@ use std::{
     time::Duration,
 };
 
-use monhop_core::{FloorState, HidUsage, ModifierState, SharedFloor, TakeBackGate};
+use monhop_core::{FloorState, HidUsage, ModifierState, MouseButton, SharedFloor, TakeBackGate};
 use monhop_platform_windows::{
     MONHOP_INJECTED_MARKER,
     capture::{
         CAPTURE_QUEUE_CAPACITY, CaptureEvent, CaptureStop, CapturedEvent, MAX_SUPPRESSION_TTL,
         StopReason, SuppressionLease, capture_channel,
     },
-    capture_decode::{DecodedInput, decode_keyboard, decode_mouse},
+    capture_decode::{
+        ClickCounter, DecodedInput, DoubleClickSettings, WINDOWS_DEFAULT_DOUBLE_CLICK,
+        decode_keyboard, decode_mouse,
+    },
     capture_physical::PhysicalCapture,
 };
+
+fn ms(value: u64) -> Duration {
+    Duration::from_millis(value)
+}
+
+#[test]
+fn quick_nearby_presses_of_one_button_count_up_and_releases_repeat_the_count() {
+    let mut clicks = ClickCounter::default();
+    let left = MouseButton::Left;
+    assert_eq!(
+        clicks.count(left, false, ms(0), WINDOWS_DEFAULT_DOUBLE_CLICK),
+        1
+    );
+    assert_eq!(
+        clicks.count(left, true, ms(0), WINDOWS_DEFAULT_DOUBLE_CLICK),
+        1
+    );
+    assert_eq!(
+        clicks.count(left, false, ms(80), WINDOWS_DEFAULT_DOUBLE_CLICK),
+        1
+    );
+    clicks.moved(2, -1);
+    clicks.moved(-1, -1);
+    assert_eq!(
+        clicks.count(left, true, ms(500), WINDOWS_DEFAULT_DOUBLE_CLICK),
+        2
+    );
+    assert_eq!(
+        clicks.count(left, false, ms(560), WINDOWS_DEFAULT_DOUBLE_CLICK),
+        2
+    );
+    assert_eq!(
+        clicks.count(left, true, ms(700), WINDOWS_DEFAULT_DOUBLE_CLICK),
+        3
+    );
+    assert_eq!(
+        clicks.count(left, false, ms(750), WINDOWS_DEFAULT_DOUBLE_CLICK),
+        3
+    );
+}
+
+#[test]
+fn a_late_far_or_different_press_starts_over() {
+    let settings = WINDOWS_DEFAULT_DOUBLE_CLICK;
+    let left = MouseButton::Left;
+    let mut late = ClickCounter::default();
+    late.count(left, true, ms(0), settings);
+    assert_eq!(late.count(left, true, ms(501), settings), 1);
+
+    for (dx, dy) in [(3, 0), (0, -3)] {
+        let mut far = ClickCounter::default();
+        far.count(left, true, ms(0), settings);
+        far.moved(dx, dy);
+        assert_eq!(far.count(left, true, ms(100), settings), 1);
+    }
+
+    let mut other = ClickCounter::default();
+    other.count(left, true, ms(0), settings);
+    assert_eq!(other.count(MouseButton::Right, true, ms(100), settings), 1);
+    assert_eq!(
+        other.count(left, true, ms(200), settings),
+        1,
+        "the other button broke the sequence"
+    );
+
+    let mut earlier = ClickCounter::default();
+    earlier.count(left, true, ms(100), settings);
+    assert_eq!(earlier.count(left, true, ms(50), settings), 1);
+}
+
+#[test]
+fn the_users_own_settings_decide_the_window() {
+    let generous = DoubleClickSettings {
+        interval: Duration::from_millis(900),
+        width: 20,
+        height: 20,
+    };
+    let mut clicks = ClickCounter::default();
+    clicks.count(MouseButton::Left, true, ms(0), generous);
+    clicks.moved(10, -10);
+    assert_eq!(clicks.count(MouseButton::Left, true, ms(900), generous), 2);
+    for _ in 0..300 {
+        clicks.count(MouseButton::Left, true, ms(900), generous);
+    }
+    assert_eq!(
+        clicks.count(MouseButton::Left, true, ms(900), generous),
+        u8::MAX
+    );
+}
+
+#[test]
+fn hook_buttons_decode_as_single_clicks_for_the_capture_thread_to_number() {
+    assert!(matches!(
+        decode_mouse(WM_LBUTTONDOWN, 0, 0, 0, 0, 0),
+        DecodedInput::Event(CaptureEvent::Button {
+            button: MouseButton::Left,
+            pressed: true,
+            click_count: 1,
+        })
+    ));
+}
 
 // Windows SDK `um/winuser.h` values for the hook records below.
 const WM_KEYDOWN: u32 = 0x0100;

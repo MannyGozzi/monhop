@@ -16,7 +16,7 @@ use std::{fmt, time::Duration};
 use monhop_core::{
     DeviceId, DisplayId, Edge, EdgeTransition, FloorOwner, FloorSnapshot, FloorState, HidUsage,
     ModifierState, MouseButton, Platform, Point, PointerOwnership, PointerTarget, SharedFloor,
-    Topology, TransitionAcknowledgement,
+    Topology, TransitionAcknowledgement, capture::SINGLE_CLICK,
 };
 use monhop_protocol::{
     Button, DeclineReason, Frame, Key, MAX_LOGICAL_ORIGIN_ABS, Message, Motion, RateLimiter,
@@ -49,6 +49,7 @@ pub const PUSH_THROUGH_RESET: Duration = Duration::from_millis(500);
 /// before constructing this type. Scroll is in signed wheel detents: positive horizontal is right
 /// and positive vertical is up. Windows adapters divide 120-unit detents, while macOS adapters
 /// divide 40-point detents after their horizontal inversion; both preserve fractional values.
+/// A `Button` carries the source OS's multi-click count, forwarded unchanged.
 #[derive(Clone, Copy, PartialEq)]
 pub enum NormalizedInput {
     Key {
@@ -60,6 +61,7 @@ pub enum NormalizedInput {
     Button {
         button: MouseButton,
         pressed: bool,
+        click_count: u8,
     },
     AbsoluteMotion(Point),
     RelativeMotion(Point),
@@ -92,7 +94,7 @@ impl NormalizedInput {
     fn is_valid(self) -> bool {
         match self {
             Self::Key { usage, .. } => usage.is_valid(),
-            Self::Button { .. } => true,
+            Self::Button { click_count, .. } => click_count != 0,
             Self::AbsoluteMotion(point) | Self::RelativeMotion(point) => valid_point(point),
             Self::Scroll {
                 horizontal,
@@ -415,6 +417,8 @@ struct KeyState {
 struct ButtonState {
     physical: bool,
     remote: bool,
+    /// Sent with the remote press and repeated on its release, so the peer sees one multi-click.
+    remote_clicks: u8,
 }
 
 fn heartbeat_gate(epoch: SessionEpoch, last: Option<u64>) -> SequenceGate {
@@ -1383,7 +1387,9 @@ impl SourceController {
                 Some(_) => {}
                 None => self.fail(SourceFailure::InvalidKeyState, effects),
             },
-            NormalizedInput::Button { button, pressed } => {
+            NormalizedInput::Button {
+                button, pressed, ..
+            } => {
                 self.update_button(button, pressed);
             }
             NormalizedInput::AbsoluteMotion(current) => {
@@ -1452,7 +1458,11 @@ impl SourceController {
                     );
                 }
             }
-            NormalizedInput::Button { button, pressed } => {
+            NormalizedInput::Button {
+                button,
+                pressed,
+                click_count,
+            } => {
                 let change = self.update_button(button, pressed);
                 if !forwarding {
                     return;
@@ -1460,10 +1470,12 @@ impl SourceController {
                 let index = button.index();
                 if pressed && !change.was_physical {
                     self.buttons[index].remote = true;
+                    self.buttons[index].remote_clicks = click_count;
                     self.push_input(
                         Message::Button(Button {
                             button,
                             is_down: true,
+                            click_count,
                         }),
                         effects,
                     );
@@ -1473,6 +1485,7 @@ impl SourceController {
                         Message::Button(Button {
                             button,
                             is_down: false,
+                            click_count: self.buttons[index].remote_clicks,
                         }),
                         effects,
                     );
@@ -2086,10 +2099,12 @@ impl SourceController {
         for index in 0..self.buttons.len() {
             if self.buttons[index].physical && !self.buttons[index].remote {
                 self.buttons[index].remote = true;
+                self.buttons[index].remote_clicks = SINGLE_CLICK;
                 self.push_input(
                     Message::Button(Button {
                         button: button_from_index(index),
                         is_down: true,
+                        click_count: SINGLE_CLICK,
                     }),
                     effects,
                 );
@@ -2166,6 +2181,7 @@ impl SourceController {
                 Message::Button(Button {
                     button: button_from_index(index),
                     is_down: false,
+                    click_count: self.buttons[index].remote_clicks,
                 }),
                 effects,
             );
@@ -2212,10 +2228,12 @@ impl SourceController {
                 continue;
             }
             self.buttons[index].remote = true;
+            self.buttons[index].remote_clicks = SINGLE_CLICK;
             self.push_input(
                 Message::Button(Button {
                     button: button_from_index(index),
                     is_down: true,
+                    click_count: SINGLE_CLICK,
                 }),
                 effects,
             );

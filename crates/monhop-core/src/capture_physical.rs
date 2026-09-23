@@ -323,7 +323,9 @@ impl PhysicalCapture {
                 }
                 suppress || (withholding && pressed)
             }
-            CaptureEvent::Button { button, pressed } => {
+            CaptureEvent::Button {
+                button, pressed, ..
+            } => {
                 let index = button.index();
                 let previous = self.buttons[index];
                 if let Some(suppress) =
@@ -670,6 +672,7 @@ mod tests {
             CaptureEvent::Button {
                 button: MouseButton::Left,
                 pressed: true,
+                click_count: 1,
             },
             false,
             Duration::ZERO,
@@ -691,6 +694,22 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn a_forwarded_button_keeps_its_click_count() {
+        let stop = CaptureStop::default();
+        let (mut tx, mut rx) = capture_channel(stop.clone());
+        let mut input = PhysicalCapture::new(Duration::ZERO);
+        for pressed in [true, false] {
+            let double = CaptureEvent::Button {
+                button: MouseButton::Right,
+                pressed,
+                click_count: 2,
+            };
+            input.process(double, false, Duration::ZERO, &mut tx, &stop);
+            assert!(rx.try_pop().unwrap() == Some(double));
+        }
     }
 
     #[test]
@@ -725,6 +744,7 @@ mod tests {
         CaptureEvent::Button {
             button: MouseButton::Left,
             pressed,
+            click_count: 1,
         }
     }
 

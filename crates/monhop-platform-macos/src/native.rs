@@ -13,7 +13,7 @@ use crate::capture_decode::{
     CG_EVENT_LEFT_MOUSE_DRAGGED, CG_EVENT_LEFT_MOUSE_UP, CG_EVENT_MOUSE_MOVED,
     CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_DRAGGED, CG_EVENT_OTHER_MOUSE_UP,
     CG_EVENT_RIGHT_MOUSE_DOWN, CG_EVENT_RIGHT_MOUSE_DRAGGED, CG_EVENT_RIGHT_MOUSE_UP,
-    CG_EVENT_SCROLL_WHEEL,
+    CG_EVENT_SCROLL_WHEEL, CG_MOUSE_EVENT_CLICK_STATE,
 };
 use crate::event_tap::{
     CFAllocatorRef, CFRelease, CFRunLoopGetCurrent, CFRunLoopRef, CFStringRef,
@@ -345,13 +345,24 @@ pub fn post_button(
     destination: PostingDestination,
     button: MouseButton,
     is_down: bool,
+    click_count: u8,
     marker: i64,
     flags: u64,
     point: Point,
 ) -> Result<(), MacError> {
     ensure_injection_permission()?;
+    let event = button_event(button, is_down, click_count, point_to_cg(point)?)?;
+    post_marked_event(destination, event, marker, flags)
+}
+
+/// Returns an owned event that the caller posts or releases.
+fn button_event(
+    button: MouseButton,
+    is_down: bool,
+    click_count: u8,
+    location: CGPoint,
+) -> Result<CGEventRef, MacError> {
     let (event_type, button_number) = mouse_button_event(button, is_down);
-    let location = point_to_cg(point)?;
     let creation_button = button_number.min(2);
     // SAFETY: location is a checked MonHop cursor point and the event type and
     // button pair are selected from the fixed MouseButton enum.
@@ -360,15 +371,16 @@ pub fn post_button(
     if event.is_null() {
         return Err(MacError::NativeEventCreationFailed);
     }
-    // SAFETY: event is a non-null Core Graphics event owned until post_marked_event releases it.
+    // SAFETY: event is a non-null Core Graphics event owned by the caller.
     unsafe {
         CGEventSetIntegerValueField(
             event,
             CG_MOUSE_EVENT_BUTTON_NUMBER,
             i64::from(button_number),
         );
+        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, i64::from(click_count));
     }
-    post_marked_event(destination, event, marker, flags)
+    Ok(event)
 }
 
 pub fn post_scroll(
@@ -666,11 +678,37 @@ mod tests {
 
     use super::{
         CFRelease, CG_EVENT_KEY_DOWN, CG_EVENT_MOUSE_MOVED, CG_EVENT_SCROLL_WHEEL,
-        CG_EVENT_SOURCE_USER_DATA, CGEventCreateKeyboardEvent, CGEventSetIntegerValueField,
-        DiagnosticState, PassiveDiagnosticCounts, diagnostic_callback, record_diagnostic_event,
+        CG_EVENT_SOURCE_USER_DATA, CG_MOUSE_EVENT_BUTTON_NUMBER, CG_MOUSE_EVENT_CLICK_STATE,
+        CGEventCreateKeyboardEvent, CGEventGetIntegerValueField, CGEventSetIntegerValueField,
+        CGPoint, DiagnosticState, MouseButton, PassiveDiagnosticCounts, button_event,
+        diagnostic_callback, record_diagnostic_event,
     };
 
     const SYNTHETIC_MARKER: i64 = 42;
+
+    #[test]
+    fn a_posted_press_and_release_carry_the_wire_click_count() {
+        for (button, number) in [(MouseButton::Left, 0), (MouseButton::Back, 3)] {
+            for click_count in [1, 2, 3, u8::MAX] {
+                for is_down in [true, false] {
+                    let event =
+                        button_event(button, is_down, click_count, CGPoint { x: 1.0, y: 2.0 })
+                            .expect("a fixed button event is created");
+                    // SAFETY: event is owned here, read, then released; it is never posted.
+                    let (state, read_number) = unsafe {
+                        let fields = (
+                            CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE),
+                            CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER),
+                        );
+                        CFRelease(event);
+                        fields
+                    };
+                    assert_eq!(state, i64::from(click_count));
+                    assert_eq!(read_number, number);
+                }
+            }
+        }
+    }
 
     #[test]
     #[ignore = "desktop Core Graphics callback check"]

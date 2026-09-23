@@ -328,7 +328,12 @@ impl MacInjector {
 
     /// Submits a button event at the last successful pointer anchor.
     /// It returns CursorPositionUnknown without an anchor and does not acknowledge delivery.
-    pub fn button(&mut self, button: MouseButton, is_down: bool) -> Result<(), MacError> {
+    pub fn button(
+        &mut self,
+        button: MouseButton,
+        is_down: bool,
+        click_count: u8,
+    ) -> Result<(), MacError> {
         if !should_post_held_state_event(is_down, self.held_buttons.contains(&button)) {
             return Ok(());
         }
@@ -339,6 +344,7 @@ impl MacInjector {
                 destination,
                 button,
                 is_down,
+                click_count,
                 SYNTHETIC_EVENT_MARKER,
                 flags,
                 point,
@@ -410,7 +416,7 @@ impl MacInjector {
             }
         }
         for button in buttons {
-            if let Err(error) = self.button(button, false) {
+            if let Err(error) = self.button(button, false, capture::SINGLE_CLICK) {
                 first_error.get_or_insert(error);
             }
         }
