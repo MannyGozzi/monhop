@@ -38,6 +38,11 @@
   --switch-track-off: light-dark(oklch(.2 .01 275 / 16%), oklch(1 0 0 / 15%));
   --thumb: oklch(1 0 0);
   --live-line: linear-gradient(90deg, transparent, color-mix(in oklab, var(--success) var(--mix-live-line), transparent), transparent);
+  /* Setup ladder: step markers, and the rail between them (coral once done, softening toward the next step). */
+  --step-fill: color-mix(in oklab, var(--primary) var(--mix-faint), transparent);
+  --step-glow: light-dark(color-mix(in oklab, var(--primary) var(--mix-edge), transparent), color-mix(in oklab, var(--primary) var(--mix-glow-strong), transparent));
+  --rail-done: linear-gradient(var(--primary), color-mix(in oklab, var(--primary) var(--mix-edge), transparent));
+  --rail-pending: linear-gradient(var(--hairline-strong), var(--hairline));
   --canvas-dots: radial-gradient(var(--hairline-strong) var(--hairline-width), transparent var(--hairline-width));
   --harness-wallpaper-dark: linear-gradient(135deg, #2b3a67 0%, #6d4c8a 35%, #c96a5c 70%, #e9b872 100%);
   --harness-wallpaper-light: linear-gradient(135deg, #9fc5e8 0%, #f2c9a6 45%, #b9dbc1 100%);
@@ -67,6 +72,9 @@
   /* SVG tiles cannot take box-shadow; the same lift as --shadow-raised, as a filter. */
   --filter-raised: drop-shadow(0 1px 2px light-dark(oklch(.2 .01 275 / 10%), oklch(0 0 0 / 40%))) drop-shadow(0 6px 8px light-dark(oklch(.2 .01 275 / 14%), oklch(0 0 0 / 45%)));
   --filter-seam-glow: drop-shadow(0 0 3px color-mix(in oklab, var(--primary) var(--mix-glow-strong), transparent));
+  --shadow-step-idle: inset 0 0 0 var(--hairline-width) var(--hairline-strong);
+  --shadow-step-ring: inset 0 0 0 var(--step-ring) var(--primary);
+  --shadow-step-glow: 0 0 0 var(--step-halo) color-mix(in oklab, var(--primary) var(--mix-tint), transparent), 0 0 var(--step-glow-blur) var(--step-glow);
 
   /* Radii, concentric: a radius plus the padding around it is the next one out. */
   --radius-swatch: 2px;
@@ -118,6 +126,13 @@
   --radio-size: 16px;
   --radio-ring: 5px;
   --section-index-size: 24px;
+  --step-ring: 1.5px;
+  --step-halo: 3px;
+  --step-glow-blur: 12px;
+  --rail-width: var(--hairline-width);
+  --rail-gap: var(--gap-1);
+  /* How far a gliding panel's clip reaches past its top and sides, so card shadows stay whole. */
+  --glide-bleed: var(--gap-10);
   --switch-width: 38px;
   --switch-height: 22px;
   --switch-thumb: 18px;
@@ -187,6 +202,7 @@
   --scale-live-ring: 2.6;
   --scale-use-ring: 1.6;
   --opacity-live-ring: .5;
+  --scale-breathe: 1.12;
 
   /* Motion: the only durations and easings in this file. JS reads them through dom.mjs motionMs(). */
   --motion-instant: 90ms;
@@ -201,8 +217,11 @@
   --loop-spin: 800ms;
   --loop-pulse: 1500ms;
   --loop-live: 2400ms;
+  --loop-breathe: 3200ms;
   --ease-out: cubic-bezier(.22, 1, .36, 1);
   --ease-in-out: cubic-bezier(.65, 0, .35, 1);
+  /* Height glides: --ease-out would cover a fifth of a tall panel in the first frame. No overshoot. */
+  --ease-glide: cubic-bezier(.33, 1, .68, 1);
   /* Damping .72, 3.8% overshoot. */
   --ease-spring: linear(0, 0.106 5%, 0.325 10%, 0.556 15%, 0.748 20%, 0.886 25%, 0.972 30%, 1.018 35%, 1.036 40%, 1.038 44%, 1.031 50%, 1.018 57%, 1.007 65%, 1.001 72%, 0.999 80%, 1);
   --transition-control: background-color var(--motion-fast) var(--ease-out), color var(--motion-fast) var(--ease-out), border-color var(--motion-fast) var(--ease-out), box-shadow var(--motion-base) var(--ease-out), opacity var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring);
@@ -249,7 +268,10 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 /* Segmented controls: the page nav and the shared-monitor chooser share one look. */
 .primary-nav, .segmented { display: flex; align-items: center; gap: var(--gap-half); padding: var(--gap-half); border-radius: var(--radius-group); background: var(--surface-inset); }
 .primary-nav button, .segmented-option { position: relative; isolation: isolate; height: var(--nav-item-height); border: 0; border-radius: var(--radius); padding: 0 var(--gap-3); background: transparent; color: var(--muted-foreground); font-size: var(--text-sm); font-weight: var(--weight-medium); white-space: nowrap; transition: var(--transition-control); }
-.primary-nav button > span:first-child { position: relative; z-index: 1; }
+.primary-nav button > span:first-child { position: relative; z-index: 1; display: inline-block; }
+/* Page switches capture each label on its own, so the sliding pill never draws over one. */
+.primary-nav [data-page="home"] > span:first-child { view-transition-name: nav-label-home; }
+.primary-nav [data-page="setup"] > span:first-child { view-transition-name: nav-label-setup; }
 .nav-active-indicator { position: absolute; z-index: 0; inset: 0; border-radius: inherit; background: var(--surface-raised); box-shadow: var(--shadow-raised); opacity: 0; }
 .primary-nav button:hover, .segmented-option:hover:not(:disabled), .primary-nav button[aria-current="page"] { color: var(--foreground); }
 .primary-nav button[aria-current="page"] .nav-active-indicator { opacity: 1; }
@@ -281,16 +303,20 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 
 /* Setup ladder. Three sections open in order; the rail between their markers is the progress. */
 .setup-page { display: block; }
-.setup-section { position: relative; display: flow-root; padding: 0 0 var(--gap-8) var(--gap-10); }
-.setup-section[data-collapsed="true"] { padding-bottom: var(--gap-4); }
+/* Spacing is the folded step's; what an open step adds lives in its body, so it glides with the fold. */
+.setup-section { position: relative; display: flow-root; padding: 0 0 var(--gap-6) var(--gap-10); }
 .setup-section:last-child { padding-bottom: 0; }
-.setup-section:not(:last-child)::before { content: ""; position: absolute; top: calc(var(--section-index-size) + var(--gap-1)); bottom: var(--gap-1); left: calc((var(--section-index-size) - var(--stroke-bold)) / 2); width: var(--stroke-bold); border-radius: var(--radius-pill); background: var(--hairline-strong); transition: background-color var(--motion-slow) var(--ease-out); }
-.setup-section[data-done="true"]:not(:last-child)::before { background: var(--primary); }
-.section-index { position: absolute; top: 0; left: 0; display: grid; width: var(--section-index-size); height: var(--section-index-size); place-items: center; border-radius: var(--radius-circle); background: var(--surface-inset); color: var(--subtle-foreground); font-size: var(--text-xs); font-weight: var(--weight-semibold); font-variant-numeric: tabular-nums; line-height: var(--leading-none); transition: var(--transition-control); }
-.setup-section[data-locked="false"] .section-index { background: var(--card); color: var(--foreground); box-shadow: inset 0 0 0 var(--stroke-bold) var(--primary); }
-.setup-section[data-done="true"] .section-index { background: var(--primary-fill); color: var(--primary-foreground); box-shadow: none; }
+.setup-section:not(:last-child)::before, .setup-section:not(:last-child)::after { content: ""; position: absolute; top: calc(var(--section-index-size) + var(--rail-gap)); bottom: var(--rail-gap); left: calc((var(--section-index-size) - var(--rail-width)) / 2); width: var(--rail-width); border-radius: var(--radius-pill); background: var(--rail-pending); pointer-events: none; }
+/* The coral fill draws down over the hairline track when its step is done. */
+.setup-section:not(:last-child)::after { background: var(--rail-done); filter: var(--filter-seam-glow); transform: scaleY(0); transform-origin: top; }
+.setup-section[data-done="true"]:not(:last-child)::after { transform: none; }
+.section-index { position: absolute; top: 0; left: 0; display: grid; width: var(--section-index-size); height: var(--section-index-size); place-items: center; border-radius: var(--radius-circle); background: transparent; box-shadow: var(--shadow-step-idle); color: var(--subtle-foreground); font-size: var(--text-xs); font-weight: var(--weight-semibold); font-variant-numeric: tabular-nums; line-height: var(--leading-none); transition: var(--transition-control); }
+/* Outer shadows never paint inside their own box, so the glow sits around the ring, not over the mark. */
+.section-index::after { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: var(--shadow-step-glow); opacity: 0; pointer-events: none; transition: opacity var(--motion-slow) var(--ease-out); }
+.setup-section[data-locked="false"] .section-index { background: var(--step-fill); box-shadow: var(--shadow-step-ring); color: var(--primary); }
+.setup-section[data-locked="false"] .section-index::after { opacity: 1; }
 .section-index svg { width: var(--icon-size-sm); height: var(--icon-size-sm); stroke-width: var(--icon-stroke-bold); animation: pop-in var(--motion-spring) var(--ease-spring) both; }
-.section-header { position: relative; isolation: isolate; display: grid; grid-template-columns: minmax(0, 1fr); grid-auto-flow: column; grid-auto-columns: auto; align-items: start; gap: var(--gap-2); margin: calc(var(--gap-1) * -1) calc(var(--gap-2) * -1) var(--gap-3); border-radius: var(--radius-group); padding: var(--gap-1) var(--gap-1) var(--gap-1) var(--gap-2); transition: var(--transition-control); }
+.section-header { position: relative; isolation: isolate; display: grid; grid-template-columns: minmax(0, 1fr); grid-auto-flow: column; grid-auto-columns: auto; align-items: start; gap: var(--gap-2); margin: calc(var(--gap-1) * -1) calc(var(--gap-2) * -1); border-radius: var(--radius-group); padding: var(--gap-1) var(--gap-1) var(--gap-1) var(--gap-2); transition: var(--transition-control); }
 .section-heading { position: relative; z-index: 1; display: grid; min-width: 0; pointer-events: none; }
 .section-heading h2 { font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); line-height: var(--section-index-size); }
 .section-status { min-width: 0; overflow: hidden; color: var(--muted-foreground); font-size: var(--text-sm); text-overflow: ellipsis; white-space: nowrap; }
@@ -302,14 +328,15 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .section-toggle:disabled { cursor: default; pointer-events: none; }
 .section-chevron { position: relative; z-index: 1; display: grid; width: var(--icon-button-size); height: var(--icon-button-size); place-items: center; color: var(--subtle-foreground); pointer-events: none; }
 .section-chevron svg { width: var(--icon-size-sm); height: var(--icon-size-sm); stroke-width: var(--icon-stroke-bold); transform: rotate(var(--rotate-open)); transition: transform var(--motion-spring) var(--ease-spring); }
-.setup-section[data-collapsed="true"] .section-header { margin-bottom: calc(var(--gap-1) * -1); }
-.setup-section[data-collapsed="true"] .section-heading { display: flex; align-items: baseline; gap: var(--gap-2); overflow: hidden; }
+.setup-section[data-collapsed="true"] .section-heading { display: flex; align-items: baseline; gap: var(--gap-2); }
 .setup-section[data-collapsed="true"] .section-heading h2 { flex: none; }
 .setup-section[data-collapsed="true"] .section-chevron svg { transform: none; }
-.section-body { display: grid; gap: var(--gap-4); min-width: 0; transition: opacity var(--motion-base) var(--ease-out); }
-.section-body > :empty { display: none; }
-.section-body[data-opening="true"] { animation: section-open var(--motion-base) var(--ease-out) both; }
-.section-body[data-closing="true"] { animation: section-close var(--motion-fast) var(--ease-out) both; pointer-events: none; }
+/* app.js glides the body's height (accordion.mjs); its inner carries the open step's extra spacing. */
+.section-body { min-width: 0; transition: opacity var(--motion-base) var(--ease-out); }
+.section-body[data-gliding="true"] { clip-path: inset(calc(var(--glide-bleed) * -1) calc(var(--glide-bleed) * -1) 0); }
+.section-body-inner { display: grid; gap: var(--gap-4); min-width: 0; padding: var(--gap-4) 0 var(--gap-2); }
+.setup-section:last-child .section-body-inner { padding-bottom: 0; }
+.section-body-inner > :empty { display: none; }
 .setup-section[data-locked="true"] .section-body { opacity: var(--opacity-disabled); pointer-events: none; }
 
 /* Card surfaces */
@@ -588,6 +615,9 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
   .use-toggle[data-enter="true"][data-state="sharing"] .use-ring { animation: use-ring var(--motion-spring) var(--ease-out) var(--motion-delay, 0ms) both; }
   .computer-layouts .rows[data-enter="true"] > .row { animation: fade-up var(--motion-base) var(--ease-out) calc(var(--motion-delay, 0ms) + var(--row-index, 0) * var(--motion-stagger)) both; }
   .notice-dot { animation: notice-dot var(--loop-pulse) var(--ease-in-out) infinite; }
+  .setup-section:not(:last-child)::after { transition: transform var(--motion-slow) var(--ease-out); }
+  /* The step to do next breathes; the marker persists across renders, so the loop never restarts. */
+  .setup-section[data-locked="false"][data-done="false"] .section-index::after { animation: step-breathe var(--loop-breathe) var(--ease-in-out) infinite alternate; }
 }
 
 /* Arrangement canvas: the Home preview and the layout editor share one surface. */
@@ -701,15 +731,14 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 :root[data-theme-switch="true"]::view-transition-old(root), :root[data-theme-switch="true"]::view-transition-new(root) { animation-duration: var(--motion-base); animation-timing-function: var(--ease-in-out); }
 ::view-transition-old(content) { animation: page-out var(--motion-fast) var(--ease-out) both; }
 ::view-transition-new(content) { animation: page-in var(--motion-slow) var(--ease-out) both; }
-::view-transition-group(nav-active-tab), ::view-transition-group(active-computer-identity), ::view-transition-group(active-arrangement) { animation-duration: var(--motion-slow); animation-timing-function: var(--ease-spring); }
-::view-transition-old(nav-active-tab), ::view-transition-old(active-computer-identity), ::view-transition-old(active-arrangement), ::view-transition-new(nav-active-tab), ::view-transition-new(active-computer-identity), ::view-transition-new(active-arrangement) { animation-duration: var(--motion-base); animation-timing-function: var(--ease-out); }
+::view-transition-group(nav-active-tab), ::view-transition-group(nav-label-home), ::view-transition-group(nav-label-setup), ::view-transition-group(active-computer-identity), ::view-transition-group(active-arrangement) { animation-duration: var(--motion-slow); animation-timing-function: var(--ease-spring); }
+::view-transition-old(nav-active-tab), ::view-transition-old(nav-label-home), ::view-transition-old(nav-label-setup), ::view-transition-old(active-computer-identity), ::view-transition-old(active-arrangement), ::view-transition-new(nav-active-tab), ::view-transition-new(nav-label-home), ::view-transition-new(nav-label-setup), ::view-transition-new(active-computer-identity), ::view-transition-new(active-arrangement) { animation-duration: var(--motion-base); animation-timing-function: var(--ease-out); }
+/* Groups stack in capture order, which can put the pill over the label it slides onto; labels stay on top. */
+::view-transition-group(nav-label-home), ::view-transition-group(nav-label-setup) { z-index: 1; }
 @supports not (view-transition-name: none) { :root[data-page-enter="true"] .app-page:not([hidden]) { animation: page-in var(--motion-slow) var(--ease-out) both; } }
 
 @keyframes page-in { from { opacity: 0; transform: translateY(var(--motion-rise-page)); } }
 @keyframes page-out { to { opacity: 0; } }
-/* app.js listens for these two names to finish a setup section's open and close. */
-@keyframes section-open { from { opacity: 0; transform: translateY(calc(var(--motion-rise) * -1)); } }
-@keyframes section-close { to { opacity: 0; transform: translateY(calc(var(--motion-rise) * -1)); } }
 @keyframes fade-up { from { opacity: 0; transform: translateY(var(--motion-rise)); } }
 /* In/out pairs end on the element's own resting style, so one keyframe serves every state. */
 @keyframes fade-in { from { opacity: 0; } }
@@ -721,6 +750,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 @keyframes theme-pop { from { opacity: 0; transform: rotate(calc(var(--rotate-open) * -1)) scale(var(--scale-pop)); } }
 @keyframes live-ring { from { opacity: var(--opacity-live-ring); transform: scale(1); } to { opacity: 0; transform: scale(var(--scale-live-ring)); } }
 @keyframes notice-dot { 0%, 100% { opacity: var(--opacity-dim); } 50% { opacity: 1; } }
+@keyframes step-breathe { to { opacity: var(--opacity-dim); transform: scale(var(--scale-breathe)); } }
 @keyframes spin { to { transform: rotate(1turn); } }
 @keyframes switch-thumb-on { from { width: var(--switch-thumb-press); transform: none; } }
 @keyframes switch-thumb-off { from { width: var(--switch-thumb-press); transform: translateX(var(--switch-travel-press)); } }
@@ -739,4 +769,4 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 }
 @media (max-width: 760px) { .window-product { display: none; } .content-region { padding-inline: var(--gap-4); } .window-header-end .status-pill { max-width: var(--status-pill-max-narrow); } }
 @media (max-width: 600px) { .window-header-end .status-pill { display: none; } .facts, .fingerprint-pair { grid-template-columns: 1fr; } .row { grid-template-columns: 1fr; } .row-actions { justify-content: flex-start; } .state-card { grid-template-columns: auto minmax(0, 1fr); } .state-actions { grid-column: 1 / -1; justify-content: flex-end; } .computer-card { grid-template-columns: minmax(0, 1fr); } .computer-actions { justify-self: start; } }
-@media (max-height: 590px) { .content-region { padding-top: var(--gap-4); } .setup-section { padding-bottom: var(--gap-4); } .arrangement-stage { height: var(--stage-height-short); } }
+@media (max-height: 590px) { .content-region { padding-top: var(--gap-4); } .setup-section { padding-bottom: var(--gap-4); } .section-body-inner { padding-bottom: 0; } .arrangement-stage { height: var(--stage-height-short); } }

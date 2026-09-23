@@ -61,7 +61,13 @@ import {
   emptyCopyFeedback,
   isCopyReplyCurrent,
 } from "./copy-feedback-model.mjs";
-import { accordionManager } from "./accordion.mjs";
+import {
+  accordionManager,
+  glideMove,
+  glideResize,
+  retargetPanel,
+  setPanelOpen,
+} from "./accordion.mjs";
 import {
   canOpenPairingOnEntry,
   recordPairingOpenContext,
@@ -230,21 +236,11 @@ nodes.windowControls.hidden = platform !== "windows";
 accordionManager.mount();
 
 for (const section of nodes.sections) {
-  const toggle = section.querySelector(".section-toggle");
-  const body = section.querySelector(".section-body");
-  toggle.addEventListener("click", () => {
+  section.querySelector(".section-toggle").addEventListener("click", () => {
     if (section.dataset.locked === "true" || section.dataset.done !== "true") return;
     setupExpansionChosen = true;
     setupExpandedSection = section.dataset.collapsed === "true" ? section.dataset.section : null;
     render();
-  });
-  body.addEventListener("animationend", (event) => {
-    if (event.target !== body) return;
-    if (event.animationName === "section-close" && body.dataset.closing === "true") {
-      body.hidden = true;
-      delete body.dataset.closing;
-    }
-    if (event.animationName === "section-open") delete body.dataset.opening;
   });
 }
 
@@ -597,6 +593,7 @@ function render() {
   renderSettings(nodes, ctx);
   applySharedTransitionNames();
   restoreInteraction(interaction);
+  for (const section of nodes.sections) retargetPanel(section.querySelector(".section-body"));
   pinPendingSection();
   if (previousArrangementView && previousArrangementView !== arrangementView)
     previousArrangementView.destroy();
@@ -691,20 +688,27 @@ function renderSections(ctx) {
   for (const section of nodes.sections) {
     const key = section.dataset.section;
     const gate = ctx.gates[key];
+    const collapsed = !gate.locked && gate.done && key !== expanded;
+    const still = section.dataset.presented !== "true" || nodes.setupView.hidden;
+    const header = section.querySelector(".section-header");
+    const status = section.querySelector(".section-status");
+    // Folding moves the status line beside the title; header and line glide from where they were drawn.
+    const drawn =
+      !still && section.dataset.collapsed !== String(collapsed)
+        ? { header: header.getBoundingClientRect().height, status: status.getBoundingClientRect() }
+        : null;
     section.dataset.locked = String(gate.locked);
     section.dataset.done = String(gate.done);
-    const body = section.querySelector(".section-body");
-    const collapsed = !gate.locked && gate.done && key !== expanded;
-    const wasCollapsed = section.dataset.collapsed === "true";
-    const wasPresented = section.dataset.presented === "true";
     section.dataset.collapsed = String(collapsed);
     section.dataset.presented = "true";
-    updateSectionBody(section, body, {
-      collapsed,
-      locked: gate.locked,
-      wasCollapsed,
-      wasPresented,
-    });
+    status.textContent = lines[key];
+    if (drawn) {
+      glideResize(header, drawn.header);
+      glideMove(status, drawn.status);
+    }
+    const body = section.querySelector(".section-body");
+    body.inert = collapsed || gate.locked;
+    setPanelOpen(body, !collapsed, { instant: still });
     const toggle = section.querySelector(".section-toggle");
     const chevron = section.querySelector(".section-chevron");
     toggle.hidden = gate.locked || !gate.done;
@@ -720,7 +724,6 @@ function renderSections(ctx) {
       if (mark === "check") marker.append(icon("check", 11));
       else marker.textContent = mark;
     }
-    section.querySelector(".section-status").textContent = lines[key];
   }
 }
 
@@ -751,24 +754,6 @@ function defaultSetupSection(gates) {
   for (const key of ["ready", "computers", "displays"])
     if (!gates[key].locked && !gates[key].done) return key;
   return "displays";
-}
-
-// Body visibility changes after its opacity/transform exit, never through an animated layout size.
-function updateSectionBody(section, body, { collapsed, locked, wasCollapsed, wasPresented }) {
-  if (collapsed) {
-    body.inert = true;
-    delete body.dataset.opening;
-    if (body.hidden || body.dataset.closing === "true") return;
-    if (!wasPresented || reducedMotion.matches) body.hidden = true;
-    else body.dataset.closing = "true";
-    return;
-  }
-  delete body.dataset.closing;
-  body.hidden = false;
-  body.inert = locked;
-  if ((wasCollapsed || !wasPresented) && !locked && !reducedMotion.matches)
-    body.dataset.opening = "true";
-  else delete body.dataset.opening;
 }
 
 function renderPageAlert(ctx) {

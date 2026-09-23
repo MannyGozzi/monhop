@@ -251,8 +251,8 @@ export function motionMs(name) {
   return Number.parseFloat(motionToken(name)) || 0;
 }
 
-export function motionEase() {
-  return motionToken("--ease-out") || "ease-out";
+export function motionEase(name = "--ease-out") {
+  return motionToken(name) || "ease-out";
 }
 
 // Motion helpers. Each keyed slot remembers what it showed and when that last changed, so a
