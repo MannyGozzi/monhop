@@ -175,7 +175,10 @@ const ACCORDION_CHECK: &str = r#"(() => {
       animation.play();
       return animated;
     };
-    await Promise.all(document.querySelector('#setup-view').getAnimations({ subtree: true }).map(a => a.finished.catch(() => {})));
+    // Ambient loops (the current step's glow) never finish, so only finite entrances are awaited.
+    await Promise.all(document.querySelector('#setup-view').getAnimations({ subtree: true })
+      .filter(a => a.effect?.getComputedTiming().iterations !== Infinity)
+      .map(a => a.finished.catch(() => {})));
     const flags = [trigger?.tagName === 'BUTTON' && panel?.getAttribute('role') === 'region'
       && trigger.getAttribute('aria-controls') === panel.id
       && panel.getAttribute('aria-labelledby') === trigger.id];
