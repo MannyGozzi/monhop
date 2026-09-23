@@ -1,5 +1,6 @@
 import { displayName } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
+import { presence } from "./accordion.mjs";
 import { computerCard } from "./computer-card.mjs";
 import { createDashboardArrangement, DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
 import { displayNoticeCopy } from "./sharing-model.mjs";
@@ -18,7 +19,6 @@ import {
   copyFeedbackControls,
   el,
   note,
-  presence,
   rows,
   sliderRow,
   swap,

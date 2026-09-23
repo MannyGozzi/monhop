@@ -288,7 +288,7 @@ html[data-platform="macos"] .window-header { padding-left: var(--titlebar-inset-
 #header-actions { position: relative; }
 /* Out of the row at once, so the status pill glides over; drawn in its old spot while it pops out. */
 .header-slot[data-leaving="true"] { position: absolute; right: calc(100% + var(--gap-half)); }
-.app-mark { display: inline-block; flex: none; width: var(--avatar-glyph); height: var(--avatar-glyph); background: currentColor; -webkit-mask: url("./assets/monhop-mark.svg") center / contain no-repeat; mask: url("./assets/monhop-mark.svg") center / contain no-repeat; color: var(--primary); }
+.app-mark { display: inline-block; flex: none; width: var(--avatar-glyph); height: var(--avatar-glyph); background: currentColor; -webkit-mask: url("./assets/monhop-mark.svg") center / contain no-repeat; mask: url("./assets/monhop-mark.svg") center / contain no-repeat; }
 .window-product { flex: none; margin-right: var(--gap-2); font-size: var(--text-base); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); }
 .window-header-end .status-pill { max-width: var(--status-pill-max); }
 .window-controls { display: none; align-self: stretch; margin-right: calc(var(--gap-2) * -1); }
@@ -327,7 +327,9 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 /* Page */
 .content-region { min-width: 0; min-height: 0; overflow: auto; overflow-x: hidden; overscroll-behavior: contain; padding: var(--gap-6) var(--gap-6) var(--gap-10); view-transition-name: content; }
 .app-page { width: min(100%, var(--content-width)); margin: 0 auto; }
-.stack { display: grid; gap: var(--gap-4); min-width: 0; }
+/* Containers of blocks that come and go (accordion.mjs presence) are flex columns: a block's negative
+   margin cancels the gap it adds while it glides, where a grid row would stop at 0. */
+.stack { display: flex; flex-direction: column; gap: var(--gap-4); min-width: 0; }
 .stack > :empty { display: none; }
 /* Its panel glides it in and out; the slot carries the gap below it. */
 .page-alert-slot { padding-bottom: var(--gap-4); }
@@ -368,7 +370,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .setup-section[data-collapsed="true"] .section-chevron svg { transform: none; }
 /* app.js glides the body's height (accordion.mjs); its inner carries the open step's extra spacing. */
 .section-body { min-width: 0; transition: opacity var(--motion-base) var(--ease-out); }
-/* Reveal panels (accordion.mjs revealPanel) clip only while they glide, like the section body. */
+/* Reveal and presence panels (accordion.mjs) clip only while they glide, like the section body. */
 .glide-panel { min-width: 0; }
 :is(.section-body, .glide-panel)[data-gliding="true"] { clip-path: inset(calc(var(--glide-bleed) * -1) calc(var(--glide-bleed) * -1) 0); }
 .section-body-inner { display: grid; gap: var(--gap-4); min-width: 0; padding: var(--gap-4) 0 var(--gap-2); }
@@ -378,7 +380,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 
 /* Card surfaces */
 .card, .overview, .stack > .accordion { position: relative; min-width: 0; border-radius: var(--radius-card); background: var(--card); box-shadow: var(--shadow-card); }
-.card, .overview { display: grid; gap: var(--card-gap); padding: var(--card-padding); }
+.card, .overview { display: flex; flex-direction: column; gap: var(--card-gap); padding: var(--card-padding); }
 .card[data-tone="muted"] { background: var(--surface-inset); box-shadow: none; }
 .card:is([data-tone="danger"], [data-tone="error"], [data-tone="warning"]), .overview[data-tone="fail"] { --tone: var(--destructive); box-shadow: 0 0 0 var(--hairline-width) color-mix(in oklab, var(--tone) var(--mix-edge), var(--hairline)), var(--shadow-card-lift); }
 .card[data-tone="warning"] { --tone: var(--warning); }
@@ -531,7 +533,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .accordion-chevron { width: var(--icon-size-sm); height: var(--icon-size-sm); flex: none; color: var(--subtle-foreground); stroke-width: var(--icon-stroke-bold); }
 .accordion[data-open="true"] > .accordion-trigger > .accordion-chevron { transform: rotate(var(--rotate-open)); }
 .accordion-panel { overflow: hidden; }
-.accordion-panel-inner { display: grid; gap: var(--gap-3); min-width: 0; padding: var(--gap-1) var(--gap-4) var(--gap-4); }
+.accordion-panel-inner { display: flex; flex-direction: column; gap: var(--gap-3); min-width: 0; padding: var(--gap-1) var(--gap-4) var(--gap-4); }
 /* Inside a card a disclosure is a full-bleed row between hairlines, flush with the card's edges. */
 :is(.card, .overview) > .accordion { margin-inline: calc(var(--card-padding) * -1); border-top: var(--hairline-width) solid var(--hairline); }
 :is(.card, .overview) > .accordion + .accordion { margin-top: calc(var(--card-gap) * -1); }
@@ -545,7 +547,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .stack > .accordion[data-open="true"] > .accordion-trigger { border-radius: var(--radius-card) var(--radius-card) 0 0; }
 
 /* Connection state */
-.state-card { grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--gap-3); }
+.state-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--gap-3); }
 .state-glyph { display: grid; width: var(--avatar-size); height: var(--avatar-size); place-items: center; border-radius: var(--radius-circle); background: var(--control-fill); color: var(--muted-foreground); }
 .state-glyph svg { width: var(--avatar-glyph); height: var(--avatar-glyph); stroke-width: var(--icon-stroke); }
 .state-copy { display: grid; gap: var(--gap-1); min-width: 0; }
@@ -588,8 +590,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .swap[data-block="true"] { display: grid; }
 .swap > * { grid-area: 1 / 1; min-width: 0; }
 .swap > [data-exit="true"] { pointer-events: none; }
-.presence { display: grid; min-width: 0; }
-.presence[data-leave="true"] > * { pointer-events: none; }
 
 /* Link capsule (Home): the two computers as nodes that merge into the live dot, on glass that tints
    and gains a comet lapping its edge while sharing. computer-card.mjs tweens between these looks. */

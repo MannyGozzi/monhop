@@ -1,5 +1,6 @@
 import {
   changedAgo,
+  ghostOf,
   handOffFocus,
   motionEase,
   motionEnabled,
@@ -10,9 +11,12 @@ import {
 import {
   contentMove,
   copyPlacement,
+  gapMargin,
+  gapShare,
   moved,
   panelNeedsChange,
   rebuiltDisclosure,
+  rebuiltPresence,
   settledBox,
 } from "./glide-model.mjs";
 import { icon } from "./icons.mjs";
@@ -23,6 +27,13 @@ const glides = new Map();
 // Each disclosure key's last asked-for state and current panel. Renders rebuild disclosures, and the
 // fresh node starts from here, so it carries on a running glide instead of landing it.
 const disclosures = new Map();
+// Each presence key's last panel, the node it drew live and the node that left, which a leaving
+// panel keeps drawing as a ghost.
+const presences = new Map();
+// Presence panels a render built that are opened or closed once they are in the page.
+let unplaced = [];
+// Panels drawing what left, which go once they have closed.
+const ghostPanels = new WeakSet();
 // Each watched panel content's last observed box. Content that changes size under a panel moves the
 // panel with it, whatever changed it, so no call site has to remember to.
 const contentBoxes = new WeakMap();
@@ -50,24 +61,32 @@ export function setPanelOpen(panel, open, { instant = false } = {}) {
   const running = glides.get(panel);
   const glidingTo = running ? running.target : null;
   if (!panelNeedsChange({ glidingTo, hidden: panel.hidden, open: target, instant })) return;
-  const settle = () => {
-    panel.hidden = !target;
-  };
+  const settle = () => land(panel, target);
   if (instant || !canGlide(panel)) {
     endGlide(panel, settle);
     return;
   }
+  const gap = gapOf(panel);
   const from = running || !target ? panel.getBoundingClientRect().height : 0;
+  const margin = [running ? bottomMargin(panel) : gapMargin(gap, !target), gapMargin(gap, target)];
   const opacity = running ? contentOpacity(panel) : null;
   stopGlide(panel);
   panel.hidden = false;
   const to = target ? contentHeight(panel) : 0;
-  if (!moved(to, from)) {
+  if (!moved(to, from) && !moved(...margin)) {
     settle();
     return;
   }
   const fade = fadeContent(panel.firstElementChild, target, opacity);
-  glideHeight(panel, from, to, { target, fade, settle });
+  glideHeight(panel, from, to, { target, fade, settle, gap, margin });
+}
+
+// Where a panel's glide lands: shown or hidden, and a closed ghost gone from the page.
+function land(panel, open) {
+  panel.hidden = !open;
+  if (open || !ghostPanels.has(panel)) return;
+  panel.remove();
+  unwatch(panel.firstElementChild);
 }
 
 // A block that comes and goes in place: a disclosure without its trigger.
@@ -86,6 +105,55 @@ export function setRevealOpen(panel, open, { focusTarget = null } = {}) {
   if (!open) handOffFocus(panel, focusTarget);
   panel.inert = !open;
   setPanelOpen(panel, open);
+}
+
+// A keyed block that comes and goes across renders: its height glides between 0 and its content's
+// while the content fades, and the gap it takes in a flex column glides with it. A render mid-glide
+// carries the glide on; asking for the other state reverses it from where it is.
+export function presence(key, node) {
+  const present = Boolean(node);
+  const last = presences.get(key) ?? null;
+  const drawn = last?.panel ?? null;
+  const motion = motionEnabled();
+  const start = rebuiltPresence({
+    present,
+    motion,
+    last: last && {
+      drawn: drawn !== null,
+      hidden: drawn?.hidden === true,
+      gliding: glides.has(drawn),
+    },
+  });
+  const left = present ? null : (last?.node ?? last?.left ?? null);
+  if (!start || (start.ghost && !left)) {
+    presences.set(key, { panel: null, node: null, left: null });
+    return null;
+  }
+  const panel = document.createElement("div");
+  panel.className = "glide-panel";
+  panel.hidden = start.hidden;
+  panel.append(start.ghost ? ghostOf(left) : node);
+  if (start.ghost) ghostPanels.add(panel);
+  if (start.glide) transplant(drawn, panel);
+  if (drawn) handOverContent(drawn, panel);
+  presences.set(key, { panel, node, left });
+  if (motion) placeLater(panel, present);
+  return panel;
+}
+
+// Opens or closes each presence panel once it is in the page and can be measured, before it paints.
+function placeLater(panel, open) {
+  if (!unplaced.length) queueMicrotask(placePanels);
+  unplaced.push({ panel, open });
+}
+
+// One on a page that is not shown cannot be measured, so it lands at once.
+function placePanels() {
+  const batch = unplaced;
+  unplaced = [];
+  for (const { panel, open } of batch)
+    if (panel.isConnected)
+      setPanelOpen(panel, open, { instant: !panel.parentElement.getClientRects().length });
 }
 
 // Runs after layout and before paint, so a panel drawn at its old height glides from there. An
@@ -160,9 +228,9 @@ function rejoinBench() {
 }
 
 // A glide that ended inside watched contents may not resize them again, which leaves their stored
-// boxes marked mid glide; read them afresh so their next real change glides.
-function settleAround(node) {
-  for (let at = node.parentElement; at; at = at.parentElement) {
+// boxes marked mid glide; read them afresh, from `start` out, so their next real change glides.
+function settleFrom(start) {
+  for (let at = start; at; at = at.parentElement) {
     const box = contentBoxes.get(at);
     if (!box || at.querySelector("[data-gliding]")) continue;
     const { width, height } = at.getBoundingClientRect();
@@ -172,9 +240,10 @@ function settleAround(node) {
 
 function retargetPanel(panel, entry, to) {
   const from = panel.getBoundingClientRect().height;
+  const margin = [bottomMargin(panel), gapMargin(entry.gap, entry.target)];
   glides.delete(panel);
   entry.animation.cancel();
-  glideHeight(panel, from, to, entry);
+  glideHeight(panel, from, to, { ...entry, margin });
 }
 
 function watchContent(panel) {
@@ -191,8 +260,12 @@ function handOverContent(from, to) {
   const content = to.firstElementChild;
   if (!old || !content) return;
   if (contentBoxes.has(old)) contentBoxes.set(content, contentBoxes.get(old));
-  if (!watched.delete(old)) return;
-  contentObserver.unobserve(old);
+  unwatch(old);
+}
+
+// The observer holds what it watches, so content that left the page is let go.
+function unwatch(content) {
+  if (content && watched.delete(content)) contentObserver.unobserve(content);
 }
 
 // A box whose own layout just changed eases from the height it was drawn at (`from`) to its new one.
@@ -218,15 +291,24 @@ export function glideMove(node, from) {
   track(node, { animation });
 }
 
-// Height is the one layout property animated, so what sits below glides instead of jumping. No
-// overshoot: a height that overshoots makes everything below it jitter.
-function glideHeight(node, from, to, { target = null, fade = null, settle = null } = {}) {
+// Height is the one layout property animated, so what sits below glides instead of jumping; the bottom
+// margin rides along only to cancel a column gap (`margin`, from and to). No overshoot: a height that
+// overshoots makes everything below it jitter.
+function glideHeight(
+  node,
+  from,
+  to,
+  { target = null, fade = null, settle = null, gap = 0, margin = null } = {},
+) {
   node.dataset.gliding = "true";
-  const animation = node.animate(
-    { height: [`${Math.max(0, from)}px`, `${to}px`] },
-    { duration: motionMs("--motion-slow"), easing: motionEase("--ease-glide"), fill: "both" },
-  );
-  track(node, { animation, fade, target, to, settle });
+  const keyframes = { height: [`${Math.max(0, from)}px`, `${to}px`] };
+  if (margin && moved(...margin)) keyframes.marginBottom = margin.map((value) => `${value}px`);
+  const animation = node.animate(keyframes, {
+    duration: motionMs("--motion-slow"),
+    easing: motionEase("--ease-glide"),
+    fill: "both",
+  });
+  track(node, { animation, fade, target, to, settle, gap });
 }
 
 // Moves a running glide onto the node that replaced its panel, at the same point in its timing.
@@ -237,9 +319,7 @@ function transplant(from, to) {
   const fade = entry.fade && content ? copyAnimation(entry.fade, content) : null;
   stopGlide(from);
   to.dataset.gliding = "true";
-  const settle = () => {
-    to.hidden = !entry.target;
-  };
+  const settle = () => land(to, entry.target);
   track(to, { ...entry, animation, fade, settle });
 }
 
@@ -285,12 +365,14 @@ function track(node, entry) {
   };
 }
 
-// Lands a glide for good. The panel settles first, so the boxes read around it are final.
+// Lands a glide for good. The panel settles first, so the boxes read around it are final; a ghost
+// that settles leaves the page, so where it was is read.
 function endGlide(node, settle) {
   const ended = glides.has(node);
+  const parent = node.parentElement;
   stopGlide(node);
   settle?.();
-  if (ended) settleAround(node);
+  if (ended) settleFrom(parent);
 }
 
 function stopGlide(node) {
@@ -304,6 +386,27 @@ function stopGlide(node) {
 
 function canGlide(node) {
   return motionEnabled() && typeof node.animate === "function";
+}
+
+// The gap `panel` adds to its container, which its margin cancels while it is closed.
+function gapOf(panel) {
+  const host = panel.parentElement;
+  if (!host) return 0;
+  const style = getComputedStyle(host);
+  return gapShare({
+    column: style.display.endsWith("flex") && style.flexDirection === "column",
+    rowGap: Number.parseFloat(style.rowGap) || 0,
+    alone: ![...host.children].some((child) => child !== panel && inFlow(child)),
+  });
+}
+
+function inFlow(node) {
+  const { display, position } = getComputedStyle(node);
+  return display !== "none" && position !== "absolute" && position !== "fixed";
+}
+
+function bottomMargin(node) {
+  return Number.parseFloat(getComputedStyle(node).marginBottom) || 0;
 }
 
 function contentHeight(panel) {

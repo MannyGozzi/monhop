@@ -46,8 +46,8 @@ export function tweenTiming({ part, property, rising }) {
 
 // The orbit runs along the capsule's edge at one speed. Its keyframes move a point out from the
 // capsule's centre: straight edges translate, round ends turn, and each keyframe's offset is its share
-// of the perimeter. Translations are in % of the capsule's own width, so the path hugs the edge
-// through a width glide; the offsets are exact once the width settles.
+// of the perimeter. WebKit resolves the % translations once, when it composites the animation, so a
+// width glide rebuilds the path each frame (computer-card.mjs followWidth).
 export function orbitPath({ width, height, inset }) {
   const radius = height / 2 - inset;
   const straight = Math.max(width - height, 0);

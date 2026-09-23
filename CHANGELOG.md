@@ -16,10 +16,12 @@ Both computers can control each other. **Breaking:** update both computers, pair
 
 - Home and Set up are redesigned: one compact card for the computer in use, a small Sharing pill with a green live outline, the connection status only in the top bar, and completed setup steps collapsed to one line.
 - Switching between Home and Set up animates smoothly; the page transition no longer blurs the whole window.
+- Sections that appear or disappear on Home, such as the control switches when sharing starts or pauses, glide in and out instead of popping. The header logo is white like the product name.
 - After a display change, the computer with the lower device id chooses the layout, and only after both computers' displays have held still for a second. The window comes forward only when you need to arrange.
 
 ### Fixed
 
+- The Sharing pill's outline animation stays on the edge while the pill resizes.
 - A display change on the Mac ends sharing as a display change and resyncs, instead of as a failure with a ten-second wait.
 - The computer whose displays did not change no longer reports that the other computer failed.
 - A layout proposal interrupted by a brief disconnect or another display change is made again instead of leaving both computers waiting for you to arrange.

@@ -14,6 +14,28 @@ export function rebuiltDisclosure({ open = false, gliding = false } = {}) {
   return { open, hidden: !open && !gliding, glide: gliding };
 }
 
+// How a keyed block that comes and goes starts when a render rebuilds it, from what its key's last
+// render drew (`last`, null at first sight): `ghost` draws a copy of what left, `hidden` a block that has
+// not grown yet, and `glide` carries on the running glide, whichever way. Null draws nothing.
+export function rebuiltPresence({ present, motion = true, last = null }) {
+  if (!motion || !last) return present ? { ghost: false, hidden: false, glide: false } : null;
+  if (last.gliding) return { ghost: !present, hidden: false, glide: true };
+  if (!present && (!last.drawn || last.hidden)) return null;
+  return { ghost: !present, hidden: !last.drawn || last.hidden, glide: false };
+}
+
+// The gap a block adds to its container: a flex column's row gap once the block has an in-flow
+// sibling. A grid row never shrinks below 0, so no margin can cancel a grid gap and none is claimed.
+export function gapShare({ column, rowGap, alone }) {
+  return column && !alone && rowGap > 0 ? rowGap : 0;
+}
+
+// The bottom margin that cancels that gap while the block is closed, so gliding with its height the
+// column grows by exactly what the block adds and nothing below it jumps.
+export function gapMargin(gap, open) {
+  return open || !gap ? 0 : -gap;
+}
+
 // What a panel does when its content's box goes from `last` to `next`: an opening glide retargets and
 // a panel at rest glides. First sightings, closing, reflows and nested glides follow at once.
 export function contentMove({ last = null, next, glide = null, motion = true }) {

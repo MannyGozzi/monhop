@@ -326,7 +326,7 @@ export async function settle(animation, after) {
 }
 
 // A visual copy of a node that left: never focusable, never announced, never a duplicate id.
-function ghostOf(node) {
+export function ghostOf(node) {
   const ghost = node.cloneNode(true);
   ghost.dataset.exit = "true";
   ghost.setAttribute("aria-hidden", "true");
@@ -380,34 +380,6 @@ export function changedAgo(key, signature) {
 export function sinceChanged(key, signature) {
   const elapsed = changedAgo(key, signature);
   return motionEnabled() ? elapsed : Infinity;
-}
-
-// Presence changes only fade and translate the visible content. Layout remains synchronous.
-export function presence(key, node) {
-  const now = performance.now();
-  const present = Boolean(node);
-  const entry = motionMemory.get(key) ?? { present, changedAt: -Infinity };
-  if (entry.present !== present) {
-    entry.present = present;
-    entry.changedAt = now;
-    entry.leaving = entry.ghost;
-  }
-  entry.ghost = node ? node.cloneNode(true) : null;
-  motionMemory.set(key, entry);
-  const elapsed = now - entry.changedAt;
-  const animate = motionEnabled() && elapsed < (present ? enterMs() : exitMs());
-  if (node) {
-    const wrapper = el("div", { className: "presence", children: [node] });
-    if (!animate) return wrapper;
-    play(node, ENTER_FRAMES, enterMs(), elapsed);
-    return wrapper;
-  }
-  if (!animate || !entry.leaving) return null;
-  const ghost = ghostOf(entry.leaving);
-  const wrapper = el("div", { className: "presence", children: [ghost] });
-  wrapper.dataset.leave = "true";
-  play(ghost, EXIT_FRAMES, exitMs(), elapsed, () => wrapper.remove());
-  return wrapper;
 }
 
 // A live label fades in place. Its container keeps normal layout rather than animating width.

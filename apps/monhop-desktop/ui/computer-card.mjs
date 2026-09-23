@@ -1,4 +1,4 @@
-import { ACCORDION_TOGGLE, createAccordion } from "./accordion.mjs";
+import { ACCORDION_TOGGLE, createAccordion, presence } from "./accordion.mjs";
 import { computerStatus } from "./computer-status.mjs";
 import { computerArrangements, displayName } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
@@ -22,7 +22,6 @@ import {
   motionToken,
   note,
   platformGlyph,
-  presence,
   reducedMotion,
   row,
   rows,
@@ -155,6 +154,8 @@ export function computerCard(
 const pills = new Map();
 const PILL_LABELS = { start: "Start sharing", sharing: "Sharing", pause: "Pause" };
 const GLYPH = ["opacity", "transform", "filter"];
+// Play states of a tween that no longer moves anything.
+const UNTWEENED = new Set(["finished", "idle"]);
 let pillsQueued = false;
 reducedMotion.addEventListener("change", () => {
   for (const pill of pills.values()) {
@@ -258,6 +259,7 @@ function buildPill(fingerprint) {
     comet: [],
     cometWidth: null,
     cometLap: null,
+    following: false,
     moved: false,
     width: Number.NaN,
     sweepTween: null,
@@ -378,7 +380,10 @@ function runOrbit(pill, look) {
   if (orbitShown(look)) {
     if (!Number.isFinite(pill.width)) return;
     const lap = motionMs(look.busy ? "--loop-orbit-busy" : "--loop-orbit");
-    if (pill.moved || pill.width !== pill.cometWidth || lap !== pill.cometLap) runComet(pill, lap);
+    const width = orbitWidth(pill);
+    if (pill.moved || width !== pill.cometWidth || lap !== pill.cometLap)
+      runComet(pill, lap, width);
+    followWidth(pill);
     if (reducedMotion.matches) for (const dot of pill.comet) dot.pause();
     if (pill.moved) {
       for (const animation of pill.loops) animation.cancel();
@@ -395,20 +400,48 @@ function runOrbit(pill, look) {
     stopLoops(pill);
     return;
   }
+  followWidth(pill);
   void settle(fade, () => {
     if (!orbitShown(pill.shown)) stopLoops(pill);
   });
 }
 
+// WebKit fixes a composited orbit's % to the width the capsule had when it started, so while the
+// width tweens the comet is rebuilt around the width on screen every frame, then once where it lands.
+function followWidth(pill) {
+  if (pill.following || !widthTweening(pill)) return;
+  pill.following = true;
+  const frame = () => {
+    const running = pill.comet.length > 0 && pill.wrap.isConnected;
+    const width = orbitWidth(pill);
+    if (running && Number.isFinite(width) && width !== pill.cometWidth)
+      runComet(pill, pill.cometLap, width);
+    pill.following = running && widthTweening(pill);
+    if (pill.following) requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
+function widthTweening(pill) {
+  return pill.tweens.some(
+    (tween) => tween.effect?.target === pill.button && !UNTWEENED.has(tween.playState),
+  );
+}
+
+// The width the comet circles: the one drawn this frame while the width tweens, else where it lands.
+function orbitWidth(pill) {
+  return widthTweening(pill) ? Number.parseFloat(getComputedStyle(pill.button).width) : pill.width;
+}
+
 // A new width or lap rebuilds the comet at the old head's share of its lap, already running, so it
 // carries on unbroken without a held frame.
-function runComet(pill, duration) {
+function runComet(pill, duration, width) {
   const now = document.timeline.currentTime;
   const was = pill.comet[0]?.currentTime;
   const head = was == null ? now % duration : ((was % pill.cometLap) / pill.cometLap) * duration;
   for (const dot of pill.comet) dot.cancel();
   const { perimeter, keyframes } = orbitPath({
-    width: pill.width,
+    width,
     height: pill.button.offsetHeight,
     inset: Number.parseFloat(motionToken("--sharing-ring-width")) / 2,
   });
@@ -421,7 +454,7 @@ function runComet(pill, duration) {
     animation.startTime = now - (head + duration * (1 - lag));
     return animation;
   });
-  pill.cometWidth = pill.width;
+  pill.cometWidth = width;
   pill.cometLap = duration;
 }
 

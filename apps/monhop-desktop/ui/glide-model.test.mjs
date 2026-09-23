@@ -5,9 +5,12 @@ import {
   SUBPIXEL_PX,
   contentMove,
   copyPlacement,
+  gapMargin,
+  gapShare,
   moved,
   panelNeedsChange,
   rebuiltDisclosure,
+  rebuiltPresence,
   settledBox,
 } from "./glide-model.mjs";
 
@@ -145,4 +148,87 @@ test("a content change beside a starting nested glide glides, then follows that 
     contentMove({ last: box(350), next: box(380, { nested: true }), glide: own }),
     "retarget",
   );
+});
+
+const drew = (extra = {}) => ({ drawn: true, hidden: false, gliding: false, ...extra });
+
+test("a block first seen, or seen without motion, is drawn at rest or not at all", () => {
+  const rest = { ghost: false, hidden: false, glide: false };
+  assert.deepEqual(rebuiltPresence({ present: true }), rest);
+  assert.equal(rebuiltPresence({ present: false }), null);
+  // Without motion nothing glides and nothing that left lingers, whatever the last render drew.
+  assert.deepEqual(
+    rebuiltPresence({ present: true, motion: false, last: drew({ gliding: true }) }),
+    rest,
+  );
+  assert.equal(
+    rebuiltPresence({ present: false, motion: false, last: drew({ gliding: true }) }),
+    null,
+  );
+});
+
+test("a block that appears starts closed, and one that leaves draws a ghost from its full height", () => {
+  assert.deepEqual(rebuiltPresence({ present: true, last: { drawn: false } }), {
+    ghost: false,
+    hidden: true,
+    glide: false,
+  });
+  assert.deepEqual(rebuiltPresence({ present: false, last: drew() }), {
+    ghost: true,
+    hidden: false,
+    glide: false,
+  });
+});
+
+test("a block rebuilt mid-glide carries the glide on either way, so a flip reverses it", () => {
+  const gliding = drew({ gliding: true });
+  assert.deepEqual(rebuiltPresence({ present: true, last: gliding }), {
+    ghost: false,
+    hidden: false,
+    glide: true,
+  });
+  assert.deepEqual(rebuiltPresence({ present: false, last: gliding }), {
+    ghost: true,
+    hidden: false,
+    glide: true,
+  });
+});
+
+test("a rebuild before a glide starts keeps the block where it was drawn", () => {
+  // Built closed but not yet opened: still closed. Built as a ghost but not yet closing: still whole.
+  assert.equal(rebuiltPresence({ present: true, last: drew({ hidden: true }) }).hidden, true);
+  assert.equal(rebuiltPresence({ present: false, last: drew() }).hidden, false);
+  // A ghost whose glide ended is gone, and one that never showed is never drawn.
+  assert.equal(rebuiltPresence({ present: false, last: drew({ hidden: true }) }), null);
+  assert.equal(rebuiltPresence({ present: false, last: { drawn: false } }), null);
+  // Coming back after it left, it grows from closed again, as when it first appeared.
+  assert.deepEqual(
+    rebuiltPresence({ present: true, last: drew({ hidden: true }) }),
+    rebuiltPresence({ present: true, last: { drawn: false } }),
+  );
+});
+
+test("only a flex column's gap is claimed, and only beside another block", () => {
+  assert.equal(gapShare({ column: true, rowGap: 16, alone: false }), 16);
+  assert.equal(gapShare({ column: true, rowGap: 16, alone: true }), 0);
+  assert.equal(gapShare({ column: false, rowGap: 16, alone: false }), 0);
+  assert.equal(gapShare({ column: true, rowGap: 0, alone: false }), 0);
+});
+
+test("a closed block adds nothing to its column and an open one its height plus one gap", () => {
+  const gap = 16;
+  const height = 120;
+  // A column of n blocks has n - 1 gaps, so the block adds one gap, its height and its margin.
+  const added = (progress) => {
+    const margin =
+      gapMargin(gap, false) + (gapMargin(gap, true) - gapMargin(gap, false)) * progress;
+    return gap + height * progress + margin;
+  };
+  assert.equal(added(0), 0);
+  assert.equal(added(1), gap + height);
+  // Height and margin share one easing, so the column moves on one curve and never steps.
+  for (const progress of [0.25, 0.5, 0.75])
+    assert.equal(added(progress), (gap + height) * progress);
+  assert.equal(gapMargin(0, false), 0);
+  assert.equal(gapMargin(undefined, false), 0);
 });
