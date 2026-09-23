@@ -306,7 +306,7 @@ if (!uiCheck) {
 }
 
 function onReturn() {
-  if (!refreshAfterReturn) return;
+  if (uiCheck || !refreshAfterReturn) return;
   refreshAfterReturn = false;
   if (page === "setup") void requestAutomaticSnapshot("focus");
   void refreshSharingStatus();
