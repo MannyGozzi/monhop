@@ -53,6 +53,14 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_PENDING_INCOMING: usize = 4;
 const INCOMING_BUFFER_SIZE: u64 = 32 * 1024;
 const TOTAL_INCOMING_BUFFER_SIZE: u64 = 128 * 1024;
+// Handshake PTO is 3x this until the first sample: a lost first flight costs 300 ms, not 1 s.
+const INITIAL_RTT: Duration = Duration::from_millis(100);
+// Replaces the peer's 25 ms in our PTO once it acknowledges ACK_FREQUENCY; quinn's floor is 1 ms.
+const PEER_MAX_ACK_DELAY: Duration = Duration::from_millis(1);
+// The peer ACKs every ack-eliciting packet on arrival, so no coarse OS timer can outlast 1 ms.
+const PEER_ACK_ELICITING_THRESHOLD: u32 = 0;
+// Any gap draws an immediate ACK as in RFC 9000; quinn's extension default of 2 would hold it.
+const PEER_REORDERING_THRESHOLD: u32 = 1;
 
 /// Errors intentionally identify a failed security property without exposing
 /// certificates, private keys, packet bytes, or other sensitive material.
@@ -571,7 +579,18 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     config.datagram_send_buffer_size(DATAGRAM_BUFFER_SIZE);
     config.mtu_discovery_config(None);
     config.allow_spin(false);
+    config.initial_rtt(INITIAL_RTT);
+    config.ack_frequency_config(Some(peer_ack_frequency()));
     Arc::new(config)
+}
+
+/// Asks the peer to acknowledge input at once, so a lost packet costs about one RTT-scaled PTO.
+fn peer_ack_frequency() -> quinn::AckFrequencyConfig {
+    let mut config = quinn::AckFrequencyConfig::default();
+    config.ack_eliciting_threshold(quinn::VarInt::from_u32(PEER_ACK_ELICITING_THRESHOLD));
+    config.max_ack_delay(Some(PEER_MAX_ACK_DELAY));
+    config.reordering_threshold(quinn::VarInt::from_u32(PEER_REORDERING_THRESHOLD));
+    config
 }
 
 fn map_rustls_error(error: RustlsError) -> CryptoError {
