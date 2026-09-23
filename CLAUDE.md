@@ -8,6 +8,8 @@ No input hooks, suppression, injection, listeners, pairing trust changes, firewa
 
 Keep performance-critical input/transport/state handling entirely in Rust. Screen dimming is MonHop's own desktop `dimming` module (overlay per display, one system-wide chord, persisted preference); its overlays are never displays or input targets.
 
+Every UI animation must be buttery smooth. Anything that enters, leaves, or changes position or size animates instead of popping or jumping. Animate transform and opacity where possible and use the shared motion tokens in apps/monhop-desktop/ui/styles.css. An interrupted animation retargets from its current visual state instead of snapping, one whose target is unchanged never restarts, and `prefers-reduced-motion: reduce` makes every change instant.
+
 Installation retention: replace MonHop in place without backing up earlier installations. Delete obsolete executable copies, rollback payloads, and pending installers when updating. Preserve the current installed app, user settings, and diagnostic logs.
 
 Original code is licensed under GPL-3.0-or-later (LICENSE). Third-party dependencies must have permissive GPL-compatible licenses, except the five package-specific MPL-2.0 allowances explicitly approved by the user and recorded in THIRD_PARTY_LICENSES.md. Pin direct versions and commit Cargo.lock when commits are authorized. Keep all runtime dependencies and license/SBOM reports reproducible from the lockfile.
