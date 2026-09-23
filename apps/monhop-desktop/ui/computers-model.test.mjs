@@ -4,13 +4,18 @@ import test from "node:test";
 import {
   beginComputerArrangements,
   computerArrangements,
+  coverComputersLoad,
   displayName,
   failComputerArrangements,
   findComputer,
+  finishComputersLoad,
+  followSetupRevision,
   initialComputerArrangements,
   initialComputers,
+  initialComputersLoad,
   normalizeComputers,
   pruneComputerArrangements,
+  requestComputersLoad,
   setComputerArrangements,
 } from "./computers-model.mjs";
 
@@ -207,6 +212,60 @@ test("each computer's layout history lives apart from the polled computer list",
   store = pruneComputerArrangements(store, computers);
   assert.equal(Object.hasOwn(store, WINDOWS), true);
   assert.equal(Object.hasOwn(store, MAC), false);
+});
+
+// Plays status polls against the load model the way app.js does: a started read covers the
+// revision the status names right then, and finishes before the next poll.
+function readsForPolls(revisions) {
+  let load = initialComputersLoad();
+  let reads = 0;
+  for (const revision of revisions) {
+    const followed = followSetupRevision(load, revision);
+    load = followed.load;
+    if (!followed.start) continue;
+    reads += 1;
+    load = finishComputersLoad(coverComputersLoad(load, revision)).load;
+  }
+  return reads;
+}
+
+test("a setup revision the list was not read at reads it once, and an unchanged one never", () => {
+  assert.equal(readsForPolls(["3"]), 1);
+  assert.equal(readsForPolls(["3", "3", "3"]), 1);
+  assert.equal(readsForPolls(["3", "3", "4", "4", "4"]), 2);
+  // A view that names no revision proves nothing changed.
+  assert.equal(readsForPolls([null, undefined, null]), 0);
+  assert.equal(readsForPolls(["3", null, "3"]), 1);
+
+  // Polls while a read is still covering the new revision ask for nothing more.
+  let load = coverComputersLoad(initialComputersLoad(), "4");
+  const started = followSetupRevision(load, "5");
+  assert.equal(started.start, true);
+  load = coverComputersLoad(started.load, "5");
+  const again = followSetupRevision(load, "5");
+  assert.equal(again.start, false);
+  assert.equal(again.load.queued, false);
+  assert.equal(finishComputersLoad(again.load).again, false);
+});
+
+test("reads asked for while one runs coalesce into exactly one more after it", () => {
+  let { load, start } = requestComputersLoad(initialComputersLoad());
+  assert.equal(start, true);
+  for (let index = 0; index < 3; index += 1) {
+    const requested = requestComputersLoad(load);
+    assert.equal(requested.start, false);
+    load = requested.load;
+  }
+  // A commit seen mid-read asks too, and still adds only the one.
+  const followed = followSetupRevision(coverComputersLoad(load, "7"), "8");
+  assert.equal(followed.start, false);
+  let finished = finishComputersLoad(followed.load);
+  assert.equal(finished.again, true);
+  assert.equal(finished.load.running, true);
+  finished = finishComputersLoad(finished.load);
+  assert.equal(finished.again, false);
+  assert.equal(finished.load.running, false);
+  assert.equal(requestComputersLoad(finished.load).start, true);
 });
 
 test("a computer without a name falls back to its platform", () => {

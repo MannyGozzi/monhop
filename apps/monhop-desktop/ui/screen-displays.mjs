@@ -20,7 +20,7 @@ import { createArrangementView } from "./arrangement-view.mjs";
 import { newestFirst } from "./computer-card-model.mjs";
 import { layoutChipStrip } from "./computer-card.mjs";
 import { createAccordion } from "./accordion.mjs";
-import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
+import { createDashboardArrangement, DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
 import { autostartDescription } from "./autostart-model.mjs";
 import {
   badge,
@@ -117,7 +117,7 @@ function offLinkCard(ctx) {
           "display-layout-details",
           "display-layout-details",
           "Details",
-          note("Saved display positions. Not a current display check."),
+          note(DRAWN_DISPLAYS_NOTE),
         ),
       ]
     : [note("No layout saved yet.")];

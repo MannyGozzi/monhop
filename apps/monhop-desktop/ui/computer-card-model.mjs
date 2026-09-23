@@ -86,6 +86,12 @@ export function keepForgetArmed(armed, fingerprints) {
   return armed && [...fingerprints].includes(armed.fingerprint) ? armed : null;
 }
 
+// A list read again in the background keeps the confirm while the row it armed is still listed.
+export function keepForgetListed(armed, fingerprint, entries) {
+  if (armed?.fingerprint !== fingerprint) return armed;
+  return entries.some((entry) => entry.name === armed.name) ? armed : null;
+}
+
 // --- control switches --------------------------------------------------
 
 export const CONTROL_PAUSE_HINT = "Use Pause to stop sharing";

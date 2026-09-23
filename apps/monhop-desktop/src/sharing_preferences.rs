@@ -9,13 +9,15 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use monhop_core::{MonitorIdentity, Point};
 use monhop_protocol::ControlPermissions;
 use monhop_transport::{
     crypto::CertificateFingerprint,
     session_handshake::device_id_from_fingerprint,
     session_setup::{
-        DisplayTopology, InspectedPeer, MAX_DISPLAY_NAME_BYTES, MAX_LOGICAL_ORIGIN_ABS,
-        MAX_LOGICAL_SIZE, MAX_NATIVE_DIMENSION, MAX_SCALE_FACTOR, MIN_SCALE_FACTOR,
+        DisplayDescription, DisplayTopology, InspectedPeer, MAX_DISPLAY_NAME_BYTES,
+        MAX_LOGICAL_ORIGIN_ABS, MAX_LOGICAL_SIZE, MAX_NATIVE_DIMENSION, MAX_SCALE_FACTOR,
+        MIN_SCALE_FACTOR,
     },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -185,6 +187,19 @@ impl SetupFile {
         self.interface_id = Some(setup.interface_id.clone());
         self.computers
             .insert(fingerprint_key(&setup.peer_fingerprint), setup);
+    }
+
+    /// A copy to draw from and never save: each record replaced by `preview`'s answer for it,
+    /// the active choice and the network left as they are.
+    pub(crate) fn previewed(
+        &self,
+        mut preview: impl FnMut(&SharingPreferences) -> SharingPreferences,
+    ) -> Self {
+        let mut previewed = self.clone();
+        for record in previewed.computers.values_mut() {
+            *record = preview(record);
+        }
+        previewed
     }
 
     /// Drops the record and, when it was the active computer, the active choice with it.
@@ -649,6 +664,46 @@ impl SharingPreferences {
         Self::from_inspection(inspection, layout).ok()
     }
 
+    /// The pair as this computer knows it without a link: `local` as read now beside the other
+    /// computer's displays as this record last saw them. A record names no platform and nothing
+    /// that adapts one reads it, so both sides carry this computer's.
+    pub(crate) fn with_local_displays(&self, local: DisplayTopology) -> Option<InspectedPeer> {
+        let local_fingerprint = CertificateFingerprint::parse_full(&self.local_fingerprint).ok()?;
+        let peer_fingerprint = CertificateFingerprint::parse_full(&self.peer_fingerprint).ok()?;
+        Some(InspectedPeer {
+            local_device: device_id_from_fingerprint(local_fingerprint),
+            peer_device: device_id_from_fingerprint(peer_fingerprint),
+            local_fingerprint,
+            peer_fingerprint,
+            local_platform: crate::sharing::local_platform(),
+            peer_platform: crate::sharing::local_platform(),
+            local_displays: local,
+            peer_displays: topology_of(&self.peer_displays)?,
+            interface_id: self.interface_id.clone(),
+        })
+    }
+
+    /// The record as the displays in `now` show it: itself while it fits them, else rebuilt by
+    /// `adapt_to_inspection`, else those displays with no crossing, since none of its own survive.
+    pub(crate) fn preview_for(&self, now: &InspectedPeer) -> Self {
+        if !self.same_pair(now) || self.fits_displays(now) {
+            return self.clone();
+        }
+        adapt_to_inspection(self, now).map_or_else(
+            || Self {
+                local_displays: snapshots(&now.local_displays),
+                peer_displays: snapshots(&now.peer_displays),
+                layout: LayoutRequest {
+                    links: Vec::new(),
+                    arrangement: None,
+                    control: self.layout.control.clone(),
+                },
+                ..self.clone()
+            },
+            |adapted| adapted.record,
+        )
+    }
+
     pub fn matches_inspection(&self, inspection: &InspectedPeer) -> bool {
         self.validate().is_ok()
             && self.interface_id == inspection.interface_id
@@ -1033,6 +1088,36 @@ pub(crate) fn snapshots(topology: &DisplayTopology) -> Vec<DisplaySnapshot> {
         .collect()
 }
 
+/// The inverse of `snapshots`: saved displays as the topology an inspection carries.
+fn topology_of(displays: &[DisplaySnapshot]) -> Option<DisplayTopology> {
+    let displays = displays
+        .iter()
+        .map(|display| {
+            Some(DisplayDescription {
+                id: parse_display(&display.id).ok()?,
+                name: display.name.clone(),
+                native_width: display.native_size[0],
+                native_height: display.native_size[1],
+                logical_origin: Point::new(display.origin[0], display.origin[1]),
+                logical_size: Point::new(display.size[0], display.size[1]),
+                scale_factor: display.scale,
+                is_primary: display.primary,
+                monitor: display.monitor.as_deref().and_then(monitor_from_key),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    DisplayTopology::new(displays).ok()
+}
+
+/// The identity `crate::sharing::monitor_key` writes, read back.
+fn monitor_from_key(key: &str) -> Option<MonitorIdentity> {
+    let mut parts = key.split('-');
+    let vendor = u16::from_str_radix(parts.next()?, 16).ok()?;
+    let product = u16::from_str_radix(parts.next()?, 16).ok()?;
+    let serial = u32::from_str_radix(parts.next()?, 16).ok()?;
+    MonitorIdentity::new(vendor, product, serial)
+}
+
 fn validate_fingerprint(value: &str) -> Result<(), PreferenceError> {
     let fingerprint =
         CertificateFingerprint::parse_full(value).map_err(|_| PreferenceError::Invalid)?;
@@ -1252,15 +1337,6 @@ pub(crate) mod tests {
                 }
             }
         }
-    }
-
-    /// The identity `crate::sharing::monitor_key` writes, read back for a test inspection.
-    fn monitor_from_key(key: &str) -> Option<monhop_core::MonitorIdentity> {
-        let mut parts = key.split('-');
-        let vendor = u16::from_str_radix(parts.next()?, 16).ok()?;
-        let product = u16::from_str_radix(parts.next()?, 16).ok()?;
-        let serial = u32::from_str_radix(parts.next()?, 16).ok()?;
-        monhop_core::MonitorIdentity::new(vendor, product, serial)
     }
 
     pub(crate) const BUILT_IN: &str = "0610-a050-00000000";
@@ -1549,6 +1625,69 @@ pub(crate) mod tests {
         assert!(adapted.fits_displays(&inspected));
     }
 
+    #[test]
+    fn a_card_draws_the_displays_there_are_now_through_the_adapted_record() {
+        let record = preferences();
+        let file = file_with(record.clone());
+        let drawn = |file: &SetupFile, now: &InspectedPeer| {
+            let previewed = file.previewed(|saved| saved.preview_for(now));
+            let view = SavedSetupView::from_saved(previewed.active_computer(), None, "0");
+            serde_json::to_value(view).unwrap()
+        };
+        // A record that still fits is drawn exactly as saved.
+        assert_eq!(record.preview_for(&inspection(&record)), record);
+
+        // The link reports this computer's display somewhere else than the record saved it.
+        let mut moved = record.clone();
+        moved.move_local_display_for_test("1", [0.0, 240.0]);
+        let live = inspection(&moved);
+        let preview = record.preview_for(&live);
+        assert_eq!(
+            preview,
+            adapt_to_inspection(&record, &live)
+                .expect("a display that moved adapts")
+                .record
+        );
+        let view = drawn(&file, &live);
+        assert_eq!(
+            view["localDisplays"][0]["origin"],
+            serde_json::json!([0.0, 240.0])
+        );
+        assert_eq!(
+            view["previewLayout"]["links"],
+            serde_json::to_value(&record.layout().links).unwrap()
+        );
+        // The saved file itself is untouched.
+        assert_eq!(file.active_computer(), Some(&record));
+
+        // Without a link: this computer's displays as read now, the other's as last saved.
+        let now = record
+            .with_local_displays(topology_of(&moved.local_displays).unwrap())
+            .expect("the pair as this computer knows it");
+        assert_eq!(snapshots(&now.peer_displays), record.peer_displays);
+        assert_eq!(
+            record.preview_for(&now).local_displays(),
+            moved.local_displays()
+        );
+
+        // The display every crossing led to went away, so nothing of the record survives: the
+        // card draws the displays there are now with no crossing, never the saved ones.
+        let mut crossed = preferences();
+        crossed.set_local_displays_for_test(&["1", "3"]);
+        crossed.layout.links = vec![
+            link("2", "left", "3", "right"),
+            link("3", "right", "2", "left"),
+        ];
+        let mut unplugged = crossed.clone();
+        unplugged.set_local_displays_for_test(&["1"]);
+        let now = inspection(&unplugged);
+        assert!(adapt_to_inspection(&crossed, &now).is_none());
+        let view = drawn(&file_with(crossed), &now);
+        assert_eq!(view["localDisplays"].as_array().unwrap().len(), 1);
+        assert_eq!(view["previewLayout"]["links"], serde_json::json!([]));
+        assert_eq!(view["saved"], serde_json::json!(true));
+    }
+
     /// A crossing on part of an edge, so one display can lead to two others on the same side.
     fn split_link(
         from: &str,
@@ -1658,43 +1797,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn inspection(saved: &SharingPreferences) -> InspectedPeer {
-        let topology = |displays: &[DisplaySnapshot]| {
-            DisplayTopology::new(
-                displays
-                    .iter()
-                    .map(
-                        |display| monhop_transport::session_setup::DisplayDescription {
-                            id: parse_display(&display.id).unwrap(),
-                            name: display.name.clone(),
-                            native_width: display.native_size[0],
-                            native_height: display.native_size[1],
-                            logical_origin: monhop_core::Point::new(
-                                display.origin[0],
-                                display.origin[1],
-                            ),
-                            logical_size: monhop_core::Point::new(display.size[0], display.size[1]),
-                            scale_factor: display.scale,
-                            is_primary: display.primary,
-                            monitor: display.monitor.as_deref().and_then(monitor_from_key),
-                        },
-                    )
-                    .collect(),
-            )
-            .unwrap()
-        };
-        let local_fingerprint =
-            CertificateFingerprint::parse_full(&saved.local_fingerprint).unwrap();
-        let peer_fingerprint = CertificateFingerprint::parse_full(&saved.peer_fingerprint).unwrap();
         InspectedPeer {
-            local_device: device_id_from_fingerprint(local_fingerprint),
-            peer_device: device_id_from_fingerprint(peer_fingerprint),
-            local_fingerprint,
-            peer_fingerprint,
             local_platform: Platform::MacOs,
             peer_platform: Platform::Windows,
-            local_displays: topology(&saved.local_displays),
-            peer_displays: topology(&saved.peer_displays),
-            interface_id: saved.interface_id.clone(),
+            ..saved
+                .with_local_displays(topology_of(&saved.local_displays).unwrap())
+                .unwrap()
         }
     }
 

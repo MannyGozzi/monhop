@@ -146,6 +146,24 @@ test("the view names which computer is live and which one is in use, in one case
   );
 });
 
+test("the setup revision is a canonical counter or nothing at all", () => {
+  assert.equal(normalizeSharingView(offView).setupRevision, null);
+  assert.equal(normalizeSharingView({ ...offView, setupRevision: "12" }).setupRevision, "12");
+  // A malformed one only stops the computers from following it; the view is still read.
+  const malformed = normalizeSharingView({ ...offView, setupRevision: 12 });
+  assert.equal(malformed.recognized, true);
+  assert.equal(malformed.setupRevision, null);
+  assert.equal(normalizeSharingView({ garbage: true, setupRevision: "12" }).setupRevision, null);
+  // It is part of the view, so a poll that only moved it still counts as a change.
+  assert.equal(
+    sameSharingView(
+      normalizeSharingView({ ...offView, setupRevision: "12" }),
+      normalizeSharingView({ ...offView, setupRevision: "13" }),
+    ),
+    false,
+  );
+});
+
 test("native link views reject malformed IDs, coordinates, phases, and empty connected topologies", () => {
   for (const patch of [
     { localDisplays: [{ ...connectedView.localDisplays[0], id: "1e3" }] },

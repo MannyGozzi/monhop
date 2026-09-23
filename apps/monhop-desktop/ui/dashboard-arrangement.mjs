@@ -95,8 +95,11 @@ export function savedDashboardArrangement(setup) {
 // missing instead of warning that the details need a review.
 export function dashboardCaption(arrangement) {
   if (arrangement?.noCrossingYet) return "No crossing yet. Arrange the displays to connect them.";
-  return "Saved display positions. Not a current display check.";
+  return DRAWN_DISPLAYS_NOTE;
 }
+
+// The diagram follows this computer's displays live and the other computer's as last reported.
+export const DRAWN_DISPLAYS_NOTE = "Displays as each computer last reported them.";
 
 // What changed between two drawings of one viewport: how far each display moved, as the inverse
 // translate a FLIP transition starts from, and which displays are on screen for the first time.

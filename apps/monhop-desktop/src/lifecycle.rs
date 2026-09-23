@@ -2,12 +2,16 @@
 //! the active computer connected.
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime},
 };
 
-use monhop_transport::{crypto::CertificateFingerprint, session_setup::InspectedPeer};
+use monhop_transport::{
+    crypto::CertificateFingerprint,
+    session_setup::{DisplayTopology, InspectedPeer},
+};
 
 use crate::{
     arrangement_library::ArrangementLibrary,
@@ -87,6 +91,13 @@ struct CachedSetup {
     file: SetupFile,
 }
 
+/// This computer's displays as `watch_local_displays` last read them, and when it last tried.
+#[derive(Default)]
+struct DisplaysWatch {
+    read_at: Option<Instant>,
+    displays: Option<DisplayTopology>,
+}
+
 #[derive(Default)]
 pub struct AppController {
     pub pairing: Arc<PairingController>,
@@ -100,12 +111,17 @@ pub struct AppController {
     setup_cache: Mutex<Option<CachedSetup>>,
     /// When this computer's displays first failed to read in a row; see `local_displays_fit`.
     displays_unreadable_since: Mutex<Option<Instant>>,
+    displays_watch: Mutex<DisplaysWatch>,
 }
 
 /// The sharing session and the setup link share one port, so a link waits for the session to stop.
 const SESSION_PAUSE_WINDOW: Duration = Duration::from_secs(3);
 const SUPERVISOR_BACKOFF: Duration = Duration::from_secs(10);
+/// With nothing else reporting them, this computer's displays are read at most this often; with
+/// the window's one-second poll, a change reaches its cards within about two seconds.
+const DISPLAYS_WATCH: Duration = Duration::from_secs(1);
 const PAIRING_HOLDS_PORT: &str = "Pairing in progress. Sharing resumes afterwards.";
+const SETUP_UNREADABLE: &str = "The saved setup could not be read. Apply a layout again.";
 
 impl AppController {
     /// The same gate reserves sharing starts and update work, including across async downloads.
@@ -224,9 +240,13 @@ impl AppController {
         Ok(())
     }
 
+    /// Only adopting a finished pairing writes, so only that needs the gate, and a busy gate leaves
+    /// it to the supervisor's next pass. The view reads files every writer replaces by rename, so a
+    /// pass or an action holding the gate never fails it.
     pub fn computers_load(&self) -> Result<ComputersView, String> {
-        let _lease = self.gate.begin()?;
-        self.adopt_completed_pairings()?;
+        if let Ok(_lease) = self.gate.begin() {
+            self.adopt_completed_pairings()?;
+        }
         self.computers_view()
     }
 
@@ -254,11 +274,12 @@ impl AppController {
             self.quiesce_connection(crate::sharing::PAUSED)?;
         }
         self.pairing.forget(fingerprint)?;
-        self.sharing
-            .update_setup_file(&setup_path, |file| file.remove(&fingerprint.full_hex()))?;
+        // The list goes first: the setup write bumps the revision a reload keys on.
         let mut list = ComputerList::load(&list_path)?;
         list.forget(fingerprint);
         list.save(&list_path)?;
+        self.sharing
+            .update_setup_file(&setup_path, |file| file.remove(&fingerprint.full_hex()))?;
         crate::autostart::computer_forgotten(&setup_path);
         self.computers_view()
     }
@@ -392,12 +413,13 @@ impl AppController {
         if let Err(message) = self.adopt_completed_pairings() {
             log::warn!("supervisor: could not record a completed pairing: {message}");
         }
-        if lock(&self.sharing_retry_after).is_some_and(|until| Instant::now() < until) {
-            return;
-        }
         let Ok(path) = self.setup_path() else {
             return;
         };
+        self.watch_local_displays(&path);
+        if lock(&self.sharing_retry_after).is_some_and(|until| Instant::now() < until) {
+            return;
+        }
         match self.keep_connected(&path) {
             Ok(Some(transition)) => log::info!("supervisor: {transition}"),
             Ok(None) => {}
@@ -416,10 +438,7 @@ impl AppController {
         if !self.pairing.shutdown_ready() || self.pairing.occupies_port() {
             return Ok(None);
         }
-        let file = self.cached_setup(
-            path,
-            "The saved setup could not be read. Apply a layout again.",
-        )?;
+        let file = self.cached_setup(path, SETUP_UNREADABLE)?;
         self.sharing.adopt_saved(&file);
         let Some(active) = file.active() else {
             return Ok(None);
@@ -495,6 +514,40 @@ impl AppController {
                 Err(message)
             }
         }
+    }
+
+    /// Reads this computer's displays at most once a watch interval while no link or session
+    /// reports them, and moves the setup revision on when they changed, so its cards redraw.
+    fn watch_local_displays(&self, path: &Path) {
+        // A link reports every change itself, and a session ends on one.
+        if self.sharing.live_inspection().is_some() {
+            return;
+        }
+        let mut watch = lock(&self.displays_watch);
+        if watch
+            .read_at
+            .is_some_and(|read_at| read_at.elapsed() < DISPLAYS_WATCH)
+        {
+            return;
+        }
+        watch.read_at = Some(Instant::now());
+        let Ok(file) = self.cached_setup(path, SETUP_UNREADABLE) else {
+            return;
+        };
+        let Some(now) = file
+            .active_computer()
+            .and_then(|record| current_local_displays(record).ok())
+        else {
+            return;
+        };
+        if watch
+            .displays
+            .as_ref()
+            .is_none_or(|seen| !seen.same_geometry(&now))
+        {
+            self.sharing.advance_setup_revision();
+        }
+        watch.displays = Some(now);
     }
 
     /// The link's decision pass. Only the decider (lower DeviceId) picks the record, leaving via
@@ -671,6 +724,7 @@ impl AppController {
         let file = self.load_setup(&self.setup_path()?, "The saved setup could not be read.")?;
         let list = ComputerList::load(&self.list_path()?)?;
         let live = self.sharing.live_inspection();
+        let file = drawn_setup(&file, live.as_ref());
         let live = live
             .as_ref()
             .map(|(fingerprint, inspection)| LiveInspection {
@@ -699,11 +753,11 @@ impl AppController {
         self.sharing.save_setup(path, revision, layout)
     }
 
+    /// Only reads a file that is replaced whole, so like `computers_load` it never waits for the gate.
     pub fn arrangements(
         &self,
         path: &Path,
     ) -> Result<Vec<crate::arrangement_library::ArrangementView>, String> {
-        let _lease = self.gate.begin()?;
         self.sharing.arrangements(path)
     }
 
@@ -722,12 +776,12 @@ impl AppController {
     }
 
     /// Every arrangement kept for one paired computer, whether or not it is connected. Only a
-    /// live link to that same computer can mark an entry as one that fits right now.
+    /// live link to that same computer can mark an entry as one that fits right now. It only
+    /// reads, so like `computers_load` it never waits for the gate.
     pub fn arrangements_for(
         &self,
         fingerprint: &str,
     ) -> Result<Vec<crate::arrangement_library::ArrangementView>, String> {
-        let _lease = self.gate.begin()?;
         self.arrangement_views(fingerprint, None)
     }
 
@@ -793,6 +847,27 @@ impl AppController {
 
 /// How long a quit waits for held input and sockets to let go before the process ends anyway.
 const EXIT_DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
+/// The setup as the computer cards draw it: each record for the displays there are now, as the
+/// link or session reports them for its computer, else as this computer reads its own beside the
+/// other's last seen. A record whose displays cannot be read is drawn as saved.
+fn drawn_setup(file: &SetupFile, live: Option<&(String, InspectedPeer)>) -> SetupFile {
+    // One read per identity this computer has held; every record normally names the same one.
+    let mut local_now: BTreeMap<String, Option<DisplayTopology>> = BTreeMap::new();
+    file.previewed(|record| {
+        let linked = live
+            .filter(|(fingerprint, _)| *fingerprint == fingerprint_key(record.peer_fingerprint()))
+            .map(|(_, inspection)| inspection.clone());
+        let now = linked.or_else(|| {
+            local_now
+                .entry(record.local_fingerprint().to_owned())
+                .or_insert_with(|| current_local_displays(record).ok())
+                .clone()
+                .and_then(|local| record.with_local_displays(local))
+        });
+        now.map_or_else(|| record.clone(), |now| record.preview_for(&now))
+    })
+}
 
 /// One log line per supervisor step: each side's display count and geometry digest, the record's
 /// digest and the decider. Nothing in it names a key or typed text.
@@ -1171,6 +1246,28 @@ mod tests {
                 .is_empty()
         );
         assert!(controller.arrangements_for(&peer).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn the_computers_and_their_layouts_read_while_another_pass_holds_the_gate() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let controller = AppController::default();
+        let folder = folder("busy-gate");
+        controller.use_setup_path(folder.join("sharing.json"));
+        let peer = "B".repeat(64);
+        let pass = controller
+            .gate
+            .begin()
+            .expect("a supervisor pass holds the gate");
+        let computers = serde_json::to_value(controller.computers_load().unwrap()).unwrap();
+        assert_eq!(computers["computers"], serde_json::json!([]));
+        assert!(controller.arrangements_for(&peer).unwrap().is_empty());
+        // Whatever writes still waits for the pass to end.
+        assert!(controller.computers_rename(&peer, "Desk").is_err());
+        assert!(controller.forget_arrangement(&peer, "Desk").is_err());
+        drop(pass);
+        assert!(controller.computers_load().is_ok());
         let _ = std::fs::remove_dir_all(folder);
     }
 

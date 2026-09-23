@@ -5,6 +5,7 @@ import { placementOffset } from "./arrangement-model.mjs";
 import {
   arrangementMotion,
   dashboardCaption,
+  DRAWN_DISPLAYS_NOTE,
   savedDashboardArrangement,
 } from "./dashboard-arrangement.mjs";
 
@@ -188,10 +189,7 @@ test("a layout with no crossing yet still draws both computers' displays, just u
   assert.deepEqual(result.tiles.map((tile) => tile.id).toSorted(), ["1", "2"]);
   // The caption says what is missing rather than warning that the saved details need a review.
   assert.equal(dashboardCaption(result), "No crossing yet. Arrange the displays to connect them.");
-  assert.equal(
-    dashboardCaption(savedDashboardArrangement(setup())),
-    "Saved display positions. Not a current display check.",
-  );
+  assert.equal(dashboardCaption(savedDashboardArrangement(setup())), DRAWN_DISPLAYS_NOTE);
 });
 
 test("a redrawn viewport knows which displays moved, and which ones are new on screen", () => {

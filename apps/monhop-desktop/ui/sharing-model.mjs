@@ -783,6 +783,7 @@ export function normalizeSharingView(value) {
       recognized: false,
       phase: "error",
       revision: null,
+      setupRevision: null,
       localPlatform: null,
       peerPlatform: null,
       localDisplays: [],
@@ -805,6 +806,8 @@ export function normalizeSharingView(value) {
     recognized: true,
     phase,
     revision: revision(source.revision),
+    // Moves on whenever what the computer cards draw may have changed; null proves nothing.
+    setupRevision: revision(source.setupRevision),
     localPlatform: PLATFORMS.has(source.localPlatform) ? source.localPlatform : null,
     peerPlatform: PLATFORMS.has(source.peerPlatform) ? source.peerPlatform : null,
     localDisplays: localDisplays ?? [],

@@ -42,7 +42,8 @@ static NATIVE_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(
 
 /// How often the supervisor decides between a session and a setup link. Short enough that a
 /// finished worker, an ended arranging session or a display change is answered without a pause
-/// the user can feel; each pass is a stat of the setup file and a few state checks.
+/// the user can feel; each pass is a stat of the setup file and a few state checks, plus a display
+/// read at most once per DISPLAYS_WATCH while no link reports them.
 const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(any(windows, test))]

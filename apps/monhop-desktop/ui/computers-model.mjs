@@ -11,6 +11,40 @@ export function initialComputers() {
   return { loaded: false, items: [], active: null, interfaceId: null };
 }
 
+// --- reading the computers again --------------------------------------------------------
+
+// One read at a time. `revision` is the setup revision the last read was made at: it is read just
+// before the list, so the list is at least that new.
+export function initialComputersLoad() {
+  return { running: false, queued: false, revision: null };
+}
+
+// A request while a read runs is answered by exactly one more read after it, however many arrive.
+export function requestComputersLoad(load) {
+  return load.running
+    ? { load: { ...load, queued: true }, start: false }
+    : { load: { ...load, running: true }, start: true };
+}
+
+export function coverComputersLoad(load, revision) {
+  return { ...load, revision };
+}
+
+// Ends the running read. `again` means a request arrived meanwhile and its read has now begun.
+export function finishComputersLoad(load) {
+  return load.queued
+    ? { load: { ...load, queued: false }, again: true }
+    : { load: { ...load, running: false }, again: false };
+}
+
+// A status poll naming a setup revision the list was not read at means a commit or a display
+// change since then, so the list is read again; the same revision, or none, asks for nothing.
+export function followSetupRevision(load, revision) {
+  if (revision === null || revision === undefined || revision === load.revision)
+    return { load, start: false };
+  return requestComputersLoad(load);
+}
+
 // --- each computer's layout history, kept outside the polled `computers` reply ------------
 
 const EMPTY_ARRANGEMENTS = Object.freeze({ items: [], loading: false, error: "" });

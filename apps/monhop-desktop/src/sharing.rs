@@ -119,6 +119,9 @@ pub struct DisplayView {
 pub struct SharingView {
     pub(crate) phase: &'static str,
     revision: String,
+    /// Moves on whenever what the computer cards draw may have changed; the window then reads
+    /// the computers and their layouts again.
+    pub(crate) setup_revision: String,
     local_platform: &'static str,
     pub(crate) peer_platform: Option<&'static str>,
     local_displays: Vec<DisplayView>,
@@ -201,7 +204,8 @@ impl Default for SharingView {
         Self {
             phase: "off",
             revision: "0".into(),
-            local_platform: local_platform_name(),
+            setup_revision: "0".into(),
+            local_platform: platform_name(local_platform()),
             peer_platform: None,
             local_displays: Vec::new(),
             peer_displays: Vec::new(),
@@ -412,6 +416,9 @@ struct State {
     view: SharingView,
     worker_generation: u64,
     authorization_revision: u64,
+    /// Each write of the setup file or the layouts remembered with it, and each change of the
+    /// displays a card draws, moves this on; see `SharingView::setup_revision`.
+    setup_revision: u64,
     shutdown: bool,
     native_cleanup_pending: bool,
     inspection: Option<InspectedPeer>,
@@ -644,11 +651,11 @@ fn overlaid(control: &ControlMap, pending: Option<&ControlMap>) -> ControlMap {
     control
 }
 
-const fn local_platform_name() -> &'static str {
+pub(crate) const fn local_platform() -> Platform {
     if cfg!(target_os = "macos") {
-        "macos"
+        Platform::MacOs
     } else {
-        "windows"
+        Platform::Windows
     }
 }
 
@@ -905,7 +912,14 @@ impl SharingController {
             .to_owned()
         })?;
         self.adopt_saved(&file);
+        self.advance_setup_revision();
         Ok(file)
+    }
+
+    /// For a change the cards draw that no write made: this computer's displays, read without a
+    /// link or session reporting them.
+    pub fn advance_setup_revision(&self) {
+        advance_setup_revision(&mut lock(&self.state));
     }
 
     /// Flips one direction for the active computer. The change stays pending here until both
@@ -1630,7 +1644,8 @@ impl SharingController {
         self.clear_display_notice();
         remember_applied(path, &preferences);
         crate::autostart::setup_applied(path);
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
+        advance_setup_revision(&mut state);
         Ok(SavedSetupView::from_saved(
             Some(&preferences),
             state.inspection.as_ref(),
@@ -2414,9 +2429,10 @@ fn apply_link_event(shared: &Arc<Mutex<State>>, generation: u64, event: LinkEven
     false
 }
 
-/// Geometry may have changed with every connect, so the previous authorization is spent and the
-/// decider waits for the displays to hold still again.
+/// Geometry may have changed with every connect, so the previous authorization is spent, the
+/// decider waits for the displays to hold still again, and the cards redraw from them.
 fn adopt_inspection(state: &mut State, inspection: InspectedPeer) {
+    advance_setup_revision(state);
     state.displays_changed_at = Some(Instant::now());
     state.view.local_displays = display_views(&inspection.local_displays);
     state.view.peer_displays = display_views(&inspection.peer_displays);
@@ -2540,6 +2556,8 @@ fn link_persist(
                     remember_applied(&commit_path, &applied);
                 }
                 crate::autostart::setup_applied(&commit_path);
+                // Only now, so a window that reads again finds the remembered layout as well.
+                advance_setup_revision(&mut lock(&commit_state));
             }
             Ok(())
         }),
@@ -2642,12 +2660,13 @@ fn view_of(state: &State) -> SharingView {
         .link_since
         .map(|since| human_duration(since.elapsed()))
         .unwrap_or_default();
-    view.local_platform = state
-        .inspection
-        .as_ref()
-        .map_or_else(local_platform_name, |inspection| {
-            platform_name(inspection.local_platform)
-        });
+    view.setup_revision = state.setup_revision.to_string();
+    view.local_platform = platform_name(
+        state
+            .inspection
+            .as_ref()
+            .map_or_else(local_platform, |inspection| inspection.local_platform),
+    );
     view.peer_platform = state
         .inspection
         .as_ref()
@@ -2698,6 +2717,12 @@ fn advance_authorization(state: &mut State) {
         }
     }
 }
+
+/// The window only compares it for equality, so wrapping is harmless.
+fn advance_setup_revision(state: &mut State) {
+    state.setup_revision = state.setup_revision.wrapping_add(1);
+}
+
 fn invalidate_authorization(state: &mut State) {
     advance_authorization(state);
     state.inspection = None;
@@ -4924,6 +4949,68 @@ pub(crate) mod tests {
             (persist.commit)(&fresh, &bytes),
             Err(LinkRejectReason::SaveFailed)
         );
+    }
+
+    #[test]
+    fn the_setup_revision_moves_on_with_each_write_and_commit_and_never_with_a_poll() {
+        let controller = SharingController::default();
+        let (directory, path) = sync_test_path();
+        let revision = || controller.status().setup_revision;
+        let start = revision();
+        // A status poll, and the supervisor mirroring the file into the view every pass, write
+        // nothing.
+        controller.adopt_saved(&SetupFile::load(&path).unwrap());
+        assert_eq!(revision(), start);
+        controller
+            .update_setup_file(&path, |file| file.set_interface_id("en0:4:192.168.1.4"))
+            .unwrap();
+        let written = revision();
+        assert_ne!(written, start);
+        assert_eq!(revision(), written);
+
+        let (fresh, bytes) = sync_payload();
+        let persist = link_persist(
+            Arc::clone(&controller.state),
+            0,
+            path.clone(),
+            Arc::clone(&controller.setup_file),
+        );
+        (persist.stage)(&fresh, &bytes).unwrap();
+        assert_eq!(revision(), written);
+        (persist.commit)(&fresh, &bytes).unwrap();
+        let committed = revision();
+        assert_ne!(committed, written);
+        // By then the layout is remembered as well, so a window reading again lists it.
+        let library = ArrangementLibrary::load(&path.with_file_name(ARRANGEMENTS_FILE)).unwrap();
+        assert_eq!(library.views(&fresh).len(), 1);
+        // A commit with nothing staged writes nothing, so nothing moves.
+        assert_eq!(
+            (persist.commit)(&fresh, &bytes),
+            Err(LinkRejectReason::SaveFailed)
+        );
+        assert_eq!(revision(), committed);
+        drop(directory);
+    }
+
+    #[test]
+    fn displays_a_link_reports_move_the_setup_revision_on() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let (controller, fixture, inspection) = connected_link(Duration::from_secs(600));
+        let connected = controller.status().setup_revision;
+        assert_ne!(connected, SharingView::default().setup_revision);
+        let mut moved = crate::sharing_preferences::tests::preferences();
+        moved.move_local_display_for_test("1", [0.0, 240.0]);
+        let changed = crate::sharing_preferences::tests::inspection(&moved);
+        assert!(!changed.matches(&inspection));
+        fixture
+            .events
+            .send(LinkEvent::TopologyChanged {
+                inspection: changed,
+            })
+            .unwrap();
+        wait_for(&controller, |view| view.setup_revision != connected);
+        controller.stop_with(NOT_CONNECTED);
+        join_finished_worker(&controller);
     }
 
     #[test]

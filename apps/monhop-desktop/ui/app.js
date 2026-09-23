@@ -44,6 +44,7 @@ import {
   layoutForSave,
   loadArrangement,
   loadArrangementLayout,
+  normalizeSharingView,
   resetArrangement as resetSharingArrangement,
   sameSharingView,
   setArrangement,
@@ -78,17 +79,28 @@ import {
 import {
   beginComputerArrangements,
   computerArrangements,
+  coverComputersLoad,
   displayName,
   failComputerArrangements,
   findComputer,
+  finishComputersLoad,
+  followSetupRevision,
   initialComputerArrangements,
   initialComputers,
+  initialComputersLoad,
   normalizeComputers,
   pruneComputerArrangements,
+  requestComputersLoad,
   setComputerArrangements,
 } from "./computers-model.mjs";
 import { activeStatus, isLiveStatus } from "./computer-status.mjs";
-import { clearForgetFor, keepForgetArmed, loadGate, pressForget } from "./computer-card-model.mjs";
+import {
+  clearForgetFor,
+  keepForgetArmed,
+  keepForgetListed,
+  loadGate,
+  pressForget,
+} from "./computer-card-model.mjs";
 import { forgetArrangementMotion } from "./dashboard-arrangement.mjs";
 import {
   applyDimmingView,
@@ -176,7 +188,7 @@ let autostart = normalizeAutostartView(null);
 let autostartPending = false;
 let computers = initialComputers();
 let computersRequest = 0;
-let computersLoadPending = false;
+let computersLoad = initialComputersLoad();
 let computersLoadFailure = "";
 // Each computer's layout history, kept apart from `computers` so a `computers_load` poll never wipes it.
 let computerArrangementsStore = initialComputerArrangements();
@@ -184,6 +196,8 @@ let computerArrangementsStore = initialComputerArrangements();
 // computer at a time so a reply that predates a newer one never lands.
 let layoutForget = null;
 const arrangementRequests = new Map();
+// Lists due a background read that waits for the read or forget of their own still in flight.
+const arrangementsRefreshAfter = new Set();
 let renaming = null;
 // What the user has typed into the name so far; polls re-render the field and must not erase it.
 let renameDraft = null;
@@ -493,7 +507,7 @@ function context() {
     snapshotCheck,
     pairingPending,
     pairingOperation,
-    computersLoadPending,
+    computersLoadPending: computersLoad.running,
     computersLoadFailure,
     renaming,
     renamePending,
@@ -675,8 +689,8 @@ function renderHeaderRefresh() {
         label: "Check the paired computers again",
         variant: "ghost",
         size: "sm",
-        disabled: computersLoadPending,
-        busy: computersLoadPending,
+        disabled: computersLoad.running,
+        busy: computersLoad.running,
         onClick: loadComputers,
       }),
     );
@@ -810,8 +824,8 @@ function renderPageAlert(ctx) {
       iconButton({
         id: "computers-retry",
         label: "Read the paired computers again",
-        disabled: computersLoadPending,
-        busy: computersLoadPending,
+        disabled: computersLoad.running,
+        busy: computersLoad.running,
         size: "sm",
         onClick: loadComputers,
       }),
@@ -1182,19 +1196,39 @@ function applyPairingResult(result) {
 // ---------- computers ----------
 
 async function loadComputers() {
-  if (!core?.invoke || computersLoadPending) return;
-  computersLoadPending = true;
+  if (!core?.invoke) return;
+  const requested = requestComputersLoad(computersLoad);
+  computersLoad = requested.load;
+  if (requested.start) await readComputerList();
+}
+
+// One read, then the one more that any request made meanwhile asked for.
+async function readComputerList() {
   const request = ++computersRequest;
   render();
   try {
+    // Read before the list, so the list is at least as new as this revision.
+    const status = await core.invoke("sharing_status").catch(() => null);
+    computersLoad = coverComputersLoad(computersLoad, normalizeSharingView(status).setupRevision);
     applyComputers(await readComputers("computers_load"), request);
+    if (request === computersRequest) refreshComputerArrangements();
   } catch {
+    // Not covered after all, so the next status poll reads again.
+    computersLoad = coverComputersLoad(computersLoad, null);
     if (request === computersRequest)
       computersLoadFailure = "The paired computers could not be read.";
-  } finally {
-    computersLoadPending = false;
-    if (request === computersRequest) render();
   }
+  const finished = finishComputersLoad(computersLoad);
+  computersLoad = finished.load;
+  if (request === computersRequest) render();
+  if (finished.again) await readComputerList();
+}
+
+// Called with every sharing view applied: a commit, or a display change on either computer.
+function followComputers() {
+  const followed = followSetupRevision(computersLoad, sharing.view?.setupRevision);
+  computersLoad = followed.load;
+  if (followed.start) void readComputerList();
 }
 
 async function readComputers(command, payload) {
@@ -1295,14 +1329,12 @@ async function forgetComputer(fingerprint) {
 async function useComputer(fingerprint) {
   const interfaceId = state.selectedInterfaceId ?? null;
   await runSharing("active", () => core.invoke("sharing_set_active", { fingerprint, interfaceId }));
-  await loadComputers();
 }
 
 async function beginLayoutEdit(fingerprint = activeFingerprint()) {
   const interfaceId = state.selectedInterfaceId;
   if (!fingerprint || !canEditLayout(sharing, interfaceId)) return;
   await runSharing("edit", () => core.invoke("sharing_edit_begin", { interfaceId, fingerprint }));
-  await loadComputers();
 }
 
 async function endLayoutEdit() {
@@ -1335,7 +1367,6 @@ async function applySetup() {
   await runSharing("apply", () =>
     core.invoke("sharing_apply_setup", { revision: sharing.view.revision, layout }),
   );
-  await loadComputers();
 }
 
 // A connected link always has a draft to edit, so every view settles into one.
@@ -1561,6 +1592,7 @@ async function runSharing(kind, invoke) {
     sharing = failPending(sharing, generation, nativeError(error));
   }
   render();
+  followComputers();
   scheduleSharingPoll();
 }
 
@@ -1620,6 +1652,7 @@ async function refreshSharingStatus() {
     sharingStatusPending = false;
   }
   if (changed) render();
+  followComputers();
   scheduleSharingPoll();
 }
 
@@ -1717,7 +1750,7 @@ function loadSavedArrangement(name) {
 // ---------- each computer's layout history ----------
 
 // Read on demand (the disclosure opening, or after a forget) rather than polled, since it works
-// disconnected and most cards never open it.
+// disconnected and most cards never open it. Once read, it follows every read of the computers.
 async function loadComputerArrangements(fingerprint) {
   if (
     !core?.invoke ||
@@ -1725,9 +1758,21 @@ async function loadComputerArrangements(fingerprint) {
     computerArrangements(computerArrangementsStore, fingerprint).loading
   )
     return;
-  await readArrangementsFor(fingerprint, () =>
-    core.invoke("sharing_arrangements_for", { fingerprint }),
-  );
+  await readArrangementsFor(fingerprint, listArrangementsFor(fingerprint));
+}
+
+function listArrangementsFor(fingerprint) {
+  return () => core.invoke("sharing_arrangements_for", { fingerprint });
+}
+
+// A commit remembers its layout beside the setup it writes, so every list already read is read
+// again with the computers. One with its own read or forget in flight is read after that ends.
+function refreshComputerArrangements() {
+  for (const fingerprint of Object.keys(computerArrangementsStore)) {
+    if (computerArrangements(computerArrangementsStore, fingerprint).loading)
+      arrangementsRefreshAfter.add(fingerprint);
+    else void readArrangementsFor(fingerprint, listArrangementsFor(fingerprint), { quiet: true });
+  }
 }
 
 // Forget is armed on the first press and runs on the second, one row at a time across the app.
@@ -1753,14 +1798,17 @@ async function forgetComputerArrangement(fingerprint, name) {
 }
 
 // One command per computer at a time. Its reply is the whole list, so it lands in that computer's
-// history and, when this is the computer in use, in the connected editor's list as well.
-async function readArrangementsFor(fingerprint, invoke) {
+// history and, when this is the computer in use, in the connected editor's list as well. A quiet
+// read leaves the rows as they are while it runs.
+async function readArrangementsFor(fingerprint, invoke, { quiet = false } = {}) {
   const request = (arrangementRequests.get(fingerprint) ?? 0) + 1;
   arrangementRequests.set(fingerprint, request);
-  // The list is about to be replaced, so a confirm armed against the old one is dropped.
-  layoutForget = clearForgetFor(layoutForget, fingerprint);
-  computerArrangementsStore = beginComputerArrangements(computerArrangementsStore, fingerprint);
-  render();
+  if (!quiet) {
+    // The list is about to be replaced, so a confirm armed against the old one is dropped.
+    layoutForget = clearForgetFor(layoutForget, fingerprint);
+    computerArrangementsStore = beginComputerArrangements(computerArrangementsStore, fingerprint);
+    render();
+  }
   try {
     const list = await invoke();
     if (arrangementRequests.get(fingerprint) !== request) return;
@@ -1773,7 +1821,14 @@ async function readArrangementsFor(fingerprint, invoke) {
       nativeError(error),
     );
   }
+  layoutForget = keepForgetListed(
+    layoutForget,
+    fingerprint,
+    computerArrangements(computerArrangementsStore, fingerprint).items,
+  );
   render();
+  if (arrangementsRefreshAfter.delete(fingerprint))
+    void readArrangementsFor(fingerprint, listArrangementsFor(fingerprint), { quiet: true });
 }
 
 // Both surfaces read the same library, so neither may keep showing an entry the other removed.

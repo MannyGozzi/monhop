@@ -8,6 +8,7 @@ import {
   displaysFreshness,
   isForgetArmed,
   keepForgetArmed,
+  keepForgetListed,
   layoutChips,
   layoutRowKey,
   layoutRows,
@@ -150,6 +151,15 @@ test("an armed row is dropped when its list is read again or its computer is unp
   assert.deepEqual(keepForgetArmed(armed, [WINDOWS, MAC]), armed);
   assert.equal(keepForgetArmed(armed, [MAC]), null);
   assert.equal(keepForgetArmed(null, [WINDOWS]), null);
+});
+
+test("a list read again in the background keeps the confirm only while its row is listed", () => {
+  const armed = { fingerprint: WINDOWS, name: "Desk" };
+  assert.deepEqual(keepForgetListed(armed, WINDOWS, [{ name: "Sofa" }, { name: "Desk" }]), armed);
+  assert.equal(keepForgetListed(armed, WINDOWS, [{ name: "Sofa" }]), null);
+  // Another computer's list says nothing about this row.
+  assert.deepEqual(keepForgetListed(armed, MAC, []), armed);
+  assert.equal(keepForgetListed(null, WINDOWS, []), null);
 });
 
 test("renders_both_switches_on_by_default", () => {

@@ -1,7 +1,7 @@
 import { displayName } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
 import { computerCard } from "./computer-card.mjs";
-import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
+import { createDashboardArrangement, DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
 import { displayNoticeCopy } from "./sharing-model.mjs";
 import {
   DIM_LEVEL_STEP,
@@ -247,9 +247,7 @@ function activeDetails(ctx) {
     onClick: actions.copyLastDrop,
   });
   return [
-    activeComputer.setup?.saved === true
-      ? note("Saved display positions. Not a current display check.")
-      : null,
+    activeComputer.setup?.saved === true ? note(DRAWN_DISPLAYS_NOTE) : null,
     presence(
       `${key}-last-drop`,
       lastFailure
