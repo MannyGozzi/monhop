@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use monhop_core::{
     DeviceId, Display, DisplayId, HidUsage, LogicalRect, LogicalSize, MouseButton, NativeSize,
-    Point,
+    Point, clicks::SINGLE_CLICK,
 };
 
 pub use monhop_core::{capture, capture_control, capture_physical};
@@ -416,7 +416,7 @@ impl MacInjector {
             }
         }
         for button in buttons {
-            if let Err(error) = self.button(button, false, capture::SINGLE_CLICK) {
+            if let Err(error) = self.button(button, false, SINGLE_CLICK) {
                 first_error.get_or_insert(error);
             }
         }

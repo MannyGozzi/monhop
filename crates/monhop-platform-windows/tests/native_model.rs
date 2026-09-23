@@ -1,12 +1,11 @@
 use std::time::Duration;
 
-use monhop_core::{DeviceId, Display, HidUsage, MouseButton};
+use monhop_core::{DeviceId, Display, HidUsage, MouseButton, clicks::DOUBLE_CLICK_SLOP};
 use monhop_platform_windows::{
-    CaptureStats, ClickAnchors, DOUBLE_CLICK_SNAP_PIXELS, DisplayError, InputError, KeyMapError,
-    MONHOP_INJECTED_MARKER, Set1Prefix, Set1ScanCode, VirtualDesktop,
-    absolute_send_input_coordinates, capture_counts, display_id_from_device_name,
-    enumerate_displays, hid_usage_from_set1, is_monhop_injected, set1_from_hid_usage,
-    summarize_raw_mouse,
+    CaptureStats, ClickAnchors, DisplayError, InputError, KeyMapError, MONHOP_INJECTED_MARKER,
+    Set1Prefix, Set1ScanCode, VirtualDesktop, absolute_send_input_coordinates, capture_counts,
+    display_id_from_device_name, enumerate_displays, hid_usage_from_set1, is_monhop_injected,
+    set1_from_hid_usage, summarize_raw_mouse,
 };
 
 #[test]
@@ -41,14 +40,14 @@ fn a_multi_click_press_far_away_or_already_in_place_is_left_alone() {
     anchors.moved_to(0, 0);
     anchors.pressed(MouseButton::Left, None);
     for (x, y) in [
-        (DOUBLE_CLICK_SNAP_PIXELS + 1, 0),
-        (0, -DOUBLE_CLICK_SNAP_PIXELS - 1),
+        (DOUBLE_CLICK_SLOP + 1, 0),
+        (0, -DOUBLE_CLICK_SLOP - 1),
         (i32::MAX, i32::MIN),
     ] {
         anchors.moved_to(x, y);
         assert_eq!(anchors.press_target(MouseButton::Left, 2), None);
     }
-    anchors.moved_to(DOUBLE_CLICK_SNAP_PIXELS, -DOUBLE_CLICK_SNAP_PIXELS);
+    anchors.moved_to(DOUBLE_CLICK_SLOP, -DOUBLE_CLICK_SLOP);
     assert_eq!(anchors.press_target(MouseButton::Left, 2), Some((0, 0)));
     anchors.moved_to(0, 0);
     assert_eq!(anchors.press_target(MouseButton::Left, 2), None);
@@ -65,6 +64,75 @@ fn a_multi_click_press_far_away_or_already_in_place_is_left_alone() {
         None,
         "a press at an unknown spot anchors nothing"
     );
+}
+
+/// A press at `first`, released, then a double-click press the source reports at `second`.
+fn snapped_double(first: (i32, i32), second: (i32, i32)) -> ClickAnchors {
+    let mut anchors = ClickAnchors::new();
+    anchors.moved_to(first.0, first.1);
+    anchors.pressed(MouseButton::Left, None);
+    anchors.released(MouseButton::Left);
+    anchors.moved_to(second.0, second.1);
+    let snapped = anchors.press_target(MouseButton::Left, 2);
+    assert_eq!(snapped, Some(first));
+    anchors.pressed(MouseButton::Left, snapped);
+    anchors
+}
+
+#[test]
+fn small_moves_under_a_held_snapped_press_stay_on_it_until_one_goes_farther() {
+    let mut anchors = snapped_double((100, 200), (106, 195));
+    assert_eq!(
+        anchors.move_target(107, 196),
+        (100, 200),
+        "the source's unsnapped spot"
+    );
+    anchors.pressed(MouseButton::Right, None);
+    assert_eq!(anchors.release_target(MouseButton::Right), None);
+    anchors.released(MouseButton::Right);
+    assert_eq!(
+        anchors.move_target(100 + DOUBLE_CLICK_SLOP, 200 - DOUBLE_CLICK_SLOP),
+        (100, 200),
+        "another button's release keeps the hold"
+    );
+    assert_eq!(
+        anchors.move_target(101 + DOUBLE_CLICK_SLOP, 200),
+        (101 + DOUBLE_CLICK_SLOP, 200)
+    );
+    assert_eq!(
+        anchors.move_target(101, 200),
+        (101, 200),
+        "following resumed for good"
+    );
+    assert_eq!(anchors.release_target(MouseButton::Left), None);
+}
+
+#[test]
+fn the_release_of_a_held_snapped_press_resumes_the_sources_position() {
+    let mut anchors = snapped_double((0, 0), (3, 2));
+    assert_eq!(anchors.move_target(4, 1), (0, 0));
+    assert_eq!(
+        anchors.release_target(MouseButton::Left),
+        Some((4, 1)),
+        "released on the snap, then moved to where the source put the cursor"
+    );
+    anchors.released(MouseButton::Left);
+    assert_eq!(anchors.release_target(MouseButton::Left), None);
+    assert_eq!(anchors.move_target(4, 2), (4, 2));
+
+    let mut in_place = snapped_double((0, 0), (1, 1));
+    in_place.move_target(0, 0);
+    assert_eq!(
+        in_place.release_target(MouseButton::Left),
+        None,
+        "the source came back to the snap on its own"
+    );
+
+    let mut unsnapped = ClickAnchors::new();
+    unsnapped.moved_to(0, 0);
+    unsnapped.pressed(MouseButton::Left, None);
+    assert_eq!(unsnapped.move_target(2, 2), (2, 2), "only a snap holds");
+    assert_eq!(unsnapped.release_target(MouseButton::Left), None);
 }
 
 #[test]

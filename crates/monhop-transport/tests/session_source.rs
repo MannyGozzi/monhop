@@ -1,6 +1,7 @@
 use std::{cell::RefCell, sync::Once, time::Duration};
 
 use monhop_core::capture::DECLINE_RETRY_AFTER;
+use monhop_core::clicks::DOUBLE_CLICK_SLOP;
 use monhop_core::{
     DeviceId, Display, DisplayId, Edge, EdgeLink, HidUsage, LogicalSize, Machine, ModifierState,
     MouseButton, NativeSize, NormalizedSpan, Platform, Point, Topology,
@@ -1056,18 +1057,19 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
         ),
         ms(1),
     );
-    remote_to_remote.fresh_capture(
-        routed(
-            NormalizedInput::Button {
-                button: MouseButton::Left,
-                pressed: true,
-                click_count: 2,
-            },
-            true,
-            1,
-        ),
-        ms(2),
-    );
+    for pressed in [true, false, true] {
+        remote_to_remote.fresh_capture(
+            routed(
+                NormalizedInput::Button {
+                    button: MouseButton::Left,
+                    pressed,
+                },
+                true,
+                1,
+            ),
+            ms(2),
+        );
+    }
     remote_to_remote.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(98.0, 0.0)),
@@ -1122,7 +1124,6 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
             NormalizedInput::Button {
                 button: MouseButton::Left,
                 pressed: false,
-                click_count: 2,
             },
             true,
             1,
@@ -1282,6 +1283,149 @@ fn a_pointer_held_on_a_far_edge_stays_inside_the_receivers_own_coordinates() {
     );
 }
 
+/// Control of a 400 px wide display on the peer, delivered through a real receiver.
+fn controlling_a_wide_peer_display() -> (SourceController, ReceiverBridge) {
+    let topology = two_machine_topology(
+        vec![
+            display_at(1, 1, Point::new(0.0, 0.0), 100),
+            display_at(2, 2, Point::new(100.0, 0.0), 400),
+        ],
+        vec![
+            full_link(1, Edge::Right, 2, Edge::Left),
+            full_link(2, Edge::Left, 1, Edge::Right),
+        ],
+    );
+    let mut source = SourceController::new(
+        topology,
+        device(1),
+        DisplayId(1),
+        SessionEpoch::new(3).unwrap(),
+        3,
+        Duration::ZERO,
+    )
+    .unwrap();
+    let mut bridge = ReceiverBridge::new(
+        DisplayTopology::new(vec![DisplayDescription {
+            id: DisplayId(2),
+            name: "remote".into(),
+            native_width: 400,
+            native_height: 100,
+            logical_origin: Point::new(100.0, 0.0),
+            logical_size: Point::new(400.0, 100.0),
+            scale_factor: 1.0,
+            is_primary: true,
+            monitor: None,
+        }])
+        .unwrap(),
+    );
+    source.fresh_capture(
+        local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
+        ms(0),
+    );
+    let edge = push_through(&mut source, Point::new(1.0, 0.0), ms(0));
+    bridge.pump(&mut source, edge, ms(0)).unwrap();
+    assert_eq!(source.mode(), SourceMode::Remote);
+    (source, bridge)
+}
+
+fn click(
+    source: &mut SourceController,
+    bridge: &mut ReceiverBridge,
+    button: MouseButton,
+    now: Duration,
+) {
+    for pressed in [true, false] {
+        let outcome = capture_on_route(source, NormalizedInput::Button { button, pressed }, now);
+        bridge.pump(source, outcome, now).unwrap();
+    }
+}
+
+fn nudge(source: &mut SourceController, bridge: &mut ReceiverBridge, by: Point, now: Duration) {
+    let outcome = capture_on_route(source, NormalizedInput::RelativeMotion(by), now);
+    bridge.pump(source, outcome, now).unwrap();
+}
+
+fn delivered_clicks(bridge: &ReceiverBridge) -> Vec<(MouseButton, bool, u8)> {
+    bridge
+        .destination
+        .actions
+        .iter()
+        .filter_map(|action| match *action {
+            RecordedAction::Button(button, pressed, count) => Some((button, pressed, count)),
+            _ => None,
+        })
+        .collect()
+}
+
+const LEFT_CLICK: [(MouseButton, bool, u8); 2] =
+    [(MouseButton::Left, true, 1), (MouseButton::Left, false, 1)];
+const LEFT_DOUBLE: [(MouseButton, bool, u8); 2] =
+    [(MouseButton::Left, true, 2), (MouseButton::Left, false, 2)];
+
+#[test]
+fn quick_presses_far_apart_on_the_peer_are_single_clicks_though_the_pinned_cursor_never_moved() {
+    // Capture reports both presses at this computer's cursor, pinned at the crossed edge; only
+    // the peer cursor the source tracks moves between them.
+    let (mut source, mut bridge) = controlling_a_wide_peer_display();
+    click(&mut source, &mut bridge, MouseButton::Left, ms(10));
+    nudge(&mut source, &mut bridge, Point::new(200.0, 0.0), ms(20));
+    click(&mut source, &mut bridge, MouseButton::Left, ms(30));
+    assert_eq!(delivered_clicks(&bridge), [LEFT_CLICK, LEFT_CLICK].concat());
+}
+
+#[test]
+fn a_double_click_with_hand_jitter_inside_the_slop_arrives_as_a_double() {
+    let jitter = f64::from(DOUBLE_CLICK_SLOP) - 1.0;
+    let (mut source, mut bridge) = controlling_a_wide_peer_display();
+    nudge(&mut source, &mut bridge, Point::new(50.0, 0.0), ms(5));
+    click(&mut source, &mut bridge, MouseButton::Left, ms(10));
+    nudge(
+        &mut source,
+        &mut bridge,
+        Point::new(jitter, -jitter),
+        ms(20),
+    );
+    click(&mut source, &mut bridge, MouseButton::Left, ms(30));
+    assert_eq!(
+        delivered_clicks(&bridge),
+        [LEFT_CLICK, LEFT_DOUBLE].concat()
+    );
+}
+
+#[test]
+fn the_source_users_double_click_interval_numbers_its_presses() {
+    let (mut source, mut bridge) = controlling_a_wide_peer_display();
+    source.set_double_click_interval(ms(150));
+    click(&mut source, &mut bridge, MouseButton::Left, ms(10));
+    click(&mut source, &mut bridge, MouseButton::Left, ms(160));
+    click(&mut source, &mut bridge, MouseButton::Left, ms(311));
+    assert_eq!(
+        delivered_clicks(&bridge),
+        [LEFT_CLICK, LEFT_DOUBLE, LEFT_CLICK].concat(),
+        "151 ms is outside this user's interval, though inside the 500 ms fallback"
+    );
+}
+
+#[test]
+fn another_button_between_two_quick_presses_breaks_the_double() {
+    let (mut source, mut bridge) = controlling_a_wide_peer_display();
+    click(&mut source, &mut bridge, MouseButton::Left, ms(10));
+    click(&mut source, &mut bridge, MouseButton::Right, ms(20));
+    click(&mut source, &mut bridge, MouseButton::Left, ms(30));
+    assert_eq!(
+        delivered_clicks(&bridge),
+        [
+            LEFT_CLICK,
+            [
+                (MouseButton::Right, true, 1),
+                (MouseButton::Right, false, 1)
+            ],
+            LEFT_CLICK,
+        ]
+        .concat()
+    );
+}
+
 #[test]
 fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
     let mut source = source();
@@ -1315,7 +1459,6 @@ fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
             NormalizedInput::Button {
                 button: MouseButton::Left,
                 pressed: true,
-                click_count: 1,
             },
             true,
             1,
@@ -1739,7 +1882,6 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
         NormalizedInput::Button {
             button: MouseButton::Left,
             pressed: true,
-            click_count: 2,
         },
     ] {
         assert!(source.fresh_capture(local(event), ms(0)).effects.is_empty());

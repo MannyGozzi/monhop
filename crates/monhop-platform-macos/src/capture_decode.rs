@@ -4,8 +4,7 @@
 //! its event-tap callback, which keeps the policy testable on non-macOS hosts.
 
 use monhop_core::{
-    HidUsage, LogicalRect, ModifierState, MouseButton, Point, TakeBackGate,
-    capture::{CaptureEvent, SINGLE_CLICK},
+    HidUsage, LogicalRect, ModifierState, MouseButton, Point, TakeBackGate, capture::CaptureEvent,
     capture_physical::LocalTransfer,
 };
 
@@ -93,8 +92,6 @@ pub struct PointerFields {
     pub delta_x: f64,
     pub delta_y: f64,
     pub button_number: i64,
-    /// [`CG_MOUSE_EVENT_CLICK_STATE`].
-    pub click_state: i64,
 }
 
 /// Active logical display rectangles cached by the capture owner thread.
@@ -361,12 +358,12 @@ pub fn decode_pointer(
                 input,
             )
         }
-        CG_EVENT_LEFT_MOUSE_DOWN => (None, button(MouseButton::Left, true, fields)),
-        CG_EVENT_LEFT_MOUSE_UP => (None, button(MouseButton::Left, false, fields)),
-        CG_EVENT_RIGHT_MOUSE_DOWN => (None, button(MouseButton::Right, true, fields)),
-        CG_EVENT_RIGHT_MOUSE_UP => (None, button(MouseButton::Right, false, fields)),
-        CG_EVENT_OTHER_MOUSE_DOWN => (None, mouse_button(fields, true)),
-        CG_EVENT_OTHER_MOUSE_UP => (None, mouse_button(fields, false)),
+        CG_EVENT_LEFT_MOUSE_DOWN => (None, button(MouseButton::Left, true)),
+        CG_EVENT_LEFT_MOUSE_UP => (None, button(MouseButton::Left, false)),
+        CG_EVENT_RIGHT_MOUSE_DOWN => (None, button(MouseButton::Right, true)),
+        CG_EVENT_RIGHT_MOUSE_UP => (None, button(MouseButton::Right, false)),
+        CG_EVENT_OTHER_MOUSE_DOWN => (None, mouse_button(fields.button_number, true)),
+        CG_EVENT_OTHER_MOUSE_UP => (None, mouse_button(fields.button_number, false)),
         _ => {
             return DecodedPointer {
                 local_absolute: None,
@@ -420,21 +417,12 @@ pub fn decode_scroll(
     })
 }
 
-fn button(button: MouseButton, pressed: bool, fields: PointerFields) -> DecodedInput {
-    DecodedInput::Event(CaptureEvent::Button {
-        button,
-        pressed,
-        click_count: click_count(fields.click_state),
-    })
+fn button(button: MouseButton, pressed: bool) -> DecodedInput {
+    DecodedInput::Event(CaptureEvent::Button { button, pressed })
 }
 
-/// A press macOS did not number still reaches the peer as a single click.
-fn click_count(click_state: i64) -> u8 {
-    u8::try_from(click_state.max(i64::from(SINGLE_CLICK))).unwrap_or(u8::MAX)
-}
-
-fn mouse_button(fields: PointerFields, pressed: bool) -> DecodedInput {
-    let mouse_button = match fields.button_number {
+fn mouse_button(button_number: i64, pressed: bool) -> DecodedInput {
+    let mouse_button = match button_number {
         0 => MouseButton::Left,
         1 => MouseButton::Right,
         2 => MouseButton::Middle,
@@ -442,7 +430,7 @@ fn mouse_button(fields: PointerFields, pressed: bool) -> DecodedInput {
         4 => MouseButton::Forward,
         _ => return DecodedInput::Unsupported,
     };
-    button(mouse_button, pressed, fields)
+    button(mouse_button, pressed)
 }
 
 fn valid_rectangle(rectangle: LogicalRect) -> bool {
@@ -976,7 +964,6 @@ mod tests {
             delta_x: 0.0,
             delta_y: -0.0,
             button_number: 0,
-            click_state: 0,
         };
         let motion = |source| {
             decode_pointer(

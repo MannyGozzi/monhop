@@ -8,7 +8,9 @@ use crate::{
     session_actor::DestinationActor,
     session_clock::{SessionClock, millis_u64},
     session_handshake::NegotiatedSession,
-    session_native::{NativeDestination, current_displays, current_pointer_position},
+    session_native::{
+        NativeDestination, current_displays, current_pointer_position, double_click_interval,
+    },
     session_source::{SourceController, SourceEffect, SourceMode},
     session_source_runtime::{
         NativeCapture, NativeCaptureError, apply_outcome, apply_route, lease_budget,
@@ -114,6 +116,7 @@ pub async fn run_session(
     let floor = SharedFloor::new();
     let gate = TakeBackGate::new(floor.clone());
     let origin = SessionClock::try_now()?;
+    let double_click = double_click_interval();
     let mut source = SourceController::new(
         topology.clone(),
         local,
@@ -124,6 +127,7 @@ pub async fn run_session(
     )
     .map_err(|_| SessionFailure::InvalidLayout)?
     .with_floor(floor.clone(), permissions.allows(outbound_scope));
+    source.set_double_click_interval(double_click);
     let mut outbound = Some(StartupControl::new(epoch, sequence, true, origin.elapsed()));
     let mut inbound = Some(StartupControl::new(
         epoch,
@@ -381,6 +385,7 @@ pub async fn run_session(
                 .with_floor(floor.clone(), permissions.allows(outbound_scope));
                 ready_source.inherit_bookkeeping(&source);
                 ready_source.set_peer_offset(peer_offset);
+                ready_source.set_double_click_interval(double_click);
                 source = ready_source;
                 let control = inbound
                     .take()

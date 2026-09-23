@@ -22,7 +22,7 @@ mod macos {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use monhop_core::{HidUsage, MouseButton, Point, capture::SINGLE_CLICK};
+    use monhop_core::{HidUsage, MouseButton, Point, clicks::SINGLE_CLICK};
     use monhop_platform_macos::{
         MacError, MacInjector, PassiveDiagnosticCounts, SYNTHETIC_EVENT_MARKER,
         run_passive_diagnostic_with_cancel,

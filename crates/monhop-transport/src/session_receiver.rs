@@ -20,7 +20,7 @@ pub enum DestinationAction {
         usage: HidUsage,
         pressed: bool,
     },
-    /// `click_count` is the source OS's multi-click count; destinations reproduce it natively.
+    /// `click_count` is the source's multi-click count; destinations reproduce it natively.
     Button {
         button: MouseButton,
         pressed: bool,

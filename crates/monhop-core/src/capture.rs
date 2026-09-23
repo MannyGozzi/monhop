@@ -27,9 +27,6 @@ pub const MAX_SUPPRESSION_TTL: Duration = Duration::from_millis(120);
 /// A seam whose crossing the peer declined is retried only after this much continued pressure.
 pub const DECLINE_RETRY_AFTER: Duration = Duration::from_millis(50);
 
-/// The click count of a press that does not continue a multi-click.
-pub const SINGLE_CLICK: u8 = 1;
-
 static NATIVE_INPUT_OWNED: AtomicBool = AtomicBool::new(false);
 
 /// Clears the process-wide flag when the claim and every permit split from it have dropped.
@@ -109,8 +106,7 @@ impl fmt::Debug for InjectionPermit {
 ///
 /// `RelativeMotion` is expressed in unscaled raw-input counts. `AbsoluteMotion` is expressed in
 /// physical virtual-desktop pixels. The two coordinate systems are never converted here.
-/// `Scroll` is expressed in Windows wheel units, where one detent is 120 units. A `Button` carries
-/// the source OS's multi-click count for the press and its release, never 0.
+/// `Scroll` is expressed in Windows wheel units, where one detent is 120 units.
 ///
 /// The `Logical*` variants preserve macOS Quartz logical desktop points. `LogicalScroll` is
 /// normalized to logical points by the macOS adapter: continuous point deltas pass through and
@@ -127,7 +123,6 @@ pub enum CaptureEvent {
     Button {
         button: MouseButton,
         pressed: bool,
-        click_count: u8,
     },
     AbsoluteMotion {
         x: i32,
@@ -185,8 +180,7 @@ impl CaptureEvent {
     pub const fn is_valid(self) -> bool {
         match self {
             Self::Key { usage, .. } => usage.is_valid(),
-            Self::Button { click_count, .. } => click_count != 0,
-            Self::AbsoluteMotion { .. } => true,
+            Self::Button { .. } | Self::AbsoluteMotion { .. } => true,
             Self::RelativeMotion { dx, dy } => dx != 0 || dy != 0,
             Self::Scroll {
                 horizontal,
@@ -586,15 +580,8 @@ impl From<CaptureEvent> for EncodedEvent {
                 payload: 0,
                 revision: 0,
             },
-            CaptureEvent::Button {
-                button,
-                pressed,
-                click_count,
-            } => Self {
-                header: EVENT_BUTTON
-                    | ((button.index() as u64) << 8)
-                    | (u64::from(pressed) << 11)
-                    | (u64::from(click_count) << 12),
+            CaptureEvent::Button { button, pressed } => Self {
+                header: EVENT_BUTTON | ((button.index() as u64) << 8) | (u64::from(pressed) << 11),
                 payload: 0,
                 revision: 0,
             },
@@ -667,7 +654,6 @@ impl CapturedEvent {
             EVENT_BUTTON => CaptureEvent::Button {
                 button: MouseButton::from_index(((header >> 8) & 0x07) as usize)?,
                 pressed: header & (1 << 11) != 0,
-                click_count: ((header >> 12) & u64::from(u8::MAX)) as u8,
             },
             EVENT_ABSOLUTE_MOTION => {
                 let (x, y) = unpack_i32_pair(payload);
@@ -851,32 +837,6 @@ mod tests {
         producer.try_push(key(true)).unwrap();
         producer.try_push(key(false)).unwrap();
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn a_button_click_count_survives_the_ring_and_zero_is_invalid() {
-        let (mut producer, mut consumer) = capture_channel(CaptureStop::new());
-        for button in [MouseButton::Left, MouseButton::Forward] {
-            for click_count in [1, 2, 3, u8::MAX] {
-                for pressed in [true, false] {
-                    let event = CaptureEvent::Button {
-                        button,
-                        pressed,
-                        click_count,
-                    };
-                    producer.try_push(event).unwrap();
-                    assert!(consumer.try_pop().unwrap() == Some(event));
-                }
-            }
-        }
-        assert_eq!(
-            producer.try_push(CaptureEvent::Button {
-                button: MouseButton::Left,
-                pressed: true,
-                click_count: 0,
-            }),
-            Err(StopReason::InvalidInput)
-        );
     }
 
     #[test]

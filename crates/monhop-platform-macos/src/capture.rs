@@ -19,6 +19,11 @@ use std::{
     time::Duration,
 };
 
+use core_foundation::{
+    base::{CFType, CFTypeRef, TCFType},
+    number::CFNumber,
+    string::{CFString, CFStringRef},
+};
 use monhop_core::{
     MouseButton, Point, RevocationSignal, TakeBackGate,
     capture::{
@@ -36,10 +41,9 @@ use crate::{
     ContinuousInstant, MacError, PowerWatch, SYNTHETIC_EVENT_MARKER,
     capture_decode::{
         ActiveDisplayBounds, CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
-        CG_EVENT_SCROLL_WHEEL, CG_MOUSE_EVENT_CLICK_STATE, DecodedInput, DecodedPointer,
-        EventSourceMetadata, HidKeyState, LocalModifierState, PhysicalModifierLedger,
-        PointerFields, decode_keyboard, decode_pointer, decode_scroll, is_pointer_motion,
-        should_ignore_source, should_keep_quarantine_tap,
+        CG_EVENT_SCROLL_WHEEL, DecodedInput, DecodedPointer, EventSourceMetadata, HidKeyState,
+        LocalModifierState, PhysicalModifierLedger, PointerFields, decode_keyboard, decode_pointer,
+        decode_scroll, is_pointer_motion, should_ignore_source, should_keep_quarantine_tap,
     },
     enumerate_active_displays,
     event_tap::{
@@ -117,6 +121,13 @@ unsafe extern "C" {
         >,
         user_info: *mut c_void,
     ) -> CGError;
+}
+
+// SAFETY: These declarations match the current Core Foundation CFPreferences SDK declarations.
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFPreferencesAnyApplication: CFStringRef;
+    fn CFPreferencesCopyAppValue(key: CFStringRef, application: CFStringRef) -> CFTypeRef;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1106,11 +1117,10 @@ impl CallbackState {
             }
             _ => {
                 // SAFETY: these getters borrow the event, which remains live for the callback.
-                let (point, button_number, click_state, delta_x, delta_y) = unsafe {
+                let (point, button_number, delta_x, delta_y) = unsafe {
                     (
                         CGEventGetLocation(event),
                         CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER),
-                        CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE),
                         CGEventGetDoubleValueField(event, CG_MOUSE_EVENT_DELTA_X),
                         CGEventGetDoubleValueField(event, CG_MOUSE_EVENT_DELTA_Y),
                     )
@@ -1128,7 +1138,6 @@ impl CallbackState {
                         delta_x,
                         delta_y,
                         button_number,
-                        click_state,
                     },
                     self.pointer_position,
                     source,
@@ -1582,6 +1591,30 @@ pub fn current_pointer_position() -> Option<Point> {
     (point.x.is_finite() && point.y.is_finite()).then_some(Point::new(point.x, point.y))
 }
 
+/// The user's global double-click speed setting in seconds, or None while it is unset (the system
+/// default) or unreadable.
+pub fn double_click_interval() -> Option<Duration> {
+    let key = CFString::from_static_string("com.apple.mouse.doubleClickThreshold");
+    // SAFETY: both arguments are live CFStrings, and the Copy rule hands the result to us.
+    let value = unsafe {
+        CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), kCFPreferencesAnyApplication)
+    };
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: value is a non-null Core Foundation object this function owns.
+    let value = unsafe { CFType::wrap_under_create_rule(value) };
+    seconds_setting(&value)
+}
+
+/// Only a positive, finite number of seconds is an interval.
+fn seconds_setting(value: &CFType) -> Option<Duration> {
+    let seconds = value.downcast::<CFNumber>()?.to_f64()?;
+    Duration::try_from_secs_f64(seconds)
+        .ok()
+        .filter(|interval| !interval.is_zero())
+}
+
 struct Resources {
     tap: EventTap,
 }
@@ -1804,7 +1837,6 @@ mod callback_tests {
         state: &mut CallbackState,
         event_type: CGEventType,
         number: i64,
-        click_state: i64,
     ) -> (bool, Point) {
         // SAFETY: the event type is a fixed other-button type and the point is finite; the owned
         // event is never posted.
@@ -1813,10 +1845,7 @@ mod callback_tests {
         };
         assert!(!event.is_null());
         // SAFETY: event is owned and non-null until the release below.
-        unsafe {
-            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER, number);
-            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, click_state);
-        }
+        unsafe { CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER, number) };
         let suppressed = state.native_event(event_type, event, physical_source());
         // SAFETY: event is still owned; it is released right after this read and never transferred.
         let location = unsafe { CGEventGetLocation(event) };
@@ -2068,7 +2097,7 @@ mod callback_tests {
             let expected = if remote { pin } else { Point::new(10.0, 10.0) };
             for number in [5, 7] {
                 for event_type in [CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_UP] {
-                    let (withheld, location) = deliver_button(&mut state, event_type, number, 1);
+                    let (withheld, location) = deliver_button(&mut state, event_type, number);
                     assert!(
                         !withheld,
                         "local apps receive extra buttons on either route"
@@ -2086,20 +2115,19 @@ mod callback_tests {
     }
 
     #[test]
-    fn a_remote_press_and_release_carry_the_quartz_click_state() {
+    fn a_remote_press_and_release_are_withheld_and_queued() {
         let (mut state, mut consumer) = callback_fixture();
         route_remote(&mut state, &mut consumer);
         for (event_type, pressed) in [
             (CG_EVENT_OTHER_MOUSE_DOWN, true),
             (CG_EVENT_OTHER_MOUSE_UP, false),
         ] {
-            assert!(deliver_button(&mut state, event_type, 2, 2).0);
+            assert!(deliver_button(&mut state, event_type, 2).0);
             assert!(
                 consumer.try_pop().unwrap()
                     == Some(CaptureEvent::Button {
                         button: MouseButton::Middle,
                         pressed,
-                        click_count: 2,
                     })
             );
         }
@@ -2337,6 +2365,27 @@ mod startup_tests {
         assert!(
             !NativeSessionClaim::is_claimed(),
             "a refused start releases its permit"
+        );
+    }
+
+    #[test]
+    fn the_double_click_setting_reads_as_unset_or_a_positive_interval() {
+        assert!(double_click_interval().is_none_or(|interval| !interval.is_zero()));
+    }
+
+    #[test]
+    fn only_a_positive_number_of_seconds_is_a_double_click_interval() {
+        let number = |value: f64| CFNumber::from(value).as_CFType();
+        assert_eq!(
+            seconds_setting(&number(0.25)),
+            Some(Duration::from_millis(250))
+        );
+        for refused in [0.0, -0.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(seconds_setting(&number(refused)), None);
+        }
+        assert_eq!(
+            seconds_setting(&CFString::from_static_string("0.5").as_CFType()),
+            None
         );
     }
 

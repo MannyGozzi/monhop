@@ -773,7 +773,6 @@ fn drag_in_progress_take_back_withholds_until_release() {
         NormalizedInput::Button {
             button: monhop_core::MouseButton::Left,
             pressed: true,
-            click_count: 1,
         },
     );
     p.pump();
@@ -795,31 +794,8 @@ fn drag_in_progress_take_back_withholds_until_release() {
     assert!(!c.gate.injected_held());
     assert!(!physical.process(motion, false, ms(1), &mut producer, &stop));
 }
-#[test]
-fn a_double_click_reaches_the_peer_with_its_count_on_press_and_release() {
-    let mut p = Pair::new();
-    p.cross(0);
-    p.pump();
-    let clicks = [
-        (true, 1),
-        (false, 1),
-        (true, 2),
-        (false, 2),
-        (true, 3),
-        (false, 3),
-    ];
-    for (pressed, click_count) in clicks {
-        p.input(
-            0,
-            NormalizedInput::Button {
-                button: monhop_core::MouseButton::Left,
-                pressed,
-                click_count,
-            },
-        );
-        p.pump();
-    }
-    let delivered: Vec<_> = p.computers[1]
+fn delivered_clicks(p: &Pair) -> Vec<(bool, u8)> {
+    p.computers[1]
         .destination
         .actions
         .iter()
@@ -831,47 +807,56 @@ fn a_double_click_reaches_the_peer_with_its_count_on_press_and_release() {
             } => Some((pressed, click_count)),
             _ => None,
         })
-        .collect();
-    assert_eq!(delivered, clicks);
+        .collect()
+}
+fn left(pressed: bool) -> NormalizedInput {
+    NormalizedInput::Button {
+        button: monhop_core::MouseButton::Left,
+        pressed,
+    }
 }
 #[test]
-fn a_held_double_click_carried_across_the_edge_is_one_single_click_on_the_peer() {
+fn quick_presses_in_place_reach_the_peer_numbered_on_press_and_release() {
+    let mut p = Pair::new();
+    p.cross(0);
+    p.pump();
+    for t in [10, 20, 30] {
+        p.at(t);
+        for pressed in [true, false] {
+            p.input(0, left(pressed));
+            p.pump();
+        }
+    }
+    assert_eq!(
+        delivered_clicks(&p),
+        [
+            (true, 1),
+            (false, 1),
+            (true, 2),
+            (false, 2),
+            (true, 3),
+            (false, 3)
+        ]
+    );
+}
+#[test]
+fn a_press_carried_across_the_edge_is_a_single_click_and_starts_no_sequence() {
     let mut p = Pair::new();
     for pressed in [true, false, true] {
-        p.input(
-            0,
-            NormalizedInput::Button {
-                button: monhop_core::MouseButton::Left,
-                pressed,
-                click_count: if pressed { 2 } else { 1 },
-            },
-        );
+        p.input(0, left(pressed));
     }
     p.cross(0);
     p.pump();
-    p.input(
-        0,
-        NormalizedInput::Button {
-            button: monhop_core::MouseButton::Left,
-            pressed: false,
-            click_count: 2,
-        },
-    );
+    p.input(0, left(false));
     p.pump();
-    let delivered: Vec<_> = p.computers[1]
-        .destination
-        .actions
-        .iter()
-        .filter_map(|action| match *action {
-            DestinationAction::Button {
-                pressed,
-                click_count,
-                ..
-            } => Some((pressed, click_count)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(delivered, [(true, 1), (false, 1)]);
+    assert_eq!(delivered_clicks(&p), [(true, 1), (false, 1)]);
+    p.input(0, left(true));
+    p.pump();
+    assert_eq!(
+        delivered_clicks(&p).last(),
+        Some(&(true, 1)),
+        "the carried press was never clicked on the peer"
+    );
 }
 #[test]
 fn sub_point_motion_accumulates_at_the_peer() {

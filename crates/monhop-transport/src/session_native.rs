@@ -5,7 +5,10 @@ use crate::{
     session_actor::WatchedDestination,
     session_receiver::{DestinationAction, DestinationFailure, InputDestination},
 };
-use monhop_core::{DeviceId, DisplayId, InjectionPermit, Point, RevocationSignal, TakeBackGate};
+use monhop_core::{
+    DeviceId, DisplayId, InjectionPermit, Point, RevocationSignal, TakeBackGate,
+    clicks::FALLBACK_DOUBLE_CLICK_INTERVAL,
+};
 use monhop_protocol::{DisplayDescription, DisplayTopology};
 
 /// Scroll wire values use signed wheel detents: positive right and positive up.
@@ -79,6 +82,17 @@ pub(crate) fn current_pointer_position() -> Option<Point> {
     {
         None
     }
+}
+
+/// This computer's double-click interval, which numbers the clicks it forwards.
+pub(crate) fn double_click_interval() -> std::time::Duration {
+    #[cfg(target_os = "macos")]
+    let interval = monhop_platform_macos::native_capture::double_click_interval();
+    #[cfg(windows)]
+    let interval = monhop_platform_windows::native_capture::double_click_interval();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let interval = None;
+    interval.unwrap_or(FALLBACK_DOUBLE_CLICK_INTERVAL)
 }
 
 /// Two computers can report the same native display id (two Macs, two Windows PCs), so every

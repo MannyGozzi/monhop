@@ -2,17 +2,16 @@
 
 use std::{fmt, time::Duration};
 
-use monhop_core::{HidUsage, MouseButton, capture::SINGLE_CLICK};
+use monhop_core::{
+    HidUsage, MouseButton,
+    clicks::{DOUBLE_CLICK_SLOP, SINGLE_CLICK},
+};
 
 use crate::keymap::KeyMapError;
 
 /// Marker copied into native input metadata so MonHop can ignore its own injected events.
 pub const MONHOP_INJECTED_MARKER: usize = 0x4c4b_4d31;
 pub const MAX_CAPTURE_DURATION: Duration = Duration::from_secs(30);
-
-/// A forwarded multi-click press this close to its button's previous press is injected on it:
-/// a Mac double-tap drifts 2-3 PC px at display scale, and a separate target sits farther away.
-pub const DOUBLE_CLICK_SNAP_PIXELS: i32 = 8;
 
 #[cfg(windows)]
 static RAW_CAPTURE_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -129,7 +128,7 @@ pub enum InjectionOperation {
         usage: HidUsage,
         pressed: bool,
     },
-    /// `click_count` is the source OS's multi-click count for this press or release.
+    /// `click_count` is the source's multi-click count for this press or release.
     Button {
         button: MouseButton,
         pressed: bool,
@@ -269,6 +268,15 @@ pub fn absolute_send_input_coordinates(
 pub struct ClickAnchors {
     cursor: Option<(i32, i32)>,
     presses: [Option<(i32, i32)>; MouseButton::ALL.len()],
+    held: Option<SnapHold>,
+}
+
+/// A snapped press still down. The source never learns of the snap, so its moves stay unsnapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapHold {
+    button: MouseButton,
+    snapped: (i32, i32),
+    source: (i32, i32),
 }
 
 impl ClickAnchors {
@@ -276,6 +284,7 @@ impl ClickAnchors {
         Self {
             cursor: None,
             presses: [None; MouseButton::ALL.len()],
+            held: None,
         }
     }
 
@@ -291,23 +300,58 @@ impl ClickAnchors {
     pub fn press_target(&self, button: MouseButton, click_count: u8) -> Option<(i32, i32)> {
         let cursor = self.cursor?;
         let previous = self.presses[button.index()]?;
-        let near = |from: i32, to: i32| {
-            (i64::from(from) - i64::from(to)).abs() <= i64::from(DOUBLE_CLICK_SNAP_PIXELS)
-        };
-        (click_count > SINGLE_CLICK
-            && cursor != previous
-            && near(cursor.0, previous.0)
-            && near(cursor.1, previous.1))
-        .then_some(previous)
+        (click_count > SINGLE_CLICK && cursor != previous && within_slop(cursor, previous))
+            .then_some(previous)
     }
 
     /// Records a press injected at `target`, or at the cursor without one.
     pub fn pressed(&mut self, button: MouseButton, target: Option<(i32, i32)>) {
-        if target.is_some() {
+        if let Some(snapped) = target {
+            self.held = self.cursor.map(|source| SnapHold {
+                button,
+                snapped,
+                source,
+            });
             self.cursor = target;
         }
         self.presses[button.index()] = self.cursor;
     }
+
+    /// Where to move right after this button's release: back to the source's own position when a
+    /// snap held the cursor away from it.
+    pub fn release_target(&self, button: MouseButton) -> Option<(i32, i32)> {
+        self.held
+            .filter(|hold| hold.button == button && hold.source != hold.snapped)
+            .map(|hold| hold.source)
+    }
+
+    pub fn released(&mut self, button: MouseButton) {
+        if self.held.is_some_and(|hold| hold.button == button) {
+            self.held = None;
+        }
+    }
+
+    /// Where a move to `(x, y)` lands: on a held snapped press while it stays within the slop, so
+    /// the source's unsnapped position cannot drag it; the first move beyond resumes following.
+    pub fn move_target(&mut self, x: i32, y: i32) -> (i32, i32) {
+        match &mut self.held {
+            Some(hold) if within_slop((x, y), hold.snapped) => {
+                hold.source = (x, y);
+                hold.snapped
+            }
+            _ => {
+                self.held = None;
+                (x, y)
+            }
+        }
+    }
+}
+
+fn within_slop(from: (i32, i32), to: (i32, i32)) -> bool {
+    let near = |from: i32, to: i32| {
+        (i64::from(from) - i64::from(to)).abs() <= i64::from(DOUBLE_CLICK_SLOP)
+    };
+    near(from.0, to.0) && near(from.1, to.1)
 }
 
 /// Summarizes a Raw Input mouse event without retaining its payload.
@@ -866,29 +910,35 @@ mod windows {
                     if !pressed && !self.held_buttons.contains(&button) {
                         return Err(InputError::ButtonNotHeld);
                     }
-                    let snap = match (pressed, self.desktop) {
-                        (true, Some(desktop)) => self
-                            .anchors
-                            .press_target(button, click_count)
-                            .map(|(x, y)| (x, y, desktop)),
-                        _ => None,
-                    };
+                    let moved = self.desktop.and_then(|desktop| {
+                        let (x, y) = if pressed {
+                            self.anchors.press_target(button, click_count)
+                        } else {
+                            self.anchors.release_target(button)
+                        }?;
+                        Some(((x, y), absolute_move_input(desktop, x, y).ok()?))
+                    });
                     let input = button_input(button, pressed);
-                    // One batch, so nothing can land between the move and the press.
-                    let sent = match snap {
-                        Some((x, y, desktop)) => {
-                            dispatch_inputs(&[absolute_move_input(desktop, x, y)?, input])
-                        }
+                    // One batch, so nothing lands between a snap and its press or a release and
+                    // the move that resumes following the source.
+                    let sent = match moved {
+                        Some((_, movement)) if pressed => dispatch_inputs(&[movement, input]),
+                        Some((_, movement)) => dispatch_inputs(&[input, movement]),
                         None => dispatch_inputs(&[input]),
                     };
                     if let Err(error) = sent {
                         self.anchors.forget_cursor();
                         return Err(error);
                     }
+                    let moved = moved.map(|(point, _)| point);
                     if pressed {
-                        self.anchors.pressed(button, snap.map(|(x, y, _)| (x, y)));
+                        self.anchors.pressed(button, moved);
                         self.held_buttons.insert(button);
                     } else {
+                        self.anchors.released(button);
+                        if let Some((x, y)) = moved {
+                            self.anchors.moved_to(x, y);
+                        }
                         self.held_buttons.remove(&button);
                     }
                 }
@@ -900,6 +950,7 @@ mod windows {
                     dispatch_inputs(&[mouse_input(dx, dy, MOUSEEVENTF_MOVE, 0)])?;
                 }
                 InjectionOperation::AbsoluteMove { x, y, desktop } => {
+                    let (x, y) = self.anchors.move_target(x, y);
                     let input = absolute_move_input(desktop, x, y)?;
                     self.anchors.forget_cursor();
                     dispatch_inputs(&[input])?;
@@ -946,8 +997,10 @@ mod windows {
 
             match dispatch_inputs(&inputs) {
                 Ok(()) => {
+                    for button in std::mem::take(&mut self.held_buttons) {
+                        self.anchors.released(button);
+                    }
                     self.held_keys.clear();
-                    self.held_buttons.clear();
                     Ok(())
                 }
                 Err(InputError::PartialSendInput {
@@ -982,6 +1035,7 @@ mod windows {
                     self.held_keys.remove(&usage);
                 }
                 HeldInput::Button(button) => {
+                    self.anchors.released(button);
                     self.held_buttons.remove(&button);
                 }
             }

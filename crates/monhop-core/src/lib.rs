@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod capture_control;
 pub mod capture_physical;
+pub mod clicks;
 pub mod dimming;
 pub mod floor;
 pub mod input;

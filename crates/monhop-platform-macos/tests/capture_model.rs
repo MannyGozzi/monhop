@@ -6,11 +6,11 @@ use monhop_platform_macos::{
     MAC_EVENT_FLAG_CONTROL, MAC_EVENT_FLAG_SHIFT, SYNTHETIC_EVENT_MARKER,
     capture_decode::{
         ActiveDisplayBounds, CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
-        CG_EVENT_LEFT_MOUSE_DOWN, CG_EVENT_LEFT_MOUSE_UP, CG_EVENT_MOUSE_MOVED,
-        CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_SOURCE_STATE_HID_SYSTEM, DecodedInput,
-        EventSourceMetadata, HidKeyState, LocalModifierState, PhysicalModifierLedger,
-        PointerFields, QUARTZ_POINTS_PER_DISCRETE_SCROLL_LINE, decode_keyboard, decode_pointer,
-        decode_scroll, should_keep_quarantine_tap,
+        CG_EVENT_LEFT_MOUSE_DOWN, CG_EVENT_MOUSE_MOVED, CG_EVENT_OTHER_MOUSE_DOWN,
+        CG_EVENT_SOURCE_STATE_HID_SYSTEM, DecodedInput, EventSourceMetadata, HidKeyState,
+        LocalModifierState, PhysicalModifierLedger, PointerFields,
+        QUARTZ_POINTS_PER_DISCRETE_SCROLL_LINE, decode_keyboard, decode_pointer, decode_scroll,
+        should_keep_quarantine_tap,
     },
 };
 
@@ -27,7 +27,6 @@ fn pointer(location: Point, delta_x: f64, delta_y: f64, button_number: i64) -> P
         delta_x,
         delta_y,
         button_number,
-        click_state: 1,
     }
 }
 
@@ -211,35 +210,6 @@ fn sub_point_trackpad_deltas_reach_capture_unrounded() {
 }
 
 #[test]
-fn a_press_and_its_release_carry_the_quartz_click_state() {
-    for (click_state, click_count) in [(2, 2), (3, 3), (0, 1), (-4, 1), (300, u8::MAX)] {
-        for (event_type, pressed) in [
-            (CG_EVENT_LEFT_MOUSE_DOWN, true),
-            (CG_EVENT_LEFT_MOUSE_UP, false),
-        ] {
-            let decoded = decode_pointer(
-                event_type,
-                PointerFields {
-                    click_state,
-                    ..pointer(Point::new(4.0, 5.0), 0.0, 0.0, 0)
-                },
-                None,
-                physical_source(),
-                SYNTHETIC_EVENT_MARKER,
-            );
-            assert!(matches!(
-                decoded.input,
-                DecodedInput::Event(CaptureEvent::Button {
-                    button: MouseButton::Left,
-                    pressed: actual,
-                    click_count: actual_count,
-                }) if actual == pressed && actual_count == click_count
-            ));
-        }
-    }
-}
-
-#[test]
 fn restore_bounds_and_modifier_post_flags_are_exact() {
     let bounds = ActiveDisplayBounds::from_rectangles([
         rect(-1440.0, 0.0, 1440.0, 900.0),
@@ -289,7 +259,6 @@ fn pointer_buttons_and_scroll_preserve_fractions_in_logical_points() {
         DecodedInput::Event(CaptureEvent::Button {
             button: MouseButton::Forward,
             pressed: true,
-            click_count: 1,
         })
     ));
     let left = decode_pointer(
@@ -304,7 +273,6 @@ fn pointer_buttons_and_scroll_preserve_fractions_in_logical_points() {
         DecodedInput::Event(CaptureEvent::Button {
             button: MouseButton::Left,
             pressed: true,
-            click_count: 1,
         })
     ));
     match decode_scroll(-0.015_625, 2.75, true, source, SYNTHETIC_EVENT_MARKER) {

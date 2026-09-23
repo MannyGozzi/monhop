@@ -1,11 +1,9 @@
 //! Pure decoding of low-level Windows hook metadata into capture events.
 
-use std::time::Duration;
-
 use monhop_core::{ModifierState, MouseButton};
 
 use crate::{
-    capture::{CaptureEvent, SINGLE_CLICK},
+    capture::CaptureEvent,
     input::MONHOP_INJECTED_MARKER,
     keymap::{Set1Prefix, Set1ScanCode, hid_usage_from_set1},
 };
@@ -87,91 +85,7 @@ pub fn decode_keyboard(
     })
 }
 
-/// The user's multi-click settings: `GetDoubleClickTime` and `SM_CXDOUBLECLK`/`SM_CYDOUBLECLK`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DoubleClickSettings {
-    pub interval: Duration,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Windows' out-of-the-box settings, also used for a metric that reads as 0.
-pub const WINDOWS_DEFAULT_DOUBLE_CLICK: DoubleClickSettings = DoubleClickSettings {
-    interval: Duration::from_millis(500),
-    width: 4,
-    height: 4,
-};
-
-#[derive(Clone, Copy)]
-struct LastPress {
-    button: MouseButton,
-    at: Duration,
-    count: u8,
-}
-
-/// Numbers presses the way Windows pairs a double-click: the same button again within the
-/// interval, having moved at most half the rectangle each way since its previous press.
-///
-/// Travel is summed from raw motion, because the hook's position stays clipped at the crossed
-/// edge while the cursor is pinned for the peer.
-#[derive(Clone, Copy)]
-pub struct ClickCounter {
-    last: Option<LastPress>,
-    travel: (i64, i64),
-    released: [u8; MouseButton::ALL.len()],
-}
-
-impl Default for ClickCounter {
-    fn default() -> Self {
-        Self {
-            last: None,
-            travel: (0, 0),
-            released: [SINGLE_CLICK; MouseButton::ALL.len()],
-        }
-    }
-}
-
-impl ClickCounter {
-    pub fn moved(&mut self, dx: i32, dy: i32) {
-        self.travel = (
-            self.travel.0.saturating_add(i64::from(dx)),
-            self.travel.1.saturating_add(i64::from(dy)),
-        );
-    }
-
-    /// The count for a press at `at`, or for a release the count of that button's last press.
-    pub fn count(
-        &mut self,
-        button: MouseButton,
-        pressed: bool,
-        at: Duration,
-        settings: DoubleClickSettings,
-    ) -> u8 {
-        if !pressed {
-            return self.released[button.index()];
-        }
-        let count = match self.last {
-            Some(last)
-                if last.button == button
-                    && at
-                        .checked_sub(last.at)
-                        .is_some_and(|gap| gap <= settings.interval)
-                    && self.travel.0.unsigned_abs() <= u64::from(settings.width / 2)
-                    && self.travel.1.unsigned_abs() <= u64::from(settings.height / 2) =>
-            {
-                last.count.saturating_add(1)
-            }
-            _ => SINGLE_CLICK,
-        };
-        self.last = Some(LastPress { button, at, count });
-        self.travel = (0, 0);
-        self.released[button.index()] = count;
-        count
-    }
-}
-
-/// Decodes one `MSLLHOOKSTRUCT` record without retaining pointer or button state. A button is a
-/// single click here; the capture thread's [`ClickCounter`] numbers it.
+/// Decodes one `MSLLHOOKSTRUCT` record without retaining pointer or button state.
 pub fn decode_mouse(
     message: u32,
     flags: u32,
@@ -211,11 +125,7 @@ fn keyboard_pressed(message: u32) -> Option<bool> {
 }
 
 fn button(button: MouseButton, pressed: bool) -> DecodedInput {
-    DecodedInput::Event(CaptureEvent::Button {
-        button,
-        pressed,
-        click_count: SINGLE_CLICK,
-    })
+    DecodedInput::Event(CaptureEvent::Button { button, pressed })
 }
 
 fn xbutton(mouse_data: u32, pressed: bool) -> DecodedInput {
@@ -272,7 +182,6 @@ mod tests {
             DecodedInput::Event(CaptureEvent::Button {
                 button: actual_button,
                 pressed: actual_pressed,
-                ..
             }) => {
                 assert_eq!(actual_button, button);
                 assert_eq!(actual_pressed, pressed);

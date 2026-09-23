@@ -16,7 +16,8 @@ use std::{fmt, time::Duration};
 use monhop_core::{
     DeviceId, DisplayId, Edge, EdgeTransition, FloorOwner, FloorSnapshot, FloorState, HidUsage,
     ModifierState, MouseButton, Platform, Point, PointerOwnership, PointerTarget, SharedFloor,
-    Topology, TransitionAcknowledgement, capture::SINGLE_CLICK,
+    Topology, TransitionAcknowledgement,
+    clicks::{ClickCounter, SINGLE_CLICK},
 };
 use monhop_protocol::{
     Button, DeclineReason, Frame, Key, MAX_LOGICAL_ORIGIN_ABS, Message, Motion, RateLimiter,
@@ -49,7 +50,6 @@ pub const PUSH_THROUGH_RESET: Duration = Duration::from_millis(500);
 /// before constructing this type. Scroll is in signed wheel detents: positive horizontal is right
 /// and positive vertical is up. Windows adapters divide 120-unit detents, while macOS adapters
 /// divide 40-point detents after their horizontal inversion; both preserve fractional values.
-/// A `Button` carries the source OS's multi-click count, forwarded unchanged.
 #[derive(Clone, Copy, PartialEq)]
 pub enum NormalizedInput {
     Key {
@@ -61,7 +61,6 @@ pub enum NormalizedInput {
     Button {
         button: MouseButton,
         pressed: bool,
-        click_count: u8,
     },
     AbsoluteMotion(Point),
     RelativeMotion(Point),
@@ -94,7 +93,7 @@ impl NormalizedInput {
     fn is_valid(self) -> bool {
         match self {
             Self::Key { usage, .. } => usage.is_valid(),
-            Self::Button { click_count, .. } => click_count != 0,
+            Self::Button { .. } => true,
             Self::AbsoluteMotion(point) | Self::RelativeMotion(point) => valid_point(point),
             Self::Scroll {
                 horizontal,
@@ -312,6 +311,8 @@ pub struct SourceController {
     failed_route_request: Option<RouteRequest>,
     keys: [KeyState; 256],
     buttons: [ButtonState; 5],
+    /// Numbers forwarded presses at the tracked peer cursor with this user's double-click interval.
+    clicks: ClickCounter,
     health: PeerHealth,
     remote_limiter: RateLimiter,
     last_now: Duration,
@@ -487,6 +488,7 @@ impl SourceController {
             failed_route_request: None,
             keys: [KeyState::default(); 256],
             buttons: [ButtonState::default(); 5],
+            clicks: ClickCounter::default(),
             health: PeerHealth::new(now),
             remote_limiter: RateLimiter::new(20_000).expect("bounded remote control rate"),
             last_now: now,
@@ -514,6 +516,11 @@ impl SourceController {
 
     pub fn set_peer_offset(&mut self, offset: Point) {
         self.peer_offset = offset;
+    }
+
+    /// This computer's user setting, read once per session.
+    pub fn set_double_click_interval(&mut self, interval: Duration) {
+        self.clicks = ClickCounter::new(interval);
     }
 
     /// Input seen during readiness updates only the physical ledger.
@@ -1387,9 +1394,7 @@ impl SourceController {
                 Some(_) => {}
                 None => self.fail(SourceFailure::InvalidKeyState, effects),
             },
-            NormalizedInput::Button {
-                button, pressed, ..
-            } => {
+            NormalizedInput::Button { button, pressed } => {
                 self.update_button(button, pressed);
             }
             NormalizedInput::AbsoluteMotion(current) => {
@@ -1458,17 +1463,14 @@ impl SourceController {
                     );
                 }
             }
-            NormalizedInput::Button {
-                button,
-                pressed,
-                click_count,
-            } => {
+            NormalizedInput::Button { button, pressed } => {
                 let change = self.update_button(button, pressed);
-                if !forwarding {
+                let State::Remote { position, .. } = self.state else {
                     return;
-                }
+                };
                 let index = button.index();
                 if pressed && !change.was_physical {
+                    let click_count = self.clicks.press(button, position, now);
                     self.buttons[index].remote = true;
                     self.buttons[index].remote_clicks = click_count;
                     self.push_input(
@@ -2078,6 +2080,7 @@ impl SourceController {
     }
 
     fn transfer_to_remote(&mut self, effects: &mut SourceEffects) {
+        self.clicks.reset();
         for index in 0xe0..=0xe7 {
             if self.keys[index].physical && !self.keys[index].remote {
                 self.keys[index].remote = true;
@@ -2122,6 +2125,7 @@ impl SourceController {
     /// left untouched. A bounded preflight turns an unrepresentable batch into one fail-closed
     /// cleanup path before any partial release is emitted.
     fn synchronize_reanchored_remote_input(&mut self, effects: &mut SourceEffects) {
+        self.clicks.reset();
         let key_changes = self
             .keys
             .iter()

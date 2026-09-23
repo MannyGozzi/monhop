@@ -253,7 +253,7 @@ pub enum Motion {
 pub struct Button {
     pub button: MouseButton,
     pub is_down: bool,
-    /// The source OS's count for this press and its release: 1 single, 2 double, 3 triple; never 0.
+    /// The source's count for this press and its release: 1 single, 2 double, 3 triple; never 0.
     pub click_count: u8,
 }
 
