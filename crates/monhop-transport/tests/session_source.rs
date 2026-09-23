@@ -345,7 +345,7 @@ impl ReceiverBridge {
             source.bind_capture_route(request, ticket, now).failure,
             None
         );
-        let crossed = source.on_captured(
+        let crossed = source.fresh_capture(
             routed(
                 NormalizedInput::RouteChanged {
                     remote,
@@ -379,6 +379,7 @@ impl ReceiverBridge {
 fn local(event: NormalizedInput) -> TaggedInput {
     TaggedInput {
         event,
+        floor_generation: 1,
         routing_revision: 0,
         remote: false,
     }
@@ -387,6 +388,7 @@ fn local(event: NormalizedInput) -> TaggedInput {
 fn routed(event: NormalizedInput, remote: bool, revision: u64) -> TaggedInput {
     TaggedInput {
         event,
+        floor_generation: 1,
         routing_revision: revision,
         remote,
     }
@@ -436,14 +438,14 @@ fn route_request(
 fn activate_remote(source: &mut SourceController) {
     assert!(
         source
-            .on_captured(
+            .fresh_capture(
                 local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
                 ms(0)
             )
             .effects
             .is_empty()
     );
-    let edge = source.on_captured(
+    let edge = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
@@ -469,7 +471,7 @@ fn activate_remote(source: &mut SourceController) {
             .failure,
         None
     );
-    let barrier = source.on_captured(
+    let barrier = source.fresh_capture(
         routed(
             NormalizedInput::RouteChanged {
                 remote: true,
@@ -492,14 +494,14 @@ fn edge_activation_uses_input_epoch_while_health_stays_on_base_epoch() {
 
     assert!(
         source
-            .on_captured(
+            .fresh_capture(
                 local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
                 ms(1)
             )
             .effects
             .is_empty()
     );
-    let edge = source.on_captured(
+    let edge = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(1),
     );
@@ -564,14 +566,14 @@ fn suppression_budget_only_refreshes_after_a_valid_pong() {
 #[test]
 fn local_absolute_resolves_nonprimary_before_edge_intent() {
     let mut source = source();
-    let first = source.on_captured(
+    let first = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(199.0, 50.0))),
         ms(0),
     );
     assert!(first.effects.is_empty());
     assert_eq!(source.motion_target().unwrap().target.display, DisplayId(4));
 
-    let edge = source.on_captured(
+    let edge = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
@@ -591,14 +593,14 @@ fn ordinary_local_display_motion_stays_local_without_synthetic_effects() {
     let mut source = source();
     assert!(
         source
-            .on_captured(
+            .fresh_capture(
                 local(NormalizedInput::AbsoluteMotion(Point::new(50.0, 50.0))),
                 ms(0),
             )
             .effects
             .is_empty()
     );
-    let second = source.on_captured(
+    let second = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(150.0, 50.0))),
         ms(1),
     );
@@ -613,21 +615,21 @@ fn captured_events_keep_their_route_until_the_remote_barrier() {
     let mut source = source();
     assert!(
         source
-            .on_captured(
+            .fresh_capture(
                 local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
                 ms(0)
             )
             .effects
             .is_empty()
     );
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
     let acknowledged = source.on_remote_frame(&activation_ack(), ms(0));
     source.bind_capture_route(route_request(&acknowledged), 1, ms(0));
 
-    let held_local = source.on_captured(
+    let held_local = source.fresh_capture(
         local(NormalizedInput::Key {
             usage: HidUsage(0x04),
             pressed: true,
@@ -637,7 +639,7 @@ fn captured_events_keep_their_route_until_the_remote_barrier() {
         ms(0),
     );
     assert!(held_local.effects.is_empty());
-    let barrier = source.on_captured(
+    let barrier = source.fresh_capture(
         routed(
             NormalizedInput::RouteChanged {
                 remote: true,
@@ -650,7 +652,7 @@ fn captured_events_keep_their_route_until_the_remote_barrier() {
     );
     assert!(barrier.effects.is_empty());
 
-    let old_release = source.on_captured(
+    let old_release = source.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0x04),
@@ -664,7 +666,7 @@ fn captured_events_keep_their_route_until_the_remote_barrier() {
         ms(1),
     );
     assert!(old_release.effects.is_empty());
-    let fresh_press = source.on_captured(
+    let fresh_press = source.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0x04),
@@ -693,11 +695,11 @@ fn captured_events_keep_their_route_until_the_remote_barrier() {
 #[test]
 fn route_barrier_uses_the_native_ticket_bound_after_submission() {
     let mut source = source();
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
         ms(0),
     );
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
@@ -707,7 +709,7 @@ fn route_barrier_uses_the_native_ticket_bound_after_submission() {
     assert_eq!(source.bind_capture_route(request, 9, ms(0)).failure, None);
     assert_eq!(
         source
-            .on_captured(
+            .fresh_capture(
                 routed(
                     NormalizedInput::RouteChanged {
                         remote: true,
@@ -733,7 +735,7 @@ fn remote_relative_motion_and_fractional_scroll_keep_logical_units() {
     assert_eq!(target.target.display, DisplayId(2));
     assert_eq!(target.platform, Platform::MacOs);
     assert_eq!(target.scale_factor, 1.0);
-    let motion = source.on_captured(
+    let motion = source.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(2.5, -1.25)),
             true,
@@ -747,7 +749,7 @@ fn remote_relative_motion_and_fractional_scroll_keep_logical_units() {
         1,
         Message::Motion(Motion::Absolute(Point::new(3.5, 48.75))),
     );
-    let scroll = source.on_captured(
+    let scroll = source.fresh_capture(
         routed(
             NormalizedInput::Scroll {
                 horizontal: 0.25,
@@ -773,7 +775,7 @@ fn remote_relative_motion_and_fractional_scroll_keep_logical_units() {
 fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
     let mut returning = source();
     activate_remote(&mut returning);
-    let release = returning.on_captured(
+    let release = returning.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(-3.0, 0.0)),
             true,
@@ -806,7 +808,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
     returning.bind_capture_route(route_request(&restore), 2, ms(2));
     assert_eq!(
         returning
-            .on_captured(
+            .fresh_capture(
                 routed(
                     NormalizedInput::RouteChanged {
                         remote: false,
@@ -824,7 +826,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
 
     let mut remote_to_remote = source();
     activate_remote(&mut remote_to_remote);
-    remote_to_remote.on_captured(
+    remote_to_remote.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0xe0),
@@ -837,7 +839,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
         ),
         ms(1),
     );
-    remote_to_remote.on_captured(
+    remote_to_remote.fresh_capture(
         routed(
             NormalizedInput::Button {
                 button: MouseButton::Left,
@@ -848,7 +850,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
         ),
         ms(2),
     );
-    remote_to_remote.on_captured(
+    remote_to_remote.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(98.0, 0.0)),
             true,
@@ -856,7 +858,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
         ),
         ms(3),
     );
-    let handoff = remote_to_remote.on_captured(
+    let handoff = remote_to_remote.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(3.0, 0.0)),
             true,
@@ -877,7 +879,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
         remote_to_remote.on_remote_frame(&activation_ack_for(5, 0, DisplayId(3)), ms(5));
     assert!(remote_ack.effects.is_empty());
     assert_eq!(remote_to_remote.mode(), SourceMode::Remote);
-    let control_release = remote_to_remote.on_captured(
+    let control_release = remote_to_remote.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0xe0),
@@ -901,7 +903,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
             modifiers: ModifierState(0),
         }),
     );
-    let button_release = remote_to_remote.on_captured(
+    let button_release = remote_to_remote.fresh_capture(
         routed(
             NormalizedInput::Button {
                 button: MouseButton::Left,
@@ -921,7 +923,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
             is_down: false,
         }),
     );
-    let resumed = remote_to_remote.on_captured(
+    let resumed = remote_to_remote.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(1.0, 0.0)),
             true,
@@ -941,11 +943,11 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
 fn remote_motion_carries_the_tracked_position_so_the_far_edge_is_never_overshot() {
     let mut source = source();
     let mut bridge = ReceiverBridge::new(destination_topology(&[DisplayId(2), DisplayId(3)]));
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
         ms(0),
     );
-    let edge = source.on_captured(
+    let edge = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
@@ -957,7 +959,7 @@ fn remote_motion_carries_the_tracked_position_so_the_far_edge_is_never_overshot(
     deltas.extend(std::iter::repeat_n(0.1, 76));
     deltas.push(1_000.0);
     for (step, delta) in (1_u64..).zip(deltas) {
-        let motion = source.on_captured(
+        let motion = source.fresh_capture(
             routed(
                 NormalizedInput::RelativeMotion(Point::new(0.0, delta)),
                 true,
@@ -991,7 +993,7 @@ fn remote_motion_carries_the_tracked_position_so_the_far_edge_is_never_overshot(
         bridge.destination.actions.last(),
         Some(&RecordedAction::Move(Point::new(1.0, far_edge)))
     );
-    let stalled = source.on_captured(
+    let stalled = source.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(0.0, 1.0)),
             true,
@@ -1006,7 +1008,7 @@ fn remote_motion_carries_the_tracked_position_so_the_far_edge_is_never_overshot(
 fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
     let mut source = source();
     activate_remote(&mut source);
-    let control = source.on_captured(
+    let control = source.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0xe0),
@@ -1030,7 +1032,7 @@ fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
             modifiers: ModifierState(ModifierState::LEFT_CONTROL),
         }),
     );
-    source.on_captured(
+    source.fresh_capture(
         routed(
             NormalizedInput::Button {
                 button: MouseButton::Left,
@@ -1041,7 +1043,7 @@ fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
         ),
         ms(2),
     );
-    source.on_captured(
+    source.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0x04),
@@ -1079,7 +1081,7 @@ fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
     assert_eq!(ack.effects.iter().count(), 1);
     source.bind_capture_route(route_request(&ack), 2, ms(5));
 
-    let local_barrier = source.on_captured(
+    let local_barrier = source.fresh_capture(
         routed(
             NormalizedInput::RouteChanged {
                 remote: false,
@@ -1097,11 +1099,11 @@ fn returning_local_waits_for_release_ack_before_one_native_restore_command() {
 #[test]
 fn stale_ack_and_mismatched_capture_route_fail_closed() {
     let mut controller = source();
-    controller.on_captured(
+    controller.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
         ms(0),
     );
-    controller.on_captured(
+    controller.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
@@ -1121,7 +1123,7 @@ fn stale_ack_and_mismatched_capture_route_fail_closed() {
 
     let mut other = source();
     activate_remote(&mut other);
-    let mismatch = other.on_captured(
+    let mismatch = other.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(1.0, 0.0)),
             false,
@@ -1174,7 +1176,7 @@ fn a_silent_peer_makes_a_remote_source_retreat_before_its_lease_can_expire() {
             .failure
             .is_none()
     );
-    let returned = source.on_captured(
+    let returned = source.fresh_capture(
         routed(
             NormalizedInput::RouteChanged {
                 remote: false,
@@ -1222,7 +1224,7 @@ fn a_hold_resumes_only_after_the_barrier_is_acknowledged_and_a_fresh_reply_arriv
         .expect("the retreat sends the barrier");
     assert_eq!(barrier.epoch, SessionEpoch::new(4).unwrap());
     source.bind_capture_route(route_request(&retreat), 2, RETREAT_AFTER);
-    source.on_captured(
+    source.fresh_capture(
         routed(
             NormalizedInput::RouteChanged {
                 remote: false,
@@ -1244,7 +1246,7 @@ fn a_hold_resumes_only_after_the_barrier_is_acknowledged_and_a_fresh_reply_arriv
     assert!(source.on_remote_frame(&fresh, ms(420)).failure.is_none());
     assert!(source.held_since().is_some());
     // Crossing the seam while held keeps input local.
-    let wall = source.on_captured(
+    let wall = source.fresh_capture(
         routed(
             NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0)),
             false,
@@ -1254,7 +1256,7 @@ fn a_hold_resumes_only_after_the_barrier_is_acknowledged_and_a_fresh_reply_arriv
     );
     assert_eq!(wall.failure, None);
     assert!(wall.effects.is_empty());
-    let wall = source.on_captured(
+    let wall = source.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(1.0, 0.0)),
             false,
@@ -1296,7 +1298,7 @@ fn a_hold_without_the_link_coming_back_ends_at_the_limit() {
     source.tick(ms(0));
     let retreat = source.tick(RETREAT_AFTER);
     source.bind_capture_route(route_request(&retreat), 2, RETREAT_AFTER);
-    source.on_captured(
+    source.fresh_capture(
         routed(
             NormalizedInput::RouteChanged {
                 remote: false,
@@ -1371,14 +1373,14 @@ fn real_receiver_pump_crosses_configured_edges_from_windows_and_macos() {
     let mut mac_receiver = ReceiverBridge::new(destination_topology(&[DisplayId(2), DisplayId(3)]));
     assert!(
         windows_source
-            .on_captured(
+            .fresh_capture(
                 local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
                 ms(0),
             )
             .effects
             .is_empty()
     );
-    let enter = windows_source.on_captured(
+    let enter = windows_source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
@@ -1387,7 +1389,7 @@ fn real_receiver_pump_crosses_configured_edges_from_windows_and_macos() {
         .unwrap();
     assert_eq!(windows_source.mode(), SourceMode::Remote);
     let revision = windows_source.capture_route().1;
-    let returned = windows_source.on_captured(
+    let returned = windows_source.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(-3.0, 0.0)),
             true,
@@ -1411,14 +1413,14 @@ fn real_receiver_pump_crosses_configured_edges_from_windows_and_macos() {
         ReceiverBridge::new(destination_topology(&[DisplayId(1), DisplayId(4)]));
     assert!(
         mac_source
-            .on_captured(
+            .fresh_capture(
                 local(NormalizedInput::AbsoluteMotion(Point::new(0.0, 50.0))),
                 ms(0),
             )
             .effects
             .is_empty()
     );
-    let enter = mac_source.on_captured(
+    let enter = mac_source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(-1.0, 0.0))),
         ms(0),
     );
@@ -1427,7 +1429,7 @@ fn real_receiver_pump_crosses_configured_edges_from_windows_and_macos() {
         .unwrap();
     assert_eq!(mac_source.mode(), SourceMode::Remote);
     let revision = mac_source.capture_route().1;
-    let returned = mac_source.on_captured(
+    let returned = mac_source.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(3.0, 0.0)),
             true,
@@ -1451,11 +1453,11 @@ fn real_receiver_pump_crosses_configured_edges_from_windows_and_macos() {
 fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
     let mut source = source();
     let mut bridge = ReceiverBridge::new(destination_topology(&[DisplayId(2), DisplayId(3)]));
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
         ms(0),
     );
-    let edge = source.on_captured(
+    let edge = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
@@ -1483,7 +1485,7 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
             pressed: true,
         },
     ] {
-        assert!(source.on_captured(local(event), ms(0)).effects.is_empty());
+        assert!(source.fresh_capture(local(event), ms(0)).effects.is_empty());
     }
     bridge.pump(&mut source, edge, ms(0)).unwrap();
     assert_eq!(source.mode(), SourceMode::Remote);
@@ -1521,7 +1523,7 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
     )));
 
     let revision = source.capture_route().1;
-    let return_edge = source.on_captured(
+    let return_edge = source.fresh_capture(
         routed(
             NormalizedInput::RelativeMotion(Point::new(-3.0, 0.0)),
             true,
@@ -1531,7 +1533,7 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
     );
     bridge.pump(&mut source, return_edge, ms(1)).unwrap();
     assert_eq!(source.mode(), SourceMode::Local);
-    let local_release = source.on_captured(
+    let local_release = source.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0x04),
@@ -1569,18 +1571,18 @@ fn real_receiver_preserves_modifier_drag_and_quarantines_held_ordinary_key() {
 fn receiver_rejection_has_no_response_and_disconnect_releases_held_input() {
     let mut rejected_source = source();
     let mut rejected = ReceiverBridge::new(destination_topology(&[DisplayId(2), DisplayId(3)]));
-    rejected_source.on_captured(
+    rejected_source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
         ms(0),
     );
-    let edge = rejected_source.on_captured(
+    let edge = rejected_source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
     rejected.pump(&mut rejected_source, edge, ms(0)).unwrap();
     rejected.destination.reject_key_down = true;
     let revision = rejected_source.capture_route().1;
-    let rejected_key = rejected_source.on_captured(
+    let rejected_key = rejected_source.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0x04),
@@ -1605,17 +1607,17 @@ fn receiver_rejection_has_no_response_and_disconnect_releases_held_input() {
 
     let mut held_source = source();
     let mut held = ReceiverBridge::new(destination_topology(&[DisplayId(2), DisplayId(3)]));
-    held_source.on_captured(
+    held_source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
         ms(0),
     );
-    let edge = held_source.on_captured(
+    let edge = held_source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(0),
     );
     held.pump(&mut held_source, edge, ms(0)).unwrap();
     let revision = held_source.capture_route().1;
-    let held_key = held_source.on_captured(
+    let held_key = held_source.fresh_capture(
         routed(
             NormalizedInput::Key {
                 usage: HidUsage(0x04),
@@ -1653,26 +1655,26 @@ fn receiver_rejection_has_no_response_and_disconnect_releases_held_input() {
 #[test]
 fn a_cursor_on_a_display_outside_the_layout_keeps_the_session() {
     let mut source = source();
-    let inside = source.on_captured(
+    let inside = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(50.0, 50.0))),
         ms(0),
     );
     assert_eq!(inside.failure, None);
     // Below display 1 there is no display in the layout and no link on that edge.
-    let outside = source.on_captured(
+    let outside = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(50.0, 150.0))),
         ms(1),
     );
     assert_eq!(outside.failure, None);
     assert!(outside.effects.is_empty());
     assert_eq!(source.mode(), SourceMode::Local);
-    let wandering = source.on_captured(
+    let wandering = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(5.0, 5.0))),
         ms(2),
     );
     assert_eq!(wandering.failure, None);
     assert!(wandering.effects.is_empty());
-    let back = source.on_captured(
+    let back = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(150.0, 50.0))),
         ms(3),
     );
@@ -1684,14 +1686,14 @@ fn a_cursor_on_a_display_outside_the_layout_keeps_the_session() {
 #[test]
 fn a_session_that_starts_with_the_cursor_outside_the_layout_waits_for_it() {
     let mut source = source();
-    let outside = source.on_captured(
+    let outside = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(50.0, 150.0))),
         ms(0),
     );
     assert_eq!(outside.failure, None);
     assert!(outside.effects.is_empty());
     assert_eq!(source.mode(), SourceMode::Local);
-    let inside = source.on_captured(
+    let inside = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(60.0, 60.0))),
         ms(1),
     );
@@ -1703,19 +1705,19 @@ fn a_session_that_starts_with_the_cursor_outside_the_layout_waits_for_it() {
 #[test]
 fn a_slow_crossing_through_the_dead_zone_still_reaches_the_linked_display() {
     let mut source = source();
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(195.0, 50.0))),
         ms(0),
     );
     // Half a pixel past display 4's right edge is inside the link's dead zone and outside every
     // in-use display, as on a panel the layout leaves out.
-    let dead_zone = source.on_captured(
+    let dead_zone = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(200.5, 50.0))),
         ms(1),
     );
     assert_eq!(dead_zone.failure, None);
     assert!(dead_zone.effects.is_empty());
-    let crossing = source.on_captured(
+    let crossing = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(203.0, 50.0))),
         ms(2),
     );
@@ -1734,15 +1736,15 @@ fn a_slow_crossing_through_the_dead_zone_still_reaches_the_linked_display() {
 #[test]
 fn a_push_from_the_dead_zone_still_reaches_the_linked_display() {
     let mut source = source();
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(195.0, 50.0))),
         ms(0),
     );
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(200.5, 50.0))),
         ms(1),
     );
-    let push = source.on_captured(
+    let push = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(2),
     );
@@ -1836,14 +1838,14 @@ fn source_on(topology: Topology, display: DisplayId) -> SourceController {
 #[test]
 fn a_display_not_in_use_is_space_past_the_edge_of_the_display_the_pointer_left() {
     let mut source = source_on(topology_with_displays_not_in_use(), DisplayId(4));
-    let settled = source.on_captured(
+    let settled = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(150.0, 50.0))),
         ms(0),
     );
     assert!(settled.effects.is_empty());
     // Deep inside display 5, at a different height: the crossing follows the pointer, not the
     // point where it left display 4.
-    let crossing = source.on_captured(
+    let crossing = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(230.0, 60.0))),
         ms(1),
     );
@@ -1862,7 +1864,7 @@ fn a_display_not_in_use_is_space_past_the_edge_of_the_display_the_pointer_left()
 #[test]
 fn a_pointer_already_resting_on_a_display_not_in_use_crosses_on_its_first_sample() {
     let mut source = source_on(topology_with_displays_not_in_use(), DisplayId(4));
-    let crossing = source.on_captured(
+    let crossing = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(250.0, 80.0))),
         ms(0),
     );
@@ -1883,14 +1885,14 @@ fn a_pointer_on_a_display_not_in_use_settles_through_the_in_use_display_that_bor
     // The pointer's display is 1; display 5 lies past display 4. The first sample reaches 4
     // through its shared edge, the next one crosses from 4 to the other computer.
     let mut source = source_on(topology_with_displays_not_in_use(), DisplayId(1));
-    let reached = source.on_captured(
+    let reached = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(250.0, 50.0))),
         ms(0),
     );
     assert_eq!(reached.failure, None);
     assert!(reached.effects.is_empty());
     assert_eq!(source.motion_target().unwrap().target.display, DisplayId(4));
-    let crossing = source.on_captured(
+    let crossing = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(250.0, 50.0))),
         ms(1),
     );
@@ -1909,11 +1911,11 @@ fn a_pointer_on_a_display_not_in_use_settles_through_the_in_use_display_that_bor
 #[test]
 fn a_display_not_in_use_past_an_unlinked_edge_keeps_input_local_on_the_display_it_left() {
     let mut source = source_on(topology_with_displays_not_in_use(), DisplayId(1));
-    source.on_captured(
+    source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(50.0, 50.0))),
         ms(0),
     );
-    let outside = source.on_captured(
+    let outside = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(-50.0, 50.0))),
         ms(1),
     );
@@ -1950,7 +1952,7 @@ fn an_observed_pointer_position_on_the_pointer_display_only_moves_the_anchor() {
     let inside = source.observe_pointer(Point::new(150.0, 50.0), ms(1));
     assert_eq!(inside.failure, None);
     assert!(inside.effects.is_empty());
-    let push = source.on_captured(
+    let push = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(2),
     );
@@ -1960,7 +1962,7 @@ fn an_observed_pointer_position_on_the_pointer_display_only_moves_the_anchor() {
     );
     let edge = source.observe_pointer(Point::new(199.0, 50.0), ms(3));
     assert!(edge.effects.is_empty());
-    let crossing = source.on_captured(
+    let crossing = source.fresh_capture(
         local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
         ms(4),
     );
@@ -1980,14 +1982,14 @@ fn a_crossing_into_space_outside_the_layout_still_reaches_the_linked_display() {
     let mut source = source();
     assert_eq!(
         source
-            .on_captured(
+            .fresh_capture(
                 local(NormalizedInput::AbsoluteMotion(Point::new(150.0, 50.0))),
                 ms(0),
             )
             .failure,
         None
     );
-    let crossing = source.on_captured(
+    let crossing = source.fresh_capture(
         local(NormalizedInput::AbsoluteMotion(Point::new(250.0, 50.0))),
         ms(1),
     );
@@ -2001,4 +2003,14 @@ fn a_crossing_into_space_outside_the_layout_still_reaches_the_linked_display() {
             position: Point::new(1.0, 50.0),
         },
     );
+}
+
+trait FreshCapture {
+    fn fresh_capture(&mut self, record: TaggedInput, now: Duration) -> SourceOutcome;
+}
+impl FreshCapture for SourceController {
+    fn fresh_capture(&mut self, mut record: TaggedInput, now: Duration) -> SourceOutcome {
+        record.floor_generation = self.floor_generation();
+        self.on_captured(record, now)
+    }
 }

@@ -7,12 +7,12 @@ use crate::{
     },
     session_startup::ReadyControl,
 };
-use monhop_core::{NativeInputOwnership, RevocationSignal};
+use monhop_core::{InjectionPermit, RevocationSignal, TakeBackGate};
 use monhop_protocol::{DisplayTopology, Frame, Message, SessionEpoch};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-const CAPACITY: usize = 512;
+const CAPACITY: usize = crate::session::SESSION_QUEUE_CAPACITY;
 const TICK: Duration = Duration::from_millis(5);
 
 /// The rule that last stopped a receiver, as a code the desktop can name; never input content.
@@ -67,6 +67,7 @@ pub enum ActorFailure {
     SequenceExhausted,
     Panicked,
     Startup,
+    LocalDisplaysChanged,
 }
 
 struct Status {
@@ -79,6 +80,7 @@ struct Status {
     held: AtomicBool,
     display: AtomicU64,
     stats: Stats,
+    response_waker: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Receiver-side load counters for the session end report; never input content.
@@ -163,6 +165,7 @@ impl Status {
             6 => Some(ActorFailure::Native),
             7 => Some(ActorFailure::SequenceExhausted),
             8 => Some(ActorFailure::Panicked),
+            10 => Some(ActorFailure::LocalDisplaysChanged),
             _ => Some(ActorFailure::Startup),
         }
     }
@@ -170,6 +173,9 @@ impl Status {
 
 pub trait WatchedDestination: InputDestination {
     fn validate_environment(&mut self) -> Result<(), DestinationFailure>;
+    fn local_displays_changed(&self) -> bool {
+        false
+    }
 }
 
 struct StartupHandoff {
@@ -187,15 +193,19 @@ pub struct DestinationActor {
 
 impl DestinationActor {
     /// Factory construction and all destination operations stay on the actor thread.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_after_local_enable<D, F>(
         displays: DisplayTopology,
         revocation: RevocationSignal,
-        ownership: NativeInputOwnership,
+        ownership: InjectionPermit,
+        gate: TakeBackGate,
+        local_lower: bool,
+        enabled: bool,
         factory: F,
     ) -> Result<Self, ActorFailure>
     where
         D: WatchedDestination + 'static,
-        F: FnOnce(NativeInputOwnership) -> Result<D, DestinationFailure> + Send + 'static,
+        F: FnOnce(InjectionPermit) -> Result<D, DestinationFailure> + Send + 'static,
     {
         if revocation.is_stopping() {
             return Err(ActorFailure::Revoked);
@@ -213,6 +223,7 @@ impl DestinationActor {
             held: AtomicBool::new(false),
             display: AtomicU64::new(0),
             stats: Stats::default(),
+            response_waker: OnceLock::new(),
         });
         let worker_status = status.clone();
         let worker = thread::Builder::new()
@@ -239,7 +250,11 @@ impl DestinationActor {
                     return;
                 }
                 if destination.validate_environment().is_err() {
-                    status.stop(ActorFailure::Native);
+                    status.stop(if destination.local_displays_changed() {
+                        ActorFailure::LocalDisplaysChanged
+                    } else {
+                        ActorFailure::Native
+                    });
                     cleanup_without_receiver(&mut destination, &status);
                     return;
                 }
@@ -266,7 +281,11 @@ impl DestinationActor {
                     return;
                 }
                 if destination.validate_environment().is_err() {
-                    status.stop(ActorFailure::Native);
+                    status.stop(if destination.local_displays_changed() {
+                        ActorFailure::LocalDisplaysChanged
+                    } else {
+                        ActorFailure::Native
+                    });
                     cleanup_without_receiver(&mut destination, &status);
                     return;
                 }
@@ -278,7 +297,7 @@ impl DestinationActor {
                 };
                 let mut receiver =
                     match InputReceiver::after_startup(displays, handoff.control, now) {
-                        Ok(receiver) => receiver,
+                        Ok(receiver) => receiver.with_floor(gate, local_lower, enabled),
                         Err(failure) => {
                             status.stop(note_receiver_failure(failure));
                             cleanup_without_receiver(&mut destination, &status);
@@ -311,6 +330,14 @@ impl DestinationActor {
             status,
             worker: Some(worker),
         })
+    }
+
+    pub(crate) fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let thread = self.worker.as_ref().expect("actor worker").thread().clone();
+        Arc::new(move || thread.unpark())
+    }
+    pub(crate) fn set_response_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.status.response_waker.set(waker);
     }
 
     pub(crate) fn is_native_ready(&self) -> bool {
@@ -367,7 +394,11 @@ impl DestinationActor {
             };
             self.status.stop(failure);
             failure
-        })
+        })?;
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
+        Ok(())
     }
 
     pub fn try_response(&mut self) -> Result<Option<Frame>, ActorFailure> {
@@ -386,6 +417,9 @@ impl DestinationActor {
 
     pub fn request_stop(&self) {
         self.status.stop(ActorFailure::Requested);
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
     }
 
     pub fn stats(&self) -> ReceiverStats {
@@ -461,11 +495,11 @@ impl Drop for DestinationActor {
 fn construct_destination<D, F>(
     revocation: &RevocationSignal,
     status: &Status,
-    ownership: NativeInputOwnership,
+    ownership: InjectionPermit,
     factory: F,
 ) -> Result<D, ActorFailure>
 where
-    F: FnOnce(NativeInputOwnership) -> Result<D, DestinationFailure>,
+    F: FnOnce(InjectionPermit) -> Result<D, DestinationFailure>,
 {
     if let Some(failure) = status.failure() {
         return Err(failure);
@@ -502,6 +536,9 @@ impl<D: WatchedDestination> InputDestination for DestinationGuard<D> {
 }
 
 impl<D: WatchedDestination> WatchedDestination for DestinationGuard<D> {
+    fn local_displays_changed(&self) -> bool {
+        self.destination.local_displays_changed()
+    }
     fn validate_environment(&mut self) -> Result<(), DestinationFailure> {
         match catch_unwind(AssertUnwindSafe(|| self.destination.validate_environment())) {
             Ok(result) => result,
@@ -572,14 +609,26 @@ fn run_receiver<D: WatchedDestination>(
                 status.stop(ActorFailure::Revoked);
                 break;
             }
-            if now.saturating_sub(checked_environment) >= Duration::from_millis(30) {
+            if now.saturating_sub(checked_environment) >= crate::session::DISPLAY_CHECK_INTERVAL {
                 let validated = destination.validate_environment();
                 Stats::max(&status.stats.env_max_micros, micros_since(&origin, now));
                 if validated.is_err() {
-                    status.stop(ActorFailure::Native);
+                    status.stop(if destination.local_displays_changed() {
+                        ActorFailure::LocalDisplaysChanged
+                    } else {
+                        ActorFailure::Native
+                    });
                     break;
                 }
                 checked_environment = now;
+            }
+            match receiver.take_back(destination) {
+                Ok(Some(message)) => emit(message, receiver, &mut sequences, &outgoing, &status),
+                Ok(None) => {}
+                Err(failure) => {
+                    stop_receiver(&status, receiver, failure, now, last_frame_at);
+                    break;
+                }
             }
             match receiver.tick(now, destination) {
                 Ok(Some(message)) => emit(message, receiver, &mut sequences, &outgoing, &status),
@@ -593,10 +642,13 @@ fn run_receiver<D: WatchedDestination>(
             if status.failure().is_some() {
                 break;
             }
-            let mut next = match incoming.recv_timeout(TICK) {
+            let mut next = match incoming.try_recv() {
                 Ok(frame) => Some(frame),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(mpsc::TryRecvError::Empty) => {
+                    thread::park_timeout(TICK);
+                    None
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
                     status.stop(ActorFailure::PeerGone);
                     break;
                 }
@@ -617,6 +669,16 @@ fn run_receiver<D: WatchedDestination>(
             let mut batch = 0_u64;
             while let Some(frame) = next.take() {
                 batch += 1;
+                match receiver.take_back(destination) {
+                    Ok(Some(message)) => {
+                        emit(message, receiver, &mut sequences, &outgoing, &status)
+                    }
+                    Ok(None) => {}
+                    Err(failure) => {
+                        stop_receiver(&status, receiver, failure, now, last_frame_at);
+                        break;
+                    }
+                }
                 let received = receiver.receive(&frame, now, destination);
                 status.active.store(false, Ordering::Release);
                 if let Some(display) = receiver.active_display() {
@@ -747,6 +809,9 @@ fn emit(
             mpsc::TrySendError::Disconnected(_) => ActorFailure::PeerGone,
         });
     }
+    if let Some(wake) = status.response_waker.get() {
+        wake();
+    }
 }
 
 #[cfg(test)]
@@ -761,7 +826,7 @@ mod tests {
     use std::time::Instant;
 
     struct Probe {
-        _ownership: NativeInputOwnership,
+        _ownership: InjectionPermit,
         actions: SyncSender<DestinationAction>,
     }
 
@@ -787,7 +852,7 @@ mod tests {
     #[test]
     fn stop_before_worker_construction_never_calls_the_native_factory() {
         let _test = lock_test();
-        let ownership = NativeInputOwnership::claim().unwrap();
+        let ownership = monhop_core::NativeSessionClaim::claim().unwrap().split().1;
         let status = Status {
             stopped: AtomicU8::new(ActorFailure::Requested as u8),
             cleanup_pending: AtomicBool::new(false),
@@ -798,13 +863,14 @@ mod tests {
             held: AtomicBool::new(false),
             display: AtomicU64::new(0),
             stats: Stats::default(),
+            response_waker: OnceLock::new(),
         };
         let result: Result<Probe, ActorFailure> =
             construct_destination(&RevocationSignal::default(), &status, ownership, |_| {
                 panic!("stopped worker cannot enter native factory")
             });
         assert!(matches!(result, Err(ActorFailure::Requested)));
-        assert!(!NativeInputOwnership::is_claimed());
+        assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 
     fn displays() -> DisplayTopology {
@@ -848,11 +914,17 @@ mod tests {
     }
 
     fn ready_probe(actions: SyncSender<DestinationAction>) -> DestinationActor {
-        let ownership = NativeInputOwnership::claim().expect("test owns native input");
+        let ownership = monhop_core::NativeSessionClaim::claim()
+            .expect("test owns native input")
+            .split()
+            .1;
         let actor = DestinationActor::start_after_local_enable(
             displays(),
             RevocationSignal::default(),
             ownership,
+            TakeBackGate::new(monhop_core::SharedFloor::new()),
+            false,
+            true,
             move |ownership| {
                 Ok(Probe {
                     _ownership: ownership,
@@ -889,12 +961,18 @@ mod tests {
         let (started, started_at_factory) = mpsc::sync_channel(1);
         let (release, wait_for_release) = mpsc::sync_channel(1);
         let (actions, _) = mpsc::sync_channel(10);
-        let ownership = NativeInputOwnership::claim().expect("test owns native input");
+        let ownership = monhop_core::NativeSessionClaim::claim()
+            .expect("test owns native input")
+            .split()
+            .1;
         let before = Instant::now();
         let mut actor = DestinationActor::start_after_local_enable(
             displays(),
             RevocationSignal::default(),
             ownership,
+            TakeBackGate::new(monhop_core::SharedFloor::new()),
+            false,
+            true,
             move |ownership| {
                 let _ = started.send(());
                 wait_for_release.recv().unwrap();
@@ -909,11 +987,11 @@ mod tests {
         started_at_factory
             .recv_timeout(Duration::from_millis(100))
             .unwrap();
-        assert!(NativeInputOwnership::is_claimed());
+        assert!(monhop_core::NativeSessionClaim::is_claimed());
         actor.request_stop();
         release.send(()).unwrap();
         wait_until(|| actor.finish());
-        assert!(!NativeInputOwnership::is_claimed());
+        assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 
     #[test]
@@ -921,7 +999,10 @@ mod tests {
         let _test = lock_test();
         let revocation = RevocationSignal::default();
         revocation.revoke();
-        let ownership = NativeInputOwnership::claim().expect("test owns native input");
+        let ownership = monhop_core::NativeSessionClaim::claim()
+            .expect("test owns native input")
+            .split()
+            .1;
         let constructed = Arc::new(AtomicBool::new(false));
         let factory_constructed = constructed.clone();
         assert!(matches!(
@@ -929,6 +1010,9 @@ mod tests {
                 displays(),
                 revocation,
                 ownership,
+                TakeBackGate::new(monhop_core::SharedFloor::new()),
+                false,
+                true,
                 move |_| {
                     factory_constructed.store(true, Ordering::Release);
                     Err::<Probe, _>(DestinationFailure)
@@ -937,18 +1021,24 @@ mod tests {
             Err(ActorFailure::Revoked)
         ));
         assert!(!constructed.load(Ordering::Acquire));
-        assert!(!NativeInputOwnership::is_claimed());
+        assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 
     #[test]
     fn input_is_rejected_before_ready_handoff() {
         let _test = lock_test();
         let (actions, received) = mpsc::sync_channel(10);
-        let ownership = NativeInputOwnership::claim().expect("test owns native input");
+        let ownership = monhop_core::NativeSessionClaim::claim()
+            .expect("test owns native input")
+            .split()
+            .1;
         let mut actor = DestinationActor::start_after_local_enable(
             displays(),
             RevocationSignal::default(),
             ownership,
+            TakeBackGate::new(monhop_core::SharedFloor::new()),
+            false,
+            true,
             move |ownership| {
                 Ok(Probe {
                     _ownership: ownership,
@@ -966,7 +1056,7 @@ mod tests {
                 .iter()
                 .all(|action| matches!(action, DestinationAction::ReleaseAll))
         );
-        assert!(!NativeInputOwnership::is_claimed());
+        assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 
     #[test]
@@ -1018,7 +1108,7 @@ mod tests {
     }
 
     struct PausedProbe {
-        _ownership: NativeInputOwnership,
+        _ownership: InjectionPermit,
         actions: SyncSender<DestinationAction>,
         pause_at: PauseAt,
         environment_reads: usize,
@@ -1077,7 +1167,10 @@ mod tests {
         let mut actor = DestinationActor::start_after_local_enable(
             displays(),
             RevocationSignal::default(),
-            NativeInputOwnership::claim().unwrap(),
+            monhop_core::NativeSessionClaim::claim().unwrap().split().1,
+            TakeBackGate::new(monhop_core::SharedFloor::new()),
+            false,
+            true,
             move |ownership| {
                 Ok(PausedProbe {
                     _ownership: ownership,
@@ -1101,7 +1194,7 @@ mod tests {
         wait_until(|| actor.cleanup_pending());
         assert_eq!(actor.failure(), Some(ActorFailure::Receiver));
         assert!(!actor.is_started());
-        assert!(NativeInputOwnership::is_claimed());
+        assert!(monhop_core::NativeSessionClaim::is_claimed());
         allow_cleanup.store(true, Ordering::Release);
         wait_until(|| actor.finish());
         let actions: Vec<_> = received.try_iter().collect();
@@ -1111,7 +1204,7 @@ mod tests {
                 .iter()
                 .all(|action| matches!(action, DestinationAction::ReleaseAll))
         );
-        assert!(!NativeInputOwnership::is_claimed());
+        assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 
     #[test]
@@ -1142,7 +1235,10 @@ mod tests {
         let mut actor = DestinationActor::start_after_local_enable(
             displays(),
             RevocationSignal::default(),
-            NativeInputOwnership::claim().unwrap(),
+            monhop_core::NativeSessionClaim::claim().unwrap().split().1,
+            TakeBackGate::new(monhop_core::SharedFloor::new()),
+            false,
+            true,
             move |ownership| {
                 Ok(PausedProbe {
                     _ownership: ownership,
@@ -1231,11 +1327,11 @@ mod tests {
                 .iter()
                 .all(|action| matches!(action, DestinationAction::ReleaseAll))
         );
-        assert!(!NativeInputOwnership::is_claimed());
+        assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 
     struct PanickingDestination {
-        _ownership: NativeInputOwnership,
+        _ownership: InjectionPermit,
         attempts: Arc<std::sync::atomic::AtomicUsize>,
         released: SyncSender<()>,
         held: bool,
@@ -1274,11 +1370,17 @@ mod tests {
         let (released, done) = mpsc::sync_channel(10);
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_attempts = attempts.clone();
-        let ownership = NativeInputOwnership::claim().expect("test owns native input");
+        let ownership = monhop_core::NativeSessionClaim::claim()
+            .expect("test owns native input")
+            .split()
+            .1;
         let mut actor = DestinationActor::start_after_local_enable(
             displays(),
             RevocationSignal::default(),
             ownership,
+            TakeBackGate::new(monhop_core::SharedFloor::new()),
+            false,
+            true,
             move |ownership| {
                 Ok(PanickingDestination {
                     _ownership: ownership,
@@ -1319,6 +1421,6 @@ mod tests {
         assert_eq!(actor.failure(), Some(ActorFailure::Panicked));
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert!(!actor.cleanup_pending());
-        assert!(!NativeInputOwnership::is_claimed());
+        assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 }

@@ -15,13 +15,10 @@ const edges = {
   bottom: ["top", [0, 100]],
 };
 
-function setup(sourceSide = "local", edge = "right") {
-  const sourceId = sourceSide === "local" ? "1" : "2";
-  const destinationId = sourceSide === "local" ? "2" : "1";
+function setup(edge = "right") {
   const [destinationEdge] = edges[edge];
   return {
     saved: true,
-    sourceSide,
     localDisplays: [
       { id: "1", name: "This display", origin: [-100, -50], size: [100, 100], primary: true },
     ],
@@ -29,22 +26,21 @@ function setup(sourceSide = "local", edge = "right") {
       { id: "2", name: "Saved display", origin: [0, 0], size: [100, 100], primary: true },
     ],
     previewLayout: {
-      sourceDisplay: sourceId,
       links: [
         {
-          fromDisplay: sourceId,
+          fromDisplay: "1",
           fromEdge: edge,
           fromSpan: [0, 1],
-          toDisplay: destinationId,
+          toDisplay: "2",
           toEdge: destinationEdge,
           toSpan: [0, 1],
           hysteresis: 1,
         },
         {
-          fromDisplay: destinationId,
+          fromDisplay: "2",
           fromEdge: destinationEdge,
           fromSpan: [0, 1],
-          toDisplay: sourceId,
+          toDisplay: "1",
           toEdge: edge,
           toSpan: [0, 1],
           hysteresis: 1,
@@ -54,22 +50,14 @@ function setup(sourceSide = "local", edge = "right") {
   };
 }
 
-test("saved dashboard arrangements preserve each source direction and highlighted seam", () => {
-  for (const sourceSide of ["local", "peer"]) {
-    for (const [edge, [, offset]] of Object.entries(edges)) {
-      const value = setup(sourceSide, edge);
-      const result = savedDashboardArrangement(value);
-      assert.equal(result.available, true, `${sourceSide} ${edge}`);
-      assert.equal(result.sourceSide, sourceSide, `${sourceSide} ${edge}`);
-      assert.equal(result.placement.mode, "grouped", `${sourceSide} ${edge}`);
-      assert.deepEqual(
-        placementOffset(result.groups, result.placement),
-        offset,
-        `${sourceSide} ${edge}`,
-      );
-      assert.equal(result.seams.length, 1, `${sourceSide} ${edge}`);
-      assert.equal(result.seams[0].fromEdge, edge, `${sourceSide} ${edge}`);
-    }
+test("saved dashboard arrangements preserve the crossing edge and offset", () => {
+  for (const [edge, [, offset]] of Object.entries(edges)) {
+    const value = setup(edge);
+    const result = savedDashboardArrangement(value);
+    assert.equal(result.available, true, edge);
+    assert.deepEqual(placementOffset(result.groups, result.placement), offset, edge);
+    assert.equal(result.seams.length, 1, edge);
+    assert.equal(result.seams[0].fromEdge, edge, edge);
   }
 });
 
@@ -83,7 +71,6 @@ test("saved preview keeps each computer's monitor geometry unchanged", () => {
     primary: false,
   });
   value.previewLayout = {
-    sourceDisplay: "3",
     links: [
       {
         fromDisplay: "3",
@@ -110,7 +97,7 @@ test("saved preview keeps each computer's monitor geometry unchanged", () => {
   assert.equal(result.available, true);
   assert.deepEqual(value, before);
   assert.deepEqual(
-    result.groups.source.displays.map((display) => [
+    result.groups.local.displays.map((display) => [
       display.id,
       display.x,
       display.y,
@@ -122,79 +109,55 @@ test("saved preview keeps each computer's monitor geometry unchanged", () => {
       ["3", 100, 100, 100, 100],
     ],
   );
-  assert.deepEqual([result.groups.source.width, result.groups.source.height], [200, 200]);
+  assert.deepEqual([result.groups.local.width, result.groups.local.height], [200, 200]);
 });
 
-test("saved free positions are drawn where they were applied", () => {
+test("saved positions are drawn where they were applied, and a stale save falls back to the crossings", () => {
   const value = setup();
-  value.localDisplays.push({
-    id: "3",
-    name: "This side display",
-    origin: [0, 50],
-    size: [100, 100],
-    primary: false,
-  });
-  // Display 3 was pulled level with display 1, which its own system layout does not do.
-  value.previewLayout = {
-    sourceDisplay: "1",
-    links: [
-      {
-        fromDisplay: "3",
-        fromEdge: "right",
-        fromSpan: [0, 1],
-        toDisplay: "2",
-        toEdge: "left",
-        toSpan: [0, 1],
-        hysteresis: 1,
-      },
-      {
-        fromDisplay: "2",
-        fromEdge: "left",
-        fromSpan: [0, 1],
-        toDisplay: "3",
-        toEdge: "right",
-        toSpan: [0, 1],
-        hysteresis: 1,
-      },
+  value.previewLayout.arrangement = {
+    positions: [
+      { display: "1", x: 0, y: 0 },
+      { display: "2", x: 100, y: 0 },
     ],
-    arrangement: {
-      mode: "free",
-      positions: [
-        { display: "1", x: 0, y: 0 },
-        { display: "2", x: 200, y: 0 },
-        { display: "3", x: 100, y: 0 },
-      ],
-    },
   };
   const result = savedDashboardArrangement(value);
   assert.equal(result.available, true);
-  assert.equal(result.placement.mode, "free");
-  assert.deepEqual(
-    result.tiles.map((tile) => [tile.id, tile.x, tile.y]),
-    [
-      ["1", 0, 0],
-      ["3", 100, 0],
-      ["2", 200, 0],
-    ],
-  );
+  assert.deepEqual(result.tiles.map((tile) => [tile.id, tile.x, tile.y]), [
+    ["1", 0, 0],
+    ["2", 100, 0],
+  ]);
   assert.equal(result.seams.length, 1);
 
+  // A position naming a display that no longer exists cannot cover every connected display, so the
+  // translation is rebuilt from the crossings instead of trusting the stale positions.
   const stale = structuredClone(value);
   stale.previewLayout.arrangement.positions.push({ display: "9", x: 0, y: 300 });
-  assert.equal(savedDashboardArrangement(stale).available, false);
+  const fallback = savedDashboardArrangement(stale);
+  assert.equal(fallback.available, true);
+  assert.deepEqual(fallback.tiles.map((tile) => [tile.id, tile.x, tile.y]), [
+    ["1", 0, 0],
+    ["2", 100, 0],
+  ]);
 });
 
 test("missing, stale, or malformed saved details get an honest unavailable preview", () => {
   const valid = setup();
   const cases = [
     { ...valid, previewLayout: null },
-    { ...valid, previewLayout: { ...valid.previewLayout, sourceDisplay: "9" } },
-    { ...valid, previewLayout: { ...valid.previewLayout, links: [valid.previewLayout.links[0]] } },
+    // An odd link count has no reciprocal half.
+    { ...valid, previewLayout: { links: [valid.previewLayout.links[0]] } },
+    // Spans that no longer mirror each other are not a real reciprocal pair.
     {
       ...valid,
       previewLayout: {
-        ...valid.previewLayout,
         links: valid.previewLayout.links.map((link) => ({ ...link, fromSpan: [0, 0.5] })),
+      },
+    },
+    // A link naming a display that does not exist breaks the reciprocal match.
+    {
+      ...valid,
+      previewLayout: {
+        links: [{ ...valid.previewLayout.links[0], fromDisplay: "9" }, valid.previewLayout.links[1]],
       },
     },
     { ...valid, peerDisplays: [{ ...valid.peerDisplays[0], id: "1" }] },
@@ -202,18 +165,16 @@ test("missing, stale, or malformed saved details get an honest unavailable previ
   for (const value of cases) {
     const result = savedDashboardArrangement(value);
     assert.equal(result.available, false);
-    assert.match(result.message, /saved|review/i);
+    assert.match(result.message, /saved|review|valid/i);
   }
 });
 
 test("a layout with no crossing yet still draws both computers' displays, just unconnected", () => {
   const value = setup();
-  value.previewLayout = { ...value.previewLayout, links: [] };
+  value.previewLayout = { links: [] };
   const result = savedDashboardArrangement(value);
   assert.equal(result.available, true);
   assert.equal(result.noCrossingYet, true);
-  assert.equal(result.sourceSide, "local");
-  assert.equal(result.destinationSide, "peer");
   assert.deepEqual(result.seams, []);
   assert.deepEqual(result.tiles.map((tile) => tile.id).toSorted(), ["1", "2"]);
   // The caption says what is missing rather than warning that the saved details need a review.
@@ -222,15 +183,6 @@ test("a layout with no crossing yet still draws both computers' displays, just u
     dashboardCaption(savedDashboardArrangement(setup())),
     "Saved display positions. Not a current display check.",
   );
-  // A source display that does not exist, or a source side that contradicts the setup, still bail out.
-  assert.equal(
-    savedDashboardArrangement({
-      ...value,
-      previewLayout: { sourceDisplay: "9", links: [] },
-    }).available,
-    false,
-  );
-  assert.equal(savedDashboardArrangement({ ...value, sourceSide: "peer" }).available, false);
 });
 
 test("a redrawn viewport knows which displays moved, and which ones are new on screen", () => {
@@ -257,9 +209,9 @@ test("the dashboard preview and the editor draw through one shared renderer", as
   }
 });
 
-test("a monitor cabled to both computers is previewed once, on the side the saved layout uses", () => {
+test("a monitor cabled to both computers is previewed once, on the local copy unless marked otherwise", () => {
   const key = "10ac-4123-0000abcd";
-  const saved = setup("local", "right");
+  const saved = setup("right");
   saved.localDisplays = [
     saved.localDisplays[0],
     { id: "3", name: "Desk", origin: [-100, 50], size: [100, 100], primary: false, monitor: key },
@@ -268,17 +220,17 @@ test("a monitor cabled to both computers is previewed once, on the side the save
     saved.peerDisplays[0],
     { id: "4", name: "Desk", origin: [100, 0], size: [100, 100], primary: false, monitor: key },
   ];
-  // No hidden ids saved: the peer's copy stays out because the input computer keeps its own.
+  // No hidden ids saved and the crossing never touches the shared monitor: this computer keeps its
+  // own copy by default and the peer's is left out of the picture.
   let preview = savedDashboardArrangement(saved);
   assert.equal(preview.available, true);
   assert.deepEqual(preview.tiles.map((tile) => [tile.id, tile.side, tile.shared]).toSorted(), [
-    ["1", "source", false],
-    ["2", "destination", false],
-    ["3", "source", true],
+    ["1", "local", false],
+    ["2", "peer", false],
+    ["3", "local", true],
   ]);
   // Saved positions that hide this computer's copy draw the peer's instead.
   saved.previewLayout.arrangement = {
-    mode: "grouped",
     positions: [
       { display: "1", x: 0, y: 0 },
       { display: "2", x: 100, y: 0 },
@@ -289,9 +241,9 @@ test("a monitor cabled to both computers is previewed once, on the side the save
   preview = savedDashboardArrangement(saved);
   assert.equal(preview.available, true);
   assert.deepEqual(preview.tiles.map((tile) => [tile.id, tile.side, tile.shared]).toSorted(), [
-    ["1", "source", false],
-    ["2", "destination", false],
-    ["4", "destination", true],
+    ["1", "local", false],
+    ["2", "peer", false],
+    ["4", "peer", true],
   ]);
   assert.deepEqual(preview.placement.positions["4"], [200, 0]);
 });

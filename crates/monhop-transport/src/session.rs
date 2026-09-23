@@ -1,19 +1,15 @@
 //! Runtime for an explicitly enabled, authenticated input session.
 
+use crate::session_actor::ActorFailure;
 #[cfg(any(windows, target_os = "macos"))]
-pub use crate::session_source_runtime::run_source;
-#[cfg(any(windows, target_os = "macos"))]
-pub use crate::session_source_runtime::run_trial_source;
+pub use crate::session_runtime::run_session;
 use crate::{
-    session_actor::DestinationActor,
-    session_clock::{SessionClock, micros_u64, millis_u64},
+    session_clock::{micros_u64, millis_u64},
     session_handshake::NegotiatedSession,
-    session_startup::{StartupControl, startup_failure},
-    session_trial::TrialInputGuard,
     session_wire::{FrameReader, FrameWriter, decode_datagram, is_heartbeat},
 };
-use monhop_core::{DisplayId, NativeInputOwnership, RevocationSignal};
-use monhop_protocol::{Frame, Message};
+use monhop_core::{DeviceId, DisplayId, RevocationSignal, capture::StopReason};
+use monhop_protocol::{Frame, FrameScope, Message};
 use std::{
     sync::{
         Arc,
@@ -22,7 +18,8 @@ use std::{
     time::Duration,
 };
 
-const OUTBOUND_CAPACITY: usize = 512;
+pub(crate) const SESSION_QUEUE_CAPACITY: usize = 512;
+pub(crate) const DISPLAY_CHECK_INTERVAL: Duration = Duration::from_millis(30);
 pub const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Default)]
@@ -35,6 +32,7 @@ struct ProgressState {
     rtt_us: AtomicU64,
     display: AtomicU64,
     route: AtomicU64,
+    half: AtomicU64,
     /// The peer went silent past the deadline; input is local until the link proves itself.
     held: AtomicBool,
     /// The user ended this session (pause, switch, quit): its close tells the peer it was no failure.
@@ -52,6 +50,11 @@ pub enum LinkClose {
     /// The other computer's session ended on its own, not by its user; its Home says why.
     PeerFailed,
     PeerRevoked,
+    /// The other computer's own displays changed; its layout resyncs, nothing failed.
+    PeerDisplaysChanged,
+    /// The other computer changed who can control which computer; its link resyncs, nothing
+    /// failed.
+    PeerControlChanged,
     PeerClosed,
     IdleTimeout,
     Local,
@@ -85,6 +88,7 @@ pub struct SessionDiagnostics {
     pub round_trip_micros: u64,
     pub active_display: Option<DisplayId>,
     pub active_is_local: Option<bool>,
+    pub active_half: Option<SessionHalf>,
     /// True while the session waits for the other computer to answer again.
     pub held: bool,
     /// Receiving-side load at the end of a destination session.
@@ -134,10 +138,25 @@ impl SessionProgress {
                 2 => Some(false),
                 _ => None,
             },
+            active_half: match self.0.half.load(Ordering::Acquire) {
+                1 => Some(SessionHalf::Outbound),
+                2 => Some(SessionHalf::Inbound),
+                _ => None,
+            },
             held: self.0.held.load(Ordering::Acquire),
             receiver: self.0.receiver.lock().ok().and_then(|slot| *slot),
             link: self.0.link.lock().ok().and_then(|slot| *slot),
         }
+    }
+    pub(crate) fn active_half(&self, half: Option<SessionHalf>) {
+        self.0.half.store(
+            match half {
+                Some(SessionHalf::Outbound) => 1,
+                Some(SessionHalf::Inbound) => 2,
+                None => 0,
+            },
+            Ordering::Release,
+        );
     }
     pub(crate) fn route(&self, display: Option<DisplayId>, local: bool) {
         self.0.route.store(0, Ordering::Release);
@@ -180,7 +199,30 @@ pub enum SessionFailure {
     NativeCaptureStartup(NativeCaptureStartupFailure),
     NativeCleanup,
     InvalidLayout,
-    TrialShortcut,
+    LocalDisplaysChanged,
+}
+
+/// A fresh native display snapshot never continues a session on stale geometry.
+pub fn check_local_displays(
+    expected: &monhop_protocol::DisplayTopology,
+    current: &monhop_protocol::DisplayTopology,
+) -> Result<(), SessionFailure> {
+    if expected.same_geometry(current) {
+        Ok(())
+    } else {
+        Err(SessionFailure::LocalDisplaysChanged)
+    }
+}
+
+/// A fresh read that failed mid-change counts as a change: the session ends at once either way.
+pub(crate) fn check_read_displays<E>(
+    expected: &monhop_protocol::DisplayTopology,
+    current: Result<monhop_protocol::DisplayTopology, E>,
+) -> Result<(), SessionFailure> {
+    check_local_displays(
+        expected,
+        &current.map_err(|_| SessionFailure::LocalDisplaysChanged)?,
+    )
 }
 
 /// A bounded failure observed during session startup before input delivery begins.
@@ -215,7 +257,6 @@ pub enum StartupPeerHealthFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeCaptureStartupFailure {
     AlreadyActive,
-    TrialWindowNotForeground,
     DesktopUnavailable,
     InvalidDuration,
     StartFailed,
@@ -225,17 +266,61 @@ pub enum NativeCaptureStartupFailure {
     ControlFailed,
     WorkerPanicked,
     Stopped(monhop_core::capture::StopReason),
-    WindowsOperation {
-        operation: &'static str,
-        code: u32,
-    },
-    /// This platform has no controlled-trial capture, so it cannot supply trial input.
-    TrialSourceUnavailable,
+    WindowsOperation { operation: &'static str, code: u32 },
     Platform,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionHalf {
+    Outbound,
+    Inbound,
+}
+
+/// Scopes bind directions to device identity, never to who dialed the connection.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionScopes {
+    pub outbound: FrameScope,
+    pub inbound: FrameScope,
+}
+impl SessionScopes {
+    pub fn new(local: DeviceId, peer: DeviceId) -> Result<Self, SessionFailure> {
+        if local == peer {
+            return Err(SessionFailure::Destination);
+        }
+        let lower = local < peer;
+        Ok(Self {
+            outbound: if lower {
+                FrameScope::LowerControlsHigher
+            } else {
+                FrameScope::HigherControlsLower
+            },
+            inbound: if lower {
+                FrameScope::HigherControlsLower
+            } else {
+                FrameScope::LowerControlsHigher
+            },
+        })
+    }
+    pub fn validate(&self, frame: &Frame) -> Result<(), SessionFailure> {
+        if frame.scope == FrameScope::Connection {
+            if matches!(frame.message, Message::Disconnect(_) | Message::Error(_)) {
+                return Ok(());
+            }
+        } else if (frame.scope == self.outbound || frame.scope == self.inbound)
+            && !matches!(
+                frame.message,
+                Message::Hello(_) | Message::SessionSetup(_) | Message::DisplayTopology(_)
+            )
+        {
+            return Ok(());
+        }
+        Err(SessionFailure::UnexpectedStream)
+    }
 }
 
 /// The writer may await socket capacity while the session continues reading and polling recovery.
 pub(crate) struct SessionIo {
+    pub(crate) scopes: SessionScopes,
     pub(crate) connection: quinn::Connection,
     pub(crate) reader: FrameReader,
     pub(crate) recv: quinn::RecvStream,
@@ -248,10 +333,14 @@ pub(crate) struct SessionIo {
 
 impl SessionIo {
     pub(crate) fn new(session: NegotiatedSession, progress: SessionProgress) -> Self {
+        let scopes = SessionScopes {
+            outbound: session.outbound_scope(),
+            inbound: session.inbound_scope(),
+        };
         let connection = session.connection;
         let writer_connection = connection.clone();
         let mut send = session.control_streams.send;
-        let (outbound, mut pending) = tokio::sync::mpsc::channel::<Frame>(OUTBOUND_CAPACITY);
+        let (outbound, mut pending) = tokio::sync::mpsc::channel::<Frame>(SESSION_QUEUE_CAPACITY);
         let writer_progress = progress.clone();
         let written = Arc::new(AtomicU64::new(0));
         let writer_written = written.clone();
@@ -276,6 +365,7 @@ impl SessionIo {
             Ok(())
         });
         Self {
+            scopes,
             connection,
             reader: session.control_streams.reader,
             recv: session.control_streams.recv,
@@ -286,7 +376,7 @@ impl SessionIo {
             written,
         }
     }
-    pub(crate) fn send(&self, frame: Frame) -> Result<(), SessionFailure> {
+    fn send(&self, frame: Frame) -> Result<(), SessionFailure> {
         self.outbound.try_send(frame).map_err(|error| match error {
             tokio::sync::mpsc::error::TrySendError::Full(_) => SessionFailure::QueueFull,
             tokio::sync::mpsc::error::TrySendError::Closed(_) => SessionFailure::Wire,
@@ -294,10 +384,16 @@ impl SessionIo {
         self.queued.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+    pub(crate) fn send_outbound(&self, frame: Frame) -> Result<(), SessionFailure> {
+        self.send(frame.with_scope(self.scopes.outbound))
+    }
+    pub(crate) fn send_inbound(&self, frame: Frame) -> Result<(), SessionFailure> {
+        self.send(frame.with_scope(self.scopes.inbound))
+    }
     /// The next frame from the ordered stream or a heartbeat datagram. A peer that opens a
     /// stream ends the session; a closed connection surfaces as Wire.
     pub(crate) async fn next_frame(&mut self) -> Result<Frame, SessionFailure> {
-        tokio::select! {
+        let frame = tokio::select! {
             biased;
             frame = self.reader.read_frame(&mut self.recv) => frame.map_err(|_| SessionFailure::Wire),
             datagram = self.connection.read_datagram() => match datagram {
@@ -306,7 +402,9 @@ impl SessionIo {
             },
             event = self.connection.accept_bi() => Err(peer_event(event)),
             event = self.connection.accept_uni() => Err(peer_event(event)),
-        }
+        }?;
+        self.scopes.validate(&frame)?;
+        Ok(frame)
     }
     pub(crate) fn link_stats(
         &self,
@@ -332,15 +430,16 @@ impl SessionIo {
             close: classify_close(self.connection.close_reason()),
         }
     }
-    /// A user's stop closes as ended and the peer records no drop; any other end closes as
-    /// failed. A revocation that nobody asked for (native capture stopped) is a failure too.
-    pub(crate) fn close_after(&self, result: &Result<(), SessionFailure>, deliberate: bool) {
-        let reason = match result {
-            Ok(()) => SESSION_ENDED_REASON,
-            Err(SessionFailure::Revoked) if deliberate => SESSION_ENDED_REASON,
-            Err(_) => SESSION_FAILED_REASON,
-        };
-        self.connection.close(0_u32.into(), reason);
+    pub(crate) fn close_after(
+        &self,
+        result: &Result<(), SessionFailure>,
+        deliberate: bool,
+        control_change: bool,
+    ) {
+        self.connection.close(
+            0_u32.into(),
+            close_reason(result, deliberate, control_change),
+        );
     }
     pub(crate) fn check(&self) -> Result<(), SessionFailure> {
         self.progress
@@ -362,21 +461,37 @@ impl SessionIo {
 pub(crate) const SESSION_ENDED_REASON: &[u8] = b"input session ended";
 pub(crate) const SESSION_FAILED_REASON: &[u8] = b"input session failed";
 pub(crate) const NETWORK_REVOKED_REASON: &[u8] = b"network revoked";
+pub(crate) const DISPLAYS_CHANGED_REASON: &[u8] = b"displays changed";
+pub(crate) const CONTROL_CHANGED_REASON: &[u8] = b"control changed";
+
+/// A user's stop closes as ended and the peer records no drop; a display change or a control-flip
+/// stop closes as such so the peer resyncs instead of reporting a failure. Any other end, native
+/// stops included, failed.
+fn close_reason(
+    result: &Result<(), SessionFailure>,
+    deliberate: bool,
+    control_change: bool,
+) -> &'static [u8] {
+    match result {
+        Ok(()) => SESSION_ENDED_REASON,
+        Err(SessionFailure::Revoked) if deliberate && control_change => CONTROL_CHANGED_REASON,
+        Err(SessionFailure::Revoked) if deliberate => SESSION_ENDED_REASON,
+        Err(SessionFailure::LocalDisplaysChanged) => DISPLAYS_CHANGED_REASON,
+        Err(_) => SESSION_FAILED_REASON,
+    }
+}
 
 fn classify_close(reason: Option<quinn::ConnectionError>) -> LinkClose {
     match reason {
         None => LinkClose::Open,
-        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
-            if close.reason.as_ref() == SESSION_ENDED_REASON {
-                LinkClose::PeerEnded
-            } else if close.reason.as_ref() == SESSION_FAILED_REASON {
-                LinkClose::PeerFailed
-            } else if close.reason.as_ref() == NETWORK_REVOKED_REASON {
-                LinkClose::PeerRevoked
-            } else {
-                LinkClose::PeerClosed
-            }
-        }
+        Some(quinn::ConnectionError::ApplicationClosed(close)) => match close.reason.as_ref() {
+            SESSION_ENDED_REASON => LinkClose::PeerEnded,
+            SESSION_FAILED_REASON => LinkClose::PeerFailed,
+            NETWORK_REVOKED_REASON => LinkClose::PeerRevoked,
+            DISPLAYS_CHANGED_REASON => LinkClose::PeerDisplaysChanged,
+            CONTROL_CHANGED_REASON => LinkClose::PeerControlChanged,
+            _ => LinkClose::PeerClosed,
+        },
         Some(quinn::ConnectionError::TimedOut) => LinkClose::IdleTimeout,
         Some(quinn::ConnectionError::LocallyClosed) => LinkClose::Local,
         Some(_) => LinkClose::Transport,
@@ -424,300 +539,63 @@ impl Drop for SessionIo {
     }
 }
 
-/// Native ownership is claimed before the actor thread can begin native construction.
-#[cfg(any(windows, target_os = "macos"))]
-pub async fn run_destination(
-    session: NegotiatedSession,
-    revocation: RevocationSignal,
-    progress: SessionProgress,
-) -> Result<(), SessionFailure> {
-    let local = session.local.device_id;
-    let native_displays = session.local.topology.clone();
-    run_destination_with(
-        session,
-        revocation.clone(),
-        progress,
-        crate::session_handshake::SessionPurpose::Share,
-        move |ownership| {
-            crate::session_native::NativeDestination::new_after_local_enable(
-                local,
-                native_displays,
-                ownership,
-                revocation,
-            )
-        },
-        None,
-    )
-    .await
-}
-
-/// Runs the receiver half of a separately authenticated controlled trial, on either platform.
-#[cfg(any(windows, target_os = "macos"))]
-pub async fn run_trial_destination(
-    session: NegotiatedSession,
-    cancel: RevocationSignal,
-    progress: SessionProgress,
-    authorization: crate::session_trial::TrialAuthorization,
-) -> Result<(), SessionFailure> {
-    authorization.require_active()?;
-    // Either platform may hold either role; only the peer being the source is required here.
-    if session.source != session.peer.device_id {
-        return Err(SessionFailure::Destination);
+pub(crate) fn destination_failure(reason: ActorFailure) -> SessionFailure {
+    if reason == ActorFailure::LocalDisplaysChanged {
+        return SessionFailure::LocalDisplaysChanged;
     }
-    let _external_revocation = authorization.link_external_revocation(cancel)?;
-    let receiver_bounds = authorization
-        .receiver_bounds()
-        .ok_or(SessionFailure::Destination)?;
-    let trial_revocation = authorization.revocation();
-    let trial_guard = authorization.input_guard();
-    let phase_guard = authorization.input_guard();
-    let device = session.local.device_id;
-    let displays = session.local.topology.clone();
-    let result = run_destination_with(
-        session,
-        trial_revocation,
-        progress,
-        crate::session_handshake::SessionPurpose::ControlledTrial,
-        move |ownership| {
-            crate::session_native::TrialDestination::new_after_local_enable(
-                device,
-                displays,
-                receiver_bounds,
-                ownership,
-                trial_guard,
-            )
-        },
-        Some(phase_guard),
-    )
-    .await;
-    let result = match (authorization.rejected_system_shortcut(), result) {
-        (_, Err(SessionFailure::NativeCleanup)) => Err(SessionFailure::NativeCleanup),
-        (true, _) => Err(SessionFailure::TrialShortcut),
-        (false, result) => result,
-    };
-    authorization.revocation().revoke();
-    result
-}
-
-async fn run_destination_with<D, F>(
-    session: NegotiatedSession,
-    revocation: RevocationSignal,
-    progress: SessionProgress,
-    purpose: crate::session_handshake::SessionPurpose,
-    factory: F,
-    trial: Option<TrialInputGuard>,
-) -> Result<(), SessionFailure>
-where
-    D: crate::session_actor::WatchedDestination + 'static,
-    F: FnOnce(NativeInputOwnership) -> Result<D, crate::session_receiver::DestinationFailure>
-        + Send
-        + 'static,
-{
-    if session.local_is_source || session.purpose() != purpose {
-        return Err(SessionFailure::Destination);
-    }
-    if revocation.is_stopping() {
-        return Err(SessionFailure::Revoked);
-    }
-    let displays = session.local.topology.clone();
-    let epoch = session.initial_epoch;
-    let next_sequence = session.control.next_sequence();
-    let ownership = NativeInputOwnership::claim().ok_or(SessionFailure::Startup(
-        SessionStartupFailure::NativeOwnershipUnavailable,
-    ))?;
-    let io = SessionIo::new(session, progress.clone());
-    let destination = DestinationActor::start_after_local_enable(
-        displays,
-        revocation.clone(),
-        ownership,
-        factory,
-    )
-    .map_err(|_| SessionFailure::Startup(SessionStartupFailure::ReceiverUnavailable))?;
-    run_destination_actor(
-        io,
-        destination,
-        revocation,
-        progress,
-        epoch,
-        next_sequence,
-        trial,
-    )
-    .await
-}
-
-fn destination_failure(reason: crate::session_actor::ActorFailure) -> SessionFailure {
     let detail = match reason {
-        crate::session_actor::ActorFailure::Receiver => {
-            crate::session_actor::last_receiver_failure()
-        }
+        ActorFailure::Receiver => crate::session_actor::last_receiver_failure(),
         _ => crate::session_native::last_destination_step(),
     };
     SessionFailure::DestinationActor(reason, detail)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_destination_actor(
-    mut io: SessionIo,
-    mut destination: DestinationActor,
-    revocation: RevocationSignal,
-    progress: SessionProgress,
-    epoch: monhop_protocol::SessionEpoch,
-    next_sequence: u64,
-    trial: Option<TrialInputGuard>,
+fn displays_changed(capture: Option<StopReason>, destination: Option<ActorFailure>) -> bool {
+    capture == Some(StopReason::DisplaysChanged)
+        || destination == Some(ActorFailure::LocalDisplaysChanged)
+}
+
+/// Why the coordinator must stop now. A display change outranks the revocation the platform marks
+/// alongside it; only a user's own stop outranks the display change.
+pub(crate) fn worker_end(
+    stopping: bool,
+    deliberate: bool,
+    capture: Option<StopReason>,
+    capture_finished: bool,
+    destination: Option<ActorFailure>,
+) -> Option<SessionFailure> {
+    let changed = displays_changed(capture, destination);
+    if stopping && (deliberate || !changed) {
+        return Some(SessionFailure::Revoked);
+    }
+    if changed {
+        return Some(SessionFailure::LocalDisplaysChanged);
+    }
+    if let Some(reason) = destination {
+        return Some(destination_failure(reason));
+    }
+    (capture_finished || capture.is_some()).then_some(SessionFailure::Native)
+}
+
+/// Reclassifies an end whose display change was recorded after the loop saw its revocation or
+/// native stop.
+pub(crate) fn settle_end(
+    result: Result<(), SessionFailure>,
+    deliberate: bool,
+    capture: Option<StopReason>,
+    destination: Option<ActorFailure>,
 ) -> Result<(), SessionFailure> {
-    let origin = SessionClock::try_now()?;
-    let mut startup = Some(StartupControl::new(
-        epoch,
-        next_sequence,
-        false,
-        Duration::ZERO,
-    ));
-    let mut handoff_sent = false;
-    let mut progress_started = false;
-    let mut tick = tokio::time::interval(SESSION_POLL_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut gaps = TickGap::new(origin.elapsed());
-    let mut started_at = None;
-    let result = loop {
-        tokio::select! {
-            biased;
-            _=tick.tick()=>{
-                gaps.observe(origin.elapsed());
-                if revocation.is_stopping(){break Err(SessionFailure::Revoked);}
-                if let Err(error)=io.check(){break Err(error);}
-                if let Some(reason)=destination.failure(){break Err(destination_failure(reason));}
-                let now=origin.elapsed();
-                if !handoff_sent {
-                    let control=startup.as_mut().expect("startup remains until actor handoff");
-                    match control.poll(now) {
-                        Ok(Some(frame))=>if let Err(error)=io.send(frame){break Err(error);},
-                        Ok(None)=>{}
-                        Err(error)=>break Err(startup_failure(error)),
-                    }
-                    if destination.is_native_ready() && trial_permits_ready(trial.as_ref()) {
-                        match control.can_announce_ready(now) {
-                            Ok(true)=>match control.announce_ready(now) {
-                                Ok(frame)=>if let Err(error)=io.send(frame){break Err(error);},
-                                Err(error)=>break Err(startup_failure(error)),
-                            },
-                            Ok(false)=>{}
-                            Err(error)=>break Err(startup_failure(error)),
-                        }
-                    }
-                    match handoff_if_ready(&mut startup, &destination, &origin, trial.as_ref()) {
-                        Ok(ready) => handoff_sent = ready,
-                        Err(error) => break Err(error),
-                    }
-                    if handoff_sent { started_at.get_or_insert(origin.elapsed()); }
-                } else if !progress_started && destination.is_started() {
-                    progress.mark_started();
-                    progress_started=true;
-                }
-                if progress_started {progress.route(destination.active_display(),true);progress.hold(destination.is_held());}
-                let mut failure=None;
-                for _ in 0..OUTBOUND_CAPACITY {
-                    match destination.try_response() {
-                        Ok(Some(frame))=>if let Err(error)=io.send(frame){failure=Some(error);break;},
-                        Ok(None)=>break,
-                        Err(reason)=>{failure=Some(destination_failure(reason));break;}
-                    }
-                }
-                if let Some(error)=failure {break Err(error);}
-            }
-            frame=io.next_frame()=>{
-                if revocation.is_stopping(){break Err(SessionFailure::Revoked);}
-                let frame=match frame {Ok(frame)=>frame,Err(error)=>break Err(error)};
-                if handoff_sent {
-                    progress.received(&frame);
-                    if let Err(reason)=destination.try_submit(frame){break Err(destination_failure(reason));}
-                } else {
-                    let now=origin.elapsed();
-                    let control=startup.as_mut().expect("startup remains until actor handoff");
-                    match control.receive(&frame,now) {
-                        Ok(Some(response))=>if let Err(error)=io.send(response){break Err(error);},
-                        Ok(None)=>{}
-                        Err(error)=>break Err(startup_failure(error)),
-                    }
-                    // Source input can follow Ready in the same stream read cycle.
-                    match handoff_if_ready(&mut startup, &destination, &origin, trial.as_ref()) {
-                        Ok(ready) => handoff_sent = ready,
-                        Err(error) => break Err(error),
-                    }
-                    if handoff_sent { started_at.get_or_insert(origin.elapsed()); }
-                }
-            }
+    match result {
+        Err(_) if !deliberate && displays_changed(capture, destination) => {
+            Err(SessionFailure::LocalDisplaysChanged)
         }
-    };
-    destination.request_stop();
-    let receiver = destination.stats();
-    progress.record_receiver(receiver);
-    progress.record_link(io.link_stats(
-        session_millis(started_at, origin.elapsed()),
-        gaps.max_micros(),
-        (receiver.holds, receiver.held_max_millis),
-        &revocation,
-    ));
-    io.close_after(&result, progress.ended_deliberately());
-    drop(io);
-    // Native cleanup has its own thread and deadline. Give it time without depending on the peer.
-    let end = tokio::time::Instant::now() + Duration::from_millis(250);
-    while !destination.finish() && tokio::time::Instant::now() < end {
-        tokio::time::sleep(SESSION_POLL_INTERVAL).await;
+        other => other,
     }
-    if !destination.is_finished() || destination.cleanup_pending() {
-        log::error!("destination session ended with native cleanup pending");
-        return Err(SessionFailure::NativeCleanup);
-    }
-    match &result {
-        Ok(()) => log::info!("destination session ended by the peer"),
-        Err(error) => log::warn!("destination session ended: {error:?}"),
-    }
-    result
 }
 
 pub(crate) fn session_millis(started_at: Option<Duration>, now: Duration) -> u64 {
     started_at.map_or(0, |started| millis_u64(now.saturating_sub(started)))
 }
-
-/// A trial in its startup phase holds readiness back rather than failing on a lost window.
-fn trial_permits_ready(trial: Option<&TrialInputGuard>) -> bool {
-    trial.is_none_or(TrialInputGuard::allows_new_input)
-}
-
-fn handoff_if_ready(
-    startup: &mut Option<StartupControl>,
-    destination: &DestinationActor,
-    origin: &SessionClock,
-    trial: Option<&TrialInputGuard>,
-) -> Result<bool, SessionFailure> {
-    if !destination.is_native_ready() {
-        return Ok(false);
-    }
-    let control = startup.as_mut().ok_or(SessionFailure::Destination)?;
-    if !control
-        .is_ready(origin.elapsed())
-        .map_err(startup_failure)?
-    {
-        return Ok(false);
-    }
-    // Native readiness plus both SessionReady messages: the trial's active phase starts here.
-    if let Some(guard) = trial {
-        guard.begin_active();
-    }
-    let ready = startup
-        .take()
-        .ok_or(SessionFailure::Destination)?
-        .into_ready(origin.elapsed())
-        .map_err(startup_failure)?;
-    destination
-        .handoff_ready(ready, origin.clone())
-        .map_err(|_| SessionFailure::Destination)?;
-    Ok(true)
-}
-
-#[cfg(test)]
-#[path = "session_startup_tests.rs"]
-mod startup_tests;
 
 #[cfg(test)]
 mod close_tests {
@@ -748,9 +626,138 @@ mod close_tests {
             LinkClose::PeerRevoked
         );
         assert_eq!(
+            classify_close(closed(DISPLAYS_CHANGED_REASON)),
+            LinkClose::PeerDisplaysChanged
+        );
+        assert_eq!(
+            classify_close(closed(CONTROL_CHANGED_REASON)),
+            LinkClose::PeerControlChanged
+        );
+        assert_eq!(
             classify_close(closed(b"anything else")),
             LinkClose::PeerClosed
         );
+    }
+
+    #[test]
+    fn a_display_change_end_reaches_the_peer_as_a_display_change() {
+        let changed = Err(SessionFailure::LocalDisplaysChanged);
+        for deliberate in [false, true] {
+            assert_eq!(
+                classify_close(closed(close_reason(&changed, deliberate, false))),
+                LinkClose::PeerDisplaysChanged
+            );
+        }
+        assert_eq!(
+            classify_close(closed(close_reason(
+                &Err(SessionFailure::Native),
+                false,
+                false
+            ))),
+            LinkClose::PeerFailed
+        );
+        assert_eq!(
+            classify_close(closed(close_reason(
+                &Err(SessionFailure::Revoked),
+                true,
+                false
+            ))),
+            LinkClose::PeerEnded
+        );
+    }
+
+    #[test]
+    fn a_control_change_stop_closes_with_its_own_reason() {
+        let revoked = Err(SessionFailure::Revoked);
+        assert_eq!(close_reason(&revoked, true, true), CONTROL_CHANGED_REASON);
+        assert_eq!(close_reason(&revoked, true, false), SESSION_ENDED_REASON);
+        // A non-deliberate end never reads as a control change, whatever the flag says.
+        assert_eq!(close_reason(&revoked, false, true), SESSION_FAILED_REASON);
+        assert_eq!(
+            classify_close(closed(close_reason(&revoked, true, true))),
+            LinkClose::PeerControlChanged
+        );
+    }
+
+    #[test]
+    fn an_unreadable_display_list_is_a_display_change() {
+        let displays =
+            monhop_protocol::DisplayTopology::new(vec![monhop_protocol::DisplayDescription {
+                id: DisplayId(1),
+                name: "fixture".into(),
+                native_width: 100,
+                native_height: 100,
+                logical_origin: monhop_core::Point::default(),
+                logical_size: monhop_core::Point::new(100.0, 100.0),
+                scale_factor: 1.0,
+                is_primary: true,
+                monitor: None,
+            }])
+            .unwrap();
+        assert_eq!(
+            check_read_displays(&displays, Err::<monhop_protocol::DisplayTopology, ()>(())),
+            Err(SessionFailure::LocalDisplaysChanged)
+        );
+        assert_eq!(
+            check_read_displays(&displays, Ok::<_, ()>(displays.clone())),
+            Ok(())
+        );
+    }
+
+    /// The platform records the capture stop and marks the revocation; the loop may see either
+    /// first, and both orders must end as a display change.
+    #[test]
+    fn a_capture_display_change_outranks_its_revocation_in_both_orders() {
+        use monhop_core::capture::CaptureStop;
+        let ends = |cancel: &RevocationSignal, stop: &CaptureStop| {
+            worker_end(cancel.is_stopping(), false, stop.reason(), false, None)
+        };
+
+        let (cancel, stop) = (RevocationSignal::default(), CaptureStop::new());
+        stop.stop(StopReason::DisplaysChanged);
+        cancel.mark_revoked_without_wake();
+        assert_eq!(
+            ends(&cancel, &stop),
+            Some(SessionFailure::LocalDisplaysChanged)
+        );
+
+        let (cancel, stop) = (RevocationSignal::default(), CaptureStop::new());
+        cancel.mark_revoked_without_wake();
+        let seen = ends(&cancel, &stop).expect("revocation ends the loop");
+        assert_eq!(seen, SessionFailure::Revoked);
+        stop.stop(StopReason::DisplaysChanged);
+        assert_eq!(
+            settle_end(Err(seen), false, stop.reason(), None),
+            Err(SessionFailure::LocalDisplaysChanged)
+        );
+    }
+
+    #[test]
+    fn a_destination_display_change_outranks_revocation_and_a_user_stop_outranks_both() {
+        let watchdog = Some(ActorFailure::LocalDisplaysChanged);
+        assert_eq!(
+            worker_end(true, false, None, false, watchdog),
+            Some(SessionFailure::LocalDisplaysChanged)
+        );
+        assert_eq!(
+            settle_end(Err(SessionFailure::Revoked), false, None, watchdog),
+            Err(SessionFailure::LocalDisplaysChanged)
+        );
+        let captured = Some(StopReason::DisplaysChanged);
+        assert_eq!(
+            worker_end(true, true, captured, true, None),
+            Some(SessionFailure::Revoked)
+        );
+        assert_eq!(
+            settle_end(Err(SessionFailure::Revoked), true, captured, None),
+            Err(SessionFailure::Revoked)
+        );
+        assert_eq!(
+            worker_end(false, false, Some(StopReason::NativeFailure), true, None),
+            Some(SessionFailure::Native)
+        );
+        assert_eq!(worker_end(false, false, None, false, None), None);
+        assert_eq!(settle_end(Ok(()), false, captured, None), Ok(()));
     }
 
     #[test]

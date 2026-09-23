@@ -1,6 +1,4 @@
 import {
-  MODES,
-  MODE_INFO,
   VIEW_INSETS,
   arrangementGeometry,
   constrainTransform,
@@ -29,21 +27,22 @@ import {
   svgNode,
 } from "./arrangement-render.mjs";
 import { switchRow } from "./dom.mjs";
-import { platformLabel } from "./pairing-model.mjs";
 
 const MIN_STAGE_WIDTH = 280;
 const MIN_STAGE_HEIGHT = 190;
 const SNAP_PIXELS = 14;
 const NUDGE_PIXELS = 12;
 const COARSE_NUDGE_PIXELS = 48;
-const SIDES = ["source", "destination"];
+const SIDES = ["local", "peer"];
+const INSTRUCTIONS =
+  "Drag a computer against the other; the edge where they touch is where the pointer crosses. With a computer selected, arrow keys nudge it and Shift with an arrow moves it further.";
 
 // Only one editor is mounted at a time, so the fitted view survives the rebuild a commit triggers.
 let storedView = null;
 let refitNext = true;
 
 function shapeOf(value) {
-  return `${value.placement.mode}|${value.tiles.map((t) => `${t.id}:${t.side}:${t.x}:${t.y}:${t.width}:${t.height}`).join(",")}`;
+  return `${value.tiles.map((t) => `${t.id}:${t.side}:${t.x}:${t.y}:${t.width}:${t.height}`).join(",")}`;
 }
 
 function focusKeyOf(node) {
@@ -56,22 +55,9 @@ function emptyPreview() {
   return layer;
 }
 
-function sameMoving(a, b) {
-  return a.id ? a.id === b.id : a.side === b.side;
-}
-
 export function createArrangementView(options) {
-  const {
-    sourcePlatform,
-    destinationPlatform: peerPlatform,
-    sourceLabel: sourceOverride,
-    destinationLabel: destinationOverride,
-  } = options;
-  // Two computers on the same platform must still read apart, so colour follows the side, never the platform.
-  const sides =
-    options.sourceSide === "peer"
-      ? { source: "peer", destination: "local" }
-      : { source: "local", destination: "peer" };
+  const { localPlatform, peerPlatform, localLabel: localOverride, peerLabel: peerOverride } =
+    options;
   let arrangement = options.arrangement;
   let shared = Array.isArray(options.shared) ? options.shared : [];
   let inUse = useChoices(options.inUse);
@@ -79,7 +65,6 @@ export function createArrangementView(options) {
   let handlers = {
     onCommit: options.onCommit,
     onReset: options.onReset,
-    onMode: options.onMode,
     onShowMonitor: options.onShowMonitor,
     onUseDisplay: options.onUseDisplay,
   };
@@ -88,11 +73,10 @@ export function createArrangementView(options) {
   root.className = "arrangement-editor";
   root.setAttribute("aria-labelledby", "arrangement-title");
 
-  const destinationPlatform = peerPlatform ?? oppositePlatform(sourcePlatform);
-  const sourceName = sourceOverride ?? platformLabel(sourcePlatform, false, true);
-  const destinationName = destinationOverride ?? platformLabel(destinationPlatform, false, true);
-  const labels = { source: sourceName, destination: destinationName };
-  const platforms = { source: sourcePlatform, destination: destinationPlatform };
+  const localName = localOverride ?? "This computer";
+  const peerName = peerOverride ?? "The other computer";
+  const labels = { local: localName, peer: peerName };
+  const platforms = { local: localPlatform, peer: peerPlatform };
 
   const heading = document.createElement("div");
   heading.className = "arrangement-heading";
@@ -104,35 +88,14 @@ export function createArrangementView(options) {
   status.setAttribute("aria-live", "polite");
   heading.append(title, status);
 
-  const modeControl = document.createElement("div");
-  modeControl.className = "segmented";
-  modeControl.setAttribute("role", "radiogroup");
-  modeControl.setAttribute("aria-label", "How displays are arranged");
-  const modeButtons = {};
-  for (const mode of MODES) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "segmented-option";
-    button.dataset.arrangementMode = mode;
-    button.dataset.focusKey = `arrangement-mode-${mode}`;
-    button.setAttribute("role", "radio");
-    button.title = MODE_INFO[mode].hint;
-    button.textContent = MODE_INFO[mode].label;
-    button.addEventListener("click", () => {
-      if (disabled || currentMode() === mode) return;
-      refitNext = true;
-      handlers.onMode?.(mode);
-    });
-    modeButtons[mode] = button;
-    modeControl.append(button);
-  }
-
   const instructions = document.createElement("p");
   instructions.id = "arrangement-instructions";
   instructions.className = "arrangement-instructions";
+  instructions.textContent = INSTRUCTIONS;
 
   const stage = document.createElement("div");
   stage.className = "arrangement-stage";
+  stage.dataset.sharedTransition = "active-arrangement";
 
   const svg = svgNode("svg");
   svg.classList.add("arrangement-canvas");
@@ -145,8 +108,8 @@ export function createArrangementView(options) {
   let legend = legendFor(false);
   function legendFor(withShared) {
     return createLegend([
-      { kind: "group", label: `${sourceName} · Input`, side: sides.source },
-      { kind: "group", label: destinationName, side: sides.destination },
+      { kind: "group", label: localName, side: "local" },
+      { kind: "group", label: peerName, side: "peer" },
       { kind: "primary", label: "Primary display" },
       ...(withShared ? [{ kind: "shared", label: "Cabled to both computers" }] : []),
       { kind: "seam", label: "Pointer crossing" },
@@ -186,9 +149,9 @@ export function createArrangementView(options) {
   });
   controls.append(spacer, reset, fit);
 
-  root.append(heading, modeControl, instructions, stage, legend, sharedRow, useBlock, controls);
+  root.append(heading, instructions, stage, legend, sharedRow, useBlock, controls);
 
-  if (!arrangement?.groups?.source || !arrangement.groups?.destination || !arrangement.placement) {
+  if (!arrangement?.groups?.local || !arrangement.groups?.peer || !arrangement.placement) {
     status.textContent = arrangement?.message || "These displays cannot be arranged yet.";
     stage.dataset.state = "empty";
     const empty = document.createElement("p");
@@ -196,11 +159,7 @@ export function createArrangementView(options) {
     empty.textContent =
       "No displays to arrange. Reconnect both computers, then come back to this step.";
     stage.append(empty);
-    for (const control of [
-      ...controls.querySelectorAll("button"),
-      ...modeControl.querySelectorAll("button"),
-    ])
-      control.disabled = true;
+    for (const control of controls.querySelectorAll("button")) control.disabled = true;
     return { element: root, update() {}, destroy() {} };
   }
 
@@ -212,7 +171,7 @@ export function createArrangementView(options) {
   let transform = null;
   let stageSize = { width: MIN_STAGE_WIDTH, height: MIN_STAGE_HEIGHT };
   let rects = { tiles: {}, sides: {} };
-  let nodes = { source: null, destination: null };
+  let nodes = { local: null, peer: null };
   let rendered = { shape: null, scale: null, disabled: null };
   let groupLayer = null;
   let seamLayer = null;
@@ -223,10 +182,6 @@ export function createArrangementView(options) {
   const resizeObserver =
     typeof ResizeObserver === "function" ? new ResizeObserver(() => scheduleRender()) : null;
   resizeObserver?.observe(stage);
-
-  function currentMode() {
-    return arrangement.placement?.mode ?? "grouped";
-  }
 
   function announce(message) {
     if (message === announced) return;
@@ -248,16 +203,6 @@ export function createArrangementView(options) {
       width: Math.max(MIN_STAGE_WIDTH, Math.round(box.width || MIN_STAGE_WIDTH)),
       height: Math.max(MIN_STAGE_HEIGHT, Math.round(box.height || MIN_STAGE_HEIGHT)),
     };
-  }
-
-  function syncModeControl() {
-    const mode = currentMode();
-    for (const [key, button] of Object.entries(modeButtons)) {
-      button.setAttribute("aria-checked", String(key === mode));
-      button.disabled = disabled;
-    }
-    instructions.textContent = MODE_INFO[mode].instructions;
-    root.dataset.mode = mode;
   }
 
   function renderShared() {
@@ -327,15 +272,15 @@ export function createArrangementView(options) {
     for (const side of withDisplays) {
       const group = document.createElement("div");
       group.className = "arrangement-use-group";
-      group.dataset.side = sides[side];
+      group.dataset.side = side;
       const name = document.createElement("div");
       name.className = "arrangement-legend-item arrangement-use-title";
-      name.dataset.side = sides[side];
+      name.dataset.side = side;
       const swatch = document.createElement("span");
       swatch.className = "arrangement-legend-swatch";
       swatch.setAttribute("aria-hidden", "true");
       const text = document.createElement("span");
-      text.textContent = side === "source" ? `${labels.source} · Input` : labels.destination;
+      text.textContent = labels[side];
       name.append(swatch, text);
       group.append(name);
       for (const display of inUse[side]) {
@@ -378,7 +323,6 @@ export function createArrangementView(options) {
     // Measuring the stage also flushes the previous positions, so a moved group animates to its new one.
     stageSize = stageMetrics();
     svg.setAttribute("viewBox", `0 0 ${stageSize.width} ${stageSize.height}`);
-    syncModeControl();
     renderShared();
     renderUse();
 
@@ -386,7 +330,7 @@ export function createArrangementView(options) {
     // Nothing to place means nothing to measure: the message alone is the scene until displays return.
     if (!all.length) {
       svg.replaceChildren();
-      nodes = { source: null, destination: null };
+      nodes = { local: null, peer: null };
       rendered = { shape: null, scale: null, disabled: null };
       stage.dataset.state = "empty";
       stage.dataset.dragging = "false";
@@ -414,7 +358,7 @@ export function createArrangementView(options) {
 
     // The same displays at the same places and scale only need fresh seams; anything else is rebuilt.
     if (
-      nodes.source &&
+      nodes.local &&
       rendered.shape === shape &&
       rendered.scale === transform.scale &&
       rendered.disabled === disabled
@@ -431,10 +375,10 @@ export function createArrangementView(options) {
       groupLayer = svgNode("g");
       groupLayer.classList.add("arrangement-groups");
       nodes = {
-        source: buildGroup("source", boxes.source),
-        destination: buildGroup("destination", boxes.destination),
+        local: buildGroup("local", boxes.local),
+        peer: buildGroup("peer", boxes.peer),
       };
-      groupLayer.append(nodes.source, nodes.destination);
+      groupLayer.append(nodes.local, nodes.peer);
       seamLayer = createSeamLayer(arrangement.connected ? arrangement.seams : [], transform);
       previewLayer = emptyPreview();
       svg.replaceChildren(guideLayer, groupLayer, seamLayer, previewLayer);
@@ -455,19 +399,17 @@ export function createArrangementView(options) {
   }
 
   function buildGroup(groupKey, labelBox) {
-    const grouped = currentMode() === "grouped";
     const node = createGroupNode({
       tiles: arrangement.tiles.filter((t) => t.side === groupKey),
       tileRects: rects.tiles,
       groupKey,
       platform: platforms[groupKey],
-      side: sides[groupKey],
+      side: groupKey,
       label: labels[groupKey],
       rect: rects.sides[groupKey],
       labelBox,
-      focusable: !disabled && grouped,
-      focusTiles: !disabled && !grouped,
-      source: groupKey === "source",
+      focusable: !disabled,
+      focusTiles: false,
       ariaLabel: groupAria(groupKey),
       tileAria: (tile) => tileAria(tile, groupKey),
     });
@@ -491,52 +433,42 @@ export function createArrangementView(options) {
       node.firstChild,
     );
     setPosition(node, rects.sides[groupKey].x, rects.sides[groupKey].y);
-    for (const monitor of node.querySelectorAll(".arrangement-monitor")) {
-      monitor.removeAttribute("transform");
-      monitor.classList.remove("is-dragging");
-    }
   }
 
   function groupAria(groupKey) {
     const own = arrangement.tiles.filter((t) => t.side === groupKey);
     const count = own.length;
-    const place =
-      groupKey === "source"
-        ? `Holds the keyboard and mouse. ${labels.destination} sits ${sideWord(groupKey)}.`
-        : `Sits ${sideWord(groupKey)} of ${labels.source}.`;
+    const other = groupKey === "local" ? "peer" : "local";
+    const place = `Sits ${sideWord(groupKey)} of ${labels[other]}.`;
     const crossing = arrangement.connected ? describeArrangement(arrangement) : "Not touching yet.";
     const size = formatSize(groups[groupKey].width, groups[groupKey].height);
-    const how =
-      currentMode() === "grouped"
-        ? "Drag, or use the arrow keys."
-        : "Each display moves on its own.";
-    return `${labels[groupKey]}. ${count} display${count === 1 ? "" : "s"}, ${size} together. ${place} ${crossing} ${how}`;
+    return `${labels[groupKey]}. ${count} display${count === 1 ? "" : "s"}, ${size} together. ${place} ${crossing} Drag, or use the arrow keys.`;
   }
 
   function tileAria(tile, groupKey) {
     const seams = arrangement.seams.filter(
-      (s) => (groupKey === "source" ? s.fromDisplay : s.toDisplay) === tile.id,
+      (s) => (groupKey === "local" ? s.fromDisplay : s.toDisplay) === tile.id,
     );
     const contact = seams.length
-      ? `Crosses on its ${seams.map((s) => (groupKey === "source" ? s.fromEdge : s.toEdge)).join(" and ")} edge.`
+      ? `Crosses on its ${seams.map((s) => (groupKey === "local" ? s.fromEdge : s.toEdge)).join(" and ")} edge.`
       : "Not touching the other computer.";
     return `${tile.name}, ${formatSize(tile.width, tile.height)}${tile.primary ? ", primary display" : ""}, on ${labels[groupKey]}. ${contact} Drag, or use the arrow keys.`;
   }
 
   function sideWord(groupKey) {
-    const source = rects.sides.source;
-    const destination = rects.sides.destination;
+    const local = rects.sides.local;
+    const peer = rects.sides.peer;
     const word =
-      destination.x >= source.x + source.width
+      peer.x >= local.x + local.width
         ? "to the right"
-        : destination.x + destination.width <= source.x
+        : peer.x + peer.width <= local.x
           ? "to the left"
-          : destination.y >= source.y + source.height
+          : peer.y >= local.y + local.height
             ? "below"
-            : destination.y + destination.height <= source.y
+            : peer.y + peer.height <= local.y
               ? "above"
               : "beside";
-    if (groupKey === "destination") return word;
+    if (groupKey === "peer") return word;
     return {
       "to the right": "to the left",
       "to the left": "to the right",
@@ -551,16 +483,8 @@ export function createArrangementView(options) {
     frame = requestAnimationFrame(() => renderScene());
   }
 
-  function movingFor(target, groupKey) {
-    if (currentMode() === "grouped") return { side: groupKey };
-    const monitor = target?.closest?.(".arrangement-monitor");
-    return monitor?.dataset.display ? { id: monitor.dataset.display } : null;
-  }
-
   function movingNode(moving) {
-    return moving.id
-      ? svg.querySelector(`.arrangement-monitor[data-display="${moving.id}"]`)
-      : nodes[moving.side];
+    return nodes[moving.side];
   }
 
   function candidateFor(deltaX, deltaY) {
@@ -580,7 +504,7 @@ export function createArrangementView(options) {
     const guides = [];
     const geometry = candidate ? arrangementGeometry(groups, candidate) : null;
     if (candidate) {
-      const ids = new Set(movingIds(groups, candidate, drag.moving));
+      const ids = new Set(movingIds(groups, drag.moving));
       const outline = tileRects(
         tiles(groups, candidate).filter((t) => ids.has(t.id)),
         transform,
@@ -603,11 +527,7 @@ export function createArrangementView(options) {
     replaceLayer("previewLayer", layer);
     stage.dataset.drop = candidate ? "valid" : "none";
     if (!candidate)
-      announce(
-        currentMode() === "grouped"
-          ? "No touching position here. Release to keep the current arrangement."
-          : "No room here. Release to keep the current arrangement.",
-      );
+      announce("No touching position here. Release to keep the current arrangement.");
     else announce(`Drop here. ${describeArrangement(geometry)}`);
   }
 
@@ -615,21 +535,19 @@ export function createArrangementView(options) {
     drag.deltaX = deltaX;
     drag.deltaY = deltaY;
     drag.moved ||= Math.abs(deltaX) > 1 || Math.abs(deltaY) > 1;
-    if (drag.moving.id) drag.node?.setAttribute("transform", `translate(${deltaX} ${deltaY})`);
-    else setPosition(drag.node, drag.baseX + deltaX, drag.baseY + deltaY);
+    setPosition(drag.node, drag.baseX + deltaX, drag.baseY + deltaY);
     drag.resolved = candidateFor(deltaX, deltaY);
     drawPreview(drag.resolved);
   }
 
-  function startDrag(moving, groupKey, keyboard) {
+  function startDrag(moving, keyboard) {
     const node = movingNode(moving);
     // Raising the group above the other one moves it in the DOM, which drops focus: take both before the drag exists.
-    if (!moving.id) groupLayer.append(nodes[groupKey]);
+    groupLayer.append(nodes[moving.side]);
     node?.focus({ preventScroll: true });
-    const base = moving.id ? { x: 0, y: 0 } : rects.sides[groupKey];
+    const base = rects.sides[moving.side];
     drag = {
       moving,
-      groupKey,
       node,
       keyboard,
       pointerId: null,
@@ -697,11 +615,7 @@ export function createArrangementView(options) {
     if (!current.moved || !current.resolved) {
       renderScene();
       if (current.moved)
-        announce(
-          currentMode() === "grouped"
-            ? "No touching position there, so the arrangement is unchanged."
-            : "No room there, so the arrangement is unchanged.",
-        );
+        announce("No touching position there, so the arrangement is unchanged.");
       return;
     }
     refitNext = true;
@@ -710,11 +624,9 @@ export function createArrangementView(options) {
 
   const beginDrag = (event, groupKey) => {
     if (destroyed || disabled || event.button !== 0 || !transform) return;
-    const moving = movingFor(event.target, groupKey);
-    if (!moving) return;
     event.preventDefault();
     if (drag) endDrag();
-    startDrag(moving, groupKey, false);
+    startDrag({ side: groupKey }, false);
     drag.pointerId = event.pointerId;
     drag.startClientX = event.clientX;
     drag.startClientY = event.clientY;
@@ -751,9 +663,8 @@ export function createArrangementView(options) {
 
   function onKeyDown(event, groupKey) {
     if (destroyed || disabled || !transform) return;
-    const moving = movingFor(event.target, groupKey);
-    if (!moving) return;
-    const same = drag?.keyboard && sameMoving(drag.moving, moving);
+    const moving = { side: groupKey };
+    const same = drag?.keyboard && drag.moving.side === moving.side;
     if (event.key === "Escape") {
       if (!drag) return;
       event.preventDefault();
@@ -767,9 +678,9 @@ export function createArrangementView(options) {
         return;
       }
       if (drag) endDrag();
-      startDrag(moving, groupKey, true);
+      startDrag(moving, true);
       announce(
-        `${movingName(moving, groupKey)} picked up. Arrow keys move it, Enter drops it, Escape cancels.`,
+        `${labels[groupKey]} picked up. Arrow keys move it, Enter drops it, Escape cancels.`,
       );
       return;
     }
@@ -792,20 +703,10 @@ export function createArrangementView(options) {
     ]);
     const target = resolvePlacement(groups, nudged, moving);
     if (!target) {
-      announce(
-        currentMode() === "grouped"
-          ? "That direction has no touching position."
-          : "That direction has no room.",
-      );
+      announce("That direction has no touching position.");
       return;
     }
     handlers.onCommit?.(target, moving);
-  }
-
-  function movingName(moving, groupKey) {
-    return moving.id
-      ? (arrangement.tiles.find((t) => t.id === moving.id)?.name ?? "Display")
-      : labels[groupKey];
   }
 
   const onStageKeyDown = (event) => {
@@ -834,7 +735,7 @@ export function createArrangementView(options) {
       // A gesture cannot outlive the editing it belongs to, so going busy drops it.
       if (disabled && drag) endDrag();
       const incoming = next.arrangement;
-      if (incoming?.groups?.source && incoming.groups?.destination && incoming.placement) {
+      if (incoming?.groups?.local && incoming.groups?.peer && incoming.placement) {
         if (drag && shapeOf(incoming) === shapeOf(arrangement)) {
           pending = incoming;
           capturePointer();
@@ -860,8 +761,8 @@ export function createArrangementView(options) {
 
 function useChoices(value) {
   return {
-    source: Array.isArray(value?.source) ? value.source : [],
-    destination: Array.isArray(value?.destination) ? value.destination : [],
+    local: Array.isArray(value?.local) ? value.local : [],
+    peer: Array.isArray(value?.peer) ? value.peer : [],
   };
 }
 
@@ -877,10 +778,6 @@ function dedupeGuides(guides) {
 
 function clampDelta(value, extent) {
   return Math.min(Math.max(value, -extent * 4), extent * 4);
-}
-
-function oppositePlatform(platform) {
-  return platform === "macos" ? "windows" : "macos";
 }
 
 function controlButton(label, title, disabled) {

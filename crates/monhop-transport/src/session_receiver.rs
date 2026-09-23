@@ -3,10 +3,13 @@
 use crate::session_clock::millis_u64;
 use crate::session_health::{HOLD_LIMIT, HealthError, PEER_LIVENESS, PeerHealth, hold_stats};
 use crate::session_startup::ReadyControl;
-use monhop_core::{DisplayId, HidUsage, ModifierState, MouseButton, Point};
+use monhop_core::{
+    DisplayId, FloorSnapshot, FloorState, HidUsage, ModifierState, MouseButton, Point, SharedFloor,
+    TakeBackGate,
+};
 use monhop_protocol::{
-    DeliveryClass, DisplayTopology, Frame, Message, Motion, RateLimiter, SequenceGate,
-    SequenceGateError, SessionEpoch,
+    DeclineReason, DeliveryClass, DisplayTopology, Frame, Message, Motion, RateLimiter,
+    SequenceGate, SequenceGateError, SessionEpoch,
 };
 use std::time::Duration;
 
@@ -44,6 +47,11 @@ pub enum ReceiverFailure {
 
 /// Construct only after matching SessionSetup proposals, full peer authentication and local enable.
 pub struct InputReceiver {
+    gate: TakeBackGate,
+    floor_generation: Option<u64>,
+    local_lower: bool,
+    enabled: bool,
+    yielding: bool,
     displays: DisplayTopology,
     epoch: SessionEpoch,
     sequences: SequenceGate,
@@ -75,6 +83,11 @@ impl InputReceiver {
             .activate_epoch(epoch)
             .expect("fresh control gate");
         Self {
+            gate: TakeBackGate::new(SharedFloor::new()),
+            floor_generation: None,
+            local_lower: false,
+            enabled: true,
+            yielding: false,
             displays,
             epoch,
             sequences,
@@ -91,6 +104,76 @@ impl InputReceiver {
             held_since: None,
             holds: 0,
             held_max: Duration::ZERO,
+        }
+    }
+
+    pub fn with_floor(mut self, gate: TakeBackGate, local_lower: bool, enabled: bool) -> Self {
+        self.gate = gate;
+        self.local_lower = local_lower;
+        self.enabled = enabled;
+        self
+    }
+
+    /// Called before queued input: cleanup is local and never waits for a peer response.
+    pub fn take_back(
+        &mut self,
+        destination: &mut impl InputDestination,
+    ) -> Result<Option<Message>, ReceiverFailure> {
+        let Some(generation) = self.gate.take_triggered() else {
+            return Ok(None);
+        };
+        let floor = self.gate.floor().snapshot();
+        if self.floor_generation.is_none()
+            || floor.state != FloorState::Yielding
+            || floor.generation != generation
+        {
+            return Ok(None);
+        }
+        self.floor_generation = Some(generation);
+        self.yielding = true;
+        self.pending_move = None;
+        if destination.apply(DestinationAction::ReleaseAll).is_err() {
+            return Err(self.stop(ReceiverFailure::NativeDelivery, destination));
+        }
+        self.gate.note_injected_released();
+        Ok(Some(Message::TakeBack))
+    }
+
+    fn suppress_injection(&self) -> bool {
+        self.yielding || self.gate.floor().snapshot().state == FloorState::Yielding
+    }
+
+    fn release_floor(&mut self) {
+        if let Some(generation) = self.floor_generation.take() {
+            let floor = self.gate.floor();
+            release_inbound(floor, generation, floor.snapshot());
+        }
+        self.yielding = false;
+    }
+
+    fn admit_activation(&mut self) -> Result<(), DeclineReason> {
+        if !self.enabled {
+            return Err(DeclineReason::Disabled);
+        }
+        loop {
+            let floor = self.gate.floor().snapshot();
+            match floor.state {
+                FloorState::Free => {}
+                FloorState::Requesting if !self.local_lower => {}
+                FloorState::Requesting => return Err(DeclineReason::Contended),
+                FloorState::Sending | FloorState::Returning => return Err(DeclineReason::Busy),
+                FloorState::Receiving | FloorState::Yielding => {
+                    if self.floor_generation.is_some() {
+                        return Ok(());
+                    }
+                    return Err(DeclineReason::Busy);
+                }
+            }
+            if let Ok(receiving) = self.gate.floor().transition(floor, FloorState::Receiving) {
+                self.floor_generation = Some(receiving.generation);
+                self.gate.open_injection(receiving.generation);
+                return Ok(());
+            }
         }
     }
 
@@ -167,6 +250,9 @@ impl InputReceiver {
         &mut self,
         destination: &mut impl InputDestination,
     ) -> Result<(), ReceiverFailure> {
+        if self.suppress_injection() {
+            self.pending_move = None;
+        }
         if let Some(point) = self.pending_move {
             destination
                 .apply(DestinationAction::MoveTo(point))
@@ -214,6 +300,7 @@ impl InputReceiver {
         destination: &mut impl InputDestination,
     ) -> Result<(), ReceiverFailure> {
         log::warn!("receiver held: no fresh reply for {PEER_LIVENESS:?}; injected input released");
+        self.gate.open_injection(0);
         self.active = None;
         self.pending_move = None;
         self.cleanup_pending = true;
@@ -313,12 +400,17 @@ impl InputReceiver {
                 self.epoch = frame.epoch;
                 return Ok(None);
             }
+            self.epoch = frame.epoch;
+            if let Err(reason) = self.admit_activation() {
+                return Ok(Some(Message::ActivationDeclined { display_id, reason }));
+            }
             // Moving between displays on this destination preserves an in-progress drag.
             self.pending_move = None;
-            destination
-                .apply(DestinationAction::MoveTo(position))
-                .map_err(|_| ReceiverFailure::NativeDelivery)?;
-            self.epoch = frame.epoch;
+            if !self.suppress_injection() {
+                destination
+                    .apply(DestinationAction::MoveTo(position))
+                    .map_err(|_| ReceiverFailure::NativeDelivery)?;
+            }
             self.active = Some((display_id, position));
             return Ok(Some(Message::ActivationAck(display_id)));
         }
@@ -341,12 +433,19 @@ impl InputReceiver {
         }
         match &frame.message {
             Message::ReleaseAll => {
+                // Closing admission precedes native cleanup and the floor becoming available.
+                if self.floor_generation.is_some() {
+                    self.gate.open_injection(0);
+                }
                 destination
                     .apply(DestinationAction::ReleaseAll)
                     .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                self.gate.note_injected_released();
+                self.release_floor();
                 self.keys.fill(false);
                 self.buttons.fill(false);
                 self.active = None;
+                self.pending_move = None;
                 if held {
                     self.cleanup_pending = false;
                     self.resume(now)?;
@@ -374,12 +473,14 @@ impl InputReceiver {
                 if self.modifiers() != key.modifiers {
                     return Err(ReceiverFailure::InvalidPressedState);
                 }
-                destination
-                    .apply(DestinationAction::Key {
-                        usage: key.usage,
-                        pressed: key.is_down,
-                    })
-                    .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                if !self.suppress_injection() {
+                    destination
+                        .apply(DestinationAction::Key {
+                            usage: key.usage,
+                            pressed: key.is_down,
+                        })
+                        .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                }
                 Ok(None)
             }
             Message::Button(button) => {
@@ -388,12 +489,14 @@ impl InputReceiver {
                 if self.buttons[index] == button.is_down {
                     return Err(ReceiverFailure::InvalidPressedState);
                 }
-                destination
-                    .apply(DestinationAction::Button {
-                        button: button.button,
-                        pressed: button.is_down,
-                    })
-                    .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                if !self.suppress_injection() {
+                    destination
+                        .apply(DestinationAction::Button {
+                            button: button.button,
+                            pressed: button.is_down,
+                        })
+                        .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                }
                 self.buttons[index] = button.is_down;
                 Ok(None)
             }
@@ -406,12 +509,14 @@ impl InputReceiver {
                 {
                     return Err(ReceiverFailure::InvalidPoint);
                 }
-                destination
-                    .apply(DestinationAction::Scroll {
-                        horizontal: scroll.horizontal,
-                        vertical: scroll.vertical,
-                    })
-                    .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                if !self.suppress_injection() {
+                    destination
+                        .apply(DestinationAction::Scroll {
+                            horizontal: scroll.horizontal,
+                            vertical: scroll.vertical,
+                        })
+                        .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                }
                 Ok(None)
             }
             Message::Motion(motion) => {
@@ -440,6 +545,7 @@ impl InputReceiver {
             log::warn!("receiver stopped: {failure:?}");
         }
         let failure = *self.failure.get_or_insert(failure);
+        self.gate.open_injection(0);
         self.active = None;
         self.pending_move = None;
         self.cleanup_pending = true;
@@ -452,6 +558,8 @@ impl InputReceiver {
             self.keys.fill(false);
             self.buttons.fill(false);
             self.cleanup_pending = false;
+            self.gate.note_injected_released();
+            self.release_floor();
         }
     }
 
@@ -485,6 +593,29 @@ impl InputReceiver {
             return Err(ReceiverFailure::InvalidPoint);
         }
         Ok(())
+    }
+}
+
+/// Frees this half's claim at `generation`: Receiving, or the Yielding a take-back made from it.
+/// The capture callback may yield between any snapshot and the swap, so the swap retries until it
+/// lands or the floor is no longer this claim's.
+fn release_inbound(floor: &SharedFloor, generation: u64, mut current: FloorSnapshot) {
+    loop {
+        let ours = match current.state {
+            FloorState::Receiving => current.generation == generation,
+            FloorState::Yielding => {
+                current.generation == generation
+                    || generation.checked_add(1) == Some(current.generation)
+            }
+            _ => false,
+        };
+        if !ours {
+            return;
+        }
+        match floor.transition(current, FloorState::Free) {
+            Ok(_) => return,
+            Err(changed) => current = changed,
+        }
     }
 }
 
@@ -1122,5 +1253,83 @@ mod tests {
             target.calls.last(),
             Some(DestinationAction::ReleaseAll)
         ));
+    }
+
+    /// The capture callback yields the claim after the release took its snapshot: the swap must
+    /// retry on the Yielding successor instead of leaving the floor with no owner.
+    #[test]
+    fn a_take_back_between_the_release_snapshot_and_its_swap_still_frees_the_floor() {
+        let floor = SharedFloor::new();
+        let receiving = floor
+            .transition(floor.snapshot(), FloorState::Receiving)
+            .unwrap();
+        let observed = floor.snapshot();
+        let yielding = floor.transition(observed, FloorState::Yielding).unwrap();
+        release_inbound(&floor, receiving.generation, observed);
+        assert_eq!(floor.snapshot().state, FloorState::Free);
+        assert!(floor.snapshot().generation > yielding.generation);
+
+        let receiving = floor
+            .transition(floor.snapshot(), FloorState::Receiving)
+            .unwrap();
+        floor.transition(receiving, FloorState::Yielding).unwrap();
+        release_inbound(&floor, receiving.generation, floor.snapshot());
+        assert_eq!(floor.snapshot().state, FloorState::Free);
+    }
+
+    #[test]
+    fn a_release_never_frees_a_floor_its_claim_no_longer_holds() {
+        let floor = SharedFloor::new();
+        let old = floor
+            .transition(floor.snapshot(), FloorState::Receiving)
+            .unwrap();
+        release_inbound(&floor, old.generation, floor.snapshot());
+        let requesting = floor
+            .transition(floor.snapshot(), FloorState::Requesting)
+            .unwrap();
+        release_inbound(&floor, old.generation, floor.snapshot());
+        assert_eq!(floor.snapshot(), requesting);
+        floor.transition(requesting, FloorState::Free).unwrap();
+        let newer = floor
+            .transition(floor.snapshot(), FloorState::Receiving)
+            .unwrap();
+        release_inbound(&floor, old.generation, floor.snapshot());
+        assert_eq!(floor.snapshot(), newer);
+    }
+
+    #[test]
+    fn a_take_back_for_a_claim_already_released_is_ignored() {
+        use monhop_core::capture::{CaptureEvent, CaptureStop, capture_channel};
+        let floor = SharedFloor::new();
+        let gate = TakeBackGate::new(floor.clone());
+        let mut receiver = receiver().with_floor(gate.clone(), false, true);
+        let mut target = Destination::default();
+        receiver
+            .receive(&activate(), Duration::ZERO, &mut target)
+            .unwrap();
+        let stop = CaptureStop::new();
+        let (mut producer, _consumer) = capture_channel(stop.clone());
+        let mut physical = monhop_core::capture_physical::PhysicalCapture::new(Duration::ZERO)
+            .with_take_back(gate.clone());
+        physical.process(
+            CaptureEvent::LogicalRelativeMotion { dx: 6.0, dy: 0.0 },
+            false,
+            Duration::ZERO,
+            &mut producer,
+            &stop,
+        );
+        assert_eq!(floor.snapshot().state, FloorState::Yielding);
+        assert_eq!(
+            receiver.receive(
+                &frame(2, 1, Message::ReleaseAll),
+                Duration::ZERO,
+                &mut target
+            ),
+            Ok(Some(Message::ReleaseAck))
+        );
+        let freed = floor.snapshot();
+        assert_eq!(freed.state, FloorState::Free);
+        assert_eq!(receiver.take_back(&mut target), Ok(None));
+        assert_eq!(floor.snapshot(), freed);
     }
 }

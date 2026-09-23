@@ -1,7 +1,7 @@
-use monhop_core::{DeviceId, DisplayId, Platform, Point};
+use monhop_core::{DisplayId, Platform, Point};
 use monhop_protocol::{
-    Capabilities, DisplayDescription, DisplayTopology, Frame, Hello, Key, Message,
-    PROTOCOL_VERSION, SessionEpoch, SessionPurpose, SessionSetup,
+    Capabilities, ControlPermissions, DisplayDescription, DisplayTopology, Frame, Hello, Key,
+    Message, PROTOCOL_VERSION, SessionEpoch, SessionPurpose, SessionSetup,
 };
 use monhop_transport::session_handshake::{
     HandshakeConfig, HandshakeError, device_id_from_fingerprint, validate_peer_handshake,
@@ -45,7 +45,7 @@ fn peer_frames(
     peer: &DeviceIdentity,
     epoch: SessionEpoch,
     topology: &DisplayTopology,
-    source: DeviceId,
+    control: ControlPermissions,
     platform: Platform,
     capabilities: Capabilities,
     purpose: SessionPurpose,
@@ -65,7 +65,7 @@ fn peer_frames(
         Frame::new(
             epoch,
             2,
-            Message::SessionSetup(SessionSetup { source, purpose }),
+            Message::SessionSetup(SessionSetup { control, purpose }),
         ),
     ]
 }
@@ -77,7 +77,7 @@ fn generated_certificates_bind_the_full_pin_and_stable_hello_id() {
     let other = DeviceIdentity::generate().expect("other identity");
     let peer_pin = peer_pin(&peer);
     let topology = topology();
-    let source = device_id_from_fingerprint(local.fingerprint());
+    let control = ControlPermissions::BOTH;
     let config = HandshakeConfig::new(
         &local,
         &peer_pin,
@@ -86,7 +86,7 @@ fn generated_certificates_bind_the_full_pin_and_stable_hello_id() {
         capabilities(),
         capabilities(),
         &topology,
-        source,
+        control,
         SessionPurpose::Share,
     )
     .expect("valid handshake configuration");
@@ -94,7 +94,7 @@ fn generated_certificates_bind_the_full_pin_and_stable_hello_id() {
         &peer,
         epoch(),
         &topology,
-        source,
+        control,
         Platform::MacOs,
         capabilities(),
         SessionPurpose::Share,
@@ -113,12 +113,12 @@ fn generated_certificates_bind_the_full_pin_and_stable_hello_id() {
 }
 
 #[test]
-fn model_rejects_duplicate_out_of_order_input_and_source_mismatch() {
+fn model_rejects_duplicate_out_of_order_input_and_control_mismatch() {
     let local = DeviceIdentity::generate().expect("local identity");
     let peer = DeviceIdentity::generate().expect("peer identity");
     let peer_pin = peer_pin(&peer);
     let topology = topology();
-    let source = device_id_from_fingerprint(peer.fingerprint());
+    let control = ControlPermissions::BOTH;
     let config = HandshakeConfig::new(
         &local,
         &peer_pin,
@@ -127,7 +127,7 @@ fn model_rejects_duplicate_out_of_order_input_and_source_mismatch() {
         capabilities(),
         capabilities(),
         &topology,
-        source,
+        control,
         SessionPurpose::Share,
     )
     .expect("valid handshake configuration");
@@ -135,7 +135,7 @@ fn model_rejects_duplicate_out_of_order_input_and_source_mismatch() {
         &peer,
         epoch(),
         &topology,
-        source,
+        control,
         Platform::MacOs,
         capabilities(),
         SessionPurpose::Share,
@@ -177,29 +177,32 @@ fn model_rejects_duplicate_out_of_order_input_and_source_mismatch() {
         Err(HandshakeError::InvalidFrame)
     );
 
-    let mut wrong_source = frames;
-    wrong_source[2].message = Message::SessionSetup(SessionSetup {
-        source: device_id_from_fingerprint(local.fingerprint()),
+    let mut wrong_control = frames;
+    wrong_control[2].message = Message::SessionSetup(SessionSetup {
+        control: ControlPermissions {
+            lower_controls_higher: true,
+            higher_controls_lower: false,
+        },
         purpose: SessionPurpose::Share,
     });
     assert_eq!(
-        validate_peer_handshake(&config, peer.fingerprint(), epoch(), &wrong_source),
-        Err(HandshakeError::SourceMismatch)
+        validate_peer_handshake(&config, peer.fingerprint(), epoch(), &wrong_control),
+        Err(HandshakeError::ControlMismatch)
     );
 
     let frames = peer_frames(
         &peer,
         epoch(),
         &topology,
-        source,
+        control,
         Platform::MacOs,
         capabilities(),
         SessionPurpose::Share,
     );
     let mut wrong_purpose = frames;
     wrong_purpose[2].message = Message::SessionSetup(SessionSetup {
-        source,
-        purpose: SessionPurpose::Inspect,
+        control,
+        purpose: SessionPurpose::Setup,
     });
     assert_eq!(
         validate_peer_handshake(&config, peer.fingerprint(), epoch(), &wrong_purpose),
@@ -213,7 +216,7 @@ fn model_requires_the_expected_platform_and_capabilities() {
     let peer = DeviceIdentity::generate().expect("peer identity");
     let peer_pin = peer_pin(&peer);
     let topology = topology();
-    let source = device_id_from_fingerprint(local.fingerprint());
+    let control = ControlPermissions::BOTH;
     let config = HandshakeConfig::new(
         &local,
         &peer_pin,
@@ -222,7 +225,7 @@ fn model_requires_the_expected_platform_and_capabilities() {
         capabilities(),
         capabilities(),
         &topology,
-        source,
+        control,
         SessionPurpose::Share,
     )
     .expect("valid handshake configuration");
@@ -231,7 +234,7 @@ fn model_requires_the_expected_platform_and_capabilities() {
         &peer,
         epoch(),
         &topology,
-        source,
+        control,
         Platform::Windows,
         capabilities(),
         SessionPurpose::Share,
@@ -247,7 +250,7 @@ fn model_requires_the_expected_platform_and_capabilities() {
         &peer,
         epoch(),
         &topology,
-        source,
+        control,
         Platform::MacOs,
         reduced_capabilities,
         SessionPurpose::Share,
@@ -259,7 +262,7 @@ fn model_requires_the_expected_platform_and_capabilities() {
 }
 
 #[test]
-fn configuration_rejects_a_source_outside_the_authenticated_pair() {
+fn configuration_rejects_both_directions_disabled() {
     let local = DeviceIdentity::generate().expect("local identity");
     let peer = DeviceIdentity::generate().expect("peer identity");
     let peer_pin = peer_pin(&peer);
@@ -274,7 +277,10 @@ fn configuration_rejects_a_source_outside_the_authenticated_pair() {
             capabilities(),
             capabilities(),
             &topology,
-            DeviceId([0; 16]),
+            ControlPermissions {
+                lower_controls_higher: false,
+                higher_controls_lower: false
+            },
             SessionPurpose::Share,
         ),
         Err(HandshakeError::InvalidConfiguration)

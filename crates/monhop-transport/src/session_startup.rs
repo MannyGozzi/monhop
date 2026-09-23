@@ -159,9 +159,9 @@ impl StartupControl {
         }
     }
 
-    pub fn can_prepare_source(&mut self, now: Duration) -> Result<bool, StartupError> {
+    pub fn health_confirmed(&mut self, now: Duration) -> Result<bool, StartupError> {
         self.check(now)?;
-        Ok(self.local_is_source && self.peer_ready && self.control.health.is_confirmed())
+        Ok(self.control.health.is_confirmed())
     }
 
     pub fn can_announce_ready(&mut self, now: Duration) -> Result<bool, StartupError> {
@@ -255,15 +255,15 @@ mod tests {
     }
 
     #[test]
-    fn receiver_readiness_precedes_capture_and_source_readiness() {
+    fn inbound_readiness_requires_health_and_precedes_outbound_readiness() {
         let (mut source, mut receiver) = pair();
         heartbeat(&mut source, &mut receiver, ms(0));
-        assert!(!source.can_prepare_source(ms(0)).unwrap());
+        assert!(source.health_confirmed(ms(0)).unwrap());
         assert!(!source.can_announce_ready(ms(0)).unwrap());
         assert!(!receiver.is_ready(ms(0)).unwrap());
         let ready = receiver.announce_ready(ms(1)).unwrap();
         source.receive(&ready, ms(1)).unwrap();
-        assert!(source.can_prepare_source(ms(1)).unwrap());
+        assert!(source.health_confirmed(ms(1)).unwrap());
         receiver
             .receive(&source.announce_ready(ms(2)).unwrap(), ms(2))
             .unwrap();
@@ -276,7 +276,7 @@ mod tests {
         let (mut source, mut receiver) = pair();
         for time in (0..3_000).step_by(30) {
             heartbeat(&mut source, &mut receiver, ms(time));
-            assert!(!source.can_prepare_source(ms(time)).unwrap());
+            assert!(source.health_confirmed(ms(time)).unwrap());
         }
         assert_eq!(
             source.poll(ms(3_000)).map_err(startup_failure),
@@ -374,17 +374,14 @@ mod tests {
             ),
             Err(StartupError::Sequence)
         );
-        assert_eq!(
-            source.can_prepare_source(ms(1)),
-            Err(StartupError::Sequence)
-        );
+        assert_eq!(source.health_confirmed(ms(1)), Err(StartupError::Sequence));
         let (mut source, mut receiver) = pair();
         heartbeat(&mut source, &mut receiver, ms(0));
         source
             .receive(&receiver.announce_ready(ms(0)).unwrap(), ms(0))
             .unwrap();
         assert_eq!(
-            source.can_prepare_source(PEER_LIVENESS),
+            source.health_confirmed(PEER_LIVENESS),
             Err(StartupError::Health(HealthError::DeadlineExpired))
         );
         assert_eq!(

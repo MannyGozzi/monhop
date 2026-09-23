@@ -6,6 +6,7 @@ import { initialComputers, normalizeComputers } from "./computers-model.mjs";
 
 const WINDOWS = "b".repeat(64);
 const MAC = "c".repeat(64);
+const LOCAL_NAME = "This Mac";
 
 const computer = { fingerprint: WINDOWS, name: "Office Windows PC", platform: "windows" };
 const other = { fingerprint: MAC, name: "Studio Mac", platform: "macos" };
@@ -16,7 +17,7 @@ function view(patch = {}) {
     peerFingerprint: null,
     active: null,
     editing: false,
-    sharingRole: null,
+    control: null,
     lastFailure: "",
     message: "",
     ...patch,
@@ -25,30 +26,82 @@ function view(patch = {}) {
 
 test("a computer nobody is using reads as paired, whatever the live connection is doing", () => {
   const live = view({ phase: "sharing", peerFingerprint: WINDOWS, active: WINDOWS });
-  const standby = computerStatus(other, live, WINDOWS);
+  const standby = computerStatus(other, live, WINDOWS, LOCAL_NAME);
   assert.equal(standby.key, "standby");
   assert.equal(standby.label, "Paired");
   assert.equal(standby.tone, "neutral");
   assert.equal(isLiveStatus(standby), false);
 });
 
-test("the computer in use follows the live phase, and says which way input travels", () => {
-  const sends = computerStatus(
+test("both_directions_copy", () => {
+  const both = computerStatus(
     computer,
-    view({ phase: "sharing", peerFingerprint: WINDOWS, active: WINDOWS, sharingRole: "sends" }),
+    view({
+      phase: "sharing",
+      peerFingerprint: WINDOWS,
+      active: WINDOWS,
+      control: { localToPeer: true, peerToLocal: true },
+    }),
     WINDOWS,
+    LOCAL_NAME,
   );
-  assert.equal(sends.label, "Sharing input");
-  assert.equal(sends.tone, "active");
-  assert.equal(sends.detail, "Your keyboard and mouse reach Office Windows PC");
-  assert.equal(isLiveStatus(sends), true);
+  assert.equal(both.label, "Sharing");
+  assert.equal(both.tone, "active");
+  assert.equal(both.detail, "Either computer's keyboard and mouse can control the other");
+  assert.equal(isLiveStatus(both), true);
+  // No active record reads the same as both on, matching the default a fresh setup turns on.
+  const noRecord = computerStatus(
+    computer,
+    view({ phase: "sharing", peerFingerprint: WINDOWS, active: WINDOWS, control: null }),
+    WINDOWS,
+    LOCAL_NAME,
+  );
+  assert.equal(noRecord.detail, both.detail);
+});
 
-  const receives = computerStatus(
+test("one_direction_copy_names_controller_and_controlled", () => {
+  const localToPeer = computerStatus(
     computer,
-    view({ phase: "sharing", peerFingerprint: WINDOWS, active: WINDOWS, sharingRole: "receives" }),
+    view({
+      phase: "sharing",
+      peerFingerprint: WINDOWS,
+      active: WINDOWS,
+      control: { localToPeer: true, peerToLocal: false },
+    }),
     WINDOWS,
+    LOCAL_NAME,
   );
-  assert.equal(receives.detail, "Office Windows PC's keyboard and mouse reach this computer");
+  assert.equal(localToPeer.detail, "This Mac's keyboard and mouse can control Office Windows PC");
+
+  const peerToLocal = computerStatus(
+    computer,
+    view({
+      phase: "sharing",
+      peerFingerprint: WINDOWS,
+      active: WINDOWS,
+      control: { localToPeer: false, peerToLocal: true },
+    }),
+    WINDOWS,
+    LOCAL_NAME,
+  );
+  assert.equal(peerToLocal.detail, "Office Windows PC's keyboard and mouse can control This Mac");
+});
+
+test("no_input_source_wording", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const files = ["computer-status.mjs", "computer-card.mjs", "screen-home.mjs", "screen-displays.mjs"];
+  const sources = await Promise.all(
+    files.map((file) => readFile(new URL(file, import.meta.url), "utf8")),
+  );
+  for (const [index, source] of sources.entries())
+    assert.doesNotMatch(
+      source,
+      new RegExp(
+        ["input computer", "keyboard computer", "input source", "source" + "Side", "sharing" + "Role"].join("|"),
+        "i",
+      ),
+      files[index],
+    );
 });
 
 test("a session waiting out a silence reads as reconnecting, and stays live", () => {
@@ -58,10 +111,11 @@ test("a session waiting out a silence reads as reconnecting, and stays live", ()
       phase: "sharing",
       peerFingerprint: WINDOWS,
       active: WINDOWS,
-      sharingRole: "sends",
+      control: { localToPeer: true, peerToLocal: true },
       held: true,
     }),
     WINDOWS,
+    LOCAL_NAME,
   );
   assert.equal(held.key, "reconnecting");
   assert.equal(held.label, "Reconnecting…");
@@ -260,6 +314,8 @@ test("the header pill names the computer in use, or why there is nothing to repo
     sharingView: view({ phase: "sharing", peerFingerprint: WINDOWS, active: WINDOWS }),
     active: WINDOWS,
     nativeAvailable: true,
+    localName: LOCAL_NAME,
   });
-  assert.equal(live.label, "Sharing input");
+  assert.equal(live.label, "Sharing");
+  assert.equal(live.detail, "Either computer's keyboard and mouse can control the other");
 });

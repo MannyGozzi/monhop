@@ -4,6 +4,32 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+Both computers can control each other. **Breaking:** update both computers, pair them again, then arrange once. Saved layouts and the network choice from earlier versions are discarded.
+
+### Added
+
+- Either computer's keyboard and mouse can cross to the other and back. Touching the computer being controlled (a key, a click, a scroll or a deliberate mouse movement) hands it back to its own keyboard and mouse at once.
+- Two switches on Home, "<A> can control <B>" and "<B> can control <A>", both on by default. Flipping one updates both computers; sharing reconnects for about two seconds.
+
+### Changed
+
+- Home and Set up are redesigned: one compact card for the computer in use, a small Sharing pill with a green live outline, the connection status only in the top bar, and completed setup steps collapsed to one line.
+- Switching between Home and Set up animates smoothly; the page transition no longer blurs the whole window.
+- After a display change, the computer with the lower device id chooses the layout, and only after both computers' displays have held still for a second. The window comes forward only when you need to arrange.
+
+### Fixed
+
+- A display change on the Mac ends sharing as a display change and resyncs, instead of as a failure with a ten-second wait.
+- The computer whose displays did not change no longer reports that the other computer failed.
+- A layout proposal interrupted by a brief disconnect or another display change is made again instead of leaving both computers waiting for you to arrange.
+- Two computers can no longer bounce between the setup link and sharing when each remembered a different layout for its own displays.
+- A display list that cannot be read for a moment while monitors reconnect is waited out instead of reported as an error.
+- A computer that presents a different identity than the one paired now says to pair again, instead of retrying every two seconds forever.
+
+### Removed
+
+- The controlled test window, the "Input computer" choice and free arrangement mode.
+
 ## [0.1.4] - 2026-09-21
 
 ### Changed

@@ -168,7 +168,7 @@ function renderAccess(nodes, ctx) {
 
 function recoveryDisclosure(recovery) {
   const steps = el("ol", {
-    className: "note",
+    className: "note recovery-steps",
     children: [
       el("li", { text: `Open ${recovery.pane}.` }),
       el("li", {
@@ -178,7 +178,6 @@ function recoveryDisclosure(recovery) {
       el("li", { text: "Reopen MonHop. It checks again automatically." }),
     ],
   });
-  steps.style.paddingLeft = "18px";
   const content = [note("Updated development builds can leave a stale entry behind."), steps];
   if (recovery.restartNote) content.push(note(recovery.restartNote));
   return createAccordion(

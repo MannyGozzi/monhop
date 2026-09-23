@@ -1,7 +1,5 @@
 //! Preserve each OS's monitor adjacency; caller-provided links join computers only.
 //! A hidden display (one marked not in use) keeps no adjacency: nothing routes the pointer onto it.
-//! `placed` overrides a display's OS origin with where the picture puts it: the other computer's
-//! cursor only goes where MonHop puts it, so its adjacency is the picture, not its OS.
 
 use monhop_core::{Display, DisplayId, Edge, EdgeLink, NormalizedSpan, Point};
 
@@ -9,7 +7,6 @@ pub(crate) fn inherit_display_edges(
     displays: &[Display],
     mut seams: Vec<EdgeLink>,
     hidden: &[DisplayId],
-    placed: &[(DisplayId, Point)],
 ) -> Result<Vec<EdgeLink>, ()> {
     for seam in &seams {
         let from = displays
@@ -26,10 +23,7 @@ pub(crate) fn inherit_display_edges(
     }
     let placed_at = |d: &Display| Placed {
         id: d.id,
-        origin: placed
-            .iter()
-            .find(|(id, _)| *id == d.id)
-            .map_or(d.origin, |(_, origin)| *origin),
+        origin: d.origin,
         size: d.logical_size,
     };
     for (index, a) in displays.iter().enumerate() {
@@ -127,7 +121,7 @@ mod tests {
             display(3, 2, 0.0, 0.0, 100.0, 100.0),
         ];
         let original = monitors.clone();
-        let links = inherit_display_edges(&monitors, vec![], &[], &[]).unwrap();
+        let links = inherit_display_edges(&monitors, vec![], &[]).unwrap();
         assert_eq!(monitors, original);
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].from_display, DisplayId(1));
@@ -145,39 +139,10 @@ mod tests {
             display(3, 2, 0.0, 0.0, 100.0, 100.0),
         ];
         assert!(
-            inherit_display_edges(&monitors, vec![], &[], &[])
+            inherit_display_edges(&monitors, vec![], &[])
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn placed_positions_replace_a_computers_own_geometry() {
-        // The OS stacks 1 over 2; the picture puts 2 beside 1 instead, and 3 belongs elsewhere.
-        let monitors = vec![
-            display(1, 1, 0.0, 0.0, 100.0, 100.0),
-            display(2, 1, 0.0, 100.0, 100.0, 100.0),
-            display(3, 2, 0.0, 0.0, 100.0, 100.0),
-        ];
-        let apart = inherit_display_edges(
-            &monitors,
-            vec![],
-            &[],
-            &[(DisplayId(2), Point::new(300.0, 0.0))],
-        )
-        .unwrap();
-        assert!(apart.is_empty());
-        let beside = inherit_display_edges(
-            &monitors,
-            vec![],
-            &[],
-            &[(DisplayId(2), Point::new(100.0, 50.0))],
-        )
-        .unwrap();
-        assert_eq!(beside.len(), 2);
-        assert_eq!(beside[0].from_edge, Edge::Right);
-        assert_eq!(beside[0].from_span, NormalizedSpan::new(0.5, 1.0).unwrap());
-        assert_eq!(beside[0].to_span, NormalizedSpan::new(0.0, 0.5).unwrap());
     }
 
     #[test]
@@ -187,9 +152,9 @@ mod tests {
             display(2, 1, 100.0, 0.0, 100.0, 100.0),
             display(3, 1, 200.0, 0.0, 100.0, 100.0),
         ];
-        let links = inherit_display_edges(&monitors, vec![], &[DisplayId(2)], &[]).unwrap();
+        let links = inherit_display_edges(&monitors, vec![], &[DisplayId(2)]).unwrap();
         assert!(links.is_empty());
-        let links = inherit_display_edges(&monitors, vec![], &[DisplayId(3)], &[]).unwrap();
+        let links = inherit_display_edges(&monitors, vec![], &[DisplayId(3)]).unwrap();
         assert_eq!(links.len(), 2);
         assert!(links.iter().all(|link| link.to_display != DisplayId(3)));
     }
@@ -200,9 +165,9 @@ mod tests {
             display(1, 1, 0.0, 0.0, 100.0, 100.0),
             display(2, 1, 100.0, 0.0, 100.0, 100.0),
         ];
-        let mut links = inherit_display_edges(&monitors, vec![], &[], &[]).unwrap();
-        assert!(inherit_display_edges(&monitors, vec![links.remove(0)], &[], &[]).is_err());
+        let mut links = inherit_display_edges(&monitors, vec![], &[]).unwrap();
+        assert!(inherit_display_edges(&monitors, vec![links.remove(0)], &[]).is_err());
         let overlap = vec![monitors[0].clone(), display(2, 1, 50.0, 0.0, 100.0, 100.0)];
-        assert!(inherit_display_edges(&overlap, vec![], &[], &[]).is_err());
+        assert!(inherit_display_edges(&overlap, vec![], &[]).is_err());
     }
 }

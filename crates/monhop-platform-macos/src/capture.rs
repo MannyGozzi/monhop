@@ -1,8 +1,8 @@
 //! Explicit macOS Quartz capture lifetime.
 //!
-//! A capture exists only after the caller has enabled MonHop locally. Its event tap and run loop
-//! are confined to one owned thread. Callback work is limited to copied-field decoding, fixed
-//! queue admission, physical-ledger updates, and atomic failure latching.
+//! A capture exists only for a session's capture permit or a bounded diagnostic. Its event tap and
+//! run loop are confined to one owned thread. Callback work is limited to copied-field decoding,
+//! fixed queue admission, physical-ledger updates, and atomic failure latching.
 
 use std::{
     cell::RefCell,
@@ -19,10 +19,10 @@ use std::{
 };
 
 use monhop_core::{
-    MouseButton, Point, RevocationSignal,
+    MouseButton, Point, RevocationSignal, TakeBackGate,
     capture::{
-        CaptureConsumer, CaptureEvent, CaptureProducer, CaptureStop, CapturedEvent,
-        MAX_SUPPRESSION_TTL, NativeInputOwnership, StopReason, SuppressionLease, capture_channel,
+        CaptureConsumer, CaptureEvent, CapturePermit, CaptureProducer, CaptureStop, CapturedEvent,
+        MAX_SUPPRESSION_TTL, NativeSessionClaim, StopReason, SuppressionLease, capture_channel,
     },
     capture_control::{
         CaptureCommand, ControlCompletion, ControlError, ControlReader, ControlWriter,
@@ -35,9 +35,9 @@ use crate::{
     ContinuousInstant, MacError, PowerWatch, SYNTHETIC_EVENT_MARKER,
     capture_decode::{
         ActiveDisplayBounds, CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
-        CG_EVENT_SCROLL_WHEEL, DecodedInput, DecodedPointer, EventSourceMetadata,
-        LocalModifierState, PointerFields, decode_keyboard, decode_pointer, decode_scroll,
-        should_ignore_source, should_keep_quarantine_tap,
+        CG_EVENT_SCROLL_WHEEL, DecodedInput, DecodedPointer, EventSourceMetadata, HidKeyState,
+        LocalModifierState, PhysicalModifierLedger, PointerFields, decode_keyboard, decode_pointer,
+        decode_scroll, should_ignore_source, should_keep_quarantine_tap,
     },
     enumerate_active_displays,
     event_tap::{
@@ -48,7 +48,6 @@ use crate::{
         full_input_event_mask, tap_disabled,
     },
     hid_to_mac_virtual_key, mac_virtual_key_to_hid, preflight_permissions,
-    trial_window::{ForegroundSample, TrialWindow},
 };
 
 type CGDirectDisplayID = u32;
@@ -66,6 +65,7 @@ struct CGPoint {
 }
 
 const CG_ERROR_SUCCESS: CGError = 0;
+const CG_DISPLAY_BEGIN_CONFIGURATION_FLAG: CGDisplayChangeSummaryFlags = 1;
 const CG_MOUSE_EVENT_BUTTON_NUMBER: CGEventField = 3;
 const CG_MOUSE_EVENT_DELTA_X: CGEventField = 4;
 const CG_MOUSE_EVENT_DELTA_Y: CGEventField = 5;
@@ -119,7 +119,6 @@ unsafe extern "C" {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeCaptureError {
     AlreadyActive,
-    TrialWindowNotForeground,
     InvalidDuration,
     StartFailed,
     StartupTimeout,
@@ -133,6 +132,11 @@ pub enum NativeCaptureError {
     Power(crate::PowerWatchError),
 }
 
+enum CaptureMode {
+    Session(TakeBackGate),
+    Diagnostic(Duration),
+}
+
 struct Shared {
     origin: ContinuousInstant,
     generation: u64,
@@ -143,11 +147,9 @@ struct Shared {
     interception_failed: AtomicBool,
     progress_ms: AtomicU64,
     allows_suppression: bool,
-    /// Present only for a controlled trial, whose foreground window is its whole confinement.
-    trial_window: Option<TrialWindow>,
 }
 
-/// The caller must establish local enablement, a paired peer, and topology before starting.
+/// The caller must establish the paired peer and topology before starting a session capture.
 /// Dropping this owner requests local restoration; it neither requests permission nor reconnects.
 pub struct NativeCapture {
     shared: Arc<Shared>,
@@ -158,46 +160,43 @@ pub struct NativeCapture {
 }
 
 impl NativeCapture {
-    pub fn start_after_local_enable(
+    /// Physical input while `gate`'s floor is Receiving takes this computer back.
+    pub fn start_for_session(
         generation: u64,
         revocation: RevocationSignal,
+        permit: CapturePermit,
+        gate: TakeBackGate,
     ) -> Result<Self, NativeCaptureError> {
-        Self::start(generation, revocation, None, None)
+        Self::start(generation, revocation, permit, CaptureMode::Session(gate))
     }
 
-    /// The trial window replaces local enablement as the confinement, so it must already be in
-    /// front. Refusing revokes without waking, because no capture thread exists to clean up yet.
-    pub fn start_controlled_trial(
-        generation: u64,
-        revocation: RevocationSignal,
-        window: TrialWindow,
-    ) -> Result<Self, NativeCaptureError> {
-        if !window.is_foreground() {
-            revocation.mark_revoked_without_wake();
-            return Err(NativeCaptureError::TrialWindowNotForeground);
-        }
-        Self::start(generation, revocation, None, Some(window))
-    }
-
+    /// Claims native input for a passive, bounded capture that never suppresses or takes back.
     pub fn start_diagnostic(duration: Duration) -> Result<Self, NativeCaptureError> {
         if duration.is_zero() || duration > crate::MAX_DIAGNOSTIC_DURATION {
             return Err(NativeCaptureError::InvalidDuration);
         }
-        Self::start(1, RevocationSignal::default(), Some(duration), None)
+        let (permit, injection) = NativeSessionClaim::claim()
+            .ok_or(NativeCaptureError::AlreadyActive)?
+            .split();
+        drop(injection);
+        Self::start(
+            1,
+            RevocationSignal::default(),
+            permit,
+            CaptureMode::Diagnostic(duration),
+        )
     }
 
     fn start(
         generation: u64,
         revocation: RevocationSignal,
-        diagnostic_duration: Option<Duration>,
-        trial_window: Option<TrialWindow>,
+        permit: CapturePermit,
+        mode: CaptureMode,
     ) -> Result<Self, NativeCaptureError> {
         if generation == 0 || revocation.is_revoked() {
             return Err(NativeCaptureError::Stopped(StopReason::InvalidInput));
         }
         let origin = ContinuousInstant::try_now().map_err(NativeCaptureError::Clock)?;
-        let native_input_ownership =
-            NativeInputOwnership::claim().ok_or(NativeCaptureError::AlreadyActive)?;
         let stop = CaptureStop::default();
         let power_watch =
             PowerWatch::start_after_local_enable(revocation.clone(), Some(stop.clone()))
@@ -209,6 +208,18 @@ impl NativeCapture {
         }
         let (producer, consumer) = capture_channel(stop.clone());
         let (control, control_reader) = control_channel();
+        let (physical, take_back, diagnostic_duration) = match mode {
+            CaptureMode::Session(gate) => (
+                PhysicalCapture::new(Duration::ZERO).with_take_back(gate.clone()),
+                Some(gate),
+                None,
+            ),
+            CaptureMode::Diagnostic(duration) => (
+                PhysicalCapture::new_passive(Duration::ZERO),
+                None,
+                Some(duration),
+            ),
+        };
         let shared = Arc::new(Shared {
             origin,
             generation,
@@ -219,7 +230,6 @@ impl NativeCapture {
             interception_failed: AtomicBool::new(false),
             progress_ms: AtomicU64::new(0),
             allows_suppression: diagnostic_duration.is_none(),
-            trial_window,
         });
         let thread_shared = Arc::clone(&shared);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -229,13 +239,15 @@ impl NativeCapture {
                 if let Err(code) = crate::threads::mark_time_sensitive() {
                     log::warn!("native capture keeps normal priority (code {code})");
                 }
-                // This remains live through final local release retries. A destination cannot
-                // start injecting while the prior capture owner still has ledger cleanup work.
-                let native_input_ownership = native_input_ownership;
+                // Held through final local release retries, so no later session can claim native
+                // input while this capture still owes cleanup.
+                let permit = permit;
                 let power_watch = power_watch;
                 let result = run(
                     thread_shared.clone(),
                     producer,
+                    physical,
+                    take_back,
                     control_reader,
                     diagnostic_duration,
                     started_tx,
@@ -244,7 +256,7 @@ impl NativeCapture {
                     thread_shared.stop.stop(StopReason::NativeFailure);
                 }
                 let stopped = thread_shared.stop.is_stopped();
-                drop(native_input_ownership);
+                drop(permit);
                 drop(power_watch);
                 if stopped {
                     log::warn!("native capture stopped on its own; revoking the session");
@@ -274,6 +286,10 @@ impl NativeCapture {
 
     pub fn try_next_event(&mut self) -> Result<Option<CapturedEvent>, StopReason> {
         self.consumer.try_pop_tagged()
+    }
+    /// False while a key or button held at capture start keeps suppression refused.
+    pub fn is_ready_for_suppression(&self) -> bool {
+        self.shared.allows_suppression && self.shared.ready.load(Ordering::Acquire)
     }
 
     /// Runs `waker` on the tap thread after every queued event; see `CaptureConsumer::set_waker`.
@@ -428,11 +444,20 @@ struct CallbackState {
     shared: Arc<Shared>,
     producer: CaptureProducer,
     physical: PhysicalCapture,
+    take_back: Option<TakeBackGate>,
     lease: SuppressionLease,
     route_remote: bool,
     pointer_position: Option<Point>,
     active_display_bounds: ActiveDisplayBounds,
     local_modifiers: LocalModifierState,
+    physical_modifiers: PhysicalModifierLedger,
+    unsupported_events: u64,
+}
+
+impl Drop for CallbackState {
+    fn drop(&mut self) {
+        log::info!("ignored {} unsupported events", self.unsupported_events);
+    }
 }
 
 thread_local! {
@@ -450,66 +475,6 @@ fn latch_callback_failure(reason: StopReason) {
             shared.revocation.mark_revoked_without_wake();
         }
     });
-}
-
-/// What one window-server reading permits a capture to do with the event that prompted it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TrialGate {
-    /// No trial window: ordinary sharing capture is never foreground-gated.
-    Ungated,
-    /// The trial window is still in front, so the ordinary suppression decision stands.
-    Confined,
-    /// Foreground lost or unreadable: stop the capture and let the event reach local apps.
-    Released,
-}
-
-/// Only a confirmed front reading keeps a trial suppressing; Unknown is not that proof.
-fn trial_gate(sample: Option<ForegroundSample>) -> TrialGate {
-    match sample {
-        None => TrialGate::Ungated,
-        Some(ForegroundSample::Front) => TrialGate::Confined,
-        Some(ForegroundSample::Behind | ForegroundSample::Unknown) => TrialGate::Released,
-    }
-}
-
-/// Reads the window server once and latches the result. Callers must run this before admitting
-/// a tapped event, so a released gate is recorded before the suppression decision reads stop.
-fn latch_trial_focus_loss(shared: &Shared) -> bool {
-    latch_focus_loss(
-        trial_gate(
-            shared
-                .trial_window
-                .as_ref()
-                .map(TrialWindow::foreground_sample),
-        ),
-        &shared.stop,
-        &shared.revocation,
-    )
-}
-
-/// Native callbacks may not wake an arbitrary observer, so revocation is marked without a wake.
-fn latch_focus_loss(gate: TrialGate, stop: &CaptureStop, revocation: &RevocationSignal) -> bool {
-    if gate != TrialGate::Released {
-        return false;
-    }
-    stop.stop(StopReason::NativeFailure);
-    revocation.mark_revoked_without_wake();
-    true
-}
-
-/// An earlier terminal reason outranks a focus loss first seen while seeding local state.
-fn startup_completion_error(
-    previous_stop: Option<StopReason>,
-    trial_focus_lost: bool,
-    later_stop: impl FnOnce() -> Option<StopReason>,
-) -> Option<NativeCaptureError> {
-    if let Some(reason) = previous_stop {
-        return Some(NativeCaptureError::Stopped(reason));
-    }
-    if trial_focus_lost {
-        return Some(NativeCaptureError::TrialWindowNotForeground);
-    }
-    later_stop().map(NativeCaptureError::Stopped)
 }
 
 fn with_callback(action: impl FnOnce(&mut CallbackState) -> bool) -> bool {
@@ -547,8 +512,6 @@ impl CallbackState {
     }
 
     fn apply_control(&mut self, revision: u64, command: CaptureCommand) -> ControlCompletion {
-        // Suppression may never be started or extended for a window that went behind.
-        latch_trial_focus_loss(&self.shared);
         if self.shared.stop.is_stopped() {
             self.mark_stopped();
             return ControlCompletion::Failed;
@@ -656,6 +619,7 @@ impl CallbackState {
             // submitted the event, never as a claim that another process observed delivery.
             self.physical.apply_transfer_success(transfer);
             self.local_modifiers.apply_transfer_success(transfer);
+            self.physical_modifiers.record_posted(transfer);
         }
         true
     }
@@ -666,6 +630,10 @@ impl CallbackState {
                 event: CaptureEvent::RouteChanged { remote, revision },
                 routing_revision: revision,
                 remote,
+                floor_generation: self
+                    .take_back
+                    .as_ref()
+                    .map_or(0, |gate| gate.floor().snapshot().generation),
             };
             if self.producer.try_push_tagged(barrier).is_err() {
                 self.mark_stopped();
@@ -710,6 +678,10 @@ impl CallbackState {
         match decoded {
             DecodedInput::Ignored => false,
             DecodedInput::Unsupported => {
+                self.unsupported_events = self.unsupported_events.saturating_add(1);
+                false
+            }
+            DecodedInput::Malformed => {
                 self.shared.stop.stop(StopReason::InvalidInput);
                 self.mark_stopped();
                 false
@@ -732,31 +704,32 @@ impl CallbackState {
         event: CGEventRef,
         source: EventSourceMetadata,
     ) -> bool {
-        // One window-server reading per tapped event: a latched stop makes the ledger below
-        // refuse suppression, so nothing is withheld once the trial window is behind.
-        latch_trial_focus_loss(&self.shared);
         match event_type {
             CG_EVENT_KEY_DOWN | CG_EVENT_KEY_UP | CG_EVENT_FLAGS_CHANGED => {
                 // SAFETY: keyboard events expose kCGKeyboardEventKeycode as an integer field.
                 let raw_key =
                     unsafe { CGEventGetIntegerValueField(event, CG_KEYBOARD_EVENT_KEYCODE) };
                 let Ok(key) = u16::try_from(raw_key) else {
-                    return self.decoded(DecodedInput::Unsupported);
+                    return self.decoded(DecodedInput::Malformed);
                 };
-                let changed_pressed = if event_type == CG_EVENT_FLAGS_CHANGED {
-                    // SAFETY: key is copied from the callback event and the HID state query has no
-                    // ownership or allocation side effect. It preserves the modifier side.
-                    unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, key) }
+                let hid = if event_type == CG_EVENT_FLAGS_CHANGED {
+                    HidKeyState::sample(self.take_back.as_ref(), || {
+                        // SAFETY: key is copied from the callback event and the HID state query
+                        // has no ownership or allocation side effect. It preserves the side.
+                        unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, key) }
+                    })
                 } else {
-                    false
+                    HidKeyState::default()
                 };
-                self.decoded(decode_keyboard(
+                let decoded = decode_keyboard(
                     event_type,
                     key,
-                    changed_pressed,
+                    &mut self.physical_modifiers,
+                    hid,
                     source,
                     SYNTHETIC_EVENT_MARKER,
-                ))
+                );
+                self.decoded(decoded)
             }
             CG_EVENT_SCROLL_WHEEL => {
                 // SAFETY: the live callback scroll event exposes the continuous-scroll flag.
@@ -828,13 +801,16 @@ impl CallbackState {
                     SYNTHETIC_EVENT_MARKER,
                 );
                 self.pointer_position = position;
+                let mut absolute_withheld = false;
                 if !remote && let Some(absolute) = local_absolute {
-                    self.event_for_route(absolute, false);
+                    absolute_withheld = self.event_for_route(absolute, false);
                     if self.shared.stop.is_stopped() {
                         return false;
                     }
                 }
-                self.decoded_for_route(input, remote)
+                // Either component withholds the record, even when the relative one is ignored.
+                let relative_withheld = self.decoded_for_route(input, remote);
+                absolute_withheld || relative_withheld
             }
         }
     }
@@ -874,21 +850,24 @@ unsafe extern "C" fn event_callback(
 
 unsafe extern "C" fn display_reconfiguration_callback(
     _: CGDirectDisplayID,
-    _: CGDisplayChangeSummaryFlags,
+    flags: CGDisplayChangeSummaryFlags,
     user_info: *mut c_void,
 ) {
-    if user_info.is_null() {
+    // The preliminary notification precedes the new geometry; only the completion ends capture.
+    if flags == CG_DISPLAY_BEGIN_CONFIGURATION_FLAG || user_info.is_null() {
         return;
     }
     // SAFETY: DisplayWatch retains one Arc for the entire registered callback lifetime.
     let shared = unsafe { &*user_info.cast::<Shared>() };
-    shared.stop.stop(StopReason::NativeFailure);
+    shared.stop.stop(StopReason::DisplaysChanged);
     shared.revocation.mark_revoked_without_wake();
 }
 
 fn run(
     shared: Arc<Shared>,
     producer: CaptureProducer,
+    physical: PhysicalCapture,
+    take_back: Option<TakeBackGate>,
     mut control: ControlReader,
     diagnostic_duration: Option<Duration>,
     started: mpsc::SyncSender<Result<(), NativeCaptureError>>,
@@ -909,26 +888,18 @@ fn run(
         *slot.borrow_mut() = Some(CallbackState {
             shared: Arc::clone(&shared),
             producer,
-            physical: if diagnostic_duration.is_some() {
-                PhysicalCapture::new_passive(Duration::ZERO)
-            } else {
-                PhysicalCapture::new(Duration::ZERO)
-            },
+            physical,
+            take_back,
             lease: SuppressionLease::new(shared.generation, Duration::ZERO, shared.stop.clone()),
             route_remote: false,
             pointer_position: None,
             active_display_bounds,
             local_modifiers: LocalModifierState::default(),
+            physical_modifiers: PhysicalModifierLedger::default(),
+            unsupported_events: 0,
         });
     });
 
-    // No tap is installed behind a trial window that already lost the foreground.
-    if latch_trial_focus_loss(&shared) {
-        let error = NativeCaptureError::TrialWindowNotForeground;
-        let _ = started.send(Err(error));
-        clear_callback();
-        return Err(error);
-    }
     let mut resources = match Resources::install(
         diagnostic_duration.is_some(),
         &shared.stop,
@@ -941,6 +912,8 @@ fn run(
             return Err(error);
         }
     };
+    // Seed as soon as the tap is live: while injection is held the modifier ledger toggles from it.
+    seed_initial_state();
     let mut display_watch = match DisplayWatch::install(&shared) {
         Ok(watch) => watch,
         Err(error) => {
@@ -950,12 +923,8 @@ fn run(
             return cleanup.and(Err(error));
         }
     };
-    seed_initial_state();
-    let seeded_stop = shared.stop.reason();
-    let trial_focus_lost = latch_trial_focus_loss(&shared);
-    if let Some(error) =
-        startup_completion_error(seeded_stop, trial_focus_lost, || shared.stop.reason())
-    {
+    if let Some(reason) = shared.stop.reason() {
+        let error = NativeCaptureError::Stopped(reason);
         let _ = started.send(Err(error));
         let cleanup = close_native_resources(&mut resources, &mut display_watch);
         clear_callback();
@@ -1070,6 +1039,7 @@ fn seed_initial_state() {
                 if unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, key) } {
                     state.physical.seed_locally_held_key(usage);
                     state.local_modifiers.record_local_key(usage, true);
+                    state.physical_modifiers.seed_held(usage);
                 }
             }
         }
@@ -1363,109 +1333,277 @@ impl DisplayWatch {
 }
 
 #[cfg(test)]
-mod trial_gate_tests {
+mod callback_tests {
     use super::*;
-    use monhop_core::{HidUsage, ModifierState};
+    use crate::capture_decode::{
+        CG_EVENT_MOUSE_MOVED, CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_UP,
+        CG_EVENT_SOURCE_STATE_HID_SYSTEM,
+    };
+    use monhop_core::{FloorState, LogicalRect, LogicalSize, SharedFloor};
 
-    fn key(pressed: bool) -> CaptureEvent {
-        CaptureEvent::Key {
-            usage: HidUsage(0x04),
-            pressed,
-            repeat: false,
-            modifiers: ModifierState(0),
+    fn callback_fixture() -> (CallbackState, CaptureConsumer) {
+        callback_fixture_with(None)
+    }
+
+    fn callback_fixture_with(take_back: Option<TakeBackGate>) -> (CallbackState, CaptureConsumer) {
+        let stop = CaptureStop::default();
+        let (producer, consumer) = capture_channel(stop.clone());
+        let shared = Arc::new(Shared {
+            origin: ContinuousInstant::try_now().expect("continuous clock"),
+            generation: 1,
+            stop: stop.clone(),
+            revocation: RevocationSignal::default(),
+            ready: AtomicBool::new(true),
+            remote_active: AtomicBool::new(false),
+            interception_failed: AtomicBool::new(false),
+            progress_ms: AtomicU64::new(0),
+            allows_suppression: true,
+        });
+        let physical = match &take_back {
+            Some(gate) => PhysicalCapture::new(Duration::ZERO).with_take_back(gate.clone()),
+            None => PhysicalCapture::new(Duration::ZERO),
+        };
+        let state = CallbackState {
+            shared,
+            producer,
+            physical,
+            take_back,
+            lease: SuppressionLease::new(1, Duration::ZERO, stop),
+            route_remote: false,
+            pointer_position: None,
+            active_display_bounds: ActiveDisplayBounds::from_rectangles([LogicalRect {
+                origin: Point::new(0.0, 0.0),
+                size: LogicalSize::new(100.0, 100.0),
+            }])
+            .expect("valid display"),
+            local_modifiers: LocalModifierState::default(),
+            physical_modifiers: PhysicalModifierLedger::default(),
+            unsupported_events: 0,
+        };
+        (state, consumer)
+    }
+
+    fn physical_source() -> EventSourceMetadata {
+        EventSourceMetadata {
+            user_data: 0,
+            state_id: CG_EVENT_SOURCE_STATE_HID_SYSTEM,
+        }
+    }
+
+    fn route_remote(state: &mut CallbackState, consumer: &mut CaptureConsumer) {
+        let now = state.shared.origin.elapsed();
+        state.lease.renew(1, now, MAX_SUPPRESSION_TTL).unwrap();
+        assert_eq!(state.publish_route(1, true), ControlCompletion::Applied);
+        assert!(consumer.try_pop().unwrap().is_some());
+    }
+
+    /// Returns whether the callback withheld one physical key record from local apps.
+    fn deliver_key(
+        state: &mut CallbackState,
+        event_type: CGEventType,
+        key: u16,
+        down: bool,
+    ) -> bool {
+        // SAFETY: a null source requests the default source; the owned event is never posted.
+        let event = unsafe { CGEventCreateKeyboardEvent(ptr::null(), key, down) };
+        assert!(!event.is_null());
+        let suppressed = state.native_event(event_type, event, physical_source());
+        // SAFETY: event was created above and never transferred.
+        unsafe { CFRelease(event) };
+        suppressed
+    }
+
+    /// Returns whether the callback withheld one physical other-button record from local apps.
+    fn deliver_button(state: &mut CallbackState, event_type: CGEventType, number: i64) -> bool {
+        // SAFETY: the event type is a fixed other-button type and the point is finite; the owned
+        // event is never posted.
+        let event = unsafe {
+            CGEventCreateMouseEvent(ptr::null(), event_type, CGPoint { x: 10.0, y: 10.0 }, 2)
+        };
+        assert!(!event.is_null());
+        // SAFETY: event is owned and non-null until the release below.
+        unsafe { CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER, number) };
+        let suppressed = state.native_event(event_type, event, physical_source());
+        // SAFETY: event was created above and never transferred.
+        unsafe { CFRelease(event) };
+        suppressed
+    }
+
+    /// Returns whether the callback withheld one physical mouse-moved record from local apps.
+    fn deliver_motion(state: &mut CallbackState, delta_x: i64, delta_y: i64) -> bool {
+        // SAFETY: the event type is mouse-moved and the point is finite; the owned event is never
+        // posted.
+        let event = unsafe {
+            CGEventCreateMouseEvent(
+                ptr::null(),
+                CG_EVENT_MOUSE_MOVED,
+                CGPoint { x: 10.0, y: 10.0 },
+                0,
+            )
+        };
+        assert!(!event.is_null());
+        // SAFETY: event is owned and non-null until the release below.
+        unsafe {
+            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X, delta_x);
+            CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y, delta_y);
+        }
+        let suppressed = state.native_event(CG_EVENT_MOUSE_MOVED, event, physical_source());
+        // SAFETY: event was created above and never transferred.
+        unsafe { CFRelease(event) };
+        suppressed
+    }
+
+    fn assert_capture_untouched(state: &CallbackState, consumer: &mut CaptureConsumer) {
+        assert_eq!(state.shared.stop.reason(), None);
+        assert!(!state.shared.revocation.is_revoked());
+        assert!(consumer.try_pop().unwrap().is_none(), "never queued");
+    }
+
+    #[test]
+    fn fn_globe_flags_changed_never_stops_capture() {
+        let (mut state, mut consumer) = callback_fixture();
+        for _ in 0..2 {
+            assert!(
+                !deliver_key(&mut state, CG_EVENT_FLAGS_CHANGED, 0x3f, true),
+                "local apps receive Fn/Globe"
+            );
+        }
+        assert_capture_untouched(&state, &mut consumer);
+    }
+
+    #[test]
+    fn unmapped_key_never_stops_capture() {
+        const JIS_EISU: u16 = 0x66;
+        const JIS_KANA: u16 = 0x68;
+        for remote in [false, true] {
+            let (mut state, mut consumer) = callback_fixture();
+            if remote {
+                route_remote(&mut state, &mut consumer);
+            }
+            for key in [JIS_EISU, JIS_KANA] {
+                for (event_type, down) in [(CG_EVENT_KEY_DOWN, true), (CG_EVENT_KEY_UP, false)] {
+                    assert!(
+                        !deliver_key(&mut state, event_type, key, down),
+                        "local apps receive unmapped keys on either route"
+                    );
+                }
+            }
+            assert_eq!(state.remote(), remote);
+            assert_eq!(state.unsupported_events, 4);
+            assert_capture_untouched(&state, &mut consumer);
         }
     }
 
     #[test]
-    fn only_a_confirmed_front_reading_keeps_a_trial_confined() {
-        assert_eq!(
-            trial_gate(Some(ForegroundSample::Front)),
-            TrialGate::Confined
-        );
-        assert_eq!(
-            trial_gate(Some(ForegroundSample::Behind)),
-            TrialGate::Released
-        );
-        assert_eq!(
-            trial_gate(Some(ForegroundSample::Unknown)),
-            TrialGate::Released
-        );
-    }
-
-    #[test]
-    fn ordinary_sharing_capture_is_never_foreground_gated() {
-        assert_eq!(trial_gate(None), TrialGate::Ungated);
-        let stop = CaptureStop::default();
-        let revocation = RevocationSignal::default();
-        assert!(!latch_focus_loss(TrialGate::Ungated, &stop, &revocation));
-        assert!(!latch_focus_loss(TrialGate::Confined, &stop, &revocation));
-        assert_eq!(stop.reason(), None);
-        assert!(!revocation.is_revoked());
-    }
-
-    #[test]
-    fn a_released_gate_latches_stop_and_revocation() {
-        let stop = CaptureStop::default();
-        let revocation = RevocationSignal::default();
-        assert!(latch_focus_loss(TrialGate::Released, &stop, &revocation));
-        assert_eq!(stop.reason(), Some(StopReason::NativeFailure));
-        assert!(revocation.is_revoked());
-    }
-
-    #[test]
-    fn a_released_gate_passes_later_input_through_and_drains_only_its_own_suppression() {
-        let stop = CaptureStop::default();
-        let (mut producer, _consumer) = capture_channel(stop.clone());
-        let mut physical = PhysicalCapture::new(Duration::ZERO);
-        // The remote route opens with its barrier, exactly as publish_route does.
-        producer
-            .try_push_tagged(CapturedEvent {
-                event: CaptureEvent::RouteChanged {
-                    remote: true,
-                    revision: 1,
-                },
-                routing_revision: 1,
-                remote: true,
-            })
+    fn movement_without_relative_delta_is_withheld_while_withholding() {
+        let floor = SharedFloor::new();
+        let receiving = floor
+            .transition(floor.snapshot(), FloorState::Receiving)
             .unwrap();
-        physical.set_routing_revision(1);
-        assert!(physical.process(key(true), true, Duration::ZERO, &mut producer, &stop));
-
-        assert!(latch_focus_loss(
-            TrialGate::Released,
-            &stop,
-            &RevocationSignal::default()
-        ));
-
-        // The release of an already-suppressed press still drains: no application may see a key
-        // go up that it never saw go down. Anything pressed afterwards reaches the user.
-        assert!(physical.process(key(false), true, Duration::ZERO, &mut producer, &stop));
-        assert!(!physical.process(key(true), true, Duration::ZERO, &mut producer, &stop));
+        let gate = TakeBackGate::new(floor);
+        gate.open_injection(receiving.generation);
+        gate.note_injected_press();
+        let (mut state, mut consumer) = callback_fixture_with(Some(gate.clone()));
+        assert!(
+            deliver_key(&mut state, CG_EVENT_KEY_DOWN, 0x00, true),
+            "the key takes back and is withheld while injected input is down"
+        );
+        assert!(gate.take_triggered().is_some());
+        assert!(
+            deliver_motion(&mut state, 0, 0),
+            "an absolute-only movement is withheld too"
+        );
+        gate.note_injected_released();
+        assert!(!deliver_motion(&mut state, 0, 0));
+        assert_eq!(state.shared.stop.reason(), None);
+        let anchors = std::iter::from_fn(|| consumer.try_pop().unwrap())
+            .filter(|event| matches!(event, CaptureEvent::LogicalAbsoluteMotion { .. }))
+            .count();
+        assert_eq!(anchors, 2, "withheld positions still reach local routing");
     }
 
     #[test]
-    fn startup_reports_focus_loss_but_never_over_an_earlier_terminal_reason() {
-        assert_eq!(startup_completion_error(None, false, || None), None);
+    fn display_reconfiguration_stops_capture_only_once_it_completes() {
+        const DISPLAY_REMOVED: CGDisplayChangeSummaryFlags = 1 << 5;
+        let (state, _consumer) = callback_fixture();
+        let shared = Arc::clone(&state.shared);
+        let user_info: *mut c_void = Arc::as_ptr(&shared).cast_mut().cast();
+        // SAFETY: shared outlives the call, as DisplayWatch's retained Arc does when registered.
+        unsafe {
+            display_reconfiguration_callback(1, CG_DISPLAY_BEGIN_CONFIGURATION_FLAG, user_info)
+        };
         assert_eq!(
-            startup_completion_error(None, true, || Some(StopReason::NativeFailure)),
-            Some(NativeCaptureError::TrialWindowNotForeground)
+            shared.stop.reason(),
+            None,
+            "the new geometry does not exist yet"
         );
-        assert_eq!(
-            startup_completion_error(Some(StopReason::EmergencyEscape), true, || panic!(
-                "an earlier reason is terminal"
-            )),
-            Some(NativeCaptureError::Stopped(StopReason::EmergencyEscape))
+        assert!(!shared.revocation.is_revoked());
+        // SAFETY: as above.
+        unsafe { display_reconfiguration_callback(1, DISPLAY_REMOVED, user_info) };
+        assert_eq!(shared.stop.reason(), Some(StopReason::DisplaysChanged));
+        assert!(
+            shared.revocation.is_revoked(),
+            "the session still fails closed"
         );
-        assert_eq!(
-            startup_completion_error(None, false, || Some(StopReason::Requested)),
-            Some(NativeCaptureError::Stopped(StopReason::Requested))
-        );
+    }
+
+    #[test]
+    fn extra_mouse_button_never_stops_capture() {
+        for remote in [false, true] {
+            let (mut state, mut consumer) = callback_fixture();
+            if remote {
+                route_remote(&mut state, &mut consumer);
+            }
+            for number in [5, 7] {
+                for event_type in [CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_UP] {
+                    assert!(
+                        !deliver_button(&mut state, event_type, number),
+                        "local apps receive extra buttons on either route"
+                    );
+                }
+            }
+            assert_eq!(state.remote(), remote);
+            assert_eq!(state.unsupported_events, 4);
+            assert_capture_untouched(&state, &mut consumer);
+        }
     }
 }
 
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+    use monhop_core::SharedFloor;
+
+    #[test]
+    fn session_start_requires_capture_permit() {
+        let (permit, injection) = NativeSessionClaim::claim()
+            .expect("no other test in this crate claims native input")
+            .split();
+        drop(injection);
+        assert!(
+            NativeSessionClaim::claim().is_none(),
+            "a live capture permit keeps the session claimed"
+        );
+        assert!(matches!(
+            NativeCapture::start_diagnostic(Duration::from_secs(1)),
+            Err(NativeCaptureError::AlreadyActive)
+        ));
+        let revocation = RevocationSignal::default();
+        revocation.mark_revoked_without_wake();
+        assert!(matches!(
+            NativeCapture::start_for_session(
+                1,
+                revocation,
+                permit,
+                TakeBackGate::new(SharedFloor::new())
+            ),
+            Err(NativeCaptureError::Stopped(StopReason::InvalidInput))
+        ));
+        assert!(
+            !NativeSessionClaim::is_claimed(),
+            "a refused start releases its permit"
+        );
+    }
 
     #[test]
     fn stopped_capture_never_enters_native_startup_reads() {

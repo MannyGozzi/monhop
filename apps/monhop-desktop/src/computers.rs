@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     pairing::PairedPeer,
     sharing_preferences::{
-        MAX_COMPUTERS, SavedSetupView, SetupFile, SourcePlatform, fingerprint_key, load_bounded,
+        ComputerPlatform, MAX_COMPUTERS, SavedSetupView, SetupFile, fingerprint_key, load_bounded,
         save_metadata,
     },
 };
@@ -24,7 +24,7 @@ pub struct Computer {
     /// Stored in the uppercase form the pairing exchange shows; views lowercase it.
     fingerprint: String,
     name: String,
-    platform: SourcePlatform,
+    platform: ComputerPlatform,
     address: Option<SocketAddrV4>,
 }
 
@@ -51,7 +51,7 @@ impl Default for ComputerList {
 pub struct ComputerView {
     fingerprint: String,
     name: String,
-    platform: SourcePlatform,
+    platform: ComputerPlatform,
     address: Option<SocketAddrV4>,
     setup: SavedSetupView,
 }
@@ -381,7 +381,14 @@ mod tests {
         assert_eq!(computers[1]["fingerprint"], "b".repeat(64));
         assert_eq!(computers[1]["name"], legacy_name);
         assert_eq!(computers[1]["platform"], legacy_platform);
-        assert_eq!(computers[1]["setup"]["layout"]["sourceDisplay"], "2");
+        assert_eq!(
+            computers[1]["setup"]["layout"]["control"]["a".repeat(64)],
+            true
+        );
+        assert_eq!(
+            computers[1]["setup"]["layout"]["control"]["b".repeat(64)],
+            true
+        );
         assert_eq!(computers[1]["setup"]["revision"], "7");
         assert!(view["computers"][0]["setup"]["peerFingerprint"].is_null());
     }
@@ -446,7 +453,7 @@ mod tests {
         list.remember(newest, endpoint(), Some(Platform::MacOs))
             .unwrap();
         assert_eq!(list.computers[0].name, "Office");
-        assert_eq!(list.computers[0].platform, SourcePlatform::Macos);
+        assert_eq!(list.computers[0].platform, ComputerPlatform::Macos);
         assert_eq!(list.computers.len(), MAX_COMPUTERS);
         list.validate().unwrap();
         list.forget(newest);

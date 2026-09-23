@@ -14,7 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use monhop_core::{MouseButton, NativeInputOwnership, Point, RevocationSignal};
+use monhop_core::{
+    CapturePermit, FloorState, MouseButton, NativeSessionClaim, Point, RevocationSignal,
+    TakeBackGate,
+};
 use windows_sys::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
@@ -53,7 +56,6 @@ use crate::{
         absolute_send_input_coordinates,
     },
     keymap::set1_from_hid_usage,
-    trial_window::TrialWindow,
 };
 
 const CLASS_NAME: &[u16] = &[
@@ -67,7 +69,6 @@ const MOUSE_INJECTED_FLAGS: u32 = 0x03;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeCaptureError {
     AlreadyActive,
-    TrialWindowNotForeground,
     DesktopUnavailable,
     InvalidDuration,
     StartFailed,
@@ -98,11 +99,22 @@ struct Shared {
     progress_ms: AtomicU64,
     allows_suppression: bool,
     device_removed: AtomicBool,
-    trial_window: Option<TrialWindow>,
     revocation: RevocationSignal,
 }
 
-/// The caller must validate local enablement, the authenticated peer and topology first.
+enum CaptureMode {
+    Session(TakeBackGate),
+    Diagnostic(Duration),
+}
+
+/// What the hook thread's callback state takes ownership of when capture starts.
+struct CallbackParts {
+    producer: CaptureProducer,
+    physical: PhysicalCapture,
+    take_back: Option<TakeBackGate>,
+}
+
+/// The caller must validate the authenticated peer and topology before a session capture.
 /// Dropping this owner stops forwarding. Only already-suppressed presses may keep draining.
 pub struct NativeCapture {
     shared: Arc<Shared>,
@@ -113,43 +125,42 @@ pub struct NativeCapture {
 }
 
 impl NativeCapture {
-    pub fn start_after_local_enable(
+    /// Physical input while `gate`'s floor is Receiving takes this computer back.
+    pub fn start_for_session(
         generation: u64,
         revocation: RevocationSignal,
+        permit: CapturePermit,
+        gate: TakeBackGate,
     ) -> Result<Self, NativeCaptureError> {
-        Self::start(generation, revocation, None, None)
+        Self::start(generation, revocation, permit, CaptureMode::Session(gate))
     }
 
-    pub fn start_controlled_trial(
-        generation: u64,
-        revocation: RevocationSignal,
-        window: TrialWindow,
-    ) -> Result<Self, NativeCaptureError> {
-        if !window.is_foreground() {
-            revocation.mark_revoked_without_wake();
-            return Err(NativeCaptureError::TrialWindowNotForeground);
-        }
-        Self::start(generation, revocation, None, Some(window))
-    }
-
+    /// Claims native input for a passive, bounded capture that never suppresses or takes back.
     pub fn start_diagnostic(duration: Duration) -> Result<Self, NativeCaptureError> {
         if duration.is_zero() || duration > Duration::from_secs(30) {
             return Err(NativeCaptureError::InvalidDuration);
         }
-        Self::start(1, RevocationSignal::default(), Some(duration), None)
+        let (permit, injection) = NativeSessionClaim::claim()
+            .ok_or(NativeCaptureError::AlreadyActive)?
+            .split();
+        drop(injection);
+        Self::start(
+            1,
+            RevocationSignal::default(),
+            permit,
+            CaptureMode::Diagnostic(duration),
+        )
     }
 
     fn start(
         generation: u64,
         revocation: RevocationSignal,
-        duration: Option<Duration>,
-        trial_window: Option<TrialWindow>,
+        permit: CapturePermit,
+        mode: CaptureMode,
     ) -> Result<Self, NativeCaptureError> {
         if generation == 0 || revocation.is_stopping() {
             return Err(NativeCaptureError::Stopped(StopReason::InvalidInput));
         }
-        let native_ownership =
-            NativeInputOwnership::claim().ok_or(NativeCaptureError::AlreadyActive)?;
         if ACTIVE
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -166,6 +177,23 @@ impl NativeCapture {
         let stop = CaptureStop::default();
         let (producer, consumer) = capture_channel(stop.clone());
         let (control, control_reader) = control_channel();
+        let (physical, take_back, duration) = match mode {
+            CaptureMode::Session(gate) => (
+                PhysicalCapture::new(Duration::ZERO).with_take_back(gate.clone()),
+                Some(gate),
+                None,
+            ),
+            CaptureMode::Diagnostic(duration) => (
+                PhysicalCapture::new_passive(Duration::ZERO),
+                None,
+                Some(duration),
+            ),
+        };
+        let parts = CallbackParts {
+            producer,
+            physical,
+            take_back,
+        };
         let shared = Arc::new(Shared {
             origin: Instant::now(),
             generation,
@@ -174,7 +202,6 @@ impl NativeCapture {
             progress_ms: AtomicU64::new(0),
             allows_suppression: duration.is_none(),
             device_removed: AtomicBool::new(false),
-            trial_window,
             revocation: revocation.clone(),
         });
         let thread_shared = shared.clone();
@@ -188,7 +215,9 @@ impl NativeCapture {
                 }
                 let wake_after_cleanup = revocation.clone();
                 let result = {
-                    let _native_ownership = native_ownership;
+                    // Held through final local release retries, so no later session can claim
+                    // native input while this capture still owes cleanup.
+                    let _permit = permit;
                     struct ActiveGuard;
                     impl Drop for ActiveGuard {
                         fn drop(&mut self) {
@@ -199,7 +228,7 @@ impl NativeCapture {
                     let mut ownership = ownership;
                     let result = run(
                         thread_shared.clone(),
-                        producer,
+                        parts,
                         control_reader,
                         revocation,
                         duration,
@@ -243,6 +272,11 @@ impl NativeCapture {
 
     pub fn try_next_event(&mut self) -> Result<Option<CapturedEvent>, StopReason> {
         self.consumer.try_pop_tagged()
+    }
+
+    /// False while a key or button held at capture start keeps suppression refused.
+    pub fn is_ready_for_suppression(&self) -> bool {
+        self.shared.allows_suppression && self.shared.ready.load(Ordering::Acquire)
     }
 
     /// Runs `waker` on the hook thread after every queued event; see `CaptureConsumer::set_waker`.
@@ -388,6 +422,7 @@ struct CallbackState {
     shared: Arc<Shared>,
     producer: CaptureProducer,
     physical: PhysicalCapture,
+    take_back: Option<TakeBackGate>,
     lease: SuppressionLease,
     route_remote: bool,
     press_revision: u64,
@@ -433,6 +468,15 @@ enum CallbackFailure {
     RawInputRead,
 }
 
+impl CallbackFailure {
+    const fn stop_reason(self) -> StopReason {
+        match self {
+            Self::DisplayChanged => StopReason::DisplaysChanged,
+            _ => StopReason::NativeFailure,
+        }
+    }
+}
+
 #[track_caller]
 fn latch_failure(failure: CallbackFailure) {
     let stop = CALLBACK_STOP.with(|slot| slot.try_borrow().ok().and_then(|slot| slot.clone()));
@@ -442,7 +486,7 @@ fn latch_failure(failure: CallbackFailure) {
                 first.set(Some(failure));
             }
         });
-        stop.stop(StopReason::NativeFailure);
+        stop.stop(failure.stop_reason());
     }
 }
 
@@ -477,34 +521,8 @@ fn propagate_capture_stop(shared: &Shared, wake_attempted: &mut bool) {
     }
 }
 
-fn latch_trial_focus_loss(shared: &Shared) -> bool {
-    let focus_lost = shared
-        .trial_window
-        .as_ref()
-        .is_some_and(|window| !window.is_foreground());
-    latch_focus_loss(focus_lost, &shared.stop, &shared.revocation)
-}
-
-fn latch_focus_loss(focus_lost: bool, stop: &CaptureStop, revocation: &RevocationSignal) -> bool {
-    if !focus_lost {
-        return false;
-    }
-    stop.stop(StopReason::NativeFailure);
-    revocation.mark_revoked_without_wake();
-    true
-}
-
-fn startup_environment_error(
-    trial_focus_lost: bool,
-    ordinary_desktop_active: bool,
-) -> Option<NativeCaptureError> {
-    if trial_focus_lost {
-        Some(NativeCaptureError::TrialWindowNotForeground)
-    } else if !ordinary_desktop_active {
-        Some(NativeCaptureError::DesktopUnavailable)
-    } else {
-        None
-    }
+fn startup_environment_error(ordinary_desktop_active: bool) -> Option<NativeCaptureError> {
+    (!ordinary_desktop_active).then_some(NativeCaptureError::DesktopUnavailable)
 }
 
 fn startup_completion_error(
@@ -611,6 +629,10 @@ impl CallbackState {
             event: CaptureEvent::RouteChanged { remote, revision },
             routing_revision: revision,
             remote,
+            floor_generation: self
+                .take_back
+                .as_ref()
+                .map_or(0, |gate| gate.floor().snapshot().generation),
         };
         self.producer
             .try_push_tagged(event)
@@ -621,6 +643,10 @@ impl CallbackState {
     }
 
     fn event(&mut self, event: CaptureEvent) -> bool {
+        self.event_with_travel(event, None)
+    }
+
+    fn event_with_travel(&mut self, event: CaptureEvent, travel: Option<(f64, f64)>) -> bool {
         if matches!(
             event,
             CaptureEvent::Key { .. } | CaptureEvent::Button { .. }
@@ -630,17 +656,41 @@ impl CallbackState {
                 None => self.shared.stop.stop(StopReason::NativeFailure),
             }
         }
-        // A revoked trial still drains releases for presses it previously suppressed.
-        latch_trial_focus_loss(&self.shared);
         let now = self.shared.origin.elapsed();
         let remote = self.remote();
-        let result =
-            self.physical
-                .process(event, remote, now, &mut self.producer, &self.shared.stop);
+        let result = self.physical.process_with_travel(
+            event,
+            travel,
+            remote,
+            now,
+            &mut self.producer,
+            &self.shared.stop,
+        );
         self.shared
             .ready
             .store(self.physical.is_ready_for_suppression(), Ordering::Release);
         result
+    }
+
+    /// The low-level hook is the only point that can withhold before delivery, so it measures a
+    /// physical move's travel from `cursor_before`, read only while take-back can fire.
+    fn hook_mouse(
+        &mut self,
+        decoded: DecodedInput,
+        cursor_before: impl FnOnce() -> Option<Point>,
+    ) -> bool {
+        let DecodedInput::Event(event @ CaptureEvent::AbsoluteMotion { x, y }) = decoded else {
+            return self.decoded(decoded);
+        };
+        let receiving = self
+            .take_back
+            .as_ref()
+            .is_some_and(|gate| gate.floor().snapshot().state == FloorState::Receiving);
+        let travel = receiving
+            .then(cursor_before)
+            .flatten()
+            .map(|before| (f64::from(x) - before.x, f64::from(y) - before.y));
+        self.event_with_travel(event, travel)
     }
 
     fn decoded(&mut self, event: DecodedInput) -> bool {
@@ -730,6 +780,7 @@ impl CallbackState {
                 self.ignored.unsourced_motion_samples.saturating_add(1);
             return;
         }
+        // WM_INPUT arrives too late to withhold; hook_mouse withholds the same movement.
         if mouse.lLastX != 0 || mouse.lLastY != 0 {
             self.event(CaptureEvent::RelativeMotion {
                 dx: mouse.lLastX,
@@ -774,7 +825,6 @@ fn control_state<T>(
 
 fn check_control_live(shared: &Shared) -> Result<(), NativeCaptureError> {
     latch_session_stop(shared);
-    latch_trial_focus_loss(shared);
     match shared.stop.reason() {
         Some(reason) => Err(NativeCaptureError::Stopped(reason)),
         None => Ok(()),
@@ -1087,15 +1137,20 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             // SAFETY: injected input is never admitted or borrowed from callback-local state.
             return unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) };
         }
+        // The system moves the cursor only after this hook returns, so the cursor position is the
+        // one this record moves from, including any injected travel since the last physical record.
         if with_callback(|state| {
-            state.decoded(decode_mouse(
-                wparam as u32,
-                mouse.flags,
-                mouse.dwExtraInfo,
-                mouse.mouseData,
-                mouse.pt.x,
-                mouse.pt.y,
-            ))
+            state.hook_mouse(
+                decode_mouse(
+                    wparam as u32,
+                    mouse.flags,
+                    mouse.dwExtraInfo,
+                    mouse.mouseData,
+                    mouse.pt.x,
+                    mouse.pt.y,
+                ),
+                current_pointer_position,
+            )
         }) {
             return 1;
         }
@@ -1164,7 +1219,7 @@ fn device_change_is_loss(wparam: usize) -> bool {
 
 fn run(
     shared: Arc<Shared>,
-    producer: CaptureProducer,
+    parts: CallbackParts,
     mut control: ControlReader,
     revocation: RevocationSignal,
     duration: Option<Duration>,
@@ -1175,12 +1230,9 @@ fn run(
     CALLBACK.with(|slot| {
         *slot.borrow_mut() = Some(CallbackState {
             shared: shared.clone(),
-            producer,
-            physical: if duration.is_some() {
-                PhysicalCapture::new_passive(Duration::ZERO)
-            } else {
-                PhysicalCapture::new(Duration::ZERO)
-            },
+            producer: parts.producer,
+            physical: parts.physical,
+            take_back: parts.take_back,
             lease: SuppressionLease::new(shared.generation, Duration::ZERO, shared.stop.clone()),
             route_remote: false,
             ignored: IgnoredInputCounts::default(),
@@ -1189,10 +1241,7 @@ fn run(
             press_revision: 0,
         })
     });
-    if let Some(error) = startup_environment_error(
-        latch_trial_focus_loss(&shared),
-        ordinary_desktop_is_active(),
-    ) {
+    if let Some(error) = startup_environment_error(ordinary_desktop_is_active()) {
         shared.stop.stop(stop_reason(error));
         revocation.mark_revoked_without_wake();
         let _ = started.send(Err(error));
@@ -1212,12 +1261,7 @@ fn run(
     seed_initial_state();
     if let Some(error) = startup_completion_error(
         shared.stop.reason(),
-        || {
-            startup_environment_error(
-                latch_trial_focus_loss(&shared),
-                ordinary_desktop_is_active(),
-            )
-        },
+        || startup_environment_error(ordinary_desktop_is_active()),
         || shared.stop.reason(),
     ) {
         shared.stop.stop(stop_reason(error));
@@ -1241,7 +1285,6 @@ fn run(
     let mut last_ownership_check = Duration::ZERO;
     let mut revocation_wake_attempted = false;
     loop {
-        latch_trial_focus_loss(&shared);
         shared.progress_ms.store(
             shared
                 .origin
@@ -1658,6 +1701,10 @@ mod tests {
     use super::*;
 
     fn callback_fixture() -> (CallbackState, CaptureConsumer) {
+        callback_fixture_with(None)
+    }
+
+    fn callback_fixture_with(take_back: Option<TakeBackGate>) -> (CallbackState, CaptureConsumer) {
         let stop = CaptureStop::default();
         let (producer, consumer) = capture_channel(stop.clone());
         let shared = Arc::new(Shared {
@@ -1668,14 +1715,18 @@ mod tests {
             progress_ms: AtomicU64::new(0),
             allows_suppression: true,
             device_removed: AtomicBool::new(false),
-            trial_window: None,
             revocation: RevocationSignal::default(),
         });
+        let physical = match &take_back {
+            Some(gate) => PhysicalCapture::new(Duration::ZERO).with_take_back(gate.clone()),
+            None => PhysicalCapture::new(Duration::ZERO),
+        };
         (
             CallbackState {
                 shared,
                 producer,
-                physical: PhysicalCapture::new(Duration::ZERO),
+                physical,
+                take_back,
                 lease: SuppressionLease::new(1, Duration::ZERO, stop),
                 route_remote: false,
                 ignored: IgnoredInputCounts::default(),
@@ -2144,13 +2195,110 @@ mod tests {
     }
 
     #[test]
-    fn a_stopping_session_cannot_install_capture() {
-        let revocation = RevocationSignal::default();
-        revocation.request_stop();
-        assert!(matches!(
-            NativeCapture::start_after_local_enable(1, revocation),
-            Err(NativeCaptureError::Stopped(StopReason::InvalidInput))
-        ));
+    fn injected_callback_input_never_takes_back() {
+        let floor = monhop_core::SharedFloor::new();
+        let receiving = floor
+            .transition(floor.snapshot(), monhop_core::FloorState::Receiving)
+            .unwrap();
+        let gate = TakeBackGate::new(floor);
+        gate.open_injection(receiving.generation);
+        let (mut state, mut consumer) = callback_fixture_with(Some(gate.clone()));
+
+        for (flags, marker) in [(0x10, 0), (0x02, 0), (0, MONHOP_INJECTED_MARKER)] {
+            assert!(is_injected_keyboard(flags, marker));
+            assert!(!state.keyboard(WM_KEYDOWN, 0x41, 0x1e, flags, marker));
+        }
+        for (flags, marker) in [(0x01, 0), (0x02, 0), (0, MONHOP_INJECTED_MARKER)] {
+            assert!(is_injected_mouse(flags, marker));
+            assert!(!state.decoded(decode_mouse(WM_LBUTTONDOWN, flags, marker, 0, 0, 0)));
+        }
+        assert!(!is_injected_keyboard(0, 0) && !is_injected_mouse(0, 0));
+        let mut marked = raw_motion(true, 0);
+        marked.data.mouse = windows_sys::Win32::UI::Input::RAWMOUSE {
+            ulExtraInformation: MONHOP_INJECTED_MARKER as u32,
+            lLastX: 40,
+            ..Default::default()
+        };
+        for raw in [marked, raw_motion(false, 0)] {
+            state.raw_mouse(&raw);
+        }
+        assert_eq!(gate.take_triggered(), None);
+        assert_eq!(gate.floor().snapshot(), receiving);
+        assert!(consumer.try_pop().unwrap().is_none());
+
+        state.raw_mouse(&raw_motion(true, 0));
+        assert!(
+            gate.take_triggered().is_some(),
+            "physical relative motion past the threshold takes back"
+        );
+    }
+
+    fn receiving_gate_holding_injected_input() -> TakeBackGate {
+        let floor = monhop_core::SharedFloor::new();
+        let receiving = floor
+            .transition(floor.snapshot(), FloorState::Receiving)
+            .unwrap();
+        let gate = TakeBackGate::new(floor);
+        gate.open_injection(receiving.generation);
+        gate.note_injected_press();
+        gate
+    }
+
+    fn physical_move(x: i32) -> DecodedInput {
+        decode_mouse(WM_MOUSEMOVE, 0, 0, 0, x, 100)
+    }
+
+    #[test]
+    fn hook_withholds_the_movement_that_takes_back_while_injected_input_is_down() {
+        let gate = receiving_gate_holding_injected_input();
+        let (mut state, mut consumer) = callback_fixture_with(Some(gate.clone()));
+        let at = |x| move || Some(Point::new(x, 100.0));
+        assert!(
+            !state.hook_mouse(physical_move(904), at(900.0)),
+            "sub-threshold travel is delivered"
+        );
+        assert_eq!(gate.take_triggered(), None);
+        assert!(
+            state.hook_mouse(physical_move(907), at(904.0)),
+            "the movement that takes back is withheld before delivery"
+        );
+        assert!(gate.take_triggered().is_some());
+        assert!(state.hook_mouse(physical_move(908), || {
+            panic!("the cursor is read only while take-back can fire")
+        }));
+        assert_eq!(state.shared.stop.reason(), None);
+        let positions = std::iter::from_fn(|| consumer.try_pop().unwrap())
+            .filter(|event| matches!(event, CaptureEvent::AbsoluteMotion { .. }))
+            .count();
+        assert_eq!(positions, 3, "hook positions still reach local routing");
+    }
+
+    #[test]
+    fn injected_travel_between_physical_moves_never_takes_back() {
+        let gate = receiving_gate_holding_injected_input();
+        let (mut state, _consumer) = callback_fixture_with(Some(gate.clone()));
+        assert!(!state.hook_mouse(physical_move(100), || Some(Point::new(99.0, 100.0))));
+        // The peer's injected motion moved the cursor 800 units before the next physical nudge.
+        assert!(!state.hook_mouse(physical_move(901), || Some(Point::new(900.0, 100.0))));
+        assert!(!state.hook_mouse(physical_move(902), || None));
+        assert_eq!(gate.take_triggered(), None);
+    }
+
+    #[test]
+    fn route_barriers_carry_the_floor_generation() {
+        let gate = TakeBackGate::new(monhop_core::SharedFloor::new());
+        let (mut state, mut consumer) = callback_fixture_with(Some(gate.clone()));
+        state.publish_route(1, true).unwrap();
+        let barrier = consumer.try_pop_tagged().unwrap().unwrap();
+        assert!(matches!(barrier.event, CaptureEvent::RouteChanged { .. }));
+        assert_eq!(barrier.floor_generation, gate.floor().snapshot().generation);
+
+        let (mut ungated, mut consumer) = callback_fixture();
+        ungated.publish_route(1, true).unwrap();
+        assert_eq!(
+            consumer.try_pop_tagged().unwrap().unwrap().floor_generation,
+            0
+        );
     }
 
     #[test]
@@ -2680,7 +2828,8 @@ mod tests {
                 .is_pending()
         );
 
-        latch_focus_loss(true, &state.shared.stop, &state.shared.revocation);
+        state.shared.stop.stop(StopReason::NativeFailure);
+        state.shared.revocation.mark_revoked_without_wake();
         let mut wake_attempted = false;
         propagate_capture_stop(&state.shared, &mut wake_attempted);
         rx.recv_timeout(Duration::from_secs(1))
@@ -2738,43 +2887,25 @@ mod tests {
         let expected_line = line!() + 1;
         latch_failure(CallbackFailure::DisplayChanged);
         assert_eq!(stop.origin().unwrap().line(), expected_line);
+        assert_eq!(stop.reason(), Some(StopReason::DisplaysChanged));
         clear_callback_stop();
     }
 
     #[test]
-    fn capture_stop_preserves_hard_revocation_for_focus_loss() {
+    fn capture_stop_preserves_hard_revocation() {
         let (state, _consumer) = callback_fixture();
-        latch_focus_loss(true, &state.shared.stop, &state.shared.revocation);
+        state.shared.stop.stop(StopReason::NativeFailure);
+        state.shared.revocation.mark_revoked_without_wake();
         propagate_capture_stop(&state.shared, &mut false);
         assert!(state.shared.revocation.is_revoked());
     }
 
     #[test]
-    fn focus_loss_latches_stop_and_revocation() {
-        let stop = CaptureStop::default();
-        let revocation = RevocationSignal::default();
-
-        assert!(!latch_focus_loss(false, &stop, &revocation));
-        assert!(!revocation.is_revoked());
-        assert!(latch_focus_loss(true, &stop, &revocation));
-        assert_eq!(stop.reason(), Some(StopReason::NativeFailure));
-        assert!(revocation.is_revoked());
-    }
-
-    #[test]
-    fn startup_preflight_distinguishes_focus_from_desktop_unavailability() {
-        assert_eq!(startup_environment_error(false, true), None);
+    fn startup_preflight_reports_an_unavailable_desktop() {
+        assert_eq!(startup_environment_error(true), None);
         assert_eq!(
-            startup_environment_error(true, true),
-            Some(NativeCaptureError::TrialWindowNotForeground)
-        );
-        assert_eq!(
-            startup_environment_error(false, false),
+            startup_environment_error(false),
             Some(NativeCaptureError::DesktopUnavailable)
-        );
-        assert_eq!(
-            startup_environment_error(true, false),
-            Some(NativeCaptureError::TrialWindowNotForeground)
         );
     }
 
@@ -2788,7 +2919,7 @@ mod tests {
             stop.reason(),
             || {
                 environment_checked.set(true);
-                startup_environment_error(true, false)
+                startup_environment_error(false)
             },
             || stop.reason(),
         );

@@ -3,14 +3,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
+    hash::{DefaultHasher, Hasher},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use monhop_core::DeviceId;
+use monhop_protocol::ControlPermissions;
 use monhop_transport::{
     crypto::CertificateFingerprint,
+    session_handshake::device_id_from_fingerprint,
     session_setup::{
         DisplayTopology, InspectedPeer, MAX_DISPLAY_NAME_BYTES, MAX_LOGICAL_ORIGIN_ABS,
         MAX_LOGICAL_SIZE, MAX_NATIVE_DIMENSION, MAX_SCALE_FACTOR, MIN_SCALE_FACTOR,
@@ -18,12 +20,16 @@ use monhop_transport::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::sharing::{LayoutRequest, parse_display, parse_link, validated_layout};
+use crate::sharing::{
+    ArrangementRequest, LayoutRequest, parse_display, parse_link, validated_layout,
+};
 
 /// One computer's saved setup record; also the wire format shared at Apply.
-pub const SHARING_PREFERENCES_VERSION: u8 = 1;
+pub const SHARING_PREFERENCES_VERSION: u8 = 2;
 /// The file holding every computer's record and which one is active.
-pub const SETUP_FILE_VERSION: u8 = 2;
+pub const SETUP_FILE_VERSION: u8 = 3;
+/// The layout both computers exchange at Apply.
+const SHARED_SETUP_VERSION: u8 = 2;
 pub const MAX_SHARING_PREFERENCES_BYTES: u64 = 32 * 1024;
 pub const MAX_SETUP_FILE_BYTES: u64 = 256 * 1024;
 /// Paired computers this app keeps setups and names for.
@@ -35,14 +41,19 @@ const TEMPORARY_FILE_ATTEMPTS: usize = 64;
 
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
+/// Whether each computer's keyboard and mouse may control the other, keyed by that computer's
+/// full lowercase fingerprint. Both computers of a pair are always named; at least one is true.
+pub(crate) type ControlMap = BTreeMap<String, bool>;
+
+/// A paired computer's platform, as its list entry names it.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SourcePlatform {
+pub enum ComputerPlatform {
     Windows,
     Macos,
 }
 
-impl From<monhop_core::Platform> for SourcePlatform {
+impl From<monhop_core::Platform> for ComputerPlatform {
     fn from(platform: monhop_core::Platform) -> Self {
         match platform {
             monhop_core::Platform::Windows => Self::Windows,
@@ -71,24 +82,18 @@ impl DisplaySnapshot {
     }
 }
 
-/// The source computer is never stored by side or platform: both computers write identical
-/// meaning, so it is recovered from the display list that owns the layout's starting display.
+/// Both computers write the same meaning from their own side: the layout names displays and
+/// computers by identity, never by which side of the file they sit on.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SharingPreferences {
     version: u8,
-    /// Written by earlier builds; accepted so their files still load, never written again.
-    #[serde(default, skip_serializing)]
-    source_platform: Option<SourcePlatform>,
     interface_id: String,
     local_fingerprint: String,
     peer_fingerprint: String,
     local_displays: Vec<DisplaySnapshot>,
     peer_displays: Vec<DisplaySnapshot>,
     layout: LayoutRequest,
-    /// The sharing switch of version-1 files; read only to choose the active computer on migration.
-    #[serde(default, skip_serializing)]
-    sharing_enabled: bool,
 }
 
 /// Every paired computer's saved setup and which one MonHop shares input with. Loading never
@@ -119,36 +124,21 @@ impl Default for SetupFile {
     }
 }
 
-/// Only the version is read first so a version-1 single-record file can still be migrated.
+/// Only the version is read first: a file from another version holds nothing this build reads.
 #[derive(Deserialize)]
 struct VersionedFile {
     version: u8,
 }
 
 impl SetupFile {
-    /// An absent file is empty; a version-1 file becomes one computer, active when its switch was on.
+    /// An absent file, or one another version wrote, is empty: the displays are arranged again.
     pub fn load(path: &Path) -> io::Result<Self> {
-        let Some(bytes) = read_bounded(path, MAX_SETUP_FILE_BYTES)? else {
-            return Ok(Self::default());
-        };
-        let versioned: VersionedFile =
-            serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
-        let file = match versioned.version {
-            SHARING_PREFERENCES_VERSION => {
-                let mut record: SharingPreferences =
-                    serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
-                record.validate().map_err(|_| invalid_data())?;
-                let mut file = Self::default();
-                if std::mem::take(&mut record.sharing_enabled) {
-                    file.active = Some(fingerprint_key(&record.peer_fingerprint));
-                }
-                file.insert(record);
-                file
-            }
-            _ => serde_json::from_slice::<Self>(&bytes).map_err(|_| invalid_data())?,
-        };
-        file.validate().map_err(|_| invalid_data())?;
-        Ok(file)
+        load_versioned(
+            path,
+            MAX_SETUP_FILE_BYTES,
+            SETUP_FILE_VERSION,
+            |file: &Self| file.validate().map_err(|_| invalid_data()),
+        )
     }
 
     /// Writes the whole file atomically, creating the setup folder on first use.
@@ -252,20 +242,24 @@ struct SharedSetup {
     sender_displays: Vec<DisplaySnapshot>,
     receiver_displays: Vec<DisplaySnapshot>,
     layout: LayoutRequest,
+    /// The sender had to leave a crossing or a display out; neither computer remembers it.
+    left_out: bool,
 }
 
 pub(crate) fn shared_setup_bytes(
     inspection: &InspectedPeer,
     layout: LayoutRequest,
+    left_out: bool,
 ) -> Result<Vec<u8>, PreferenceError> {
     let saved = SharingPreferences::from_inspection(inspection, layout)?;
     let shared = SharedSetup {
-        version: 1,
+        version: SHARED_SETUP_VERSION,
         sender_fingerprint: saved.local_fingerprint,
         receiver_fingerprint: saved.peer_fingerprint,
         sender_displays: saved.local_displays,
         receiver_displays: saved.peer_displays,
         layout: saved.layout,
+        left_out,
     };
     let bytes = serde_json::to_vec(&shared).map_err(|_| PreferenceError::Invalid)?;
     if bytes.len() as u64 > MAX_SHARING_PREFERENCES_BYTES {
@@ -274,16 +268,18 @@ pub(crate) fn shared_setup_bytes(
     Ok(bytes)
 }
 
+/// This computer's record for a shared layout, and whether its sender left something out. Displays
+/// match by identity and the control map names both computers, so either one may have sent it.
 pub(crate) fn shared_setup_for_inspection(
     fresh: &InspectedPeer,
     bytes: &[u8],
-) -> Result<(InspectedPeer, SharingPreferences, LayoutRequest), PreferenceError> {
+) -> Result<(SharingPreferences, bool), PreferenceError> {
     if bytes.len() as u64 > MAX_SHARING_PREFERENCES_BYTES {
         return Err(PreferenceError::Invalid);
     }
     let shared: SharedSetup =
         serde_json::from_slice(bytes).map_err(|_| PreferenceError::Invalid)?;
-    if shared.version != 1 {
+    if shared.version != SHARED_SETUP_VERSION {
         return Err(PreferenceError::Invalid);
     }
     let local = fresh.local_fingerprint.full_hex();
@@ -303,31 +299,120 @@ pub(crate) fn shared_setup_for_inspection(
     {
         return Err(PreferenceError::InspectionChanged);
     }
-    // Metadata negotiation has no input authority. Restore the reviewed source independently.
-    let mut inspection = fresh.clone();
-    inspection.source = source_device(&shared.layout, local_displays, peer_displays, fresh)
-        .ok_or(PreferenceError::Invalid)?;
-    let preferences = SharingPreferences::from_inspection(&inspection, shared.layout.clone())?;
-    Ok((inspection, preferences, shared.layout))
+    SharingPreferences::from_inspection(fresh, shared.layout)
+        .map(|record| (record, shared.left_out))
 }
 
-/// The starting display decides which computer supplies input, on either side of the link.
-fn source_device(
-    layout: &LayoutRequest,
-    local_displays: &[DisplaySnapshot],
-    peer_displays: &[DisplaySnapshot],
-    inspection: &InspectedPeer,
-) -> Option<DeviceId> {
-    let owns = |displays: &[DisplaySnapshot]| {
-        displays
-            .iter()
-            .any(|display| display.id == layout.source_display)
-    };
-    match (owns(local_displays), owns(peer_displays)) {
-        (true, false) => Some(inspection.local_device),
-        (false, true) => Some(inspection.peer_device),
-        _ => None,
+/// Both directions allowed: the control map of a pair that has no record yet.
+pub(crate) fn both_directions(local_fingerprint: &str, peer_fingerprint: &str) -> ControlMap {
+    [local_fingerprint, peer_fingerprint]
+        .into_iter()
+        .map(|fingerprint| (fingerprint_key(fingerprint), true))
+        .collect()
+}
+
+/// Exactly the two computers of the pair, by full lowercase fingerprint, and at least one allowed.
+pub(crate) fn validate_control(
+    control: &ControlMap,
+    local_fingerprint: &str,
+    peer_fingerprint: &str,
+) -> Result<(), PreferenceError> {
+    let local = fingerprint_key(local_fingerprint);
+    let peer = fingerprint_key(peer_fingerprint);
+    if local == peer
+        || control.len() != 2
+        || !control.contains_key(&local)
+        || !control.contains_key(&peer)
+        || !control.values().any(|allowed| *allowed)
+    {
+        return Err(PreferenceError::Invalid);
     }
+    Ok(())
+}
+
+/// The permissions a session negotiates. The transport orders the two directions by DeviceId,
+/// so the lower computer's entry is `lower_controls_higher` on both computers alike.
+pub(crate) fn wire_control(
+    control: &ControlMap,
+    local_fingerprint: &str,
+    peer_fingerprint: &str,
+) -> Result<ControlPermissions, PreferenceError> {
+    validate_control(control, local_fingerprint, peer_fingerprint)?;
+    let device = |fingerprint: &str| {
+        CertificateFingerprint::parse_full(fingerprint)
+            .map(device_id_from_fingerprint)
+            .map_err(|_| PreferenceError::Invalid)
+    };
+    let (lower, higher) = if device(local_fingerprint)? < device(peer_fingerprint)? {
+        (local_fingerprint, peer_fingerprint)
+    } else {
+        (peer_fingerprint, local_fingerprint)
+    };
+    let allowed = |fingerprint: &str| control.get(&fingerprint_key(fingerprint)) == Some(&true);
+    Ok(ControlPermissions {
+        lower_controls_higher: allowed(lower),
+        higher_controls_lower: allowed(higher),
+    })
+}
+
+/// The computer with the lower DeviceId decides layout changes; both computers agree on which.
+pub(crate) fn local_decides(inspection: &InspectedPeer) -> bool {
+    inspection.local_device < inspection.peer_device
+}
+
+/// A short, stable digest for log lines; it names no identity and no input.
+fn digest(hash: impl FnOnce(&mut DefaultHasher)) -> String {
+    let mut hasher = DefaultHasher::new();
+    hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+fn hash_displays(displays: &[DisplaySnapshot], hasher: &mut impl Hasher) {
+    for display in displays {
+        hasher.write(display.id.as_bytes());
+        for value in display.origin.iter().chain(&display.size) {
+            hasher.write_u64(value.to_bits());
+        }
+        hasher.write_u32(display.scale.to_bits());
+        hasher.write_u8(u8::from(display.primary));
+    }
+}
+
+/// "2 displays #1a2b3c4d": a side's display count and geometry digest, for log lines.
+pub(crate) fn describe_displays(displays: &[DisplaySnapshot]) -> String {
+    let count = displays.len();
+    let noun = if count == 1 { "display" } else { "displays" };
+    format!(
+        "{count} {noun} #{}",
+        digest(|hasher| hash_displays(displays, hasher))
+    )
+}
+
+/// Where the arrangement moved one computer's block: its anchor display's position minus that
+/// display's OS origin. The anchor is the primary display when placed, else the lowest placed id.
+pub(crate) fn block_translation(
+    arrangement: &ArrangementRequest,
+    displays: &[DisplaySnapshot],
+) -> Option<[f64; 2]> {
+    let placed = |display: &DisplaySnapshot| {
+        arrangement
+            .positions
+            .iter()
+            .find(|position| position.display == display.id)
+    };
+    let numeric =
+        |display: &&DisplaySnapshot| parse_display(&display.id).map_or(u64::MAX, |id| id.0);
+    let anchor = displays
+        .iter()
+        .find(|display| display.primary && placed(display).is_some())
+        .or_else(|| {
+            displays
+                .iter()
+                .filter(|display| placed(display).is_some())
+                .min_by_key(numeric)
+        })?;
+    let position = placed(anchor)?;
+    Some([position.x - anchor.origin[0], position.y - anchor.origin[1]])
 }
 
 /// The displays both computers show while one of them is connected, so a card can draw what is
@@ -343,7 +428,6 @@ pub struct LiveDisplays {
 #[serde(rename_all = "camelCase")]
 pub struct SavedSetupView {
     saved: bool,
-    source_side: Option<&'static str>,
     local_displays: Vec<DisplaySnapshot>,
     peer_displays: Vec<DisplaySnapshot>,
     revision: String,
@@ -373,7 +457,6 @@ impl SavedSetupView {
         };
         Self {
             saved: saved.is_some(),
-            source_side: saved.map(SharingPreferences::source_side),
             local_displays: saved
                 .map(|saved| saved.local_displays().to_vec())
                 .unwrap_or_default(),
@@ -418,14 +501,12 @@ impl SharingPreferences {
     ) -> Result<Self, PreferenceError> {
         let preferences = Self {
             version: SHARING_PREFERENCES_VERSION,
-            source_platform: None,
             interface_id: inspection.interface_id.clone(),
             local_fingerprint: inspection.local_fingerprint.full_hex(),
             peer_fingerprint: inspection.peer_fingerprint.full_hex(),
             local_displays: snapshots(&inspection.local_displays),
             peer_displays: snapshots(&inspection.peer_displays),
             layout,
-            sharing_enabled: false,
         };
         preferences.validate()?;
         preferences.validate_for_inspection(inspection)?;
@@ -434,19 +515,6 @@ impl SharingPreferences {
 
     pub fn interface_id(&self) -> &str {
         &self.interface_id
-    }
-
-    /// "local" or "peer" as seen from the computer that owns this file.
-    pub fn source_side(&self) -> &'static str {
-        if self
-            .local_displays
-            .iter()
-            .any(|display| display.id == self.layout.source_display)
-        {
-            "local"
-        } else {
-            "peer"
-        }
     }
 
     pub(crate) fn layout(&self) -> &LayoutRequest {
@@ -461,7 +529,7 @@ impl SharingPreferences {
         &self.local_fingerprint
     }
 
-    /// Geometry-only comparison for a trial opened without a live link.
+    /// Geometry-only comparison of this computer's displays, read without a live link.
     pub(crate) fn matches_local_displays(&self, current: &DisplayTopology) -> bool {
         same_display_geometry(&self.local_displays, &snapshots(current))
     }
@@ -470,19 +538,56 @@ impl SharingPreferences {
         &self.local_displays
     }
 
-    /// Names the edge the source pointer leaves for the first crossing, e.g. "the right edge of U2723QE".
-    pub(crate) fn source_seam_hint(&self) -> Option<String> {
-        if self.source_side() != "local" {
-            return None;
-        }
-        self.layout.links.iter().find_map(|link| {
-            let display = self
-                .local_displays
-                .iter()
-                .find(|display| display.id == link.from_display)?;
-            let name: String = display.name.chars().take(48).collect();
-            Some(format!("the {} edge of {}", link.from_edge, name.trim()))
+    /// Whether this computer decides layout changes for the pair, as `local_decides` does live.
+    pub(crate) fn local_decides(&self) -> bool {
+        let device = |fingerprint: &str| {
+            CertificateFingerprint::parse_full(fingerprint)
+                .ok()
+                .map(device_id_from_fingerprint)
+        };
+        device(&self.local_fingerprint) < device(&self.peer_fingerprint)
+    }
+
+    /// The record's two sides for a log line: counts and geometry digests only.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "this computer {}, other computer {}",
+            describe_displays(&self.local_displays),
+            describe_displays(&self.peer_displays)
+        )
+    }
+
+    /// The record's layout and displays as one short digest, for log lines.
+    pub(crate) fn digest(&self) -> String {
+        let layout = serde_json::to_vec(&self.layout).unwrap_or_default();
+        digest(|hasher| {
+            hasher.write(&layout);
+            hash_displays(&self.local_displays, hasher);
+            hash_displays(&self.peer_displays, hasher);
         })
+    }
+
+    /// Whether each computer may control the other, keyed by full lowercase fingerprint.
+    pub(crate) fn control(&self) -> &ControlMap {
+        &self.layout.control
+    }
+
+    /// The same record carrying `control` instead of its own; None when `control` is not valid
+    /// for this pair.
+    pub(crate) fn with_control(&self, control: ControlMap) -> Option<Self> {
+        let mut next = self.clone();
+        next.layout.control = control;
+        next.validate().ok()?;
+        Some(next)
+    }
+
+    /// The permissions this record's sessions negotiate.
+    pub(crate) fn wire_control(&self) -> Result<ControlPermissions, PreferenceError> {
+        wire_control(
+            &self.layout.control,
+            &self.local_fingerprint,
+            &self.peer_fingerprint,
+        )
     }
 
     pub fn peer_displays(&self) -> &[DisplaySnapshot] {
@@ -513,7 +618,7 @@ impl SharingPreferences {
             && same_displays(&self.peer_displays, &snapshots(&inspection.peer_displays)).is_some()
     }
 
-    /// The same two computers showing the same displays, whichever side holds the input right now.
+    /// The same two computers showing the same displays at the same geometry.
     pub(crate) fn fits_displays(&self, inspection: &InspectedPeer) -> bool {
         self.validate().is_ok()
             && self.same_pair(inspection)
@@ -541,40 +646,11 @@ impl SharingPreferences {
             return None;
         }
         let layout = remap_layout(&self.layout, &id_map(local_pairs.iter().chain(&peer_pairs)));
-        let mut inspected = inspection.clone();
-        inspected.source = source_device(&layout, &local, &peer, inspection)?;
-        Self::from_inspection(&inspected, layout).ok()
-    }
-
-    /// Like `remap_to_inspection` for this computer's displays alone; the other computer's are
-    /// checked when the session connects.
-    pub(crate) fn remap_to_local_displays(&self, current: &DisplayTopology) -> Option<Self> {
-        if self.validate().is_err() {
-            return None;
-        }
-        let local = snapshots(current);
-        let pairs = same_displays(&self.local_displays, &local)?;
-        if !pairs
-            .iter()
-            .all(|(remembered, live)| same_geometry(remembered, live))
-        {
-            return None;
-        }
-        let mut remapped = self.clone();
-        remapped.layout = remap_layout(&self.layout, &id_map(pairs.iter()));
-        remapped.local_displays = local;
-        remapped.validate().ok()?;
-        Some(remapped)
+        Self::from_inspection(inspection, layout).ok()
     }
 
     pub fn matches_inspection(&self, inspection: &InspectedPeer) -> bool {
         self.validate().is_ok()
-            && source_device(
-                &self.layout,
-                &self.local_displays,
-                &self.peer_displays,
-                inspection,
-            ) == Some(inspection.source)
             && self.interface_id == inspection.interface_id
             && self.local_fingerprint == inspection.local_fingerprint.full_hex()
             && self.peer_fingerprint == inspection.peer_fingerprint.full_hex()
@@ -609,6 +685,11 @@ impl SharingPreferences {
         validate_fingerprint(&self.peer_fingerprint)?;
         validate_displays(&self.local_displays)?;
         validate_displays(&self.peer_displays)?;
+        validate_control(
+            &self.layout.control,
+            &self.local_fingerprint,
+            &self.peer_fingerprint,
+        )?;
         validate_layout(&self.layout, &self.local_displays, &self.peer_displays)
     }
 }
@@ -628,6 +709,15 @@ impl DisplayGeometry {
         }
     }
 
+    /// Both sides for a log line: counts and geometry digests only.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "this computer {}, other computer {}",
+            describe_displays(&self.local),
+            describe_displays(&self.peer)
+        )
+    }
+
     pub(crate) fn same(&self, other: &Self) -> bool {
         same_display_geometry(&self.local, &other.local)
             && same_display_geometry(&self.peer, &other.peer)
@@ -644,11 +734,8 @@ pub(crate) struct Adapted {
     pub(crate) left_out: bool,
 }
 
-/// Rebuilds an applied record for the displays connected now. A monitor is the same display
-/// under a new OS id, so ids are rewritten first; then routes, positions, and hidden marks naming
-/// a display that went away are dropped. A display that appeared joins a free arrangement beside
-/// its computer's placed display at the OS's own offset when that spot is clear, and is left out
-/// of the routes otherwise. None when the starting display went away or nothing valid is left.
+/// The record rebuilt for the displays now: ids follow monitor identity, what names a gone display
+/// drops, blocks keep their place, and a newcomer breaking a crossing is hidden. None if invalid.
 pub(crate) fn adapt_to_inspection(
     record: &SharingPreferences,
     inspection: &InspectedPeer,
@@ -658,6 +745,13 @@ pub(crate) fn adapt_to_inspection(
     }
     let local = snapshots(&inspection.local_displays);
     let peer = snapshots(&inspection.peer_displays);
+    // Measured on the record's own ids and geometry, before either is rewritten.
+    let translations = record.layout.arrangement.as_ref().map(|arrangement| {
+        [
+            block_translation(arrangement, &record.local_displays),
+            block_translation(arrangement, &record.peer_displays),
+        ]
+    });
     let pairs: Vec<(&DisplaySnapshot, &DisplaySnapshot)> =
         pair_displays(&record.local_displays, &local)
             .into_iter()
@@ -665,76 +759,67 @@ pub(crate) fn adapt_to_inspection(
             .collect();
     let kept: BTreeSet<&str> = pairs.iter().map(|(_, live)| live.id.as_str()).collect();
     let present = |id: &str| kept.contains(id);
-    // Remapping only rewrites ids, so what this basis holds is what the record held: every count
-    // below is measured against it, and what survives the retains is what the user keeps.
     let mut layout = remap_layout(&record.layout, &id_map(pairs.iter()));
-    if !present(&layout.source_display) {
-        return None;
-    }
     let crossings = layout.links.len();
     layout
         .links
         .retain(|link| present(&link.from_display) && present(&link.to_display));
     let mut left_out = layout.links.len() != crossings;
-    let mut placed_appeared: Vec<String> = Vec::new();
-    if let Some(arrangement) = layout.arrangement.as_mut() {
+    let appeared: Vec<String> = local
+        .iter()
+        .chain(&peer)
+        .filter(|display| !present(&display.id))
+        .map(|display| display.id.clone())
+        .collect();
+    if let (Some(arrangement), Some(translations)) = (layout.arrangement.as_mut(), translations) {
         let placed = arrangement.positions.len();
         arrangement
             .positions
             .retain(|position| present(&position.display));
         left_out |= arrangement.positions.len() != placed;
         arrangement.hidden.retain(|id| present(id));
-        if arrangement.mode == "free" {
-            // Placed in id order, which is the same on both computers, so each display that
-            // appeared lands (or is left out) identically on each side without a wire message.
-            let mut appeared: Vec<(&[DisplaySnapshot], &DisplaySnapshot)> = [&local, &peer]
-                .into_iter()
-                .flat_map(|side| side.iter().map(move |display| (side.as_slice(), display)))
-                .filter(|(_, display)| !present(&display.id))
-                .collect();
-            appeared.sort_by(|(_, a), (_, b)| a.id.cmp(&b.id));
-            for (own, display) in appeared {
-                match place_beside_sibling(arrangement, display, own, &local, &peer) {
-                    Some((x, y)) => {
-                        arrangement.positions.push(crate::sharing::DisplayPosition {
-                            display: display.id.clone(),
-                            x,
-                            y,
-                        });
-                        placed_appeared.push(display.id.clone());
-                    }
-                    None => {
-                        arrangement.hidden.push(display.id.clone());
-                        left_out = true;
-                    }
+        for (side, translation) in [&local, &peer].into_iter().zip(translations) {
+            let Some([dx, dy]) = translation else {
+                continue;
+            };
+            for display in side {
+                if arrangement.hidden.contains(&display.id) {
+                    continue;
                 }
+                arrangement
+                    .positions
+                    .retain(|position| position.display != display.id);
+                arrangement.positions.push(crate::sharing::DisplayPosition {
+                    display: display.id.clone(),
+                    x: display.origin[0] + dx,
+                    y: display.origin[1] + dy,
+                });
             }
         }
     }
-    let finish = |layout: LayoutRequest| {
-        // The starting display decides which computer supplies input, as it does at Apply.
-        let mut inspected = inspection.clone();
-        inspected.source = source_device(&layout, &local, &peer, inspection)?;
-        SharingPreferences::from_inspection(&inspected, layout).ok()
-    };
-    if placed_appeared.is_empty() {
-        return finish(layout).map(|record| Adapted { record, left_out });
-    }
-    if let Some(record) = finish(layout.clone()) {
+    if let Ok(record) = SharingPreferences::from_inspection(inspection, layout.clone()) {
         return Some(Adapted { record, left_out });
     }
-    // A placed newcomer can still break the topology (an edge it shares with a kept crossing),
-    // which the rectangle check cannot see; leaving it out is always as valid as before.
-    if let Some(arrangement) = layout.arrangement.as_mut() {
-        arrangement
-            .positions
-            .retain(|position| !placed_appeared.contains(&position.display));
-        arrangement.hidden.extend(placed_appeared);
+    if appeared.is_empty() {
+        return None;
     }
-    finish(layout).map(|record| Adapted {
-        record,
-        left_out: true,
-    })
+    // A newcomer can share an edge with a kept crossing; leaving it unused is as valid as before.
+    let arrangement = layout
+        .arrangement
+        .get_or_insert_with(|| ArrangementRequest {
+            positions: Vec::new(),
+            hidden: Vec::new(),
+        });
+    arrangement
+        .positions
+        .retain(|position| !appeared.contains(&position.display));
+    arrangement.hidden.extend(appeared);
+    SharingPreferences::from_inspection(inspection, layout)
+        .ok()
+        .map(|record| Adapted {
+            record,
+            left_out: true,
+        })
 }
 
 /// A regular file of at most `limit` bytes, or None when absent; symlinks and oversize fail.
@@ -765,6 +850,25 @@ pub(crate) fn load_bounded<T: DeserializeOwned + Default>(
     let Some(bytes) = read_bounded(path, limit)? else {
         return Ok(T::default());
     };
+    let value: T = serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
+    validate(&value)?;
+    Ok(value)
+}
+
+/// Like `load_bounded`, but a file another version wrote loads as empty instead of failing.
+pub(crate) fn load_versioned<T: DeserializeOwned + Default>(
+    path: &Path,
+    limit: u64,
+    version: u8,
+    validate: impl FnOnce(&T) -> io::Result<()>,
+) -> io::Result<T> {
+    let Some(bytes) = read_bounded(path, limit)? else {
+        return Ok(T::default());
+    };
+    let versioned: VersionedFile = serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
+    if versioned.version != version {
+        return Ok(T::default());
+    }
     let value: T = serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
     validate(&value)?;
     Ok(value)
@@ -897,7 +1001,6 @@ fn id_map<'a>(
 fn remap_layout(layout: &LayoutRequest, map: &BTreeMap<String, String>) -> LayoutRequest {
     let rename = |id: &String| map.get(id).cloned().unwrap_or_else(|| id.clone());
     let mut remapped = layout.clone();
-    remapped.source_display = rename(&layout.source_display);
     for link in &mut remapped.links {
         link.from_display = rename(&link.from_display);
         link.to_display = rename(&link.to_display);
@@ -913,52 +1016,7 @@ fn remap_layout(layout: &LayoutRequest, map: &BTreeMap<String, String>) -> Layou
     remapped
 }
 
-/// Where a display that appeared goes in a free arrangement: beside its computer's primary (or
-/// first placed) display, at the offset the OS puts between them, so the picture follows the OS
-/// arrangement. None when nothing of that computer is placed or the spot overlaps a placed display.
-fn place_beside_sibling(
-    arrangement: &crate::sharing::ArrangementRequest,
-    appeared: &DisplaySnapshot,
-    own: &[DisplaySnapshot],
-    local: &[DisplaySnapshot],
-    peer: &[DisplaySnapshot],
-) -> Option<(f64, f64)> {
-    let placed = |display: &DisplaySnapshot| {
-        arrangement
-            .positions
-            .iter()
-            .find(|position| position.display == display.id)
-    };
-    let (sibling, anchor) = own
-        .iter()
-        .filter(|display| display.primary)
-        .chain(own)
-        .find_map(|display| placed(display).map(|position| (display, position)))?;
-    let x = anchor.x + (appeared.origin[0] - sibling.origin[0]);
-    let y = anchor.y + (appeared.origin[1] - sibling.origin[1]);
-    if !x.is_finite()
-        || !y.is_finite()
-        || x.abs() > crate::sharing::MAX_ARRANGEMENT_COORDINATE
-        || y.abs() > crate::sharing::MAX_ARRANGEMENT_COORDINATE
-    {
-        return None;
-    }
-    let overlaps = arrangement.positions.iter().any(|position| {
-        local
-            .iter()
-            .chain(peer)
-            .find(|display| display.id == position.display)
-            .is_some_and(|display| {
-                x < position.x + display.size[0]
-                    && position.x < x + appeared.size[0]
-                    && y < position.y + display.size[1]
-                    && position.y < y + appeared.size[1]
-            })
-    });
-    (!overlaps).then_some((x, y))
-}
-
-fn snapshots(topology: &DisplayTopology) -> Vec<DisplaySnapshot> {
+pub(crate) fn snapshots(topology: &DisplayTopology) -> Vec<DisplaySnapshot> {
     topology
         .displays()
         .iter()
@@ -1029,18 +1087,7 @@ fn validate_layout(
     local_displays: &[DisplaySnapshot],
     peer_displays: &[DisplaySnapshot],
 ) -> Result<(), PreferenceError> {
-    if layout.links.len() > MAX_LINKS {
-        return Err(PreferenceError::Invalid);
-    }
-    let source_display =
-        parse_display(&layout.source_display).map_err(|_| PreferenceError::Invalid)?;
-    if layout.source_display != source_display.0.to_string()
-        || !local_displays
-            .iter()
-            .chain(peer_displays)
-            .any(|display| display.id == layout.source_display)
-        || layout.links.iter().any(|link| parse_link(link).is_err())
-    {
+    if layout.links.len() > MAX_LINKS || layout.links.iter().any(|link| parse_link(link).is_err()) {
         return Err(PreferenceError::Invalid);
     }
     let arranged: Vec<crate::sharing::ArrangedDisplay<'_>> = local_displays
@@ -1145,28 +1192,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn the_seam_hint_names_the_local_edge_only_when_this_computer_sends() {
-        let receiver = preferences();
-        assert_eq!(receiver.source_side(), "peer");
-        assert_eq!(receiver.source_seam_hint(), None);
-        let mut sender = preferences();
-        sender.layout.source_display = "1".into();
-        sender.layout.links = vec![crate::sharing::LinkRequest {
-            from_display: "1".into(),
-            from_edge: "right".into(),
-            from_span: [0.0, 1.0],
-            to_display: "2".into(),
-            to_edge: "left".into(),
-            to_span: [0.0, 1.0],
-            hysteresis: 0.0,
-        }];
-        assert_eq!(
-            sender.source_seam_hint().as_deref(),
-            Some("the right edge of Local display")
-        );
-    }
-
     impl SharingPreferences {
         pub(crate) fn set_interface_id_for_test(&mut self, interface_id: &str) {
             self.interface_id = interface_id.to_owned();
@@ -1214,8 +1239,10 @@ pub(crate) mod tests {
             }
         }
 
+        /// Another paired computer; the control map follows so the record stays valid.
         pub(crate) fn set_peer_fingerprint_for_test(&mut self, fingerprint_char: char) {
             self.peer_fingerprint = fingerprint_char.to_string().repeat(64);
+            self.layout.control = both_directions(&self.local_fingerprint, &self.peer_fingerprint);
         }
 
         pub(crate) fn move_local_display_for_test(&mut self, id: &str, origin: [f64; 2]) {
@@ -1266,14 +1293,8 @@ pub(crate) mod tests {
         assert!(fitted.fits_displays(&inspected));
         assert_eq!(fitted.layout().links[0].to_display, "7");
         assert_eq!(fitted.layout().links[1].from_display, "7");
-        assert_eq!(fitted.layout().source_display, "2");
         assert!(record.same_display_sets(&fitted));
         assert!(record.same_displays_as_inspection(&inspected));
-        let fitted_here = record
-            .remap_to_local_displays(&inspected.local_displays)
-            .expect("this computer's displays alone fit too");
-        assert_eq!(fitted_here.layout(), fitted.layout());
-        assert_eq!(fitted_here.local_displays()[1].id, "7");
         // Without identities, only the id can tell displays apart, as before.
         let mut anonymous = record.clone();
         for display in &mut anonymous.local_displays {
@@ -1327,12 +1348,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn displays_that_appear_on_both_computers_are_placed_in_id_order() {
-        let record = free_record((1920.0, 0.0));
+    fn displays_that_appear_on_both_computers_join_their_own_blocks() {
+        let record = placed_record((1920.0, 0.0));
         let mut changed = record.clone();
-        // Display 9 appears under this computer's display 1; display 5 appears on the other
-        // computer where its picture would overlap 9. Id order places 5 and hides 9, whichever
-        // computer runs this.
+        // 9 appears under display 1 here and 5 on the other computer; each joins its own block.
+        // Overlapping pictures route nothing, since every crossing is explicit.
         changed.set_local_displays_for_test(&["1", "9"]);
         changed.peer_displays.push(DisplaySnapshot {
             id: "5".into(),
@@ -1348,19 +1368,25 @@ pub(crate) mod tests {
             record: adapted,
             left_out,
         } = adapt_to_inspection(&record, &inspection(&changed))
-            .expect("a free layout survives displays that appeared on both computers");
-        // Display 9 ends up unused, so the user is told something was left out.
-        assert!(left_out);
+            .expect("newcomers on both computers keep the layout going");
+        assert!(!left_out);
         let (positions, hidden) = arrangement_of(&adapted);
-        assert_eq!(hidden, vec!["9".to_owned()]);
-        let placed: Vec<(&str, f64, f64)> = positions
+        assert!(hidden.is_empty());
+        let mut placed: Vec<(&str, f64, f64)> = positions
             .iter()
             .map(|position| (position.display.as_str(), position.x, position.y))
             .collect();
+        placed.sort_by(|a, b| a.0.cmp(b.0));
         assert_eq!(
             placed,
-            vec![("1", 0.0, 0.0), ("2", 1920.0, 0.0), ("5", 0.0, 1440.0)]
+            vec![
+                ("1", 0.0, 0.0),
+                ("2", 1920.0, 0.0),
+                ("5", 0.0, 1440.0),
+                ("9", 0.0, 1080.0)
+            ]
         );
+        assert!(adapted.fits_displays(&inspection(&changed)));
     }
 
     #[test]
@@ -1368,7 +1394,7 @@ pub(crate) mod tests {
         // The crossing leaves display 1's whole right edge, while the picture keeps the other
         // computer's display far right. Display 9 appears exactly right of 1: its spot is clear,
         // but its inherited seam would share that edge with the crossing.
-        let record = free_record((5000.0, 0.0));
+        let record = placed_record((5000.0, 0.0));
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1", "9"]);
         changed.move_local_display_for_test("9", [1920.0, 0.0]);
@@ -1435,10 +1461,9 @@ pub(crate) mod tests {
         assert!(adapted.fits_displays(&inspection(&changed)));
     }
 
-    fn free_record(peer_position: (f64, f64)) -> SharingPreferences {
+    fn placed_record(peer_position: (f64, f64)) -> SharingPreferences {
         let mut record = preferences();
         record.layout.arrangement = Some(crate::sharing::ArrangementRequest {
-            mode: "free".into(),
             positions: vec![
                 crate::sharing::DisplayPosition {
                     display: "1".into(),
@@ -1464,13 +1489,13 @@ pub(crate) mod tests {
             .layout()
             .arrangement
             .as_ref()
-            .expect("the free arrangement survives");
+            .expect("the arrangement survives");
         (arrangement.positions.clone(), arrangement.hidden.clone())
     }
 
     #[test]
-    fn a_display_that_appeared_in_a_free_arrangement_is_placed_where_the_os_puts_it() {
-        let record = free_record((1920.0, 0.0));
+    fn a_display_that_appeared_in_an_arrangement_is_placed_where_the_os_puts_it() {
+        let record = placed_record((1920.0, 0.0));
         let mut changed = record.clone();
         // The fixture stacks display 3 directly under display 1, as the OS reports it.
         changed.set_local_displays_for_test(&["1", "3"]);
@@ -1478,32 +1503,18 @@ pub(crate) mod tests {
             record: adapted,
             left_out,
         } = adapt_to_inspection(&record, &inspection(&changed))
-            .expect("a free layout survives a display that appeared");
-        // The newcomer was placed rather than left unused, so nothing was left out.
+            .expect("a placed layout survives a display that appeared");
+        // The newcomer joined its computer's block, so nothing was left out.
         assert!(!left_out);
         let (positions, hidden) = arrangement_of(&adapted);
         assert_eq!(hidden, Vec::<String>::new());
         assert_eq!(positions.len(), 3);
-        assert_eq!(positions[2].display, "3");
-        assert_eq!((positions[2].x, positions[2].y), (0.0, 1080.0));
+        let newcomer = positions
+            .iter()
+            .find(|position| position.display == "3")
+            .expect("the newcomer is placed");
+        assert_eq!((newcomer.x, newcomer.y), (0.0, 1080.0));
         assert!(adapted.fits_displays(&inspection(&changed)));
-    }
-
-    #[test]
-    fn a_display_that_appeared_where_the_picture_is_taken_is_left_out_of_the_routes() {
-        // The other computer's display was placed under display 1, where the OS puts display 3.
-        let record = free_record((0.0, 1080.0));
-        let mut changed = record.clone();
-        changed.set_local_displays_for_test(&["1", "3"]);
-        let Adapted {
-            record: adapted,
-            left_out,
-        } = adapt_to_inspection(&record, &inspection(&changed))
-            .expect("a free layout survives a display that appeared");
-        assert!(left_out);
-        let (positions, hidden) = arrangement_of(&adapted);
-        assert_eq!(hidden, vec!["3".to_owned()]);
-        assert_eq!(positions.len(), 2);
     }
 
     #[test]
@@ -1513,21 +1524,6 @@ pub(crate) mod tests {
         record.layout.links = vec![
             link("2", "left", "3", "right"),
             link("3", "right", "2", "left"),
-        ];
-        assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
-        let mut changed = record.clone();
-        changed.set_local_displays_for_test(&["1"]);
-        assert!(adapt_to_inspection(&record, &inspection(&changed)).is_none());
-    }
-
-    #[test]
-    fn a_starting_display_that_went_away_stops_the_adaptation() {
-        let mut record = preferences();
-        record.set_local_displays_for_test(&["1", "3"]);
-        record.layout.source_display = "3".into();
-        record.layout.links = vec![
-            link("3", "right", "2", "left"),
-            link("2", "left", "3", "right"),
         ];
         assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
         let mut changed = record.clone();
@@ -1601,25 +1597,16 @@ pub(crate) mod tests {
         assert!(adapted.fits_displays(&inspected));
     }
 
-    /// The same setup with the keyboard on this computer; `preferences()` puts it on the peer.
-    pub(crate) fn preferences_with_local_source() -> SharingPreferences {
-        let mut saved = preferences();
-        saved.layout.source_display = "1".into();
-        saved.validate().expect("the flipped fixture stays valid");
-        saved
-    }
-
     /// The same setup made with another paired computer.
     pub(crate) fn preferences_for_peer(fingerprint_char: char) -> SharingPreferences {
         let mut saved = preferences();
-        saved.peer_fingerprint = fingerprint_char.to_string().repeat(64);
+        saved.set_peer_fingerprint_for_test(fingerprint_char);
         saved
     }
 
     pub(crate) fn preferences() -> SharingPreferences {
         SharingPreferences {
             version: SHARING_PREFERENCES_VERSION,
-            source_platform: None,
             interface_id: "en0:4:192.168.1.4".into(),
             local_fingerprint: "A".repeat(64),
             peer_fingerprint: "B".repeat(64),
@@ -1643,9 +1630,7 @@ pub(crate) mod tests {
                 primary: true,
                 monitor: None,
             }],
-            sharing_enabled: false,
             layout: LayoutRequest {
-                source_display: "2".into(),
                 links: vec![
                     crate::sharing::LinkRequest {
                         from_display: "1".into(),
@@ -1667,6 +1652,7 @@ pub(crate) mod tests {
                     },
                 ],
                 arrangement: None,
+                control: both_directions(&"A".repeat(64), &"B".repeat(64)),
             },
         }
     }
@@ -1696,13 +1682,14 @@ pub(crate) mod tests {
             )
             .unwrap()
         };
+        let local_fingerprint =
+            CertificateFingerprint::parse_full(&saved.local_fingerprint).unwrap();
+        let peer_fingerprint = CertificateFingerprint::parse_full(&saved.peer_fingerprint).unwrap();
         InspectedPeer {
-            local_device: monhop_core::DeviceId([1; 16]),
-            peer_device: monhop_core::DeviceId([2; 16]),
-            source: monhop_core::DeviceId([2; 16]),
-            local_fingerprint: CertificateFingerprint::parse_full(&saved.local_fingerprint)
-                .unwrap(),
-            peer_fingerprint: CertificateFingerprint::parse_full(&saved.peer_fingerprint).unwrap(),
+            local_device: device_id_from_fingerprint(local_fingerprint),
+            peer_device: device_id_from_fingerprint(peer_fingerprint),
+            local_fingerprint,
+            peer_fingerprint,
             local_platform: Platform::MacOs,
             peer_platform: Platform::Windows,
             local_displays: topology(&saved.local_displays),
@@ -1762,7 +1749,7 @@ pub(crate) mod tests {
         );
         assert_eq!(loaded.active_computer(), Some(&preferences()));
         let text = String::from_utf8(fs::read(&path).unwrap()).unwrap();
-        assert!(text.contains("\"version\":2"));
+        assert!(text.contains("\"version\":3"));
         assert!(!text.contains("sharingEnabled"));
         assert!(text.contains(&format!("\"active\":\"{}\"", "b".repeat(64))));
         assert!(text.contains(&format!("\"{}\":{{", "b".repeat(64))));
@@ -1793,34 +1780,48 @@ pub(crate) mod tests {
         assert_eq!(loaded.interface_id(), Some("en0:4:192.168.1.4"));
     }
 
-    #[test]
-    fn a_version_one_file_becomes_one_computer_active_when_its_switch_was_on() {
-        let directory = TestDirectory::new();
-        let path = directory.path("sharing.json");
-        for (enabled, active) in [(true, Some("b".repeat(64))), (false, None)] {
-            let mut legacy = serde_json::to_value(preferences()).unwrap();
-            legacy["sharingEnabled"] = serde_json::Value::Bool(enabled);
-            write_raw(&path, &serde_json::to_vec(&legacy).unwrap());
-            let loaded = SetupFile::load(&path).unwrap();
-            assert_eq!(loaded.active(), active.as_deref());
-            assert_eq!(loaded.computer(&"b".repeat(64)), Some(&preferences()));
-            assert_eq!(loaded.interface_id(), Some("en0:4:192.168.1.4"));
-            assert_eq!(
-                fs::read(&path).unwrap(),
-                serde_json::to_vec(&legacy).unwrap()
-            );
-        }
+    /// A record as v0.1.4 wrote it: a source display, a platform, an enabled switch, no control.
+    pub(crate) fn v014_record() -> serde_json::Value {
+        let mut record = serde_json::to_value(preferences()).unwrap();
+        record["version"] = serde_json::json!(1);
+        record["sourcePlatform"] = serde_json::Value::Null;
+        record["sharingEnabled"] = serde_json::json!(true);
+        let layout = record["layout"].as_object_mut().unwrap();
+        layout.remove("control");
+        layout.insert("sourceDisplay".into(), serde_json::json!("2"));
+        record
     }
 
     #[test]
-    fn restored_layout_requires_same_identity_source_network_and_displays() {
+    fn v014_setup_file_loads_as_empty() {
+        let directory = TestDirectory::new();
+        let path = directory.path("sharing.json");
+        let v014 = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "interfaceId": "en0:4:192.168.1.4",
+            "active": "b".repeat(64),
+            "computers": { "b".repeat(64): v014_record() },
+        }))
+        .unwrap();
+        write_raw(&path, &v014);
+        let loaded = SetupFile::load(&path).unwrap();
+        assert_eq!(loaded, SetupFile::default());
+        assert!(loaded.active().is_none());
+        // Loading never rewrites the old file; the next save replaces it at the current version.
+        assert_eq!(fs::read(&path).unwrap(), v014);
+        file_with(preferences()).save(&path).unwrap();
+        assert_eq!(saved_computer(&path), Some(preferences()));
+    }
+
+    #[test]
+    fn restored_layout_requires_same_identity_network_and_displays() {
         let saved = preferences();
         let current = inspection(&saved);
         assert_eq!(
             saved.layout_for_inspection(&current),
             Ok(saved.layout.clone())
         );
-        let changes: [fn(&mut InspectedPeer); 7] = [
+        let changes: [fn(&mut InspectedPeer); 6] = [
             |peer| {
                 peer.local_fingerprint =
                     CertificateFingerprint::parse_full(&"C".repeat(64)).unwrap()
@@ -1828,7 +1829,6 @@ pub(crate) mod tests {
             |peer| {
                 peer.peer_fingerprint = CertificateFingerprint::parse_full(&"D".repeat(64)).unwrap()
             },
-            |peer| peer.source = peer.local_device,
             |peer| peer.interface_id.push('x'),
             |peer| {
                 let mut changed = preferences();
@@ -1881,18 +1881,119 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn saving_requires_a_crossing_and_a_route_back_to_the_source() {
+    fn saving_requires_a_crossing_in_both_directions() {
         let saved = preferences();
         let current = inspection(&saved);
         let mut no_crossing = saved.layout.clone();
         no_crossing.links.clear();
         assert!(SharingPreferences::from_inspection(&current, no_crossing).is_err());
-        let mut no_return = saved.layout.clone();
-        no_return.links.remove(0);
-        assert!(SharingPreferences::from_inspection(&current, no_return).is_err());
-        let mut wrong_source = saved.layout.clone();
-        wrong_source.source_display = "1".into();
-        assert!(SharingPreferences::from_inspection(&current, wrong_source).is_err());
+        for missing in 0..2 {
+            let mut one_way = saved.layout.clone();
+            one_way.links.remove(missing);
+            assert!(SharingPreferences::from_inspection(&current, one_way).is_err());
+        }
+    }
+
+    #[test]
+    fn control_map_requires_both_fingerprints_and_one_true() {
+        let saved = preferences();
+        let current = inspection(&saved);
+        let (local, peer) = ("a".repeat(64), "b".repeat(64));
+        let map = |entries: &[(&str, bool)]| -> ControlMap {
+            entries
+                .iter()
+                .map(|(fingerprint, allowed)| ((*fingerprint).to_owned(), *allowed))
+                .collect()
+        };
+        for accepted in [
+            map(&[(&local, true), (&peer, true)]),
+            map(&[(&local, true), (&peer, false)]),
+            map(&[(&local, false), (&peer, true)]),
+        ] {
+            let mut layout = saved.layout.clone();
+            layout.control = accepted;
+            assert!(SharingPreferences::from_inspection(&current, layout).is_ok());
+        }
+        let other = "c".repeat(64);
+        let upper = "B".repeat(64);
+        for refused in [
+            map(&[]),
+            map(&[(&local, true)]),
+            map(&[(&local, false), (&peer, false)]),
+            map(&[(&local, true), (&other, true)]),
+            map(&[(&local, true), (&upper, true)]),
+            map(&[(&local, true), (&peer, true), (&other, true)]),
+        ] {
+            let mut layout = saved.layout.clone();
+            layout.control = refused.clone();
+            assert!(
+                SharingPreferences::from_inspection(&current, layout).is_err(),
+                "{refused:?}"
+            );
+            assert!(wire_control(&refused, &"A".repeat(64), &"B".repeat(64)).is_err());
+        }
+    }
+
+    /// The same pair seen from the other computer.
+    fn mirrored(record: &SharingPreferences) -> SharingPreferences {
+        let mut mirrored = record.clone();
+        std::mem::swap(
+            &mut mirrored.local_fingerprint,
+            &mut mirrored.peer_fingerprint,
+        );
+        std::mem::swap(&mut mirrored.local_displays, &mut mirrored.peer_displays);
+        mirrored
+    }
+
+    #[test]
+    fn wire_control_is_the_same_from_both_sides() {
+        let local = "A".repeat(64);
+        let peer = "B".repeat(64);
+        let lower_is_local =
+            device_id_from_fingerprint(CertificateFingerprint::parse_full(&local).unwrap())
+                < device_id_from_fingerprint(CertificateFingerprint::parse_full(&peer).unwrap());
+        assert!(lower_is_local);
+        for (local_allowed, peer_allowed) in [(true, true), (true, false), (false, true)] {
+            let control: ControlMap = [
+                (fingerprint_key(&local), local_allowed),
+                (fingerprint_key(&peer), peer_allowed),
+            ]
+            .into_iter()
+            .collect();
+            let here = wire_control(&control, &local, &peer).unwrap();
+            let there = wire_control(&control, &peer, &local).unwrap();
+            assert_eq!(here, there);
+            assert_eq!(here.lower_controls_higher, local_allowed);
+            assert_eq!(here.higher_controls_lower, peer_allowed);
+            let mut record = preferences();
+            record.layout.control = control;
+            assert_eq!(record.wire_control(), Ok(here));
+            assert_eq!(mirrored(&record).wire_control(), Ok(here));
+        }
+        // With the higher computer local, its own entry maps to the other field.
+        let control = both_directions(&"C".repeat(64), &peer);
+        let mut only_c = control.clone();
+        only_c.insert("b".repeat(64), false);
+        let from_c = wire_control(&only_c, &"C".repeat(64), &peer).unwrap();
+        assert!(!from_c.lower_controls_higher);
+        assert!(from_c.higher_controls_lower);
+        assert_eq!(
+            from_c,
+            wire_control(&only_c, &peer, &"C".repeat(64)).unwrap()
+        );
+    }
+
+    #[test]
+    fn decider_is_identical_from_both_sides() {
+        for peer in ['B', '0', 'F'] {
+            let mut record = preferences();
+            record.set_peer_fingerprint_for_test(peer);
+            let here = inspection(&record);
+            let there = inspection(&mirrored(&record));
+            assert_ne!(local_decides(&here), local_decides(&there), "{peer}");
+            assert_eq!(record.local_decides(), local_decides(&here));
+            assert_eq!(mirrored(&record).local_decides(), local_decides(&there));
+        }
     }
 
     #[test]
@@ -1945,23 +2046,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_file_written_by_an_earlier_build_with_a_source_platform_still_loads() {
-        let directory = TestDirectory::new();
-        let path = directory.path("legacy.json");
-        let mut legacy = serde_json::to_value(preferences()).unwrap();
-        legacy.as_object_mut().unwrap().insert(
-            "sourcePlatform".into(),
-            serde_json::Value::String("windows".into()),
-        );
-        write_raw(&path, &serde_json::to_vec(&legacy).unwrap());
-        let loaded = saved_computer(&path).unwrap();
-        let written = serde_json::to_string(&loaded).unwrap();
-        assert_eq!(written, serde_json::to_string(&preferences()).unwrap());
-        assert!(!written.contains("sourcePlatform"));
-    }
-
-    #[test]
-    fn corrupt_oversize_unknown_and_wrong_version_records_are_rejected() {
+    fn corrupt_oversize_and_unknown_records_are_rejected() {
         let directory = TestDirectory::new();
         let path = directory.path("sharing.json");
         write_raw(&path, b"{");
@@ -1970,7 +2055,11 @@ pub(crate) mod tests {
         write_raw(&path, &vec![b'x'; MAX_SETUP_FILE_BYTES as usize + 1]);
         assert!(SetupFile::load(&path).is_err());
 
-        for (level, field) in [("file", "enabled"), ("record", "enabled")] {
+        for (level, field) in [
+            ("file", "enabled"),
+            ("record", "enabled"),
+            ("record", "sourcePlatform"),
+        ] {
             let mut unknown = serde_json::to_value(file_with(preferences())).unwrap();
             let target = if level == "file" {
                 unknown.as_object_mut().unwrap()
@@ -1984,9 +2073,14 @@ pub(crate) mod tests {
             assert!(SetupFile::load(&path).is_err(), "{level}");
         }
 
-        let mut wrong_version = serde_json::to_value(file_with(preferences())).unwrap();
-        wrong_version["version"] = serde_json::json!(3);
-        write_raw(&path, &serde_json::to_vec(&wrong_version).unwrap());
+        let mut other_version = serde_json::to_value(file_with(preferences())).unwrap();
+        other_version["version"] = serde_json::json!(SETUP_FILE_VERSION + 1);
+        write_raw(&path, &serde_json::to_vec(&other_version).unwrap());
+        assert_eq!(SetupFile::load(&path).unwrap(), SetupFile::default());
+
+        let mut old_record = serde_json::to_value(file_with(preferences())).unwrap();
+        old_record["computers"][&"b".repeat(64)] = v014_record();
+        write_raw(&path, &serde_json::to_vec(&old_record).unwrap());
         assert!(SetupFile::load(&path).is_err());
 
         let mut wrong_key = serde_json::to_value(file_with(preferences())).unwrap();
@@ -2076,11 +2170,11 @@ pub(crate) mod tests {
         );
     }
 
-    fn opposite(inspection: &InspectedPeer) -> InspectedPeer {
+    /// The same pair as the other computer inspects it.
+    pub(crate) fn opposite(inspection: &InspectedPeer) -> InspectedPeer {
         InspectedPeer {
             local_device: inspection.peer_device,
             peer_device: inspection.local_device,
-            source: inspection.source,
             local_fingerprint: inspection.peer_fingerprint,
             peer_fingerprint: inspection.local_fingerprint,
             local_platform: inspection.peer_platform,
@@ -2095,48 +2189,54 @@ pub(crate) mod tests {
     fn shared_setup_maps_both_perspectives_without_importing_the_network() {
         let saved = preferences();
         let sender = inspection(&saved);
-        let bytes = shared_setup_bytes(&sender, saved.layout.clone()).unwrap();
+        let bytes = shared_setup_bytes(&sender, saved.layout.clone(), false).unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(!text.contains("interfaceId"));
         assert!(!text.contains("enabled"));
         for current in [sender.clone(), opposite(&sender)] {
-            let (fresh, restored, layout) = shared_setup_for_inspection(&current, &bytes).unwrap();
-            assert_eq!(fresh.source, sender.source);
+            let (restored, left_out) = shared_setup_for_inspection(&current, &bytes).unwrap();
+            assert!(!left_out);
             assert_eq!(restored.interface_id, current.interface_id);
             assert_eq!(
                 restored.local_fingerprint,
                 current.local_fingerprint.full_hex()
             );
-            assert_eq!(layout, saved.layout);
-            assert!(restored.matches_inspection(&fresh));
+            assert_eq!(restored.layout, saved.layout);
+            assert!(restored.matches_inspection(&current));
         }
     }
 
     #[test]
-    fn shared_source_is_independent_of_metadata_handshake_source() {
+    fn shared_setup_v2_round_trips_control() {
         let saved = preferences();
-        let mut sender = inspection(&saved);
-        sender.source = sender.local_device;
-        let mut layout = saved.layout;
-        layout.source_display = sender.local_displays.displays()[0].id.0.to_string();
-        let bytes = shared_setup_bytes(&sender, layout.clone()).unwrap();
-        let mut receiver = opposite(&sender);
-        receiver.source = receiver.local_device;
-        let (fresh, restored, received) = shared_setup_for_inspection(&receiver, &bytes).unwrap();
-        assert_eq!(fresh.source, sender.local_device);
-        assert_eq!(restored.source_side(), "peer");
-        assert_eq!(received, layout);
+        let sender = inspection(&saved);
+        let receiver = opposite(&sender);
+        let mut layout = saved.layout.clone();
+        layout.control.insert("b".repeat(64), false);
+        let bytes = shared_setup_bytes(&sender, layout.clone(), true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["leftOut"], true);
+        assert_eq!(value["layout"]["control"]["a".repeat(64)], true);
+        assert_eq!(value["layout"]["control"]["b".repeat(64)], false);
+        let (here, _) = shared_setup_for_inspection(&sender, &bytes).unwrap();
+        let (there, left_out) = shared_setup_for_inspection(&receiver, &bytes).unwrap();
+        assert!(left_out);
+        assert_eq!(here.control(), &layout.control);
+        assert_eq!(there.control(), &layout.control);
+        assert_eq!(here.wire_control(), there.wire_control());
+        assert_eq!(there.local_fingerprint(), "B".repeat(64));
     }
 
     #[test]
     fn shared_setup_rejects_stale_or_untrusted_metadata_before_saving() {
         let saved = preferences();
         let sender = inspection(&saved);
-        let bytes = shared_setup_bytes(&sender, saved.layout).unwrap();
+        let bytes = shared_setup_bytes(&sender, saved.layout, false).unwrap();
         let receiver = opposite(&sender);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         for (field, bad) in [
-            ("version", serde_json::json!(2)),
+            ("version", serde_json::json!(1)),
             ("senderFingerprint", serde_json::json!("00".repeat(32))),
             ("receiverFingerprint", serde_json::json!("00".repeat(32))),
             ("sourcePlatform", serde_json::json!("windows")),
@@ -2156,11 +2256,19 @@ pub(crate) mod tests {
         assert!(
             shared_setup_for_inspection(&receiver, &serde_json::to_vec(&stale).unwrap()).is_err()
         );
-        let mut invalid = value;
-        invalid["layout"]["links"] = serde_json::json!([]);
-        assert!(
-            shared_setup_for_inspection(&receiver, &serde_json::to_vec(&invalid).unwrap()).is_err()
-        );
+        for (field, bad) in [
+            ("links", serde_json::json!([])),
+            ("control", serde_json::json!({})),
+            ("sourceDisplay", serde_json::json!("2")),
+        ] {
+            let mut invalid = value.clone();
+            invalid["layout"][field] = bad;
+            assert!(
+                shared_setup_for_inspection(&receiver, &serde_json::to_vec(&invalid).unwrap())
+                    .is_err(),
+                "{field}"
+            );
+        }
         let mut trailing = bytes;
         trailing.extend_from_slice(b"{}");
         assert!(shared_setup_for_inspection(&receiver, &trailing).is_err());

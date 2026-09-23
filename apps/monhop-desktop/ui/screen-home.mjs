@@ -28,10 +28,6 @@ export function renderHome(nodes, ctx) {
   const { computers, state, actions, activeComputer, computersLoadFailure } = ctx;
   clear(nodes.homeContent);
 
-  // The ready card is this computer's own update, not tied to a paired computer or connection.
-  const ready = presence("home-updates-ready", updatesReadyCard(ctx));
-  if (ready) nodes.homeContent.append(ready);
-
   if (computersLoadFailure) {
     nodes.homeContent.append(
       card({
@@ -58,8 +54,6 @@ export function renderHome(nodes, ctx) {
       }),
     );
   } else {
-    const notice = presence("home-display-notice", displayNoticeCard(ctx));
-    if (notice) nodes.homeContent.append(notice);
     if (activeComputer)
       nodes.homeContent.append(
         computerCard(ctx, activeComputer, {
@@ -70,11 +64,16 @@ export function renderHome(nodes, ctx) {
           details: activeDetails(ctx),
         }),
       );
+    const notice = presence("home-display-notice", displayNoticeCard(ctx));
+    if (notice) nodes.homeContent.append(notice);
     for (const computer of computers.items)
       if (computer !== activeComputer)
         nodes.homeContent.append(computerCard(ctx, computer, { scope: "home" }));
   }
 
+  // The hero stays first. Updates and machine preferences are secondary to the computer in use.
+  const ready = presence("home-updates-ready", updatesReadyCard(ctx));
+  if (ready) nodes.homeContent.append(ready);
   nodes.homeContent.append(dimmingCard(ctx));
 
   const logPath = state.snapshot?.logPath;
@@ -198,24 +197,10 @@ function activeExtras(ctx) {
     el("div", {
       className: "home-layout",
       children: [
-        swap(
-          `${key}-layout`,
-          saved
-            ? createDashboardArrangement(activeComputer.setup, {
-                local: platformLabel(localPlatform, true),
-                peer: displayName(activeComputer),
-                localPlatform,
-                peerPlatform: activeComputer.platform,
-                motionKey: `${key}-layout`,
-              })
-            : note("No layout yet. Arrange the displays once to start sharing input."),
-          saved ? "layout" : "none",
-          { block: true },
-        ),
         el("div", {
-          className: "card-actions",
-          attrs: { "data-align": "start" },
+          className: "home-layout-heading",
           children: [
+            el("span", { text: "Displays" }),
             button(saved ? "Change layout" : "Arrange displays", {
               variant: "outline",
               size: "sm",
@@ -225,6 +210,23 @@ function activeExtras(ctx) {
             }),
           ],
         }),
+        swap(
+          `${key}-layout`,
+          saved
+            ? createDashboardArrangement(activeComputer.setup, {
+                local: platformLabel(localPlatform, true),
+                peer: displayName(activeComputer),
+                localPlatform,
+                peerPlatform: activeComputer.platform,
+                motionKey: `${key}-layout`,
+                transitionName: "active-arrangement",
+                compactLegend: true,
+                hideCaption: true,
+              })
+            : note("No layout yet. Arrange the displays once to start sharing input."),
+          saved ? "layout" : "none",
+          { block: true },
+        ),
       ],
     }),
   ].filter(Boolean);
@@ -242,6 +244,9 @@ function activeDetails(ctx) {
     onClick: actions.copyLastDrop,
   });
   return [
+    activeComputer.setup?.saved === true
+      ? note("Saved display positions. Not a current display check.")
+      : null,
     presence(
       `${key}-last-drop`,
       lastFailure

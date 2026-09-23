@@ -4,7 +4,12 @@ import { computerArrangements, displayName } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
 import { displayNoticeCopy, isConnected, noticePresentation } from "./sharing-model.mjs";
 import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
-import { displaysFreshness, layoutChips, layoutRows } from "./computer-card-model.mjs";
+import {
+  controlSwitchRows,
+  displaysFreshness,
+  layoutChips,
+  layoutRows,
+} from "./computer-card-model.mjs";
 import {
   button,
   card,
@@ -17,7 +22,6 @@ import {
   row,
   rows,
   sinceChanged,
-  statusChip,
   swap,
   switchRow,
 } from "./dom.mjs";
@@ -28,8 +32,7 @@ const USE_MOTION_MS = 700;
 // A Layouts list rebuilt within this window is still the same entrance, stagger included.
 const LIST_ENTER_MS = 600;
 
-// One computer rendered one way, so Home and the Setup list can never disagree about it.
-// The name is its own editor and the status and switch sit in the header, so the card is one row.
+// One computer rendering keeps Home and Set up in sync while each page owns its own actions.
 export function computerCard(
   ctx,
   computer,
@@ -38,7 +41,8 @@ export function computerCard(
   const { busy, renaming, renamePending, active } = ctx;
   const fingerprint = computer.fingerprint;
   const name = displayName(computer);
-  const status = computerStatus(computer, ctx.sharing.view, active);
+  const local = localName(ctx);
+  const status = computerStatus(computer, ctx.sharing.view, active, local);
   const inUse = fingerprint === active;
   const pending = renamePending === fingerprint;
   const editing = renaming === fingerprint || pending;
@@ -48,37 +52,53 @@ export function computerCard(
     el("div", {
       className: "computer-card",
       children: [
-        platformGlyph(computer.platform),
         el("div", {
-          className: "computer-copy",
+          className: "computer-identity",
           children: [
-            swap(
-              `${key}-name`,
-              editing
-                ? nameField(ctx, computer, scope, name, pending)
-                : nameButton(ctx, computer, scope, name),
-              editing ? "edit" : "view",
-            ),
             el("span", {
-              className: "computer-meta",
-              text: editing
-                ? pending
-                  ? "Saving…"
-                  : "Enter to save · Esc to cancel"
-                : [platformLabel(computer.platform), computer.address].filter(Boolean).join(" · "),
+              className: "computer-icon-wrap",
+              children: [platformGlyph(computer.platform)],
+            }),
+            el("div", {
+              className: "computer-copy",
+              children: [
+                swap(
+                  `${key}-name`,
+                  editing
+                    ? nameField(ctx, computer, scope, name, pending)
+                    : nameButton(ctx, computer, scope, name),
+                  editing ? "edit" : "view",
+                ),
+                el("span", {
+                  className: "computer-meta",
+                  text: editing
+                    ? pending
+                      ? "Saving…"
+                      : "Enter to save · Esc to cancel"
+                    : [platformLabel(computer.platform), computer.address].filter(Boolean).join(" · "),
+                }),
+              ],
             }),
           ],
         }),
         el("div", {
           className: "computer-actions",
           children: [
-            swap(`${key}-status`, statusChip(status), `${status.tone}|${status.label}`),
-            useToggle(ctx, fingerprint, scope, inUse),
+            scope === "home"
+              ? sharingPill(ctx, fingerprint, name, inUse)
+              : useToggle(ctx, fingerprint, scope, inUse),
           ],
         }),
       ],
     }),
-    swap(`${key}-detail`, note(status.detail), status.detail, { block: true }),
+    presence(
+      `${key}-detail`,
+      scope === "home" && inUse && status.key === "sharing" ? note(status.detail) : null,
+    ),
+    presence(
+      `${key}-control`,
+      scope === "home" && inUse ? controlSwitches(ctx, computer, name, local) : null,
+    ),
     presence(`${key}-notice`, noticeLine(ctx, computer, inUse)),
     presence(`${key}-viewport`, viewport ? cardArrangement(ctx, computer, key) : null),
     presence(
@@ -97,8 +117,73 @@ export function computerCard(
     ),
   ];
   const node = card({ children: children.filter(Boolean), tone: status.tone });
+  const identity = node.querySelector(".computer-identity");
+  if (inUse && ["home", "setup"].includes(scope) && identity)
+    identity.dataset.sharedTransition = "active-computer-identity";
+  if (scope === "home" && inUse) node.classList.add("home-hero");
   if (busy) node.dataset.busy = "true";
   return node;
+}
+
+function sharingPill(ctx, fingerprint, name, inUse) {
+  const { actions, busy } = ctx;
+  const state = inUse ? "active" : "idle";
+  const label = inUse ? "Pause sharing" : "Start sharing";
+  const node = el("button", {
+    className: "sharing-pill",
+    attrs: {
+      type: "button",
+      "aria-label": `${label} with ${name}`,
+      "aria-pressed": String(inUse),
+      "aria-busy": busy ? "true" : null,
+    },
+    dataset: { state, busy: String(busy) },
+    children: [
+      el("span", {
+        className: "sharing-pill-surfaces",
+        attrs: { "aria-hidden": "true" },
+        children: [
+          el("span", { className: "sharing-pill-surface idle" }),
+          el("span", { className: "sharing-pill-surface active" }),
+        ],
+      }),
+      el("span", {
+        className: "sharing-pill-icon",
+        attrs: { "aria-hidden": "true" },
+        children: [
+          sharingGlyph("play", !inUse),
+          sharingGlyph("square", inUse),
+          el("span", { className: "sharing-pill-live-dot", attrs: { "aria-hidden": "true" } }),
+        ],
+      }),
+      el("span", {
+        className: "sharing-pill-label",
+        attrs: { "aria-hidden": "true" },
+        children: [
+          el("span", { text: "Start sharing", dataset: { current: String(!inUse) } }),
+          el("span", { text: "Sharing", dataset: { current: String(inUse) } }),
+          el("span", { className: "sharing-pill-pause", text: "Pause", attrs: { "aria-hidden": "true" } }),
+        ],
+      }),
+      el("span", { className: "sharing-pill-spinner", attrs: { "aria-hidden": "true" } }),
+    ],
+  });
+  node.disabled = busy;
+  node.addEventListener("click", () => actions.useComputer(inUse ? null : fingerprint));
+  const elapsed = sinceChanged(`home-sharing-state-${fingerprint}`, state);
+  if (elapsed < USE_MOTION_MS) {
+    node.dataset.enter = "true";
+    node.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+  }
+  return node;
+}
+
+function sharingGlyph(name, current) {
+  return el("span", {
+    className: "sharing-pill-glyph",
+    dataset: { current: String(current) },
+    children: [icon(name, 15)],
+  });
 }
 
 // One button for both states, so pressing it keeps the focus and the glyph morphs in place
@@ -200,6 +285,30 @@ function nameField(ctx, computer, scope, name, pending) {
   return field;
 }
 
+function localName(ctx) {
+  return platformLabel(ctx.state.snapshot?.platform ?? ctx.platform, true);
+}
+
+// MonHop is always bidirectional: each direction of control is its own switch. Home shows both only
+// for the computer in use, since that is the only pairing sharing input right now.
+function controlSwitches(ctx, computer, peerName, local) {
+  const { actions, sharing } = ctx;
+  const syncing = sharing.pending?.kind === "control" || sharing.view?.control?.syncing === true;
+  const rows = controlSwitchRows(sharing.view?.control, local, peerName, syncing);
+  return el("div", {
+    className: "control-switches",
+    children: rows.map((row) =>
+      switchRow(row.label, {
+        description: row.hint,
+        checked: row.checked,
+        disabled: row.disabled,
+        focusKey: `control-${computer.fingerprint}-${row.direction}`,
+        onChange: (checked) => actions.setControl(computer.fingerprint, row.direction, checked),
+      }),
+    ),
+  });
+}
+
 function forgetControls(ctx, computer, name) {
   const { actions, busy, forgetConfirmed } = ctx;
   const confirmed = forgetConfirmed === computer.fingerprint;
@@ -242,7 +351,7 @@ function cardArrangement(ctx, computer, key) {
     className: "computer-viewport",
     children: [
       createDashboardArrangement(computer.setup, {
-        local: platformLabel(localPlatform, true),
+        local: localName(ctx),
         peer: displayName(computer),
         localPlatform,
         peerPlatform: computer.platform,

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CONTROL_PAUSE_HINT,
   clearForgetFor,
+  controlSwitchRows,
   displaysFreshness,
   isForgetArmed,
   keepForgetArmed,
@@ -20,10 +22,8 @@ const MAC = "c".repeat(64);
 function entry(name, patch = {}) {
   return {
     name,
-    sourceSide: "local",
-    mode: "grouped",
     crossings: 1,
-    layout: { sourceDisplay: "1", links: [] },
+    layout: { links: [] },
     automatic: true,
     fits: true,
     ...patch,
@@ -150,6 +150,82 @@ test("an armed row is dropped when its list is read again or its computer is unp
   assert.deepEqual(keepForgetArmed(armed, [WINDOWS, MAC]), armed);
   assert.equal(keepForgetArmed(armed, [MAC]), null);
   assert.equal(keepForgetArmed(null, [WINDOWS]), null);
+});
+
+test("renders_both_switches_on_by_default", () => {
+  const rows = controlSwitchRows(null, "This Mac", "Office Windows PC", false);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(
+    rows.map((row) => [row.direction, row.checked, row.disabled, row.hint]),
+    [
+      ["localToPeer", true, false, ""],
+      ["peerToLocal", true, false, ""],
+    ],
+  );
+  assert.equal(rows[0].label, "This Mac can control Office Windows PC");
+  assert.equal(rows[1].label, "Office Windows PC can control This Mac");
+  // A record with both directions on reads exactly like no record at all.
+  assert.deepEqual(
+    controlSwitchRows({ localToPeer: true, peerToLocal: true }, "This Mac", "Office Windows PC", false),
+    rows,
+  );
+});
+
+test("last_enabled_switch_is_disabled_with_pause_hint", () => {
+  const onlyLocalToPeer = controlSwitchRows(
+    { localToPeer: true, peerToLocal: false },
+    "This Mac",
+    "Office Windows PC",
+    false,
+  );
+  assert.equal(onlyLocalToPeer[0].checked, true);
+  assert.equal(onlyLocalToPeer[0].disabled, true);
+  assert.equal(onlyLocalToPeer[0].hint, CONTROL_PAUSE_HINT);
+  // The other direction is off, so turning it back on is never blocked.
+  assert.equal(onlyLocalToPeer[1].checked, false);
+  assert.equal(onlyLocalToPeer[1].disabled, false);
+  assert.equal(onlyLocalToPeer[1].hint, "");
+
+  const onlyPeerToLocal = controlSwitchRows(
+    { localToPeer: false, peerToLocal: true },
+    "This Mac",
+    "Office Windows PC",
+    false,
+  );
+  assert.equal(onlyPeerToLocal[1].disabled, true);
+  assert.equal(onlyPeerToLocal[1].hint, CONTROL_PAUSE_HINT);
+  assert.equal(onlyPeerToLocal[0].disabled, false);
+});
+
+test("switches disable while the command is in flight or both computers are syncing", () => {
+  const rows = controlSwitchRows(
+    { localToPeer: true, peerToLocal: false },
+    "This Mac",
+    "Office Windows PC",
+    true,
+  );
+  assert.deepEqual(
+    rows.map((row) => row.disabled),
+    [true, true],
+  );
+  const bothOn = controlSwitchRows(null, "This Mac", "Office Windows PC", true);
+  assert.deepEqual(
+    bothOn.map((row) => row.disabled),
+    [true, true],
+  );
+  const backendSyncing = controlSwitchRows(
+    { localToPeer: false, peerToLocal: true, syncing: true },
+    "This Mac",
+    "Office Windows PC",
+    false,
+  );
+  assert.deepEqual(
+    backendSyncing.map((row) => [row.disabled, row.hint]),
+    [
+      [true, "Updating both computers…"],
+      [true, CONTROL_PAUSE_HINT],
+    ],
+  );
 });
 
 test("a computer's rows are ordered, keyed, gated and locked in one pass", () => {

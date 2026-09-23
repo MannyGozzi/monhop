@@ -13,9 +13,8 @@ use monhop_core::{
 };
 
 pub const MAGIC: [u8; 4] = *b"LKM!";
-/// Bumped whenever the wire changes shape; both computers must run the same build. Version 8
-/// added the setup link's Arranging frame.
-pub const PROTOCOL_VERSION: u16 = 8;
+/// Bumped whenever the wire changes shape; both computers must run the same build.
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_LEN: usize = 8_192;
 pub use monhop_core::MAX_DISPLAYS;
@@ -287,31 +286,71 @@ pub enum ErrorCode {
     ProtocolViolation,
 }
 
-/// The mutually authenticated authority requested for a session.
-///
-/// Inspection and configuration exchange metadata only. Sharing and controlled trials are
-/// distinct bilateral input authorities and never fall back to one another.
+/// The mutually authenticated authority requested for a session: bidirectional sharing gated per
+/// direction by `control`, or the setup link (topology/arrangement exchange only, scope 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionPurpose {
-    Inspect,
-    Configure,
     Share,
-    ControlledTrial,
     Setup,
 }
 
-/// The bilateral setup proposal carried in the final handshake frame.
+/// Which directions a paired session may carry input, agreed during the handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlPermissions {
+    pub lower_controls_higher: bool,
+    pub higher_controls_lower: bool,
+}
+
+impl ControlPermissions {
+    pub const BOTH: Self = Self {
+        lower_controls_higher: true,
+        higher_controls_lower: true,
+    };
+
+    pub const fn to_wire(self) -> u8 {
+        (self.lower_controls_higher as u8) | ((self.higher_controls_lower as u8) << 1)
+    }
+
+    pub fn from_wire(value: u8) -> Result<Self, DecodeError> {
+        if value == 0 || value > 0b11 {
+            return Err(DecodeError::InvalidControl);
+        }
+        Ok(Self {
+            lower_controls_higher: value & 0b01 != 0,
+            higher_controls_lower: value & 0b10 != 0,
+        })
+    }
+
+    /// `Connection` never carries input, so no scope allows it there.
+    pub const fn allows(self, scope: FrameScope) -> bool {
+        match scope {
+            FrameScope::Connection => false,
+            FrameScope::LowerControlsHigher => self.lower_controls_higher,
+            FrameScope::HigherControlsLower => self.higher_controls_lower,
+        }
+    }
+}
+
+/// The bilateral setup proposal carried in the final handshake frame. `Setup` must carry
+/// `ControlPermissions::BOTH`; `control` is otherwise nonzero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionSetup {
-    pub source: DeviceId,
     pub purpose: SessionPurpose,
+    pub control: ControlPermissions,
+}
+
+/// Why the inbound half refused an `ActivateDisplayAt`; it never injects on this path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclineReason {
+    Contended = 1,
+    Busy = 2,
+    Disabled = 3,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
     Hello(Hello),
-    /// Proposes the input source and purpose. The session controller accepts it only when both
-    /// sides agree and it matches the currently trusted device.
+    /// Proposes purpose and control permissions. Accepted only once both sides agree.
     SessionSetup(SessionSetup),
     /// The local native input worker is ready. Only the startup phase may admit this message.
     SessionReady,
@@ -331,8 +370,15 @@ pub enum Message {
     /// Confirms a completed activation. An acknowledgement is not authority by itself; the session
     /// controller must validate it against the active trusted session.
     ActivationAck(DisplayId),
+    /// Answers an `ActivateDisplayAt` without injecting; consumes that epoch like an ack.
+    ActivationDeclined {
+        display_id: DisplayId,
+        reason: DeclineReason,
+    },
     ReleaseAll,
     ReleaseAck,
+    /// Local input has already been restored; this never itself moves the pointer.
+    TakeBack,
     Ping(u64),
     Pong(u64),
     Disconnect(DisconnectCode),
@@ -355,8 +401,10 @@ impl Message {
             | Self::ActivateDisplay(_)
             | Self::ActivateDisplayAt { .. }
             | Self::ActivationAck(_)
+            | Self::ActivationDeclined { .. }
             | Self::ReleaseAll
             | Self::ReleaseAck
+            | Self::TakeBack
             | Self::Ping(_)
             | Self::Pong(_)
             | Self::Disconnect(_)
@@ -378,8 +426,10 @@ impl Message {
             Self::ActivateDisplay(_) => MessageKind::ActivateDisplay,
             Self::ActivateDisplayAt { .. } => MessageKind::ActivateDisplayAt,
             Self::ActivationAck(_) => MessageKind::ActivationAck,
+            Self::ActivationDeclined { .. } => MessageKind::ActivationDeclined,
             Self::ReleaseAll => MessageKind::ReleaseAll,
             Self::ReleaseAck => MessageKind::ReleaseAck,
+            Self::TakeBack => MessageKind::TakeBack,
             Self::Ping(_) => MessageKind::Ping,
             Self::Pong(_) => MessageKind::Pong,
             Self::Disconnect(_) => MessageKind::Disconnect,
@@ -394,20 +444,54 @@ pub enum DeliveryClass {
     MotionDatagram,
 }
 
+/// Which directional half of the connection a frame belongs to. Header byte 7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FrameScope {
+    Connection,
+    LowerControlsHigher,
+    HigherControlsLower,
+}
+
+impl FrameScope {
+    pub const fn to_wire(self) -> u8 {
+        match self {
+            Self::Connection => 0,
+            Self::LowerControlsHigher => 1,
+            Self::HigherControlsLower => 2,
+        }
+    }
+
+    pub fn from_wire(value: u8) -> Result<Self, DecodeError> {
+        match value {
+            0 => Ok(Self::Connection),
+            1 => Ok(Self::LowerControlsHigher),
+            2 => Ok(Self::HigherControlsLower),
+            _ => Err(DecodeError::InvalidScope),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub epoch: SessionEpoch,
     pub sequence: u64,
     pub message: Message,
+    pub scope: FrameScope,
 }
 
 impl Frame {
+    /// Scope defaults to `Connection`; use `with_scope` for a directional half.
     pub const fn new(epoch: SessionEpoch, sequence: u64, message: Message) -> Self {
         Self {
             epoch,
             sequence,
             message,
+            scope: FrameScope::Connection,
         }
+    }
+
+    pub fn with_scope(self, scope: FrameScope) -> Self {
+        Self { scope, ..self }
     }
 
     pub fn delivery(&self) -> DeliveryClass {
@@ -438,7 +522,7 @@ pub fn encode_into(frame: &Frame, output: &mut Vec<u8>) -> Result<(), EncodeErro
     output.extend_from_slice(&MAGIC);
     write_u16(output, PROTOCOL_VERSION);
     output.push(frame.message.kind() as u8);
-    output.push(0);
+    output.push(frame.scope.to_wire());
     write_u16(output, body_len);
     write_u16(output, 0);
     write_u64(output, frame.epoch.get());
@@ -465,9 +549,7 @@ pub fn decode(input: &[u8]) -> Result<Frame, DecodeError> {
         return Err(DecodeError::UnsupportedVersion);
     }
     let kind = MessageKind::from_wire(header.read_u8()?)?;
-    if header.read_u8()? != 0 {
-        return Err(DecodeError::NonZeroReservedField);
-    }
+    let scope = FrameScope::from_wire(header.read_u8()?)?;
     let body_len = usize::from(header.read_u16()?);
     if header.read_u16()? != 0 {
         return Err(DecodeError::NonZeroReservedField);
@@ -487,7 +569,7 @@ pub fn decode(input: &[u8]) -> Result<Frame, DecodeError> {
     if body.remaining() != 0 {
         return Err(DecodeError::TrailingBytes);
     }
-    Ok(Frame::new(epoch, sequence, message))
+    Ok(Frame::new(epoch, sequence, message).with_scope(scope))
 }
 
 /// Decodes a transport datagram and rejects any state-changing message. Only
@@ -541,6 +623,9 @@ pub enum DecodeError {
     InvalidKeyUsage,
     InvalidModifierMask,
     InvalidKeyState,
+    InvalidScope,
+    InvalidControl,
+    InvalidDeclineReason,
 }
 
 impl fmt::Display for DecodeError {
@@ -763,6 +848,8 @@ enum MessageKind {
     ActivationAck = 16,
     ReleaseAck = 17,
     SessionReady = 18,
+    ActivationDeclined = 19,
+    TakeBack = 20,
 }
 
 impl MessageKind {
@@ -786,6 +873,8 @@ impl MessageKind {
             16 => Ok(Self::ActivationAck),
             17 => Ok(Self::ReleaseAck),
             18 => Ok(Self::SessionReady),
+            19 => Ok(Self::ActivationDeclined),
+            20 => Ok(Self::TakeBack),
             _ => Err(DecodeError::UnknownMessageType),
         }
     }
@@ -802,7 +891,7 @@ fn body_len(message: &Message) -> Result<usize, EncodeError> {
             }
             24
         }
-        Message::SessionSetup(_) => 24,
+        Message::SessionSetup(_) => 8,
         Message::DisplayTopology(topology) => {
             topology
                 .validate()
@@ -847,7 +936,8 @@ fn body_len(message: &Message) -> Result<usize, EncodeError> {
             24
         }
         Message::ActivationAck(_) => 8,
-        Message::ReleaseAll | Message::ReleaseAck | Message::SessionReady => 0,
+        Message::ActivationDeclined { .. } => 16,
+        Message::ReleaseAll | Message::ReleaseAck | Message::SessionReady | Message::TakeBack => 0,
         Message::Ping(_) | Message::Pong(_) => 8,
         Message::Disconnect(_) | Message::Error(_) => 4,
     };
@@ -864,9 +954,9 @@ fn encode_body(message: &Message, output: &mut Vec<u8>) -> Result<(), EncodeErro
             write_u32(output, hello.capabilities.bits());
         }
         Message::SessionSetup(setup) => {
-            output.extend_from_slice(&setup.source.0);
             output.push(session_purpose_to_wire(setup.purpose));
-            output.extend_from_slice(&[0; 7]);
+            output.push(setup.control.to_wire());
+            output.extend_from_slice(&[0; 6]);
         }
         Message::DisplayTopology(topology) => {
             output.push(topology.displays.len() as u8);
@@ -934,7 +1024,12 @@ fn encode_body(message: &Message, output: &mut Vec<u8>) -> Result<(), EncodeErro
             write_f64(output, position.y);
         }
         Message::ActivationAck(display_id) => write_u64(output, display_id.0),
-        Message::ReleaseAll | Message::ReleaseAck | Message::SessionReady => {}
+        Message::ActivationDeclined { display_id, reason } => {
+            write_u64(output, display_id.0);
+            output.push(decline_reason_to_wire(*reason));
+            output.extend_from_slice(&[0; 7]);
+        }
+        Message::ReleaseAll | Message::ReleaseAck | Message::SessionReady | Message::TakeBack => {}
         Message::Ping(nonce) | Message::Pong(nonce) => write_u64(output, *nonce),
         Message::Disconnect(code) => {
             output.push(disconnect_to_wire(*code));
@@ -969,14 +1064,13 @@ fn decode_body(kind: MessageKind, body: &mut Cursor<'_>) -> Result<Message, Deco
             }))
         }
         MessageKind::SessionSetup => {
-            let mut device_id = [0; 16];
-            device_id.copy_from_slice(body.take(16)?);
             let purpose = session_purpose_from_wire(body.read_u8()?)?;
-            body.require_zero(7)?;
-            Ok(Message::SessionSetup(SessionSetup {
-                source: DeviceId(device_id),
-                purpose,
-            }))
+            let control = ControlPermissions::from_wire(body.read_u8()?)?;
+            body.require_zero(6)?;
+            if purpose == SessionPurpose::Setup && control != ControlPermissions::BOTH {
+                return Err(DecodeError::InvalidControl);
+            }
+            Ok(Message::SessionSetup(SessionSetup { purpose, control }))
         }
         MessageKind::DisplayTopology => {
             let count = usize::from(body.read_u8()?);
@@ -1077,9 +1171,16 @@ fn decode_body(kind: MessageKind, body: &mut Cursor<'_>) -> Result<Message, Deco
             })
         }
         MessageKind::ActivationAck => Ok(Message::ActivationAck(DisplayId(body.read_u64()?))),
+        MessageKind::ActivationDeclined => {
+            let display_id = DisplayId(body.read_u64()?);
+            let reason = decline_reason_from_wire(body.read_u8()?)?;
+            body.require_zero(7)?;
+            Ok(Message::ActivationDeclined { display_id, reason })
+        }
         MessageKind::ReleaseAll => Ok(Message::ReleaseAll),
         MessageKind::ReleaseAck => Ok(Message::ReleaseAck),
         MessageKind::SessionReady => Ok(Message::SessionReady),
+        MessageKind::TakeBack => Ok(Message::TakeBack),
         MessageKind::Ping => Ok(Message::Ping(body.read_u64()?)),
         MessageKind::Pong => Ok(Message::Pong(body.read_u64()?)),
         MessageKind::Disconnect => {
@@ -1152,22 +1253,29 @@ fn platform_from_wire(value: u8) -> Result<Platform, DecodeError> {
 
 fn session_purpose_to_wire(purpose: SessionPurpose) -> u8 {
     match purpose {
-        SessionPurpose::Inspect => 1,
-        SessionPurpose::Share => 2,
-        SessionPurpose::ControlledTrial => 3,
-        SessionPurpose::Configure => 4,
-        SessionPurpose::Setup => 5,
+        SessionPurpose::Share => 1,
+        SessionPurpose::Setup => 2,
     }
 }
 
 fn session_purpose_from_wire(value: u8) -> Result<SessionPurpose, DecodeError> {
     match value {
-        1 => Ok(SessionPurpose::Inspect),
-        2 => Ok(SessionPurpose::Share),
-        3 => Ok(SessionPurpose::ControlledTrial),
-        4 => Ok(SessionPurpose::Configure),
-        5 => Ok(SessionPurpose::Setup),
+        1 => Ok(SessionPurpose::Share),
+        2 => Ok(SessionPurpose::Setup),
         _ => Err(DecodeError::InvalidEnum),
+    }
+}
+
+fn decline_reason_to_wire(reason: DeclineReason) -> u8 {
+    reason as u8
+}
+
+fn decline_reason_from_wire(value: u8) -> Result<DeclineReason, DecodeError> {
+    match value {
+        1 => Ok(DeclineReason::Contended),
+        2 => Ok(DeclineReason::Busy),
+        3 => Ok(DeclineReason::Disabled),
+        _ => Err(DecodeError::InvalidDeclineReason),
     }
 }
 

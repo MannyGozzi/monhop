@@ -7,11 +7,25 @@ use std::{
     time::Duration,
 };
 
-use monhop_core::{HidUsage, ModifierState};
-use monhop_platform_windows::capture::{
-    CAPTURE_QUEUE_CAPACITY, CaptureEvent, CaptureStop, CapturedEvent, MAX_SUPPRESSION_TTL,
-    StopReason, SuppressionLease, capture_channel,
+use monhop_core::{FloorState, HidUsage, ModifierState, SharedFloor, TakeBackGate};
+use monhop_platform_windows::{
+    MONHOP_INJECTED_MARKER,
+    capture::{
+        CAPTURE_QUEUE_CAPACITY, CaptureEvent, CaptureStop, CapturedEvent, MAX_SUPPRESSION_TTL,
+        StopReason, SuppressionLease, capture_channel,
+    },
+    capture_decode::{DecodedInput, decode_keyboard, decode_mouse},
+    capture_physical::PhysicalCapture,
 };
+
+// Windows SDK `um/winuser.h` values for the hook records below.
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const LLKHF_LOWER_IL_INJECTED: u32 = 0x02;
+const LLKHF_INJECTED: u32 = 0x10;
+const LLMHF_INJECTED: u32 = 0x01;
+const LLMHF_LOWER_IL_INJECTED: u32 = 0x02;
 
 fn motion(value: i32) -> CaptureEvent {
     CaptureEvent::AbsoluteMotion {
@@ -186,6 +200,7 @@ fn route_change_barrier_precedes_tagged_events_for_the_new_route() {
             event: CaptureEvent::RelativeMotion { dx: 3, dy: -2 },
             routing_revision: 1,
             remote: true,
+            floor_generation: 0,
         }),
         Err(StopReason::InvalidInput)
     );
@@ -200,11 +215,13 @@ fn route_change_barrier_precedes_tagged_events_for_the_new_route() {
         },
         routing_revision: 1,
         remote: true,
+        floor_generation: 0,
     };
     let event = CapturedEvent {
         event: CaptureEvent::RelativeMotion { dx: 3, dy: -2 },
         routing_revision: 1,
         remote: true,
+        floor_generation: 0,
     };
 
     assert_eq!(producer.try_push_tagged(barrier), Ok(()));
@@ -232,6 +249,7 @@ fn spsc_ring_preserves_100k_fifo_events_and_metadata_across_wraparound() {
                 },
                 routing_revision: 1,
                 remote: true,
+                floor_generation: 0,
             };
             assert_eq!(producer.try_push_tagged(barrier), Ok(()));
             for value in 0..EVENT_COUNT {
@@ -247,6 +265,7 @@ fn spsc_ring_preserves_100k_fifo_events_and_metadata_across_wraparound() {
                     },
                     routing_revision: 1,
                     remote: true,
+                    floor_generation: 0,
                 };
                 assert_eq!(producer.try_push_tagged(record), Ok(()));
             }
@@ -269,6 +288,7 @@ fn spsc_ring_preserves_100k_fifo_events_and_metadata_across_wraparound() {
                         },
                         routing_revision: 1,
                         remote: true,
+                        floor_generation: 0,
                     }
                 );
             } else {
@@ -282,6 +302,7 @@ fn spsc_ring_preserves_100k_fifo_events_and_metadata_across_wraparound() {
                         },
                         routing_revision: 1,
                         remote: true,
+                        floor_generation: 0,
                     }
                 );
             }
@@ -375,4 +396,84 @@ fn lease_clock_regression_is_terminal_and_release_can_be_followed_by_renewal() {
     );
     assert!(released.is_suppressing(Duration::from_millis(2)));
     assert_eq!(release_stop.reason(), None);
+}
+
+#[test]
+fn injected_events_never_take_back() {
+    let floor = SharedFloor::new();
+    let receiving = floor
+        .transition(floor.snapshot(), FloorState::Receiving)
+        .unwrap();
+    let gate = TakeBackGate::new(floor);
+    gate.open_injection(receiving.generation);
+    let stop = CaptureStop::new();
+    let (mut producer, mut consumer) = capture_channel(stop.clone());
+    let mut capture = PhysicalCapture::new(Duration::ZERO).with_take_back(gate.clone());
+    let mut admit = |decoded| match decoded {
+        DecodedInput::Event(event) => {
+            capture.process(event, false, Duration::ZERO, &mut producer, &stop);
+            true
+        }
+        _ => false,
+    };
+
+    for injected in [
+        decode_keyboard(WM_KEYDOWN, 0x41, 0x1e, LLKHF_INJECTED, 0),
+        decode_keyboard(WM_KEYDOWN, 0x41, 0x1e, LLKHF_LOWER_IL_INJECTED, 0),
+        decode_keyboard(WM_KEYDOWN, 0x41, 0x1e, 0, MONHOP_INJECTED_MARKER),
+        decode_mouse(WM_LBUTTONDOWN, LLMHF_INJECTED, 0, 0, 0, 0),
+        decode_mouse(WM_LBUTTONDOWN, LLMHF_LOWER_IL_INJECTED, 0, 0, 0, 0),
+        decode_mouse(WM_MOUSEWHEEL, 0, MONHOP_INJECTED_MARKER, 120 << 16, 0, 0),
+    ] {
+        assert!(!admit(injected), "injected input never reaches process");
+    }
+    assert_eq!(gate.floor().snapshot(), receiving);
+    assert!(gate.admits_injection());
+    assert_eq!(gate.take_triggered(), None);
+
+    assert!(admit(decode_keyboard(WM_KEYDOWN, 0x41, 0x1e, 0, 0)));
+    assert!(
+        gate.take_triggered().is_some(),
+        "the same key pressed physically takes back"
+    );
+    assert!(matches!(
+        consumer.try_pop(),
+        Ok(Some(CaptureEvent::Key { pressed: true, .. }))
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn session_start_requires_capture_permit() {
+    use monhop_core::{NativeSessionClaim, RevocationSignal};
+    use monhop_platform_windows::native_capture::{NativeCapture, NativeCaptureError};
+
+    let (permit, injection) = NativeSessionClaim::claim()
+        .expect("no other test in this binary claims native input")
+        .split();
+    drop(injection);
+    assert!(
+        NativeSessionClaim::claim().is_none(),
+        "a live capture permit keeps the session claimed"
+    );
+    assert!(matches!(
+        NativeCapture::start_diagnostic(Duration::from_secs(1)),
+        Err(NativeCaptureError::AlreadyActive)
+    ));
+
+    let revocation = RevocationSignal::default();
+    revocation.request_stop();
+    assert!(matches!(
+        NativeCapture::start_for_session(
+            1,
+            revocation,
+            permit,
+            TakeBackGate::new(SharedFloor::new())
+        ),
+        Err(NativeCaptureError::Stopped(StopReason::InvalidInput))
+    ));
+    assert!(
+        !NativeSessionClaim::is_claimed(),
+        "a refused start releases its permit"
+    );
 }

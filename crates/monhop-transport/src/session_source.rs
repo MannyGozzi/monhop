@@ -14,8 +14,9 @@
 use std::{fmt, time::Duration};
 
 use monhop_core::{
-    DeviceId, DisplayId, Edge, EdgeTransition, HidUsage, ModifierState, MouseButton, Platform,
-    Point, PointerOwnership, PointerTarget, Topology, TransitionAcknowledgement,
+    DeviceId, DisplayId, Edge, EdgeTransition, FloorOwner, FloorSnapshot, FloorState, HidUsage,
+    ModifierState, MouseButton, Platform, Point, PointerOwnership, PointerTarget, SharedFloor,
+    Topology, TransitionAcknowledgement,
 };
 use monhop_protocol::{
     Button, Frame, Key, MAX_LOGICAL_ORIGIN_ABS, Message, Motion, RateLimiter, SequenceGate,
@@ -104,6 +105,7 @@ pub struct TaggedInput {
     pub event: NormalizedInput,
     pub routing_revision: u64,
     pub remote: bool,
+    pub floor_generation: u64,
 }
 
 impl fmt::Debug for TaggedInput {
@@ -265,6 +267,18 @@ pub struct MotionTarget {
 
 /// Pure source routing controller.
 pub struct SourceController {
+    floor: SharedFloor,
+    floor_claim: Option<FloorSnapshot>,
+    free_generation: u64,
+    rebase_pointer: bool,
+    /// This computer's own trip ended at a verified cursor, so its release needs no fresh poll.
+    anchored_return: bool,
+    enabled: bool,
+    /// Native capture refuses suppression while input held since its start is down.
+    capture_ready: bool,
+    take_back: bool,
+    declined: Option<(DisplayId, DisplayId, Option<Duration>, Duration)>,
+    peer_offset: Point,
     topology: Topology,
     ownership: PointerOwnership,
     home: PointerTarget,
@@ -328,7 +342,7 @@ enum State {
     AwaitReleaseAcknowledgement {
         local: PointerTarget,
         local_position: Point,
-        ownership_epoch: u64,
+        ownership_epoch: Option<u64>,
     },
     AwaitLocalBarrier {
         local: PointerTarget,
@@ -388,6 +402,16 @@ impl SourceController {
         let ownership =
             PointerOwnership::new(local_machine, home).map_err(|_| SourceConfigError::Ownership)?;
         Ok(Self {
+            floor: SharedFloor::new(),
+            floor_claim: None,
+            free_generation: 1,
+            rebase_pointer: false,
+            anchored_return: false,
+            enabled: true,
+            capture_ready: true,
+            take_back: false,
+            declined: None,
+            peer_offset: Point::default(),
             topology,
             ownership,
             home,
@@ -423,6 +447,71 @@ impl SourceController {
         })
     }
 
+    /// Both directional controllers share the same owner-tagged floor.
+    pub fn with_floor(mut self, floor: SharedFloor, enabled: bool) -> Self {
+        self.free_generation = floor.snapshot().generation;
+        self.floor = floor;
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn floor_generation(&self) -> u64 {
+        self.floor.snapshot().generation
+    }
+
+    pub(crate) fn set_peer_offset(&mut self, offset: Point) {
+        self.peer_offset = offset;
+    }
+
+    /// Input seen during readiness updates only the physical ledger.
+    pub(crate) fn inherit_bookkeeping(&mut self, earlier: &Self) {
+        self.keys = earlier.keys;
+        self.buttons = earlier.buttons;
+        self.capture_ready = earlier.capture_ready;
+    }
+
+    /// Every seam is a wall until native capture can suppress; local tracking continues meanwhile.
+    pub fn set_capture_ready(&mut self, ready: bool) {
+        self.capture_ready = ready;
+    }
+
+    pub(crate) fn bookkeeping(&mut self, record: TaggedInput) -> SourceOutcome {
+        let mut effects = SourceEffects::default();
+        match record.event {
+            NormalizedInput::Key { .. } | NormalizedInput::Button { .. } => {
+                self.apply_local(record.event, &mut effects)
+            }
+            _ => {}
+        }
+        self.outcome(effects)
+    }
+
+    fn local_crossing_allowed(&mut self) -> bool {
+        let floor = self.floor.snapshot();
+        if floor.state != FloorState::Free {
+            return false;
+        }
+        if floor.generation != self.free_generation {
+            self.free_generation = floor.generation;
+            self.rebase_pointer = true;
+        }
+        self.enabled && !self.rebase_pointer
+    }
+
+    fn release_floor(&mut self) {
+        let anchored = std::mem::take(&mut self.anchored_return);
+        if let Some(owned) = self.floor_claim.take() {
+            match self.floor.transition(owned, FloorState::Free) {
+                // No inbound claim came between, so the pointer needs no rebase from a poll.
+                Ok(free) if anchored => self.free_generation = free.generation,
+                Ok(_) => {}
+                Err(_) => {
+                    self.floor.release(FloorOwner::Outbound, owned.generation);
+                }
+            }
+        }
+    }
+
     pub(crate) fn after_startup(
         topology: Topology,
         source: DeviceId,
@@ -442,11 +531,17 @@ impl SourceController {
             control.now,
         )
         .map_err(|_| SourceFailure::Topology)?;
-        controller.outbound_control_sequence = control.next_heartbeat_out;
-        controller.inbound_heartbeats = heartbeat_gate(control.epoch, control.last_heartbeat_in);
-        controller.health = control.health;
-        controller.remote_limiter = control.limiter;
+        controller.finish_startup(control)?;
         Ok(controller)
+    }
+
+    pub(crate) fn finish_startup(&mut self, control: ReadyControl) -> Result<(), SourceFailure> {
+        self.outbound_control_sequence = control.next_heartbeat_out;
+        self.inbound_heartbeats = heartbeat_gate(control.epoch, control.last_heartbeat_in);
+        self.health = control.health;
+        self.remote_limiter = control.limiter;
+        self.last_now = control.now;
+        Ok(())
     }
 
     pub fn mode(&self) -> SourceMode {
@@ -597,6 +692,36 @@ impl SourceController {
         self.outcome(effects)
     }
 
+    /// Native capture refused the activation because it cannot suppress yet: the peer that already
+    /// acknowledged is released and the pointer stays home, as after a decline.
+    pub fn refuse_capture_activation(
+        &mut self,
+        request: RouteRequest,
+        now: Duration,
+    ) -> SourceOutcome {
+        let mut effects = SourceEffects::default();
+        if self.failure.is_some() || !self.observe_time(now, &mut effects) {
+            return self.outcome(effects);
+        }
+        match self.state {
+            State::AwaitRemoteBarrier {
+                target,
+                return_target,
+                return_position,
+                request: expected,
+                ticket: None,
+                ..
+            } if expected == request => {
+                self.capture_ready = false;
+                self.take_back = false;
+                self.declined = Some((return_target.display, target.display, Some(now), now));
+                self.begin_return_to(return_target, return_position, &mut effects);
+            }
+            _ => self.fail(SourceFailure::NativeControl, &mut effects),
+        }
+        self.outcome(effects)
+    }
+
     /// Applies one capture event in native FIFO order.
     pub fn on_captured(&mut self, record: TaggedInput, now: Duration) -> SourceOutcome {
         let mut effects = SourceEffects::default();
@@ -625,6 +750,20 @@ impl SourceController {
         {
             self.fail(SourceFailure::RouteMismatch, &mut effects);
             return self.outcome(effects);
+        }
+        if matches!(
+            record.event,
+            NormalizedInput::AbsoluteMotion(_) | NormalizedInput::RelativeMotion(_)
+        ) {
+            let floor = self.floor.snapshot();
+            let permitted = if self.capture_route.remote {
+                floor.state == FloorState::Sending && record.floor_generation == floor.generation
+            } else {
+                self.local_crossing_allowed() && record.floor_generation == self.free_generation
+            };
+            if !permitted {
+                return self.outcome(effects);
+            }
         }
         if self.capture_route.remote {
             self.apply_remote(record.event, &mut effects);
@@ -687,6 +826,47 @@ impl SourceController {
             }
             _ => {}
         }
+        if matches!(frame.message, Message::TakeBack) {
+            // A take-back may precede an activation acknowledgement in the response epoch.
+            let previous_reanchor = matches!(
+                self.state,
+                State::AwaitActivation {
+                    capture_already_remote: true,
+                    ..
+                }
+            ) && self.inbound_input_epoch == Some(frame.epoch)
+                && frame.epoch < self.input_epoch;
+            let accepted = if previous_reanchor {
+                let fresh = self
+                    .inbound_input_sequence
+                    .is_none_or(|last| frame.sequence > last);
+                if fresh {
+                    self.inbound_input_sequence = Some(frame.sequence);
+                }
+                fresh
+            } else {
+                let opened = self.inbound_input_epoch == Some(frame.epoch)
+                    || (matches!(self.state, State::AwaitActivation { .. })
+                        && frame.epoch == self.input_epoch
+                        && self.activate_input_epoch(frame.epoch));
+                frame.epoch == self.input_epoch
+                    && opened
+                    && self.accept_input_sequence(frame.sequence)
+            };
+            if !accepted && !self.late_take_back(frame.epoch) {
+                self.fail(SourceFailure::InvalidRemoteFrame, &mut effects);
+            } else if accepted
+                && !matches!(
+                    self.state,
+                    State::Local { .. }
+                        | State::AwaitLocalBarrier { .. }
+                        | State::AwaitReleaseAcknowledgement { .. }
+                )
+            {
+                self.take_back = true;
+            }
+            return self.outcome(effects);
+        }
         if self.held_since.is_some() {
             // Anything else while held is from before the barrier and proves nothing.
             return self.outcome(effects);
@@ -700,9 +880,12 @@ impl SourceController {
                 ownership_epoch,
                 capture_already_remote,
             } => {
+                let declined = matches!(frame.message, Message::ActivationDeclined { display_id, .. } if display_id == target.display);
                 let valid = frame.epoch == self.input_epoch
-                    && matches!(frame.message, Message::ActivationAck(display) if display == target.display)
-                    && self.activate_input_epoch(frame.epoch)
+                    && (declined
+                        || matches!(frame.message, Message::ActivationAck(display) if display == target.display))
+                    && (self.inbound_input_epoch == Some(frame.epoch)
+                        || self.activate_input_epoch(frame.epoch))
                     && self.accept_input_sequence(frame.sequence);
                 if !valid {
                     self.fail(
@@ -710,6 +893,54 @@ impl SourceController {
                         &mut effects,
                     );
                     return self.outcome(effects);
+                }
+                if declined {
+                    if !self.recover_ownership_at(return_target) {
+                        self.fail(SourceFailure::Ownership, &mut effects);
+                        return self.outcome(effects);
+                    }
+                    self.remote_target = None;
+                    self.clear_remote_delivery();
+                    self.take_back = false;
+                    self.declined = Some((return_target.display, target.display, Some(now), now));
+                    if capture_already_remote {
+                        if let Some(owned) = self.floor_claim {
+                            match self.floor.transition(owned, FloorState::Returning) {
+                                Ok(returning) => self.floor_claim = Some(returning),
+                                Err(_) => {
+                                    self.fail(SourceFailure::Ownership, &mut effects);
+                                    return self.outcome(effects);
+                                }
+                            }
+                        }
+                        self.push_input(Message::ReleaseAll, &mut effects);
+                        self.state = State::AwaitReleaseAcknowledgement {
+                            local: return_target,
+                            local_position: return_position,
+                            ownership_epoch: None,
+                        };
+                    } else {
+                        self.state = State::Local {
+                            target: return_target,
+                            cursor: Some(return_position),
+                        };
+                        self.anchored_return = true;
+                        self.release_floor();
+                    }
+                    return self.outcome(effects);
+                }
+                if !capture_already_remote {
+                    let Some(owned) = self.floor_claim else {
+                        self.fail(SourceFailure::Ownership, &mut effects);
+                        return self.outcome(effects);
+                    };
+                    match self.floor.transition(owned, FloorState::Sending) {
+                        Ok(sending) => self.floor_claim = Some(sending),
+                        Err(_) => {
+                            self.fail(SourceFailure::Ownership, &mut effects);
+                            return self.outcome(effects);
+                        }
+                    }
                 }
                 if self
                     .ownership
@@ -765,6 +996,20 @@ impl SourceController {
         self.outcome(effects)
     }
 
+    /// Once held or home, a TakeBack the stall delayed past a reanchor is stale, not hostile. It
+    /// is ignored when its epoch is neither older than the last one opened nor one never begun.
+    fn late_take_back(&self, epoch: SessionEpoch) -> bool {
+        (self.held_since.is_some()
+            || matches!(
+                self.state,
+                State::Local { .. } | State::AwaitLocalBarrier { .. }
+            ))
+            && epoch <= self.input_epoch
+            && self
+                .inbound_input_epoch
+                .is_none_or(|opened| epoch >= opened)
+    }
+
     /// Sends `ReleaseAll` and waits for the receiver's post-delivery `ReleaseAck`.
     ///
     /// Native local routing remains disabled until that acknowledgement has been accepted.
@@ -809,6 +1054,15 @@ impl SourceController {
         local_position: Point,
         effects: &mut SourceEffects,
     ) {
+        if let Some(owned) = self.floor_claim {
+            match self.floor.transition(owned, FloorState::Returning) {
+                Ok(returning) => self.floor_claim = Some(returning),
+                Err(_) => {
+                    self.fail(SourceFailure::Ownership, effects);
+                    return;
+                }
+            }
+        }
         let Some(ownership_epoch) = self.begin_ownership_transition(local, effects) else {
             return;
         };
@@ -817,7 +1071,7 @@ impl SourceController {
             self.state = State::AwaitReleaseAcknowledgement {
                 local,
                 local_position,
-                ownership_epoch,
+                ownership_epoch: Some(ownership_epoch),
             };
         }
     }
@@ -1033,6 +1287,8 @@ impl SourceController {
                 ..
             } if !remote && revision == expected => {
                 self.capture_route = CaptureRoute { remote, revision };
+                // The native restore placed the cursor at `position` before this barrier.
+                self.anchored_return = true;
                 self.state = State::Local {
                     target: local,
                     cursor: Some(position),
@@ -1174,6 +1430,18 @@ impl SourceController {
         let State::Local { target, cursor } = self.state else {
             return;
         };
+        if let Some((from, to, _, last)) = self.declined {
+            let pressing = self.topology.display(from).is_ok_and(|display| {
+                self.topology.links().iter().any(|link| {
+                    link.from_display == from
+                        && link.to_display == to
+                        && at_physical_edge(display, current, link.from_edge)
+                })
+            });
+            if !pressing {
+                self.declined = Some((from, to, None, last));
+            }
+        }
         let local_target = match self.local_target_at(current) {
             Ok(target) => target,
             Err(()) => {
@@ -1233,7 +1501,30 @@ impl SourceController {
             return self.outcome(effects);
         }
         if !self.capture_route.remote && matches!(self.state, State::Local { .. }) {
-            self.apply_local_motion(point, &mut effects);
+            let allowed = self.local_crossing_allowed();
+            if self.floor.snapshot().state == FloorState::Free && self.rebase_pointer {
+                // Only a fresh native poll rearms crossings after the inbound half lets go.
+                if let Ok(Some(target)) = self.local_target_at(point) {
+                    if let State::Local { target: old, .. } = self.state {
+                        if old != target {
+                            self.adopt_local_target(target, point, &mut effects);
+                        } else {
+                            self.state = State::Local {
+                                target,
+                                cursor: Some(point),
+                            };
+                        }
+                    }
+                } else if let State::Local { target, .. } = self.state {
+                    self.state = State::Local {
+                        target,
+                        cursor: self.inside_display(target.display, point),
+                    };
+                }
+                self.rebase_pointer = false;
+            } else if allowed {
+                self.apply_local_motion(point, &mut effects);
+            }
         }
         self.outcome(effects)
     }
@@ -1310,14 +1601,39 @@ impl SourceController {
                 return;
             }
         };
-        if self.held_since.is_some() {
-            // The other computer cannot take input while the link is down: the seam is a wall.
+        // The other computer cannot take input while the link is down, and capture that cannot
+        // suppress yet cannot hand input over: either way the seam is a wall.
+        if self.held_since.is_some() || !self.capture_ready {
             self.state = State::Local {
                 target: from,
                 cursor: Some(return_position),
             };
             return;
         }
+        if !self.local_crossing_allowed() {
+            return;
+        }
+        if let Some((from_id, to_id, since, last)) = self.declined
+            && from_id == from.display
+            && to_id == target.display
+        {
+            let retry = monhop_core::capture::DECLINE_RETRY_AFTER;
+            let since = if self.last_now.saturating_sub(last) > retry {
+                self.last_now
+            } else {
+                since.unwrap_or(self.last_now)
+            };
+            self.declined = Some((from_id, to_id, Some(since), self.last_now));
+            if self.last_now.saturating_sub(since) < retry {
+                return;
+            }
+        }
+        let snapshot = self.floor.snapshot();
+        match self.floor.transition(snapshot, FloorState::Requesting) {
+            Ok(requesting) => self.floor_claim = Some(requesting),
+            Err(_) => return,
+        }
+        self.declined = None;
         self.begin_remote_activation(
             target,
             transition.entry_point,
@@ -1688,13 +2004,14 @@ impl SourceController {
             self.fail(SourceFailure::InvalidReleaseAcknowledgement, effects);
             return;
         };
-        if self
-            .ownership
-            .acknowledge_transition(TransitionAcknowledgement {
-                target: local,
-                epoch: ownership_epoch,
-            })
-            .is_err()
+        if let Some(epoch) = ownership_epoch
+            && self
+                .ownership
+                .acknowledge_transition(TransitionAcknowledgement {
+                    target: local,
+                    epoch,
+                })
+                .is_err()
         {
             self.fail(SourceFailure::Ownership, effects);
             return;
@@ -1873,7 +2190,15 @@ impl SourceController {
         Some(RouteRequest(request))
     }
 
-    fn push_input(&mut self, message: Message, effects: &mut SourceEffects) {
+    fn push_input(&mut self, mut message: Message, effects: &mut SourceEffects) {
+        match &mut message {
+            Message::ActivateDisplayAt { position, .. }
+            | Message::Motion(Motion::Absolute(position)) => {
+                position.x -= self.peer_offset.x;
+                position.y -= self.peer_offset.y;
+            }
+            _ => {}
+        }
         let Some(sequence) = advance_counter(&mut self.outbound_input_sequence) else {
             self.fail(SourceFailure::SequenceExhausted, effects);
             return;
@@ -1985,7 +2310,27 @@ impl SourceController {
             .unwrap_or_default()
     }
 
-    fn outcome(&self, effects: SourceEffects) -> SourceOutcome {
+    fn outcome(&mut self, mut effects: SourceEffects) -> SourceOutcome {
+        if self.failure.is_none() {
+            if self.take_back {
+                if let State::Remote {
+                    return_target,
+                    return_position,
+                    ..
+                } = self.state
+                {
+                    self.take_back = false;
+                    self.begin_return_to(return_target, return_position, &mut effects);
+                } else if matches!(self.state, State::Local { .. }) {
+                    self.take_back = false;
+                }
+            }
+            if matches!(self.state, State::Local { .. }) && self.release_acks_pending == 0 {
+                self.release_floor();
+            }
+        }
+        // Motion is untracked while the floor is held, so an anchor is fresh only within its call.
+        self.anchored_return = false;
         SourceOutcome {
             effects,
             failure: self.failure,

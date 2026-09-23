@@ -3,17 +3,17 @@
 
 use std::{io, path::Path};
 
-use monhop_transport::session_setup::{DisplayTopology, InspectedPeer};
+use monhop_transport::session_setup::InspectedPeer;
 use serde::{Deserialize, Serialize};
 
 use crate::sharing::LayoutRequest;
 use crate::sharing_preferences::{
-    DisplaySnapshot, SharingPreferences, fingerprint_key, load_bounded, save_bounded,
+    DisplaySnapshot, SharingPreferences, fingerprint_key, load_versioned, save_bounded,
 };
 
 pub const MAX_ARRANGEMENTS: usize = 32;
 pub const MAX_NAME_CHARS: usize = 64;
-const LIBRARY_VERSION: u8 = 1;
+const LIBRARY_VERSION: u8 = 2;
 const MAX_LIBRARY_BYTES: u64 = 512 * 1024;
 
 #[derive(Deserialize, Serialize)]
@@ -24,7 +24,7 @@ pub struct ArrangementLibrary {
 }
 
 /// An absent file's library, at the current version rather than a derived all-zero default;
-/// `load_bounded` returns this when there is nothing on disk to parse.
+/// `load_versioned` returns this for a missing file or one another version wrote.
 impl Default for ArrangementLibrary {
     fn default() -> Self {
         Self {
@@ -39,8 +39,7 @@ impl Default for ArrangementLibrary {
 pub struct SavedArrangement {
     name: String,
     setup: SharingPreferences,
-    /// Remembered by MonHop at Apply instead of named by the user; absent in earlier files.
-    #[serde(default)]
+    /// Remembered by MonHop at Apply instead of named by the user.
     automatic: bool,
 }
 
@@ -48,8 +47,6 @@ pub struct SavedArrangement {
 #[serde(rename_all = "camelCase")]
 pub struct ArrangementView {
     pub name: String,
-    pub source_side: &'static str,
-    pub mode: String,
     pub crossings: usize,
     /// Present only when it fits the displays both computers show right now.
     pub layout: Option<LayoutRequest>,
@@ -80,23 +77,28 @@ impl LibraryError {
 }
 
 impl ArrangementLibrary {
-    /// An absent file is an empty library; a damaged one is an error rather than a silent reset.
+    /// An absent file, or one another version wrote, is an empty library; a damaged one is an
+    /// error rather than a silent reset.
     pub fn load(path: &Path) -> io::Result<Self> {
-        load_bounded(path, MAX_LIBRARY_BYTES, |library: &Self| {
-            if library.version != LIBRARY_VERSION
-                || library.arrangements.len() > MAX_ARRANGEMENTS
-                || library.arrangements.iter().any(|entry| {
-                    normalize_name(&entry.name).as_deref() != Some(entry.name.as_str())
-                })
-                || library
-                    .arrangements
-                    .iter()
-                    .any(|entry| entry.setup.validate().is_err())
-            {
-                return Err(invalid());
-            }
-            Ok(())
-        })
+        load_versioned(
+            path,
+            MAX_LIBRARY_BYTES,
+            LIBRARY_VERSION,
+            |library: &Self| {
+                if library.arrangements.len() > MAX_ARRANGEMENTS
+                    || library.arrangements.iter().any(|entry| {
+                        normalize_name(&entry.name).as_deref() != Some(entry.name.as_str())
+                    })
+                    || library
+                        .arrangements
+                        .iter()
+                        .any(|entry| entry.setup.validate().is_err())
+                {
+                    return Err(invalid());
+                }
+                Ok(())
+            },
+        )
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -190,21 +192,6 @@ impl ArrangementLibrary {
             .map(|entry| &entry.setup)
     }
 
-    /// The most recently remembered entry for the same pair made with this computer's displays
-    /// as they are now, its local ids rewritten to theirs; the other computer's displays are
-    /// checked when the session connects.
-    pub fn automatic_for_local(
-        &self,
-        pair: &SharingPreferences,
-        current: &DisplayTopology,
-    ) -> Option<SharingPreferences> {
-        self.arrangements
-            .iter()
-            .rev()
-            .filter(|entry| entry.automatic && entry.setup.same_pair_as(pair))
-            .find_map(|entry| entry.setup.remap_to_local_displays(current))
-    }
-
     fn kept_for_pair(&self, setup: &SharingPreferences) -> usize {
         self.arrangements
             .iter()
@@ -283,14 +270,6 @@ impl ArrangementLibrary {
                     .map(|fitted| fitted.layout().clone());
                 ArrangementView {
                     name: entry.name.clone(),
-                    source_side: entry.setup.source_side(),
-                    mode: entry
-                        .setup
-                        .layout()
-                        .arrangement
-                        .as_ref()
-                        .map_or("grouped", |arrangement| arrangement.mode.as_str())
-                        .to_owned(),
                     crossings: entry.setup.layout().links.len() / 2,
                     fits: fitted.is_some(),
                     layout: fitted,
@@ -468,8 +447,7 @@ mod tests {
         // The exact names the window reads, so a change here is a change the window sees.
         let json = serde_json::to_value(&listed[0]).unwrap();
         assert_eq!(json["name"], "Desk");
-        assert_eq!(json["sourceSide"], "peer");
-        assert_eq!(json["mode"], "grouped");
+        assert_eq!(json.as_object().unwrap().len(), 5);
         assert_eq!(json["crossings"], 1);
         assert_eq!(json["automatic"], false);
         assert_eq!(json["fits"], false);
@@ -497,17 +475,6 @@ mod tests {
             Err(LibraryError::Unknown)
         );
         assert_eq!(library.views_for(&peer_key('C'), None).len(), 1);
-    }
-
-    #[test]
-    fn a_saved_layout_fits_whichever_side_holds_the_input_now() {
-        let mut library = ArrangementLibrary::default();
-        library.upsert("Desk", preferences()).unwrap();
-        let mut switched = inspection(&preferences());
-        switched.source = switched.local_device;
-        let listed = library.views(&switched);
-        assert_eq!(listed[0].source_side, "peer");
-        assert_eq!(listed[0].layout.as_ref(), Some(preferences().layout()));
     }
 
     #[test]
@@ -625,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remembered_arrangement_is_found_by_the_connected_or_the_local_displays() {
+    fn a_remembered_arrangement_is_found_by_the_connected_displays() {
         let mut library = ArrangementLibrary::default();
         library.upsert("Desk", preferences()).unwrap();
         let pair = inspection(&preferences());
@@ -637,14 +604,9 @@ mod tests {
         library.remember_automatically(other.clone()).unwrap();
         // The entry that fits is chosen, not simply the newest.
         assert_eq!(library.automatic_fit(&pair), Some(preferences()));
-        let changed = inspection(&other);
-        assert_eq!(library.automatic_fit(&changed), Some(other.clone()));
+        assert_eq!(library.automatic_fit(&inspection(&other)), Some(other));
         assert_eq!(
-            library.automatic_for_local(&preferences(), &changed.local_displays),
-            Some(other)
-        );
-        assert_eq!(
-            library.automatic_for_local(&preferences_for_peer('C'), &changed.local_displays),
+            library.automatic_fit(&inspection(&preferences_for_peer('C'))),
             None
         );
     }
@@ -664,12 +626,6 @@ mod tests {
         assert!(fitted.fits_displays(&live));
         assert_eq!(fitted.layout().links[0].to_display, "7");
         assert_eq!(library.automatic_for_same_displays(&live), Some(&record));
-        assert_eq!(
-            library
-                .automatic_for_local(&record, &live.local_displays)
-                .map(|entry| entry.layout().clone()),
-            Some(fitted.layout().clone())
-        );
         // Remembering the refreshed record replaces the memory instead of adding one.
         assert_eq!(library.remember_automatically(fitted.clone()), Ok(true));
         assert_eq!(library.arrangements.len(), 1);
@@ -705,17 +661,23 @@ mod tests {
     }
 
     #[test]
-    fn a_library_written_before_remembering_loads_as_named_arrangements() {
+    fn v014_arrangement_library_loads_as_empty() {
         let directory = directory();
         let path = directory.join("arrangements.json");
-        let mut library = ArrangementLibrary::default();
-        library.remember_automatically(preferences()).unwrap();
-        let written = serde_json::to_string(&library).unwrap();
-        assert!(written.contains("\"automatic\":true"));
-        std::fs::write(&path, written.replace(",\"automatic\":true", "")).unwrap();
+        let v014 = br#"{"version":1,"arrangements":[{"name":"Desk","automatic":true,"setup":{"version":1,"peerFingerprint":"BB","sourceDisplay":"2","sourcePlatform":"windows","sharingEnabled":true,"layout":{"links":[],"sourceDisplay":"2","arrangement":{"mode":"grouped","positions":{},"hidden":[]}}}}]}"#;
+        std::fs::write(&path, v014).unwrap();
         let loaded = ArrangementLibrary::load(&path).unwrap();
-        assert_eq!(loaded.arrangements.len(), 1);
-        assert!(!loaded.arrangements[0].automatic);
+        assert!(loaded.arrangements.is_empty());
+        assert_eq!(loaded.version, LIBRARY_VERSION);
+        // Loading never rewrites the old file; the next save replaces it at the current version.
+        assert_eq!(std::fs::read(&path).unwrap(), v014);
+        let mut library = loaded;
+        library.remember_automatically(preferences()).unwrap();
+        library.save(&path).unwrap();
+        assert_eq!(
+            ArrangementLibrary::load(&path).unwrap().arrangements.len(),
+            1
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -737,7 +699,9 @@ mod tests {
         let path = directory.join("arrangements.json");
         std::fs::write(&path, b"{corrupt").unwrap();
         assert!(ArrangementLibrary::load(&path).is_err());
-        std::fs::write(&path, br#"{"version":2,"arrangements":[]}"#).unwrap();
+        std::fs::write(&path, br#"{"version":2,"arrangements":{}}"#).unwrap();
+        assert!(ArrangementLibrary::load(&path).is_err());
+        std::fs::write(&path, br#"{"arrangements":[]}"#).unwrap();
         assert!(ArrangementLibrary::load(&path).is_err());
         let _ = std::fs::remove_dir_all(directory);
     }

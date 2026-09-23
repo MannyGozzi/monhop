@@ -47,11 +47,9 @@ import {
   resetArrangement as resetSharingArrangement,
   sameSharingView,
   setArrangement,
-  setArrangementMode,
   setArrangements,
   setDisplayInUse,
   setMonitorSide,
-  setSource,
   settlePending,
   shouldPollSharing,
 } from "./sharing-model.mjs";
@@ -120,6 +118,7 @@ const THEME_LABELS = {
 };
 const THEME_ICONS = { system: "monitor", light: "sun", dark: "moon" };
 const PAGE_TITLES = { home: "Home", setup: "Set up", settings: "Settings" };
+const PAGE_ENTER_CLEANUP_MS = 320;
 const PAIRING_POLL_MS = 500;
 const SECTION_PIN_MS = 2500;
 const LIST_UNREADABLE = "The computer list was not recognized.";
@@ -182,6 +181,10 @@ let arrangementView = null;
 let arrangementsRevision = null;
 let arrangementsRetry = { at: 0, delay: 0 };
 let pendingSection = null;
+let pageTransition = null;
+// Session-only choice: a completed setup returns to the last step the user opened.
+let setupExpandedSection = null;
+let setupExpansionChosen = false;
 
 const nodes = {
   sections: [...document.querySelectorAll("[data-section]")],
@@ -225,6 +228,25 @@ for (const button of nodes.windowControls.querySelectorAll("[data-window-action]
 }
 nodes.windowControls.hidden = platform !== "windows";
 accordionManager.mount();
+
+for (const section of nodes.sections) {
+  const toggle = section.querySelector(".section-toggle");
+  const body = section.querySelector(".section-body");
+  toggle.addEventListener("click", () => {
+    if (section.dataset.locked === "true" || section.dataset.done !== "true") return;
+    setupExpansionChosen = true;
+    setupExpandedSection = section.dataset.collapsed === "true" ? section.dataset.section : null;
+    render();
+  });
+  body.addEventListener("animationend", (event) => {
+    if (event.target !== body) return;
+    if (event.animationName === "section-close" && body.dataset.closing === "true") {
+      body.hidden = true;
+      delete body.dataset.closing;
+    }
+    if (event.animationName === "section-open") delete body.dataset.opening;
+  });
+}
 
 for (const event of ["wheel", "touchstart", "pointerdown"])
   document.querySelector(".content-region").addEventListener(
@@ -272,42 +294,62 @@ function onReturn() {
 
 // ---------- navigation ----------
 
-// Page changes cross-fade through a view transition; status polls re-render in place.
-// The state change runs inside the transition so its first capture still shows the outgoing screen.
-function navigate(update, after) {
-  pendingSection = null;
-  const paint = () => {
-    update();
-    render();
-    document.querySelector(".content-region").scrollTop = 0;
+function goToPage(nextPage, after) {
+  if (!["home", "setup", "settings"].includes(nextPage)) return;
+  const entered = page !== nextPage;
+  landed = true;
+  if (!entered) {
     after?.();
+    return;
+  }
+  pendingSection = null;
+  const commit = () => {
+    page = nextPage;
+    renderPageVisibility();
+    document.querySelector(".content-region").scrollTop = 0;
+  };
+  const finish = () => {
+    after?.();
+    onPageEntered(nextPage);
+    render();
   };
   const animate =
     !uiCheck &&
     !reducedMotion.matches &&
     document.visibilityState === "visible" &&
     typeof document.startViewTransition === "function";
-  if (animate) document.startViewTransition(paint).ready.catch(() => {});
-  else paint();
+  if (!animate) {
+    document.documentElement.dataset.pageEnter = "true";
+    commit();
+    window.requestAnimationFrame(() => {
+      finish();
+      window.setTimeout(
+        () => delete document.documentElement.dataset.pageEnter,
+        PAGE_ENTER_CLEANUP_MS,
+      );
+    });
+    return;
+  }
+  pageTransition?.skipTransition();
+  const transition = document.startViewTransition(commit);
+  pageTransition = transition;
+  void transition.finished.catch(() => {}).finally(() => {
+    if (pageTransition !== transition) return;
+    pageTransition = null;
+    finish();
+  });
 }
 
-function goToPage(nextPage, after) {
-  if (!["home", "setup", "settings"].includes(nextPage)) return;
-  const entered = page !== nextPage;
-  landed = true;
-  navigate(() => {
-    page = nextPage;
-    if (!entered) return;
-    if (nextPage === "setup") onEnterSetup();
-    else if (nextPage === "settings") {
-      void loadUpdatesStatus();
-      void loadAutostartStatus();
-    } else {
-      leavePairing();
-      if (isEditingLayout(sharing)) void endLayoutEdit();
-      void loadComputers();
-    }
-  }, after);
+function onPageEntered(nextPage) {
+  if (nextPage === "setup") onEnterSetup();
+  else if (nextPage === "settings") {
+    void loadUpdatesStatus();
+    void loadAutostartStatus();
+  } else {
+    leavePairing();
+    if (isEditingLayout(sharing)) void endLayoutEdit();
+    void loadComputers();
+  }
 }
 
 // The gear is a toggle: pressing it again from Settings returns to wherever it was opened from.
@@ -420,6 +462,7 @@ function context() {
     sharingView: sharing.view,
     active,
     nativeAvailable: state.nativeAvailable,
+    localName: platformLabel(platform, true),
   });
   return {
     core: Boolean(core?.invoke),
@@ -500,10 +543,9 @@ function context() {
       endLayoutEdit,
       changeLayout,
       dismissDisplayNotice,
-      chooseSource,
+      setControl,
       applySetup,
       commitArrangement,
-      chooseArrangementMode,
       showMonitorOn,
       useDisplay,
       resetArrangement,
@@ -541,7 +583,7 @@ function render() {
   arrangementView = null;
   const ctx = context();
   nodes.nativeState.dataset.checkState = nativeCheckState(state);
-  setLabel(nodes.nativeState, ctx.status.label, nodes.headerConnection);
+  setLabel(nodes.nativeState, ctx.status.label);
   nodes.headerConnection.dataset.tone = ctx.status.tone;
   renderPageChrome(ctx);
   renderPageAlert(ctx);
@@ -551,7 +593,7 @@ function render() {
   renderDisplays(nodes, ctx);
   renderHome(nodes, ctx);
   renderSettings(nodes, ctx);
-  accordionManager.disposeDetached();
+  applySharedTransitionNames();
   restoreInteraction(interaction);
   pinPendingSection();
   if (previousArrangementView && previousArrangementView !== arrangementView)
@@ -560,12 +602,7 @@ function render() {
 }
 
 function renderPageChrome(ctx) {
-  nodes.pageTitle.textContent = `MonHop · ${PAGE_TITLES[page]}`;
-  nodes.homeView.hidden = page !== "home";
-  nodes.setupView.hidden = page !== "setup";
-  nodes.settingsView.hidden = page !== "settings";
-  for (const button of nodes.pageLinks)
-    button.setAttribute("aria-current", button.dataset.page === page ? "page" : "false");
+  renderPageVisibility();
   clear(nodes.headerActions);
   // Home's only page-level action lives in the window header, beside the connection status.
   if (page === "home")
@@ -617,20 +654,56 @@ function renderPageChrome(ctx) {
     );
 }
 
+// The transition callback only flips page visibility and the named tab marker. Full page work
+// resumes after the compositor has captured both pages.
+function renderPageVisibility() {
+  nodes.pageTitle.textContent = `MonHop · ${PAGE_TITLES[page]}`;
+  nodes.homeView.hidden = page !== "home";
+  nodes.setupView.hidden = page !== "setup";
+  nodes.settingsView.hidden = page !== "settings";
+  for (const button of nodes.pageLinks) {
+    button.setAttribute("aria-current", button.dataset.page === page ? "page" : "false");
+    const indicator = button.querySelector(".nav-active-indicator");
+    if (indicator)
+      indicator.style.viewTransitionName = button.dataset.page === page ? "nav-active-tab" : "none";
+  }
+  applySharedTransitionNames();
+}
+
+function applySharedTransitionNames() {
+  for (const node of document.querySelectorAll("[data-shared-transition]")) {
+    const pageNode = node.closest(".app-page");
+    node.style.viewTransitionName = pageNode && !pageNode.hidden ? node.dataset.sharedTransition : "none";
+  }
+}
+
 // A locked section is washed out, inert, and says in its own header what is still missing.
 function renderSections(ctx) {
   const lines = {
     ready: readyLine(ctx.gates.ready.done),
     computers: ctx.gates.computers.locked ? ctx.gates.computers.reason : computersLine(ctx),
-    displays: ctx.gates.displays.locked ? ctx.gates.displays.reason : ctx.status.label,
+    displays: displaysLine(ctx),
   };
+  const expanded = setupExpansionChosen ? setupExpandedSection : defaultSetupSection(ctx.gates);
   for (const section of nodes.sections) {
     const key = section.dataset.section;
     const gate = ctx.gates[key];
     section.dataset.locked = String(gate.locked);
     section.dataset.done = String(gate.done);
     const body = section.querySelector(".section-body");
-    body.inert = gate.locked;
+    const collapsed = !gate.locked && gate.done && key !== expanded;
+    const wasCollapsed = section.dataset.collapsed === "true";
+    const wasPresented = section.dataset.presented === "true";
+    section.dataset.collapsed = String(collapsed);
+    section.dataset.presented = "true";
+    updateSectionBody(section, body, { collapsed, locked: gate.locked, wasCollapsed, wasPresented });
+    const toggle = section.querySelector(".section-toggle");
+    const chevron = section.querySelector(".section-chevron");
+    toggle.hidden = gate.locked || !gate.done;
+    chevron.hidden = toggle.hidden;
+    toggle.disabled = gate.locked || !gate.done;
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.setAttribute("aria-label", `${collapsed ? "Expand" : "Collapse"} ${gate.title}`);
     const marker = section.querySelector(".section-index");
     const mark = gate.done ? "check" : String(gate.index + 1);
     if (marker.dataset.mark !== mark) {
@@ -659,11 +732,42 @@ function computersLine({ computers: list, activeComputer }) {
     : `${count} · none in use`;
 }
 
+function displaysLine({ gates, activeComputer }) {
+  if (gates.displays.locked) return gates.displays.reason;
+  return activeComputer?.setup?.saved === true
+    ? "Layout saved on both computers"
+    : "Not arranged yet";
+}
+
+function defaultSetupSection(gates) {
+  for (const key of ["ready", "computers", "displays"])
+    if (!gates[key].locked && !gates[key].done) return key;
+  return "displays";
+}
+
+// Body visibility changes after its opacity/transform exit, never through an animated layout size.
+function updateSectionBody(section, body, { collapsed, locked, wasCollapsed, wasPresented }) {
+  if (collapsed) {
+    body.inert = true;
+    delete body.dataset.opening;
+    if (body.hidden || body.dataset.closing === "true") return;
+    if (!wasPresented || reducedMotion.matches) body.hidden = true;
+    else body.dataset.closing = "true";
+    return;
+  }
+  delete body.dataset.closing;
+  body.hidden = false;
+  body.inert = locked;
+  if ((wasCollapsed || !wasPresented) && !locked && !reducedMotion.matches)
+    body.dataset.opening = "true";
+  else delete body.dataset.opening;
+}
+
 function renderPageAlert(ctx) {
   const stateMessages = errorMessages(state);
   const messages = [...stateMessages];
   const pairingOnScreen = page === "setup" && ctx.showPairing;
-  const displaysOnScreen = page === "setup" && isConnected(sharing) && Boolean(sharing.source);
+  const displaysOnScreen = page === "setup" && isConnected(sharing);
   if (pairing.view?.phase === "error" && pairing.view.message && !pairingOnScreen)
     messages.push(pairing.view.message);
   if (pairing.message && !pairingOnScreen) messages.push(pairing.message);
@@ -1195,28 +1299,22 @@ async function dismissDisplayNotice() {
   await runSharing("dismiss-notice", () => core.invoke("sharing_dismiss_display_notice"));
 }
 
-async function chooseSource(side) {
-  if (controlsBusy() || !isConnected(sharing) || side === sharing.source || !core?.invoke) return;
-  sharing = setSource(sharing, side);
-  await runSharing("source", () =>
-    core.invoke("sharing_select_source", { revision: sharing.view.revision, source: side }),
+// Either direction can be turned off independently; the backend refuses turning off the last one.
+async function setControl(fingerprint, direction, allowed) {
+  if (!core?.invoke) return;
+  await runSharing("control", () =>
+    core.invoke("sharing_set_control", { fingerprint, direction, allowed }),
   );
 }
 
 async function applySetup() {
   const layout = layoutForSave(sharing);
   if (!core?.invoke || !layout || !canApplySetup(sharing)) return;
-  await runSharing("apply", () =>
-    core.invoke("sharing_apply_setup", {
-      revision: sharing.view.revision,
-      source: sharing.source,
-      layout,
-    }),
-  );
+  await runSharing("apply", () => core.invoke("sharing_apply_setup", { revision: sharing.view.revision, layout }));
   await loadComputers();
 }
 
-// A connected link with an input computer always has a draft to edit, so every view settles into one.
+// A connected link always has a draft to edit, so every view settles into one.
 // A new drop invalidates whatever copy feedback the previous one left behind.
 function applySharing(current, view) {
   if (current.view?.lastFailure !== view?.lastFailure) {
@@ -1449,13 +1547,6 @@ function commitArrangement(placement, moving) {
   render();
 }
 
-function chooseArrangementMode(mode) {
-  if (controlsBusy() || !isConnected(sharing)) return;
-  sharing = setArrangementMode(sharing, mode);
-  touchSetupLink();
-  render();
-}
-
 function showMonitorOn(monitor, side) {
   if (controlsBusy() || !isConnected(sharing)) return;
   sharing = setMonitorSide(sharing, monitor, side);
@@ -1592,12 +1683,8 @@ async function runArrangementCommand(command, payload) {
   render();
 }
 
-// An arrangement saved with the other computer as input switches the input side first, then loads.
-async function loadSavedArrangement(name) {
-  const entry = arrangementByName(sharing, name);
-  if (!entry || controlsBusy() || !canLoadArrangement(sharing, name)) return;
-  if (entry.sourceSide !== sharing.source) await chooseSource(entry.sourceSide);
-  if (!isConnected(sharing) || sharing.source !== entry.sourceSide) return;
+function loadSavedArrangement(name) {
+  if (controlsBusy() || !canLoadArrangement(sharing, name)) return;
   sharing = loadArrangement(sharing, name);
   touchSetupLink();
   render();
@@ -1674,7 +1761,7 @@ function applyArrangementList(fingerprint, list) {
 
 // Loading from a card is gated and run against that card's own list, so an enabled button always
 // does something: it opens the Displays editor and puts the layout into the draft there.
-async function loadComputerArrangement(fingerprint, name) {
+function loadComputerArrangement(fingerprint, name) {
   const store = computerArrangements(computerArrangementsStore, fingerprint);
   const entry = store.items.find((item) => item.name === name) ?? null;
   const gate = loadGate({
@@ -1688,15 +1775,6 @@ async function loadComputerArrangement(fingerprint, name) {
     return;
   }
   goToPage("setup", () => scrollToSection("displays"));
-  if (entry.sourceSide !== sharing.source) await chooseSource(entry.sourceSide);
-  if (!isConnected(sharing) || sharing.source !== entry.sourceSide) {
-    sharing = {
-      ...sharing,
-      message: "Choose the input computer this layout was saved with, then load it again.",
-    };
-    render();
-    return;
-  }
   // The listed fit can be older than the displays; the draft decides, and says so when it cannot.
   sharing = loadArrangementLayout(sharing, entry.layout);
   touchSetupLink();

@@ -24,9 +24,6 @@ mod snapshot;
 #[cfg(windows)]
 mod timer_resolution;
 mod tray;
-mod trial;
-#[cfg(target_os = "macos")]
-mod trial_dispatch;
 mod ui_smoke;
 mod updates;
 
@@ -191,12 +188,11 @@ async fn sharing_set_active(
 async fn sharing_apply_setup(
     app: tauri::AppHandle,
     revision: String,
-    source: String,
     layout: LayoutRequest,
 ) -> Result<SharingView, String> {
     let controller = app.state::<Arc<AppController>>().inner().clone();
     spawn_blocking_command(
-        move || controller.apply_setup(revision, source, layout),
+        move || controller.apply_setup(revision, layout),
         "Applying the layout did not finish. Nothing changed.",
     )
     .await?
@@ -207,68 +203,18 @@ fn sharing_touch(controller: tauri::State<'_, Arc<AppController>>) {
     controller.sharing.touch();
 }
 
+/// `direction` is "localToPeer" or "peerToLocal", seen from this computer.
 #[tauri::command]
-fn sharing_select_source(
-    controller: tauri::State<'_, Arc<AppController>>,
-    revision: String,
-    source: String,
-) -> Result<SharingView, String> {
-    controller.select_source(&revision, &source)
-}
-
-#[tauri::command]
-async fn sharing_trial_open(
+async fn sharing_set_control(
     app: tauri::AppHandle,
-    revision: String,
-    layout: LayoutRequest,
-    peer_name: String,
-) -> Result<(), String> {
-    let main_app = app.clone();
-    run_on_main_thread_for_result(
-        &app,
-        move || trial::open(&main_app, revision, layout, peer_name),
-        "The test window could not open.",
-        "The test window did not finish opening.",
-    )
-    .await?
-}
-#[tauri::command]
-async fn trial_start(window: tauri::WebviewWindow) -> Result<trial::TrialView, String> {
-    trial::start(window).await
-}
-#[tauri::command]
-fn trial_status(window: tauri::WebviewWindow) -> Result<trial::TrialView, String> {
-    trial::require_window(&window)?;
-    let controller = window.state::<Arc<AppController>>();
-    Ok(controller.trial.view(&controller.sharing))
-}
-#[tauri::command]
-fn trial_stop(window: tauri::WebviewWindow) -> Result<trial::TrialView, String> {
-    trial::stop(&window)
-}
-#[tauri::command]
-fn trial_close(window: tauri::WebviewWindow) -> Result<(), String> {
-    trial::require_window(&window)?;
-    trial::close(window.app_handle());
-    Ok(())
-}
-#[tauri::command]
-fn trial_last_result(app: tauri::AppHandle) -> Option<trial::LastTrialView> {
-    app.state::<Arc<AppController>>().trial.last_result()
-}
-#[tauri::command]
-async fn trial_copy_last_result(app: tauri::AppHandle) -> Result<(), String> {
-    let report = app
-        .state::<Arc<AppController>>()
-        .trial
-        .last_result()
-        .ok_or("No test result to copy yet.")?
-        .report();
-    run_on_main_thread_for_result(
-        &app,
-        move || public_code_copy::write(report),
-        "Could not copy the result. Try again.",
-        "Copy did not finish. Try again.",
+    fingerprint: String,
+    direction: String,
+    allowed: bool,
+) -> Result<SharingView, String> {
+    let controller = app.state::<Arc<AppController>>().inner().clone();
+    spawn_blocking_command(
+        move || controller.set_control(&fingerprint, &direction, allowed),
+        "The switch did not change. Try again.",
     )
     .await?
 }
@@ -707,7 +653,7 @@ fn main() {
             sharing_set_active,
             sharing_apply_setup,
             sharing_touch,
-            sharing_select_source,
+            sharing_set_control,
             sharing_status,
             sharing_save_setup,
             sharing_arrangements,
@@ -723,13 +669,6 @@ fn main() {
             dimming::dimming_toggle,
             appearance::appearance_status,
             appearance::appearance_set_theme,
-            sharing_trial_open,
-            trial_start,
-            trial_status,
-            trial_stop,
-            trial_close,
-            trial_last_result,
-            trial_copy_last_result,
             window_hide,
             computers_load,
             computers_rename,
@@ -878,35 +817,6 @@ fn main() {
 
 fn on_app_event(handle: &tauri::AppHandle, event: tauri::RunEvent) {
     match event {
-        tauri::RunEvent::WindowEvent {
-            label,
-            event: tauri::WindowEvent::CloseRequested { api, .. },
-            ..
-        } if label == trial::WINDOW_LABEL => {
-            api.prevent_close();
-            trial::close(handle);
-        }
-        tauri::RunEvent::WindowEvent {
-            label,
-            event: tauri::WindowEvent::Focused(false) | tauri::WindowEvent::Destroyed,
-            ..
-        } if label == trial::WINDOW_LABEL => {
-            trial::focus_lost_or_destroyed(handle);
-        }
-        tauri::RunEvent::WindowEvent {
-            label,
-            event: tauri::WindowEvent::Moved(position),
-            ..
-        } if label == trial::WINDOW_LABEL => {
-            trial::moved(handle, position);
-        }
-        tauri::RunEvent::WindowEvent {
-            label,
-            event: tauri::WindowEvent::Resized(size),
-            ..
-        } if label == trial::WINDOW_LABEL => {
-            trial::resized(handle, size);
-        }
         tauri::RunEvent::WindowEvent {
             event: tauri::WindowEvent::CloseRequested { api, .. },
             ..
@@ -1059,7 +969,7 @@ mod tests {
                 "allow-sharing-set-active",
                 "allow-sharing-apply-setup",
                 "allow-sharing-touch",
-                "allow-sharing-select-source",
+                "allow-sharing-set-control",
                 "allow-sharing-status",
                 "allow-sharing-save-setup",
                 "allow-sharing-arrangements",
@@ -1083,7 +993,6 @@ mod tests {
                 "core:window:allow-is-maximized",
                 "core:event:allow-listen",
                 "core:event:allow-unlisten",
-                "allow-sharing-trial-open",
                 "allow-window-hide",
                 "allow-computers-load",
                 "allow-computers-rename",
@@ -1102,32 +1011,11 @@ mod tests {
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         assert_eq!(
             config["app"]["security"]["capabilities"],
-            serde_json::json!(["setup", "trial"])
+            serde_json::json!(["setup"])
         );
         assert_eq!(
             config["bundle"]["windows"]["webviewInstallMode"]["type"],
             "skip"
-        );
-    }
-
-    #[test]
-    fn test_window_cannot_call_setup_or_general_input_commands() {
-        let capability: serde_json::Value =
-            serde_json::from_str(include_str!("../capabilities/trial.json")).unwrap();
-        assert_eq!(
-            capability["windows"],
-            serde_json::json!(["controlled-trial"])
-        );
-        assert_eq!(capability["local"], true);
-        assert!(capability.get("remote").is_none());
-        assert_eq!(
-            capability["permissions"],
-            serde_json::json!([
-                "allow-trial-start",
-                "allow-trial-status",
-                "allow-trial-stop",
-                "allow-trial-close"
-            ])
         );
     }
 

@@ -7,9 +7,10 @@ use monhop_platform_macos::{
     capture_decode::{
         ActiveDisplayBounds, CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
         CG_EVENT_LEFT_MOUSE_DOWN, CG_EVENT_MOUSE_MOVED, CG_EVENT_OTHER_MOUSE_DOWN,
-        CG_EVENT_SOURCE_STATE_HID_SYSTEM, DecodedInput, EventSourceMetadata, LocalModifierState,
-        PointerFields, QUARTZ_POINTS_PER_DISCRETE_SCROLL_LINE, decode_keyboard, decode_pointer,
-        decode_scroll, should_keep_quarantine_tap,
+        CG_EVENT_SOURCE_STATE_HID_SYSTEM, DecodedInput, EventSourceMetadata, HidKeyState,
+        LocalModifierState, PhysicalModifierLedger, PointerFields,
+        QUARTZ_POINTS_PER_DISCRETE_SCROLL_LINE, decode_keyboard, decode_pointer, decode_scroll,
+        should_keep_quarantine_tap,
     },
 };
 
@@ -39,10 +40,12 @@ fn rect(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
 #[test]
 fn keyboard_decode_keeps_side_specific_hid_and_defers_repeat_and_modifiers_to_ledger() {
     let source = physical_source();
+    let mut modifiers = PhysicalModifierLedger::default();
     match decode_keyboard(
         CG_EVENT_KEY_DOWN,
         0x3b,
-        false,
+        &mut modifiers,
+        HidKeyState::default(),
         source,
         SYNTHETIC_EVENT_MARKER,
     ) {
@@ -59,10 +62,15 @@ fn keyboard_decode_keeps_side_specific_hid_and_defers_repeat_and_modifiers_to_le
         }
         _ => panic!("expected left-control key press"),
     }
+    modifiers.seed_held(HidUsage(0xe4));
     match decode_keyboard(
         CG_EVENT_FLAGS_CHANGED,
         0x3e,
-        false,
+        &mut modifiers,
+        HidKeyState {
+            down: true,
+            injection_held: true,
+        },
         source,
         SYNTHETIC_EVENT_MARKER,
     ) {
@@ -76,7 +84,8 @@ fn keyboard_decode_keeps_side_specific_hid_and_defers_repeat_and_modifiers_to_le
         decode_keyboard(
             CG_EVENT_KEY_UP,
             0xffff,
-            false,
+            &mut modifiers,
+            HidKeyState::default(),
             source,
             SYNTHETIC_EVENT_MARKER,
         ),
@@ -91,7 +100,8 @@ fn marked_or_non_hid_events_never_reach_the_physical_ledger() {
         decode_keyboard(
             CG_EVENT_KEY_DOWN,
             0,
-            false,
+            &mut PhysicalModifierLedger::default(),
+            HidKeyState::default(),
             EventSourceMetadata {
                 user_data: SYNTHETIC_EVENT_MARKER,
                 ..source
@@ -264,6 +274,6 @@ fn pointer_buttons_and_scroll_preserve_fractions_in_logical_points() {
     }
     assert!(matches!(
         decode_scroll(f64::NAN, 0.0, true, source, SYNTHETIC_EVENT_MARKER),
-        DecodedInput::Unsupported
+        DecodedInput::Malformed
     ));
 }

@@ -501,6 +501,7 @@ mod windows {
                 Self::Stop(StopReason::InvalidInput) => "invalid_input",
                 Self::Stop(StopReason::EmergencyEscape) => "emergency_escape",
                 Self::Stop(StopReason::NativeFailure) => "native_failure",
+                Self::Stop(StopReason::DisplaysChanged) => "displays_changed",
                 Self::Cleanup => "cleanup",
                 Self::WorkerPanicked => "worker_panicked",
             }

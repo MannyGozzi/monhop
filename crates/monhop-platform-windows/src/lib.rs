@@ -23,7 +23,6 @@ pub mod network_watch;
 #[cfg(any(windows, test))]
 mod power_watch;
 pub mod threads;
-pub mod trial_window;
 #[cfg(any(windows, test))]
 pub mod udp_receive;
 

@@ -71,9 +71,7 @@ const RENDER_CHECK: &str = r#"(() => {
       && inViewport(button) && button.disabled === false,
     locked.length === 2
       && locked.every(section => section.dataset.locked === 'true'
-        && section.querySelector('.section-body').inert)
-      && document.querySelector('#sharing-source-platform') === null
-      && !document.querySelector('#sharing-open-trial:not(:disabled)'),
+        && section.querySelector('.section-body').inert),
     (theme === undefined ? scheme === 'light dark' : scheme === theme)
       && color?.length === 3 && background?.length === 3
       && (dark ? background.every(value => value < 64) && color.every(value => value > 190)
@@ -207,9 +205,7 @@ const ACCORDION_CHECK: &str = r#"(() => {
     trigger.click(); await settle();
     flags.push(panel.hidden && panel.inert
       && document.querySelector('#native-state').dataset.checkState === 'unchecked'
-      && [...document.querySelectorAll('.setup-section[data-locked="true"]')].length === 2
-      && document.querySelector('#sharing-source-platform') === null
-      && !document.querySelector('#sharing-open-trial:not(:disabled)'));
+      && [...document.querySelectorAll('.setup-section[data-locked="true"]')].length === 2);
     window.__MONHOP_ACCORDION_CHECK__ = flags.map(v => v ? '1' : '0').join('');
   })().catch(() => { window.__MONHOP_ACCORDION_CHECK__ = '000000000'; });
   return 'started';
@@ -332,9 +328,7 @@ fn poll_readonly_status(window: WebviewWindow) {
         return logCheck === 'passed'
             && document.querySelector('#native-state').dataset.checkState === 'checked'
             && document.querySelector('#permissions-content').innerText.length > 30
-            && document.querySelector('#interface-content').innerText.length > 30
-            && document.querySelector('#sharing-source-platform') === null
-            && !document.querySelector('#sharing-open-trial:not(:disabled)') ? 'passed' : 'failed';
+            && document.querySelector('#interface-content').innerText.length > 30 ? 'passed' : 'failed';
     })()"#, move |value| {
         if value == "\"pending\"" {
             let next = next.clone();

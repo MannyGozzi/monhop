@@ -12,6 +12,7 @@ import {
   hiddenFromLayout,
   ownSeams,
   innerBox,
+  isPlacement,
   labelPlacement,
   layoutArrangement,
   movePlacement,
@@ -27,8 +28,6 @@ import {
   snapPlacement,
   tileRects,
   tiles,
-  toFree,
-  toGrouped,
   transformFits,
   truncateToWidth,
 } from "./arrangement-model.mjs";
@@ -61,15 +60,15 @@ const link = (from, to) => ({
 
 test("computer groups preserve OS offsets, dimensions and full display identifiers", () => {
   const g = groups();
-  assert.equal(g.source.displays[0].id, "18446744073709551615");
+  assert.equal(g.local.displays[0].id, "18446744073709551615");
   assert.deepEqual(
-    g.source.displays.map((d) => [d.x, d.y, d.width, d.height]),
+    g.local.displays.map((d) => [d.x, d.y, d.width, d.height]),
     [
       [0, 0, 200, 100],
       [100, 100, 100, 100],
     ],
   );
-  assert.deepEqual([g.source.width, g.source.height], [200, 200]);
+  assert.deepEqual([g.local.width, g.local.height], [200, 200]);
   const saved = structuredClone(g);
   geometryAt(g, [200, 50]);
   assert.deepEqual(g, saved);
@@ -85,11 +84,19 @@ test("a grouped placement is each computer's own layout with one translation bet
   });
   assert.deepEqual(placementOffset(g, placement), [200, 50]);
   assert.deepEqual(
-    placementOffset(g, movePlacement(g, placement, { side: "source" }, [-30, 7])),
+    placementOffset(g, movePlacement(g, placement, { side: "local" }, [-30, 7])),
     [230, 43],
   );
-  assert.equal(placementOffset(g, movePlacement(g, placement, { id: "2" }, [0, 1])), null);
+  // Moving anything other than a whole computer's block is not a supported gesture any more.
+  assert.deepEqual(movePlacement(g, placement, { id: "2" }, [0, 1]), placement);
   assert.equal(groupedPlacement(g, [NaN, 0]), null);
+});
+
+test("only grouped placements exist: bare positions, with no per-tile move and no mode to switch", () => {
+  const g = groups();
+  const placement = grouped(g, [200, 50]);
+  assert.deepEqual(Object.keys(placement), ["positions"]);
+  assert.equal(isPlacement(g, placement), true);
 });
 
 test("one physical seam can cross two stacked monitors without stretching either edge", () => {
@@ -144,7 +151,7 @@ test("gaps, overlap, corner-only contact and non-finite positions never authoriz
 test("snap only within the requested distance, without snapping through another monitor", () => {
   const g = groups();
   const snapped = (offset, distance) =>
-    placementOffset(g, snapPlacement(g, grouped(g, offset), { side: "destination" }, distance));
+    placementOffset(g, snapPlacement(g, grouped(g, offset), { side: "peer" }, distance));
   assert.deepEqual(snapped([206, 50], 8), [200, 50]);
   assert.deepEqual(snapped([220, 50], 8), [220, 50]);
   assert.deepEqual(snapped([201, 200], 8), [201, 200]);
@@ -186,46 +193,38 @@ test("saved translations reconstruct exactly and legacy stretched edges are not 
   assert.equal(placementFromCrossings(g, tampered), null);
 });
 
-test("saved positions restore any placement, and are checked against the saved crossings and displays", () => {
+test("saved positions restore a grouped placement, checked against the saved crossings, displays and offset", () => {
   const g = groups();
-  const free = movePlacement(g, toFree(grouped(g, [200, 50])), { id: "2" }, [0, 100]);
-  const geometry = arrangementGeometry(g, free);
+  const placed = grouped(g, [200, 50]);
+  const geometry = arrangementGeometry(g, placed);
   assert.equal(geometry.connected, true);
-  const saved = layoutArrangement(free);
+  const saved = layoutArrangement(placed);
   assert.deepEqual(saved, {
-    mode: "free",
     positions: [
       { display: "18446744073709551615", x: 0, y: 0 },
-      { display: "2", x: 100, y: 200 },
+      { display: "2", x: 100, y: 100 },
       { display: "3", x: 200, y: 50 },
     ],
     hidden: [],
   });
-  assert.deepEqual(placementFromLayout(g, saved, seamCrossings(geometry.seams)), free);
-  assert.equal(placementFromLayout(g, saved, seamCrossings(geometryAt(g, [200, 50]).seams)), null);
+  assert.deepEqual(placementFromLayout(g, saved, seamCrossings(geometry.seams)), placed);
+  // Positions that no longer match the saved crossings are rejected.
+  assert.equal(placementFromLayout(g, saved, seamCrossings(geometryAt(g, [400, 50]).seams)), null);
+  // A missing display's position can never be a real placement.
+  assert.equal(placementFromLayout(g, { positions: saved.positions.slice(1) }, null), null);
+  // Neither can an extra one that names a display the groups do not have.
   assert.equal(
-    placementFromLayout(g, { mode: "free", positions: saved.positions.slice(1) }, null),
+    placementFromLayout(g, { positions: [...saved.positions, { display: "9", x: 0, y: 0 }] }, null),
     null,
   );
-  assert.equal(
-    placementFromLayout(
-      g,
-      { mode: "free", positions: [...saved.positions, { display: "9", x: 0, y: 0 }] },
-      null,
-    ),
-    null,
-  );
-  // Grouped saves that omit positions still come back from the crossings alone.
-  const crossings = seamCrossings(geometryAt(g, [200, 50]).seams);
-  assert.deepEqual(
-    placementFromLayout(g, { mode: "grouped", positions: [] }, crossings),
-    grouped(g, [200, 50]),
-  );
-  assert.deepEqual(placementFromLayout(g, null, crossings), grouped(g, [200, 50]));
-  assert.equal(
-    placementFromLayout(g, { mode: "grouped", positions: saved.positions }, crossings),
-    null,
-  );
+  // Positions that do not describe one rigid translation between the two computers are rejected,
+  // even though every display still has exactly one position.
+  const skewed = saved.positions.map((p) => (p.display === "2" ? { ...p, y: p.y + 5 } : p));
+  assert.equal(placementFromLayout(g, { positions: skewed }, null), null);
+  // A save that omits positions still comes back from the crossings alone.
+  const crossings = seamCrossings(geometry.seams);
+  assert.deepEqual(placementFromLayout(g, { positions: [] }, crossings), placed);
+  assert.deepEqual(placementFromLayout(g, null, crossings), placed);
 });
 
 test("mirrored or overlapping monitors stay visible but cannot create ambiguous routes", () => {
@@ -234,7 +233,7 @@ test("mirrored or overlapping monitors stay visible but cannot create ambiguous 
     [monitor("3", 0, 0, 100, 100)],
   );
   const view = geometryAt(g, [100, 0]);
-  assert.equal(view.groups.source.displays.length, 2);
+  assert.equal(view.groups.local.displays.length, 2);
   assert.equal(view.valid, false);
   assert.match(view.message, /mirrored|overlapping/i);
   // The editor still draws them, so the message points at something on screen.
@@ -247,7 +246,7 @@ test("mirrored or overlapping monitors stay visible but cannot create ambiguous 
 test("a grouped drop never keeps an overlap: it resolves to the nearest touching placement or to nothing", () => {
   const g = groups();
   const resolved = (offset) => {
-    const p = resolvePlacement(g, grouped(g, offset), { side: "destination" });
+    const p = resolvePlacement(g, grouped(g, offset), { side: "peer" });
     return p && placementOffset(g, p);
   };
   assert.deepEqual(resolved([200, 50]), [200, 50]);
@@ -260,65 +259,21 @@ test("a grouped drop never keeps an overlap: it resolves to the nearest touching
     [Infinity, 0],
     [21_000_000, 0],
   ])
-    assert.equal(resolvePlacement(g, grouped(g, offset), { side: "destination" }), null);
-  assert.equal(resolvePlacement(null, null, { side: "destination" }), null);
+    assert.equal(resolvePlacement(g, grouped(g, offset), { side: "peer" }), null);
+  assert.equal(resolvePlacement(null, null, { side: "peer" }), null);
 });
 
 test("every resolved grouped drop is a valid connected arrangement, wherever it is dropped", () => {
   const g = groups();
   for (let x = -260; x <= 260; x += 37) {
     for (let y = -260; y <= 260; y += 41) {
-      const resolved = resolvePlacement(g, grouped(g, [x, y]), { side: "source" });
+      const resolved = resolvePlacement(g, grouped(g, [x, y]), { side: "local" });
       assert.ok(resolved, `${x},${y}`);
       const geometry = arrangementGeometry(g, resolved);
       assert.equal(geometry.valid, true, `${x},${y}`);
       assert.equal(geometry.connected, true, `${x},${y}`);
     }
   }
-});
-
-test("a free drop keeps displays apart but may leave the computers unconnected", () => {
-  const g = groups();
-  const start = toFree(grouped(g, [200, 50]));
-  const away = movePlacement(g, start, { id: "3" }, [300, 0]);
-  const geometry = arrangementGeometry(g, away);
-  assert.equal(geometry.valid, true);
-  assert.equal(geometry.connected, false);
-  assert.match(geometry.message, /touches one from the other computer/);
-  assert.deepEqual(resolvePlacement(g, away, { id: "3" }), away);
-  const overlapping = movePlacement(g, start, { id: "3" }, [-50, 0]);
-  assert.equal(arrangementGeometry(g, overlapping).valid, false);
-  const resolved = resolvePlacement(g, overlapping, { id: "3" });
-  assert.equal(arrangementGeometry(g, resolved).valid, true);
-  assert.deepEqual(resolved.positions[3], [200, 50]);
-  // The moving display may not push a display of its own computer into another one either.
-  const ownOverlap = movePlacement(g, start, { id: "2" }, [0, -60]);
-  assert.equal(arrangementGeometry(g, ownOverlap).valid, false);
-  assert.equal(arrangementGeometry(g, resolvePlacement(g, ownOverlap, { id: "2" })).valid, true);
-});
-
-test("free snapping aligns to any nearby edge, including a display of the same computer", () => {
-  const g = groups();
-  const start = toFree(grouped(g, [200, 50]));
-  const nudged = movePlacement(g, start, { id: "2" }, [0, 6]);
-  assert.deepEqual(snapPlacement(g, nudged, { id: "2" }, 8).positions[2], [100, 100]);
-  assert.deepEqual(snapPlacement(g, nudged, { id: "2" }, 4).positions[2], [100, 106]);
-  const near = movePlacement(g, start, { id: "3" }, [5, 0]);
-  assert.deepEqual(snapPlacement(g, near, { id: "3" }, 8).positions[3], [200, 50]);
-});
-
-test("switching modes keeps the picture: free starts where grouped was, grouped returns each computer's layout", () => {
-  const g = groups();
-  const placement = grouped(g, [200, 50]);
-  const free = toFree(placement);
-  assert.equal(free.mode, "free");
-  assert.deepEqual(free.positions, placement.positions);
-  assert.deepEqual(toGrouped(g, free), placement);
-  const edited = movePlacement(g, free, { id: "2" }, [0, 100]);
-  const back = toGrouped(g, edited);
-  assert.equal(back.mode, "grouped");
-  assert.ok(placementOffset(g, back));
-  assert.equal(arrangementGeometry(g, back).connected, true);
 });
 
 test("fit frames the whole arrangement and reports a view that no longer frames it", () => {
@@ -354,15 +309,15 @@ test("group labels stay on the canvas, off the other computer and off each other
   ]) {
     const placed = all(g, grouped(g, offset));
     const rects = sideRects(placed, fitTransform(placed, stage));
-    const first = { ...labelPlacement(rects.source, rects.destination, stage, size), ...size };
+    const first = { ...labelPlacement(rects.local, rects.peer, stage, size), ...size };
     const second = {
-      ...labelPlacement(rects.destination, rects.source, stage, size, undefined, [first]),
+      ...labelPlacement(rects.peer, rects.local, stage, size, undefined, [first]),
       ...size,
     };
     const where = JSON.stringify(offset);
     for (const [label, other] of [
-      [first, rects.destination],
-      [second, rects.source],
+      [first, rects.peer],
+      [second, rects.local],
     ]) {
       assert.notEqual(label.placement, "inside", where);
       assert.ok(label.x >= 0 && label.x + size.width <= stage.width, where);
@@ -426,108 +381,99 @@ const shared = () => {
   const key = "10ac-4123-0000abcd";
   return {
     key,
-    source: [
-      monitor("1", 0, 0, 200, 100, true),
-      { ...monitor("2", 200, 0, 100, 100), monitor: key },
-    ],
-    destination: [
-      monitor("3", 0, 0, 100, 100, true),
-      { ...monitor("4", 100, 0, 100, 100), monitor: key },
-    ],
+    local: [monitor("1", 0, 0, 200, 100, true), { ...monitor("2", 200, 0, 100, 100), monitor: key }],
+    peer: [monitor("3", 0, 0, 100, 100, true), { ...monitor("4", 100, 0, 100, 100), monitor: key }],
   };
 };
 
-test("a monitor cabled to both computers is drawn once, on the input computer's side unless marked otherwise", () => {
-  const { key, source, destination } = shared();
-  const pairs = sharedMonitors(source, destination);
+test("a monitor cabled to both computers is drawn once, on the peer's copy unless marked otherwise", () => {
+  const { key, local, peer } = shared();
+  const pairs = sharedMonitors(local, peer);
   assert.deepEqual(
-    pairs.map((p) => [p.monitor, p.source.id, p.destination.id]),
+    pairs.map((p) => [p.monitor, p.local.id, p.peer.id]),
     [[key, "2", "4"]],
   );
-  assert.deepEqual(hiddenDisplays(source, destination), ["4"]);
-  assert.deepEqual(hiddenDisplays(source, destination, null), ["4"]);
-  assert.deepEqual(hiddenDisplays(source, destination, ["2"]), ["2"]);
+  assert.deepEqual(hiddenDisplays(local, peer), ["4"]);
+  assert.deepEqual(hiddenDisplays(local, peer, null), ["4"]);
+  assert.deepEqual(hiddenDisplays(local, peer, ["2"]), ["2"]);
   // A list is exact: any display can be marked not in use, both copies can, and an unknown id is nothing.
-  assert.deepEqual(hiddenDisplays(source, destination, []), []);
-  assert.deepEqual(hiddenDisplays(source, destination, ["9"]), []);
-  assert.deepEqual(hiddenDisplays(source, destination, ["2", "4"]), ["2", "4"]);
-  assert.deepEqual(hiddenDisplays(source, destination, ["1", "4"]), ["1", "4"]);
+  assert.deepEqual(hiddenDisplays(local, peer, []), []);
+  assert.deepEqual(hiddenDisplays(local, peer, ["9"]), []);
+  assert.deepEqual(hiddenDisplays(local, peer, ["2", "4"]), ["2", "4"]);
+  assert.deepEqual(hiddenDisplays(local, peer, ["1", "4"]), ["1", "4"]);
   // A computer never loses its last display, and two single-display computers both keep theirs.
-  assert.deepEqual(hiddenDisplays(source, destination, ["2", "1"]), ["1"]);
-  assert.deepEqual(hiddenDisplays(source, [destination[1]]), ["2"]);
-  assert.deepEqual(hiddenDisplays(source, [destination[1]], ["4"]), []);
-  assert.deepEqual(hiddenDisplays([source[1]], [destination[1]]), []);
+  assert.deepEqual(hiddenDisplays(local, peer, ["2", "1"]), ["1"]);
+  assert.deepEqual(hiddenDisplays(local, [peer[1]]), ["2"]);
+  assert.deepEqual(hiddenDisplays(local, [peer[1]], ["4"]), []);
+  assert.deepEqual(hiddenDisplays([local[1]], [peer[1]]), []);
   // A key that repeats on one side identifies nothing; a missing key never matches.
   assert.deepEqual(
-    sharedMonitors([...source, { ...monitor("5", 0, 100, 100, 100), monitor: key }], destination),
+    sharedMonitors([...local, { ...monitor("5", 0, 100, 100, 100), monitor: key }], peer),
     [],
   );
-  assert.deepEqual(sharedMonitors(source, [monitor("6", 0, 0, 100, 100)]), []);
+  assert.deepEqual(sharedMonitors(local, [monitor("6", 0, 0, 100, 100)]), []);
   assert.deepEqual(
-    drawnDisplays(source, ["2"], pairs).map((d) => [d.id, d.shared === true]),
+    drawnDisplays(local, ["2"], pairs).map((d) => [d.id, d.shared === true]),
     [["1", false]],
   );
   assert.deepEqual(
-    drawnDisplays(destination, ["2"], pairs).map((d) => [d.id, d.shared === true]),
+    drawnDisplays(peer, ["2"], pairs).map((d) => [d.id, d.shared === true]),
     [
       ["3", false],
       ["4", true],
     ],
   );
   const drawnGroups = displayGroups(
-    drawnDisplays(source, ["2"], pairs),
-    drawnDisplays(destination, ["2"], pairs),
+    drawnDisplays(local, ["2"], pairs),
+    drawnDisplays(peer, ["2"], pairs),
   );
   assert.deepEqual(
-    drawnGroups.destination.displays.map((d) => [d.id, d.shared, d.monitor]),
+    drawnGroups.peer.displays.map((d) => [d.id, d.shared, d.monitor]),
     [
       ["3", false, null],
       ["4", true, key],
     ],
   );
-  assert.equal(drawnGroups.source.width, 200);
+  assert.equal(drawnGroups.local.width, 200);
 });
 
 test("a stored layout lists what it left out, and an older one shows the copy it used through its links", () => {
-  const { source, destination } = shared();
+  const { local, peer } = shared();
   assert.deepEqual(
     hiddenFromLayout(
-      { links: [link("1", "3")], arrangement: { mode: "free", positions: [], hidden: ["2"] } },
-      source,
-      destination,
+      { links: [link("1", "3")], arrangement: { positions: [], hidden: ["2"] } },
+      local,
+      peer,
     ),
     ["2"],
   );
   // An empty list is a choice too: every display in use.
   assert.deepEqual(
     hiddenFromLayout(
-      { links: [link("1", "3")], arrangement: { mode: "grouped", positions: [], hidden: [] } },
-      source,
-      destination,
+      { links: [link("1", "3")], arrangement: { positions: [], hidden: [] } },
+      local,
+      peer,
     ),
     [],
   );
+  assert.deepEqual(hiddenFromLayout({ links: [link("1", "4"), link("4", "1")] }, local, peer), [
+    "2",
+  ]);
+  assert.deepEqual(hiddenFromLayout({ links: [link("2", "3"), link("3", "2")] }, local, peer), [
+    "4",
+  ]);
+  assert.deepEqual(hiddenFromLayout({ links: [link("1", "3")] }, local, peer), ["4"]);
+  assert.deepEqual(hiddenFromLayout({ links: [link("2", "4")] }, local, peer), ["4"]);
+  // An unrelated field on the layout object is simply ignored.
   assert.deepEqual(
-    hiddenFromLayout({ links: [link("1", "4"), link("4", "1")] }, source, destination),
-    ["2"],
-  );
-  assert.deepEqual(
-    hiddenFromLayout({ links: [link("2", "3"), link("3", "2")] }, source, destination),
+    hiddenFromLayout({ extra: "ignored", links: [link("1", "3")] }, local, peer),
     ["4"],
   );
-  assert.deepEqual(hiddenFromLayout({ links: [link("1", "3")] }, source, destination), ["4"]);
-  assert.deepEqual(hiddenFromLayout({ links: [link("2", "4")] }, source, destination), ["4"]);
-  assert.deepEqual(
-    hiddenFromLayout({ sourceDisplay: "2", links: [link("1", "3")] }, source, destination),
-    ["4"],
-  );
-  assert.deepEqual(layoutArrangement({ mode: "free", positions: { 1: [0, 0] } }, ["4", "2"]), {
-    mode: "free",
+  assert.deepEqual(layoutArrangement({ positions: { 1: [0, 0] } }, ["4", "2"]), {
     positions: [{ display: "1", x: 0, y: 0 }],
     hidden: ["2", "4"],
   });
-  assert.deepEqual(layoutArrangement({ mode: "grouped", positions: {} }), {
-    mode: "grouped",
+  assert.deepEqual(layoutArrangement({ positions: {} }), {
     positions: [],
     hidden: [],
   });

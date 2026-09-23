@@ -1,12 +1,10 @@
 import { isSessionStatus } from "./computer-status.mjs";
 import { platformLabel } from "./pairing-model.mjs";
-import { MODE_INFO } from "./arrangement-model.mjs";
 import {
   MAX_ARRANGEMENT_NAME,
   arrangementForSharing,
   arrangementResetTarget,
   canApplySetup,
-  canChooseSource,
   canLoadArrangement,
   canResetArrangement,
   canSaveArrangement,
@@ -32,7 +30,6 @@ import {
   el,
   iconButton,
   note,
-  platformGlyph,
   row,
   rows,
   stateCard,
@@ -79,18 +76,11 @@ export function renderDisplays(nodes, ctx) {
       onClick: reset.apply,
     }),
   );
-  nodes.displaysContent.append(sourceCard(ctx));
-  let mounted = null;
-  if (sharing.source) {
-    const built = arrangementCard(ctx, reset);
-    nodes.displaysContent.append(built.element);
-    mounted = built.mounted;
-  } else {
-    releaseEditor();
-  }
+  const built = arrangementCard(ctx, reset);
+  nodes.displaysContent.append(built.element);
   nodes.displaysContent.append(arrangementsDisclosure(ctx));
   // The editor is fed its new state only once it is back in the document, so a moved group animates there.
-  mounted?.();
+  built.mounted?.();
 }
 
 // Without the setup link there is nothing to drag: show what is saved and how to get the link back.
@@ -119,7 +109,16 @@ function offLinkCard(ctx) {
           localPlatform: ctx.state.snapshot?.platform ?? ctx.platform,
           peerPlatform: activeComputer.platform,
           motionKey: `displays-${activeComputer.fingerprint}-layout`,
+          transitionName: "active-arrangement",
+          compactLegend: true,
+          hideCaption: true,
         }),
+        createAccordion(
+          "display-layout-details",
+          "display-layout-details",
+          "Details",
+          note("Saved display positions. Not a current display check."),
+        ),
       ]
     : [note("No layout saved yet.")];
   return card({
@@ -152,75 +151,12 @@ function resetControl({ sharing, actions, busy }) {
   };
 }
 
-function sourceCard(ctx) {
-  const { sharing, state, actions, busy, peerName } = ctx;
-  const view = sharing.view;
-  const field = el("fieldset", {
-    className: "source-field",
-    attrs: { id: "sharing-source-platform", "aria-label": "Input computer" },
-  });
-  field.disabled = busy || !canChooseSource(sharing);
-  const localPlatform = view?.localPlatform ?? state.snapshot?.platform;
-  const peerPlatform = view?.peerPlatform ?? (localPlatform === "macos" ? "windows" : "macos");
-  for (const [side, platform, label, detail] of [
-    [
-      "local",
-      localPlatform,
-      platformLabel(localPlatform, true),
-      `Sends its keyboard and mouse to ${peerName}`,
-    ],
-    [
-      "peer",
-      peerPlatform,
-      peerName,
-      `Sends its keyboard and mouse to this ${platformLabel(localPlatform)}`,
-    ],
-  ]) {
-    const id = `sharing-source-${side}`;
-    const input = el("input", {
-      attrs: { type: "radio", name: "sharing-source", id, value: side },
-    });
-    input.checked = sharing.source === side;
-    input.disabled = field.disabled;
-    input.dataset.focusKey = id;
-    input.addEventListener("change", () => {
-      if (input.checked) void actions.chooseSource(side);
-    });
-    field.append(
-      el("label", {
-        className: "source-choice",
-        attrs: { for: id },
-        children: [
-          input,
-          el("span", {
-            className: "source-choice-card",
-            children: [
-              platformGlyph(platform),
-              el("span", {
-                className: "source-choice-copy",
-                children: [el("strong", { text: label }), el("small", { text: detail })],
-              }),
-              el("span", { className: "source-choice-check", attrs: { "aria-hidden": "true" } }),
-            ],
-          }),
-        ],
-      }),
-    );
-  }
-  return card({
-    title: "Input computer",
-    description:
-      "The computer whose keyboard and mouse are shared. It always keeps controlling itself.",
-    children: [field],
-  });
-}
-
 function arrangementCard(ctx, reset) {
   const { sharing, actions, busy, autostart, platform } = ctx;
   const arrangement = arrangementForSharing(sharing);
   const children = [];
   let mounted = null;
-  if (arrangement?.groups?.source && arrangement.groups?.destination) {
+  if (arrangement?.groups?.local && arrangement.groups?.peer) {
     const editor = liveEditor(ctx, reset, arrangement);
     children.push(editor.element);
     mounted = editor.mounted;
@@ -245,7 +181,7 @@ function arrangementCard(ctx, reset) {
     element: card({
       title: "Displays",
       description:
-        "Each computer starts with the layout from its own system settings. Switch to placing displays one by one when that is not how they sit on the desk.",
+        "Each computer keeps the layout from its own system settings. Drag the two computers together where the pointer should cross.",
       children,
       actions: [
         button(applying ? "Applying…" : "Apply on both computers", {
@@ -266,21 +202,16 @@ let live = null;
 function liveEditor(ctx, reset, arrangement) {
   const { sharing, actions, busy } = ctx;
   const view = sharing.view;
-  const localSource = sharing.source === "local";
-  const localLabel = `${platformLabel(view.localPlatform)} · This computer`;
   const setup = {
-    sourceSide: sharing.source,
-    sourcePlatform: localSource ? view.localPlatform : view.peerPlatform,
-    destinationPlatform: localSource ? view.peerPlatform : view.localPlatform,
     localPlatform: view.localPlatform,
-    sourceLabel: localSource ? localLabel : ctx.peerName,
-    destinationLabel: localSource ? ctx.peerName : localLabel,
+    peerPlatform: view.peerPlatform,
+    localLabel: `${platformLabel(view.localPlatform)} · This computer`,
+    peerLabel: ctx.peerName,
   };
   const key = Object.values(setup).join("|");
   const handlers = {
     onCommit: (placement, moving) => actions.commitArrangement(placement, moving),
     onReset: reset.apply,
-    onMode: (mode) => actions.chooseArrangementMode(mode),
     onShowMonitor: (monitor, side) => actions.showMonitorOn(monitor, side),
     onUseDisplay: (id, inUse) => actions.useDisplay(id, inUse),
   };
@@ -396,11 +327,9 @@ function arrangementsDisclosure(ctx) {
 }
 
 function arrangementRow(ctx, entry) {
-  const { sharing, actions, busy, peerName } = ctx;
-  const inputName = entry.sourceSide === "local" ? "this computer" : peerName;
-  const crossings = `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`;
+  const { sharing, actions, busy } = ctx;
   // Whether it fits is the "Fits now" chip's job alone, so the line never says it twice.
-  const detail = `${MODE_INFO[entry.mode].shortLabel} · ${crossings} · Input: ${inputName}`;
+  const detail = `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`;
   const key = rowKey(entry.name);
   const deleting = pendingDelete === entry.name;
   const remove = button(deleting ? "Confirm delete" : "Delete", {

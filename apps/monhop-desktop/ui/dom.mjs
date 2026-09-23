@@ -241,14 +241,13 @@ const motionMemory = new Map();
 const EASE = "cubic-bezier(.22, 1, .36, 1)";
 const ENTER_MS = 360;
 const EXIT_MS = 240;
-const MORPH_MS = 320;
 const ENTER_FRAMES = [
-  { opacity: 0, filter: "blur(6px)", transform: "translateY(3px) scale(.97)" },
-  { opacity: 1, filter: "blur(0)", transform: "none" },
+  { opacity: 0, transform: "translateY(3px) scale(.97)" },
+  { opacity: 1, transform: "none" },
 ];
 const EXIT_FRAMES = [
-  { opacity: 1, filter: "blur(0)", transform: "none" },
-  { opacity: 0, filter: "blur(6px)", transform: "translateY(-2px) scale(.97)" },
+  { opacity: 1, transform: "none" },
+  { opacity: 0, transform: "translateY(-2px) scale(.97)" },
 ];
 
 function motionEnabled() {
@@ -288,30 +287,8 @@ function ghostOf(node) {
   return ghost;
 }
 
-// Runs `measure` once the render that built `node` has mounted it.
-function mounted(node, measure) {
-  queueMicrotask(() => {
-    if (node.isConnected) measure();
-    else requestAnimationFrame(() => node.isConnected && measure());
-  });
-}
-
-function morphWidth(wrapper, node, from, elapsed) {
-  wrapper.dataset.morph = "true";
-  mounted(wrapper, () => {
-    const to = node.getBoundingClientRect().width;
-    if (Math.abs(to - from) < 1) {
-      delete wrapper.dataset.morph;
-      return;
-    }
-    play(wrapper, [{ width: `${from}px` }, { width: `${to}px` }], MORPH_MS, elapsed, () => {
-      delete wrapper.dataset.morph;
-    });
-  });
-}
-
-// A control whose state changed cross-fades: the previous rendering leaves blurred under the
-// new one while the slot morphs to the new width.
+// A control whose state changed cross-fades in place. Width stays natural so text never drives
+// a layout animation.
 export function swap(key, node, signature, { block = false } = {}) {
   const now = performance.now();
   const entry = motionMemory.get(key) ?? { signature, changedAt: -Infinity };
@@ -319,15 +296,11 @@ export function swap(key, node, signature, { block = false } = {}) {
     entry.signature = signature;
     entry.changedAt = now;
     entry.leaving = entry.ghost;
-    entry.fromWidth = entry.width;
   }
   entry.ghost = node.cloneNode(true);
   motionMemory.set(key, entry);
   const wrapper = el(block ? "div" : "span", { className: "swap", children: [node] });
   if (block) wrapper.dataset.block = "true";
-  mounted(wrapper, () => {
-    if (entry.ghost.isEqualNode(node)) entry.width = node.getBoundingClientRect().width;
-  });
   const elapsed = now - entry.changedAt;
   if (elapsed >= ENTER_MS || !motionEnabled()) return wrapper;
   play(node, ENTER_FRAMES, ENTER_MS, elapsed);
@@ -336,7 +309,6 @@ export function swap(key, node, signature, { block = false } = {}) {
     wrapper.append(ghost);
     play(ghost, EXIT_FRAMES, EXIT_MS, elapsed, () => ghost.remove());
   }
-  if (!block && entry.fromWidth) morphWidth(wrapper, node, entry.fromWidth, elapsed);
   return wrapper;
 }
 
@@ -354,12 +326,7 @@ export function sinceChanged(key, signature) {
   return motionEnabled() ? now - entry.changedAt : Infinity;
 }
 
-function rowGap(node) {
-  return Number.parseFloat(getComputedStyle(node.parentElement).rowGap) || 0;
-}
-
-// A block that exists only in some states grows in when it appears and collapses when it
-// leaves, absorbing its parent's gap so the neighbours slide instead of jumping.
+// Presence changes only fade and translate the visible content. Layout remains synchronous.
 export function presence(key, node) {
   const now = performance.now();
   const present = Boolean(node);
@@ -376,46 +343,23 @@ export function presence(key, node) {
   if (node) {
     const wrapper = el("div", { className: "presence", children: [node] });
     if (!animate) return wrapper;
-    wrapper.dataset.animating = "true";
     play(node, ENTER_FRAMES, ENTER_MS, elapsed);
-    mounted(wrapper, () => {
-      const frames = [
-        { height: "0px", marginTop: `-${rowGap(wrapper)}px` },
-        { height: `${wrapper.scrollHeight}px`, marginTop: "0px" },
-      ];
-      play(wrapper, frames, ENTER_MS, elapsed, () => delete wrapper.dataset.animating);
-    });
     return wrapper;
   }
   if (!animate || !entry.leaving) return null;
   const ghost = ghostOf(entry.leaving);
   const wrapper = el("div", { className: "presence", children: [ghost] });
   wrapper.dataset.leave = "true";
-  wrapper.dataset.animating = "true";
-  play(ghost, EXIT_FRAMES, EXIT_MS, elapsed);
-  mounted(wrapper, () => {
-    const frames = [
-      { height: `${wrapper.getBoundingClientRect().height}px`, marginTop: "0px" },
-      { height: "0px", marginTop: `-${rowGap(wrapper)}px` },
-    ];
-    play(wrapper, frames, EXIT_MS, elapsed, () => wrapper.remove());
-  });
+  play(ghost, EXIT_FRAMES, EXIT_MS, elapsed, () => wrapper.remove());
   return wrapper;
 }
 
-// Changes a live node's text with a fade and a width morph of `host` instead of a jump.
-export function setLabel(node, label, host = node) {
+// A live label fades in place. Its container keeps normal layout rather than animating width.
+export function setLabel(node, label) {
   if (node.textContent === label) return;
-  const from = host.getBoundingClientRect().width;
   node.textContent = label;
   if (!motionEnabled()) return;
   play(node, ENTER_FRAMES, ENTER_MS, 0);
-  const to = host.getBoundingClientRect().width;
-  if (from < 1 || Math.abs(from - to) < 1) return;
-  host.dataset.morph = "true";
-  play(host, [{ width: `${from}px` }, { width: `${to}px` }], MORPH_MS, 0, () => {
-    delete host.dataset.morph;
-  });
 }
 
 export function platformGlyph(platform) {

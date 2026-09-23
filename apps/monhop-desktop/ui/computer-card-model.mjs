@@ -86,6 +86,40 @@ export function keepForgetArmed(armed, fingerprints) {
   return armed && [...fingerprints].includes(armed.fingerprint) ? armed : null;
 }
 
+// --- control switches --------------------------------------------------
+
+export const CONTROL_PAUSE_HINT = "Use Pause to stop sharing";
+
+// Two switches, one per direction. With no active record yet, both read on, matching what a fresh
+// setup turns on by default. The last enabled direction cannot be turned off here — pausing is how
+// sharing stops entirely — and both disable while a change to either is still syncing.
+export function controlSwitchRows(control, localName, peerName, syncing) {
+  const localToPeer = control?.localToPeer ?? true;
+  const peerToLocal = control?.peerToLocal ?? true;
+  const isSyncing = syncing === true || control?.syncing === true;
+  const row = (direction, label, checked, isLast) => ({
+    direction,
+    label,
+    checked,
+    disabled: isSyncing || isLast,
+    hint: isLast ? CONTROL_PAUSE_HINT : isSyncing ? "Updating both computers…" : "",
+  });
+  return [
+    row(
+      "localToPeer",
+      `${localName} can control ${peerName}`,
+      localToPeer,
+      localToPeer && !peerToLocal,
+    ),
+    row(
+      "peerToLocal",
+      `${peerName} can control ${localName}`,
+      peerToLocal,
+      peerToLocal && !localToPeer,
+    ),
+  ];
+}
+
 // One pass over a computer's history: order, row keys, the armed confirm, and whether Load works.
 // `pending` is that computer's own read or forget still in flight, which locks its rows alone.
 export function layoutRows({ fingerprint, entries, armed, isActive, connected, busy, pending }) {

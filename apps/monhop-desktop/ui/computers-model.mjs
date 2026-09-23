@@ -4,7 +4,6 @@ import { normalizeArrangements, normalizeStoredLayout } from "./sharing-model.mj
 
 const FINGERPRINT = /^[a-f0-9]{64}$/i;
 const PLATFORM = new Set(["windows", "macos"]);
-const SIDE = new Set(["local", "peer"]);
 const MAX_U64 = "18446744073709551615";
 const MAX_COMPUTERS = 16;
 
@@ -106,7 +105,6 @@ function normalizeSetup(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return emptySetup();
   return {
     saved: value.saved === true,
-    sourceSide: SIDE.has(value.sourceSide) ? value.sourceSide : null,
     localDisplays: normalizeDisplays(value.localDisplays),
     peerDisplays: normalizeDisplays(value.peerDisplays),
     layout: normalizeStoredLayout(value.layout),
@@ -119,7 +117,6 @@ function normalizeSetup(value) {
 function emptySetup() {
   return {
     saved: false,
-    sourceSide: null,
     localDisplays: [],
     peerDisplays: [],
     layout: null,

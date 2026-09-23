@@ -8,8 +8,8 @@ use std::{error::Error, fmt, time::Duration};
 
 use monhop_core::{DeviceId, Platform};
 use monhop_protocol::{
-    Capabilities, DeliveryClass, DisplayTopology, Frame, Hello, Message, PROTOCOL_VERSION,
-    SessionEpoch, SessionSetup,
+    Capabilities, ControlPermissions, DeliveryClass, DisplayTopology, Frame, FrameScope, Hello,
+    Message, PROTOCOL_VERSION, SessionEpoch, SessionSetup,
 };
 
 pub use monhop_protocol::SessionPurpose;
@@ -22,7 +22,7 @@ use crate::{
 /// Bounds the entire control exchange, including stream creation and all six frame operations.
 pub const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(500);
 
-/// A purpose, source or hello disagreement is symmetric, so the peer reaches the same verdict
+/// A purpose, control or hello disagreement is symmetric, so the peer reaches the same verdict
 /// from our frames; closing before it acknowledges them strands it on [`HandshakeError::Stream`].
 /// Bounded by this grace and by the handshake deadline, whichever comes first.
 const DISAGREEMENT_ACK_GRACE: Duration = Duration::from_millis(150);
@@ -41,7 +41,7 @@ pub fn device_id_from_fingerprint(fingerprint: CertificateFingerprint) -> Device
     DeviceId(device_id)
 }
 
-/// Locally authorized expectations for the session peer and physical input source.
+/// Locally authorized peer expectations and directional control permissions.
 pub struct HandshakeConfig<'a> {
     local_identity: &'a DeviceIdentity,
     expected_peer: &'a VerifiedPeer,
@@ -50,7 +50,7 @@ pub struct HandshakeConfig<'a> {
     local_capabilities: Capabilities,
     expected_peer_capabilities: Capabilities,
     local_topology: &'a DisplayTopology,
-    source: DeviceId,
+    control: ControlPermissions,
     purpose: SessionPurpose,
 }
 
@@ -64,7 +64,7 @@ impl<'a> HandshakeConfig<'a> {
         local_capabilities: Capabilities,
         expected_peer_capabilities: Capabilities,
         local_topology: &'a DisplayTopology,
-        source: DeviceId,
+        control: ControlPermissions,
         purpose: SessionPurpose,
     ) -> Result<Self, HandshakeError> {
         let config = Self {
@@ -75,7 +75,7 @@ impl<'a> HandshakeConfig<'a> {
             local_capabilities,
             expected_peer_capabilities,
             local_topology,
-            source,
+            control,
             purpose,
         };
         config.validate()?;
@@ -90,8 +90,8 @@ impl<'a> HandshakeConfig<'a> {
         device_id_from_fingerprint(self.expected_peer.fingerprint())
     }
 
-    pub const fn source(&self) -> DeviceId {
-        self.source
+    pub const fn permissions(&self) -> ControlPermissions {
+        self.control
     }
 
     pub const fn purpose(&self) -> SessionPurpose {
@@ -107,7 +107,10 @@ impl<'a> HandshakeConfig<'a> {
             .map_err(|_| HandshakeError::InvalidConfiguration)?;
         let local = self.local_device_id();
         let peer = self.expected_peer_device_id();
-        if self.source != local && self.source != peer {
+        if local == peer
+            || ControlPermissions::from_wire(self.control.to_wire()).is_err()
+            || (self.purpose == SessionPurpose::Setup && self.control != ControlPermissions::BOTH)
+        {
             return Err(HandshakeError::InvalidConfiguration);
         }
         Ok(())
@@ -207,12 +210,10 @@ pub struct ControlStreams {
     pub reader: FrameReader,
 }
 
-/// A negotiated session that can be handed to the source or destination runtime.
+/// An authenticated connection for bilateral sharing or the setup link.
 pub struct NegotiatedSession {
     pub connection: quinn::Connection,
-    pub(crate) source: DeviceId,
-    pub(crate) destination: DeviceId,
-    pub(crate) local_is_source: bool,
+    pub permissions: ControlPermissions,
     pub peer: NegotiatedPeer,
     pub(crate) local: NegotiatedPeer,
     purpose: SessionPurpose,
@@ -223,19 +224,19 @@ pub struct NegotiatedSession {
 }
 
 impl NegotiatedSession {
-    /// Returns the source device authenticated by the bilateral exchange.
-    pub const fn source(&self) -> DeviceId {
-        self.source
+    pub fn outbound_scope(&self) -> FrameScope {
+        if self.local.device_id < self.peer.device_id {
+            FrameScope::LowerControlsHigher
+        } else {
+            FrameScope::HigherControlsLower
+        }
     }
 
-    /// Returns the destination device authenticated by the bilateral exchange.
-    pub const fn destination(&self) -> DeviceId {
-        self.destination
-    }
-
-    /// Reports whether this endpoint was authenticated as the session source.
-    pub const fn local_is_source(&self) -> bool {
-        self.local_is_source
+    pub fn inbound_scope(&self) -> FrameScope {
+        match self.outbound_scope() {
+            FrameScope::LowerControlsHigher => FrameScope::HigherControlsLower,
+            _ => FrameScope::LowerControlsHigher,
+        }
     }
 
     /// Returns the purpose authenticated by both peers during setup.
@@ -255,7 +256,7 @@ pub enum HandshakeError {
     InvalidFrame,
     UnexpectedFrame,
     PeerHelloMismatch,
-    SourceMismatch,
+    ControlMismatch,
     PurposeMismatch,
 }
 
@@ -271,7 +272,7 @@ impl fmt::Display for HandshakeError {
             Self::InvalidFrame => "session handshake frame is invalid",
             Self::UnexpectedFrame => "session handshake frame is out of order or unexpected",
             Self::PeerHelloMismatch => "session peer hello does not match the negotiated policy",
-            Self::SourceMismatch => "session peer chose a different input source",
+            Self::ControlMismatch => "session peer chose different control permissions",
             Self::PurposeMismatch => "session peer chose a different session purpose",
         })
     }
@@ -301,24 +302,15 @@ pub async fn negotiate(
         }
     };
     log::info!(
-        "handshake done ({:?}): local is source={}, peer platform {:?}",
+        "handshake done ({:?}): peer platform {:?}",
         config.purpose,
-        config.source == config.local_device_id(),
         parts.peer.platform
     );
     close_guard.disarm();
     drop(close_guard);
-
-    let destination = if config.source == config.local_device_id() {
-        config.expected_peer_device_id()
-    } else {
-        config.local_device_id()
-    };
     Ok(NegotiatedSession {
         connection,
-        source: config.source,
-        destination,
-        local_is_source: config.source == config.local_device_id(),
+        permissions: config.control,
         peer: parts.peer,
         local: NegotiatedPeer {
             device_id: config.local_device_id(),
@@ -398,7 +390,7 @@ async fn negotiate_inner(
             epoch,
             2,
             Message::SessionSetup(SessionSetup {
-                source: config.source,
+                control: config.control,
                 purpose: config.purpose,
             }),
         ),
@@ -427,7 +419,7 @@ async fn negotiate_inner(
         // to install.
         Err(
             error @ (HandshakeError::PurposeMismatch
-            | HandshakeError::SourceMismatch
+            | HandshakeError::ControlMismatch
             | HandshakeError::PeerHelloMismatch),
         ) => {
             acknowledge_disagreement(&mut send, deadline).await;
@@ -511,7 +503,10 @@ pub fn validate_peer_handshake(
         return Err(HandshakeError::PeerCertificateMismatch);
     }
     for (sequence, frame) in frames.iter().enumerate() {
-        if frame.epoch != epoch || frame.sequence != sequence as u64 {
+        if frame.scope != FrameScope::Connection
+            || frame.epoch != epoch
+            || frame.sequence != sequence as u64
+        {
             return Err(HandshakeError::InvalidFrame);
         }
         if frame.delivery() != DeliveryClass::Reliable {
@@ -539,14 +534,12 @@ pub fn validate_peer_handshake(
     let Message::SessionSetup(setup) = frames[2].message else {
         return Err(HandshakeError::UnexpectedFrame);
     };
-    // Purpose first: a link meeting a session is a step collision whatever either side believes
-    // about the keyboard, and only its own verdict tells the caller to change step. A source
-    // disagreement is then reachable only between two sessions whose saved records differ.
+    // A setup link meeting sharing is a step collision, not a saved-control disagreement.
     if setup.purpose != config.purpose {
         return Err(HandshakeError::PurposeMismatch);
     }
-    if setup.source != config.source {
-        return Err(HandshakeError::SourceMismatch);
+    if setup.control != config.control {
+        return Err(HandshakeError::ControlMismatch);
     }
 
     Ok(NegotiatedPeer {
@@ -650,8 +643,7 @@ mod tests {
             .expect("fixture capabilities are known")
     }
 
-    /// Negotiates both ends of one loopback connection at once, each side told which computer it
-    /// believes supplies input (`true` for the dialing one) and which purpose it believes it opened.
+    /// Both sides announce a control map and purpose independently.
     async fn negotiate_both(
         client: (bool, SessionPurpose),
         server: (bool, SessionPurpose),
@@ -706,13 +698,14 @@ mod tests {
                     .expect("server TLS connection")
             },
         );
-        let client_device = device_id_from_fingerprint(client_identity.fingerprint());
-        let server_device = device_id_from_fingerprint(server_identity.fingerprint());
-        let device = |source_is_dialer: bool| {
-            if source_is_dialer {
-                client_device
+        let control = |both: bool| {
+            if both {
+                ControlPermissions::BOTH
             } else {
-                server_device
+                ControlPermissions {
+                    lower_controls_higher: true,
+                    higher_controls_lower: false,
+                }
             }
         };
         let client_topology = topology(1);
@@ -725,7 +718,7 @@ mod tests {
             client_features,
             client_features,
             &client_topology,
-            device(client.0),
+            control(client.0),
             client.1,
         )
         .expect("client handshake configuration");
@@ -737,7 +730,7 @@ mod tests {
             capabilities(),
             capabilities(),
             &server_topology,
-            device(server.0),
+            control(server.0),
             server.1,
         )
         .expect("server handshake configuration");
@@ -758,11 +751,9 @@ mod tests {
         assert_eq!(server.err(), Some(HandshakeError::PurposeMismatch));
     }
 
-    /// A setup link names the dialing computer as its source, so a link meeting a session whose
-    /// record puts the keyboard elsewhere disagrees on both fields. Only the purpose verdict tells
-    /// the caller to change step, so it must win.
+    /// Purpose wins when both purpose and saved control disagree.
     #[tokio::test]
-    async fn a_link_meeting_a_session_names_the_purpose_whoever_holds_the_keyboard() {
+    async fn purpose_disagreement_precedes_control_disagreement() {
         let (client, server) = negotiate_both(
             (true, SessionPurpose::Setup),
             (false, SessionPurpose::Share),
@@ -773,14 +764,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_computers_claiming_input_both_name_the_source_disagreement() {
+    async fn control_mismatch_is_symmetric() {
         let (client, server) = negotiate_both(
             (true, SessionPurpose::Share),
             (false, SessionPurpose::Share),
         )
         .await;
-        assert_eq!(client.err(), Some(HandshakeError::SourceMismatch));
-        assert_eq!(server.err(), Some(HandshakeError::SourceMismatch));
+        assert_eq!(client.err(), Some(HandshakeError::ControlMismatch));
+        assert_eq!(server.err(), Some(HandshakeError::ControlMismatch));
     }
 
     /// Two builds that do not announce the same features: each rejects the other's hello, so both

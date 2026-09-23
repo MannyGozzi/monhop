@@ -31,7 +31,6 @@ const edge = (from, fromEdge, to, toEdge) => ({
 
 function savedLayout() {
   return {
-    sourceDisplay: localId,
     links: [edge(localId, "right", peerId, "left"), edge(peerId, "left", localId, "right")],
   };
 }
@@ -39,7 +38,6 @@ function savedLayout() {
 function setup() {
   return {
     saved: true,
-    sourceSide: "local",
     localDisplays: [
       { id: localId, name: "Built-in", origin: [0, 0], size: [1512, 982], primary: true },
     ],
@@ -51,7 +49,7 @@ function setup() {
 }
 
 function arrangementEntry(name, patch = {}) {
-  return { name, sourceSide: "local", mode: "grouped", crossings: 1, layout: null, ...patch };
+  return { name, crossings: 1, layout: null, ...patch };
 }
 
 test("the computer list is bounded, deduplicated, and lowercased on the way in", () => {
@@ -107,22 +105,21 @@ test("each computer carries its own saved layout, or an honest empty one", () =>
   });
   const saved = view.items[0].setup;
   assert.equal(saved.saved, true);
-  assert.equal(saved.sourceSide, "local");
   assert.equal(saved.localDisplays.length, 1);
-  assert.equal(saved.layout.sourceDisplay, localId);
+  assert.equal(saved.layout.links.length, 2);
   assert.equal(saved.previewLayout.links.length, 2);
   const blank = view.items[1].setup;
   assert.equal(blank.saved, false);
   assert.deepEqual(blank.localDisplays, []);
   assert.equal(blank.layout, null);
-  // A layout the saved displays cannot realize is dropped rather than drawn wrong.
+  // A layout with a malformed link is dropped rather than drawn wrong.
   const broken = normalizeComputers({
     computers: [
       {
         fingerprint: WINDOWS,
         name: "Office Windows PC",
         platform: "windows",
-        setup: { ...setup(), layout: { sourceDisplay: "1e3", links: [] } },
+        setup: { ...setup(), layout: { links: [edge("1e3", "right", peerId, "left")] } },
       },
     ],
   });

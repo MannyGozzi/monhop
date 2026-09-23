@@ -15,8 +15,8 @@
           <span class="window-product">MonHop</span>
           <h1 id="page-title" class="visually-hidden">MonHop</h1>
           <nav class="primary-nav" id="primary-nav" aria-label="MonHop navigation">
-            <button type="button" data-page="home">Home</button>
-            <button type="button" data-page="setup">Set up</button>
+            <button type="button" data-page="home"><span>Home</span><span class="nav-active-indicator" aria-hidden="true"></span></button>
+            <button type="button" data-page="setup"><span>Set up</span><span class="nav-active-indicator" aria-hidden="true"></span></button>
           </nav>
         </div>
         <div class="window-header-end">
@@ -42,13 +42,15 @@
 
         <section class="app-page setup-page" id="setup-view" aria-label="Set up" hidden>
           <section class="setup-section" data-section="ready" data-locked="false" aria-labelledby="permissions-title">
+            <span class="section-index" data-mark="1" aria-hidden="true">1</span>
             <header class="section-header">
-              <span class="section-index" data-mark="1" aria-hidden="true">1</span>
+              <button class="section-toggle" type="button" hidden aria-label="Collapse Get ready" aria-expanded="true" aria-controls="ready-body"></button>
               <div class="section-heading">
                 <h2 id="permissions-title">Get ready</h2>
                 <p class="section-status" id="ready-status">Checking this computer.</p>
               </div>
               <span class="section-actions" id="ready-actions"></span>
+              <span class="section-chevron" aria-hidden="true" hidden><svg class="lucide lucide-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg></span>
             </header>
             <div class="section-body" id="ready-body">
               <section class="overview" aria-label="Setup status">
@@ -64,13 +66,15 @@
           </section>
 
           <section class="setup-section" data-section="computers" data-locked="true" aria-labelledby="computers-title">
+            <span class="section-index" data-mark="2" aria-hidden="true">2</span>
             <header class="section-header">
-              <span class="section-index" data-mark="2" aria-hidden="true">2</span>
+              <button class="section-toggle" type="button" hidden aria-label="Collapse Computers" aria-expanded="true" aria-controls="computers-body"></button>
               <div class="section-heading">
                 <h2 id="computers-title">Computers</h2>
                 <p class="section-status" id="computers-status">Finish Get ready first</p>
               </div>
               <span class="section-actions" id="computers-actions"></span>
+              <span class="section-chevron" aria-hidden="true" hidden><svg class="lucide lucide-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg></span>
             </header>
             <div class="section-body" id="computers-body">
               <div id="computers-content" class="stack"></div>
@@ -78,13 +82,15 @@
           </section>
 
           <section class="setup-section" data-section="displays" data-locked="true" aria-labelledby="displays-title">
+            <span class="section-index" data-mark="3" aria-hidden="true">3</span>
             <header class="section-header">
-              <span class="section-index" data-mark="3" aria-hidden="true">3</span>
+              <button class="section-toggle" type="button" hidden aria-label="Collapse Displays" aria-expanded="true" aria-controls="displays-body"></button>
               <div class="section-heading">
                 <h2 id="displays-title">Displays</h2>
                 <p class="section-status" id="displays-status">Pair a computer first</p>
               </div>
               <span class="section-actions" id="displays-actions"></span>
+              <span class="section-chevron" aria-hidden="true" hidden><svg class="lucide lucide-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg></span>
             </header>
             <div class="section-body" id="displays-body">
               <div id="displays-content" class="stack"></div>

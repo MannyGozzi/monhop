@@ -23,7 +23,7 @@ const SESSION_KEYS = new Set(["sharing", "reconnecting"]);
 
 // The view is null until the first status reply lands, and stays null if that call failed, so
 // every read of it here is optional: a card must render before anything is known.
-export function computerStatus(computer, sharingView, active) {
+export function computerStatus(computer, sharingView, active, localName) {
   const fingerprint = computer?.fingerprint ?? null;
   const name = displayName(computer);
   const phase = sharingView?.phase ?? "off";
@@ -47,7 +47,7 @@ export function computerStatus(computer, sharingView, active) {
             "Reconnecting…",
             "Waiting for the network. Input stays on this computer.",
           )
-        : status("sharing", "Sharing input", roleDetail(sharingView?.sharingRole, name));
+        : status("sharing", "Sharing", controlDetail(sharingView?.control, localName, name));
     case "connected":
       return sharingView?.editing
         ? status("editing", "Arranging displays", "Sharing resumes after you apply.")
@@ -82,7 +82,7 @@ function reaching(name) {
 }
 
 // The header pill: the computer in use, or why there is nothing to report.
-export function activeStatus({ computers, sharingView, active, nativeAvailable }) {
+export function activeStatus({ computers, sharingView, active, nativeAvailable, localName }) {
   if (!nativeAvailable)
     return status("preview", "Preview only", "Open MonHop to use these computers.");
   const computer = findComputer(computers, active);
@@ -92,7 +92,7 @@ export function activeStatus({ computers, sharingView, active, nativeAvailable }
       "No computer",
       computers.items.length ? "Choose a computer to use." : "Pair a computer to get started.",
     );
-  return computerStatus(computer, sharingView, active);
+  return computerStatus(computer, sharingView, active, localName);
 }
 
 export function isLiveStatus(value) {
@@ -103,11 +103,17 @@ export function isSessionStatus(value) {
   return SESSION_KEYS.has(value?.key);
 }
 
-// Only the input computer's keyboard and mouse cross; it never stops controlling itself.
-function roleDetail(role, name) {
-  if (role === "sends") return `Your keyboard and mouse reach ${name}`;
-  if (role === "receives") return `${name}'s keyboard and mouse reach this computer`;
-  return `One keyboard and mouse across this computer and ${name}`;
+const BOTH_DIRECTIONS = "Either computer's keyboard and mouse can control the other";
+
+// Either direction can be on: both, or just one. No active record reads as both, matching the
+// default a fresh setup turns on.
+function controlDetail(control, localName, peerName) {
+  const localToPeer = control?.localToPeer ?? true;
+  const peerToLocal = control?.peerToLocal ?? true;
+  if (localToPeer && peerToLocal) return BOTH_DIRECTIONS;
+  if (localToPeer) return `${localName}'s keyboard and mouse can control ${peerName}`;
+  if (peerToLocal) return `${peerName}'s keyboard and mouse can control ${localName}`;
+  return BOTH_DIRECTIONS;
 }
 
 function status(key, label, detail) {

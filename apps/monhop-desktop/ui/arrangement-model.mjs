@@ -1,42 +1,21 @@
 // Geometry is in each OS's reported desktop units, not physical screen dimensions.
-// A placement puts every display on one shared canvas: grouped keeps each computer's own layout and
-// moves it as a block; free places each display on its own. Links between the computers come from
-// the edges that touch, whichever mode produced them.
+// A placement puts every display on one shared canvas: each computer keeps its own layout and moves
+// as one block. Links between the computers come from the edges that touch.
 const EPSILON = 1e-7;
 const MAX_COORDINATE = 20_000_000;
 const MIN_CONTACT = 1;
 const LABEL_GAP = 5;
 const OPPOSITE = { left: "right", right: "left", top: "bottom", bottom: "top" };
-const SIDES = ["source", "destination"];
+const SIDES = ["local", "peer"];
 // vendor-product-serial of the physical monitor, as the native side formats it.
 const MONITOR_KEY = /^[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{8}$/;
-
-export const MODES = Object.freeze(["grouped", "free"]);
-
-// One label/copy per mode: `shortLabel` for the displays list, the rest for the arrangement editor.
-export const MODE_INFO = Object.freeze({
-  grouped: {
-    shortLabel: "Own layouts",
-    label: "Each computer's own layout",
-    hint: "Displays stay where each computer's system settings put them; drag a computer as one block.",
-    instructions:
-      "Drag a computer against the other; the edge where they touch is where the pointer crosses. With a computer selected, arrow keys nudge it and Shift with an arrow moves it further.",
-  },
-  free: {
-    shortLabel: "Placed one by one",
-    label: "Place each display",
-    hint: "Drag any display on its own. Edges that touch a display of the other computer become crossings.",
-    instructions:
-      "Drag any display; every edge that touches a display of the other computer is a crossing. With a display selected, arrow keys nudge it and Shift with an arrow moves it further.",
-  },
-});
 
 // Top and bottom insets reserve the band a group label needs, so a label never lands off the canvas.
 export const VIEW_INSETS = Object.freeze({ top: 24, right: 16, bottom: 24, left: 16 });
 
-export function displayGroups(source, destination) {
-  const groups = { source: group(source), destination: group(destination) };
-  return groups.source && groups.destination ? groups : null;
+export function displayGroups(local, peer) {
+  const groups = { local: group(local), peer: group(peer) };
+  return groups.local && groups.peer ? groups : null;
 }
 
 function group(displays) {
@@ -79,12 +58,12 @@ export function monitorKey(value) {
 }
 
 // One physical monitor cabled to both computers appears on each side; only a key unique on its side identifies it.
-export function sharedMonitors(source, destination) {
-  const sources = uniqueMonitors(source);
-  const destinations = uniqueMonitors(destination);
-  return [...sources]
-    .filter(([key]) => destinations.has(key))
-    .map(([monitor, a]) => ({ monitor, source: a, destination: destinations.get(monitor) }));
+export function sharedMonitors(local, peer) {
+  const locals = uniqueMonitors(local);
+  const peers = uniqueMonitors(peer);
+  return [...locals]
+    .filter(([key]) => peers.has(key))
+    .map(([monitor, a]) => ({ monitor, local: a, peer: peers.get(monitor) }));
 }
 
 function uniqueMonitors(displays) {
@@ -98,33 +77,33 @@ function uniqueMonitors(displays) {
   return unique;
 }
 
-// The displays left out of the picture: the ones `chosen` marks not in use, or by default the other
-// computer's copy of each monitor cabled to both. A computer always keeps at least one display.
-export function hiddenDisplays(source, destination, chosen = null) {
+// The displays left out of the picture: the ones `chosen` marks not in use, or by default the peer's
+// copy of each monitor cabled to both. A computer always keeps at least one display.
+export function hiddenDisplays(local, peer, chosen = null) {
   if (Array.isArray(chosen)) {
     const wanted = new Set(chosen);
-    const keep = keeper(source, destination);
-    for (const side of ["source", "destination"])
-      for (const display of side === "source" ? source : destination)
+    const keep = keeper(local, peer);
+    for (const side of SIDES)
+      for (const display of side === "local" ? local : peer)
         if (wanted.has(display.id)) keep.hide(side, display.id);
     return keep.hidden;
   }
-  return oneCopyEach(source, destination, () => "destination");
+  return oneCopyEach(local, peer, () => "peer");
 }
 
 // One copy of every shared monitor leaves, trying `first(pair)`'s side before the other.
-function oneCopyEach(source, destination, first) {
-  const keep = keeper(source, destination);
-  for (const pair of sharedMonitors(source, destination)) {
+function oneCopyEach(local, peer, first) {
+  const keep = keeper(local, peer);
+  for (const pair of sharedMonitors(local, peer)) {
     const side = first(pair);
-    const other = side === "source" ? "destination" : "source";
+    const other = side === "local" ? "peer" : "local";
     if (!keep.hide(side, pair[side].id)) keep.hide(other, pair[other].id);
   }
   return keep.hidden;
 }
 
-function keeper(source, destination) {
-  const remaining = { source: source.length, destination: destination.length };
+function keeper(local, peer) {
+  const remaining = { local: local.length, peer: peer.length };
   const hidden = [];
   return {
     hidden,
@@ -138,23 +117,20 @@ function keeper(source, destination) {
 }
 
 // A stored layout lists the displays it left out. One saved before displays could be marked not in
-// use only shows which copy of a shared monitor it used: the one its starting display or links touch.
-export function hiddenFromLayout(layout, source, destination) {
+// use only shows which copy of a shared monitor its links touch.
+export function hiddenFromLayout(layout, local, peer) {
   const chosen = layout?.arrangement?.hidden;
-  if (Array.isArray(chosen)) return hiddenDisplays(source, destination, chosen);
-  const used = new Set([
-    layout?.sourceDisplay,
-    ...(layout?.links ?? []).flatMap((link) => [link.fromDisplay, link.toDisplay]),
-  ]);
-  return oneCopyEach(source, destination, (pair) =>
-    used.has(pair.destination.id) && !used.has(pair.source.id) ? "source" : "destination",
+  if (Array.isArray(chosen)) return hiddenDisplays(local, peer, chosen);
+  const used = new Set((layout?.links ?? []).flatMap((link) => [link.fromDisplay, link.toDisplay]));
+  return oneCopyEach(local, peer, (pair) =>
+    used.has(pair.peer.id) && !used.has(pair.local.id) ? "local" : "peer",
   );
 }
 
 // What one side draws: its hidden copies gone, the displays standing for a shared monitor marked.
 export function drawnDisplays(displays, hidden, shared) {
   const gone = new Set(hidden);
-  const marked = new Set(shared.flatMap((pair) => [pair.source.id, pair.destination.id]));
+  const marked = new Set(shared.flatMap((pair) => [pair.local.id, pair.peer.id]));
   return displays
     .filter((d) => !gone.has(d.id))
     .map((d) => (marked.has(d.id) ? { ...d, shared: true } : d));
@@ -216,23 +192,24 @@ function ownSeamPair(a, b, fromEdge, toEdge, overlap) {
   ];
 }
 
-// --- placements ----------------------------------------------------------
+// --- placements ------------------------------------------------------------
+// A placement is always grouped: `{ positions }`, one finite [x, y] per connected display.
 
 export function groupedPlacement(groups, offset) {
   if (!groups || !point(offset)) return null;
   const positions = {};
-  for (const d of groups.source.displays) positions[d.id] = [d.x, d.y];
-  for (const d of groups.destination.displays) positions[d.id] = [d.x + offset[0], d.y + offset[1]];
-  return { mode: "grouped", positions };
+  for (const d of groups.local.displays) positions[d.id] = [d.x, d.y];
+  for (const d of groups.peer.displays) positions[d.id] = [d.x + offset[0], d.y + offset[1]];
+  return { positions };
 }
 
-// The destination translation, when every display still sits where its own computer puts it.
+// The peer translation, when every display still sits where its own computer puts it.
 export function placementOffset(groups, placement) {
   if (!groups || !isPlacement(groups, placement)) return null;
-  const anchor = groups.source.displays[0];
+  const anchor = groups.local.displays[0];
   const base = placement.positions[anchor.id];
   const shift = [base[0] - anchor.x, base[1] - anchor.y];
-  const reference = groups.destination.displays[0];
+  const reference = groups.peer.displays[0];
   const offset = [
     placement.positions[reference.id][0] - reference.x - shift[0],
     placement.positions[reference.id][1] - reference.y - shift[1],
@@ -252,13 +229,7 @@ export function placementOffset(groups, placement) {
 
 // Exactly one finite position per connected display, and none for anything else.
 export function isPlacement(groups, placement) {
-  if (
-    !groups ||
-    !placement ||
-    !MODES.includes(placement.mode) ||
-    !placement.positions ||
-    typeof placement.positions !== "object"
-  )
+  if (!groups || !placement || !placement.positions || typeof placement.positions !== "object")
     return false;
   const ids = SIDES.flatMap((side) => groups[side].displays.map((d) => d.id));
   return (
@@ -268,7 +239,7 @@ export function isPlacement(groups, placement) {
 }
 
 export function samePlacement(a, b) {
-  if (!a || !b || a.mode !== b.mode) return false;
+  if (!a || !b) return false;
   const ids = Object.keys(a.positions);
   return (
     ids.length === Object.keys(b.positions).length &&
@@ -292,47 +263,21 @@ export function tiles(groups, placement) {
 function withPositions(placement, update) {
   const positions = { ...placement.positions };
   for (const [id, value] of Object.entries(update)) positions[id] = [...value];
-  return { mode: placement.mode, positions };
+  return { positions };
 }
 
-// A move is one display (free) or one whole computer (grouped); `moving` names which.
-export function movingIds(groups, placement, moving) {
-  if (!groups || !moving) return [];
-  if (moving.id) return placement.positions[moving.id] ? [moving.id] : [];
-  if (SIDES.includes(moving.side)) return groups[moving.side].displays.map((d) => d.id);
-  return [];
+// A move is always one whole computer's block; `moving` names which side.
+export function movingIds(groups, moving) {
+  if (!groups || !moving || !SIDES.includes(moving.side)) return [];
+  return groups[moving.side].displays.map((d) => d.id);
 }
 
 export function movePlacement(groups, placement, moving, delta) {
   if (!isPlacement(groups, placement) || !point(delta)) return placement;
   const update = {};
-  for (const id of movingIds(groups, placement, moving))
+  for (const id of movingIds(groups, moving))
     update[id] = [placement.positions[id][0] + delta[0], placement.positions[id][1] + delta[1]];
   return withPositions(placement, update);
-}
-
-// Free mode starts from the grouped picture, so nothing jumps when the toggle flips.
-export function toFree(placement) {
-  return placement ? { mode: "free", positions: structuredClone(placement.positions) } : null;
-}
-
-// Back to grouped: each computer's own layout returns, placed where its displays sat on average.
-export function toGrouped(groups, placement) {
-  if (!isPlacement(groups, placement)) return null;
-  if (placement.mode === "grouped") return placement;
-  const centre = (side) => {
-    const own = groups[side].displays;
-    const dx = own.reduce((sum, d) => sum + placement.positions[d.id][0] - d.x, 0) / own.length;
-    const dy = own.reduce((sum, d) => sum + placement.positions[d.id][1] - d.y, 0) / own.length;
-    return [dx, dy];
-  };
-  const source = centre("source");
-  const destination = centre("destination");
-  const offset = [destination[0] - source[0], destination[1] - source[1]];
-  return (
-    resolvePlacement(groups, groupedPlacement(groups, offset), { side: "destination" }) ??
-    placeGroup(groups, "right")
-  );
 }
 
 // --- geometry ------------------------------------------------------------
@@ -352,20 +297,17 @@ export function arrangementGeometry(groups, placement) {
       };
     }
   }
-  const free = placement.mode === "free";
   if (all.some((a, i) => all.slice(i + 1).some((b) => overlaps(a, b)))) {
     return {
       ...empty,
       tiles: all,
       valid: false,
-      message: free
-        ? "Move the displays apart so none of them overlap."
-        : "Move the computer groups beside each other, without overlap.",
+      message: "Move the computer groups beside each other, without overlap.",
     };
   }
   const seams = all
-    .filter((t) => t.side === "source")
-    .flatMap((a) => all.filter((t) => t.side === "destination").flatMap((b) => contacts(a, b)));
+    .filter((t) => t.side === "local")
+    .flatMap((a) => all.filter((t) => t.side === "peer").flatMap((b) => contacts(a, b)));
   if (seams.length > 32)
     return {
       ...empty,
@@ -373,16 +315,15 @@ export function arrangementGeometry(groups, placement) {
       valid: false,
       message: "This arrangement has too many separate crossings.",
     };
-  const idle = free
-    ? "Drag a display until it touches one from the other computer."
-    : "Drag a computer group until its displays touch the other group.";
   return {
     ...empty,
     tiles: all,
     valid: true,
     seams,
     connected: seams.length > 0,
-    message: seams.length ? "Highlighted edges let the pointer cross in both directions." : idle,
+    message: seams.length
+      ? "Highlighted edges let the pointer cross in both directions."
+      : "Drag a computer group until its displays touch the other group.",
   };
 }
 
@@ -439,16 +380,16 @@ export function seamCrossings(seams) {
 
 // --- snapping and drop resolution ----------------------------------------
 
-// Nudges the moving displays onto a nearby edge of anything they do not carry along.
+// Nudges the moving computer's block onto a nearby edge of the other one.
 export function snapPlacement(groups, placement, moving, distance = 0) {
   if (!isPlacement(groups, placement) || !Number.isFinite(distance) || distance <= 0)
     return placement;
-  const ids = new Set(movingIds(groups, placement, moving));
+  const ids = new Set(movingIds(groups, moving));
   if (!ids.size) return placement;
   const all = tiles(groups, placement);
   const carried = all.filter((t) => ids.has(t.id));
   const fixed = all.filter((t) => !ids.has(t.id));
-  // Each axis snaps on its own, so a display can line up sideways and vertically in one drop.
+  // Each axis snaps on its own, so a block can line up sideways and vertically in one drop.
   const best = { x: null, y: null };
   for (const a of fixed)
     for (const b of carried) {
@@ -485,13 +426,13 @@ function touchesAcross(axis, a, b, shift) {
     : Math.min(right(a), right(moved)) - Math.max(a.x, moved.x) > EPSILON;
 }
 
-// A drop only commits where it is legal: grouped needs a real crossing, free needs no overlap.
+// A drop only commits where it is legal: the two computers' blocks must actually touch.
 export function resolvePlacement(groups, placement, moving) {
   if (!isPlacement(groups, placement)) return null;
   const geometry = arrangementGeometry(groups, placement);
-  const acceptable = (g) => g.valid && (placement.mode === "free" || g.connected);
+  const acceptable = (g) => g.valid && g.connected;
   if (acceptable(geometry)) return placement;
-  const ids = new Set(movingIds(groups, placement, moving));
+  const ids = new Set(movingIds(groups, moving));
   if (!ids.size) return null;
   const all = tiles(groups, placement);
   const carried = all.filter((t) => ids.has(t.id));
@@ -538,16 +479,16 @@ export function placeGroup(groups, side = "right") {
   const horizontal = side === "left" || side === "right";
   const reference = horizontal
     ? [
-        side === "right" ? groups.source.width : -groups.destination.width,
-        (groups.source.height - groups.destination.height) / 2,
+        side === "right" ? groups.local.width : -groups.peer.width,
+        (groups.local.height - groups.peer.height) / 2,
       ]
     : [
-        (groups.source.width - groups.destination.width) / 2,
-        side === "bottom" ? groups.source.height : -groups.destination.height,
+        (groups.local.width - groups.peer.width) / 2,
+        side === "bottom" ? groups.local.height : -groups.peer.height,
       ];
   const candidates = [reference];
-  for (const a of groups.source.displays)
-    for (const b of groups.destination.displays) {
+  for (const a of groups.local.displays)
+    for (const b of groups.peer.displays) {
       candidates.push(
         horizontal
           ? [
@@ -569,13 +510,13 @@ export function placeGroup(groups, side = "right") {
 
 // --- saved layouts -------------------------------------------------------
 
-// Recover a saved grouped translation only when every recorded segment matches that geometry.
+// Recover a saved translation only when every recorded segment matches that geometry.
 export function placementFromCrossings(groups, crossings) {
   if (!groups || !Array.isArray(crossings) || !crossings.length) return null;
   const first = crossings[0];
   if (OPPOSITE[first.fromEdge] !== first.toEdge) return null;
-  const a = groups.source.displays.find((d) => d.id === first.fromDisplay);
-  const b = groups.destination.displays.find((d) => d.id === first.toDisplay);
+  const a = groups.local.displays.find((d) => d.id === first.fromDisplay);
+  const b = groups.peer.displays.find((d) => d.id === first.toDisplay);
   if (!a || !b) return null;
   const fromSpan = first.fromSpan ?? [0, 1];
   const toSpan = first.toSpan ?? [0, 1];
@@ -600,11 +541,11 @@ export function matchesCrossings(groups, placement, crossings) {
   return crossings.every((c) => geometry.seams.some((s) => sameSeam(c, s)));
 }
 
-// Saved positions win over crossings; a grouped save may omit positions and still reconstruct.
+// Saved positions win over crossings; a save may omit positions and still reconstruct from them.
 export function placementFromLayout(groups, arrangement, crossings) {
   if (!groups) return null;
   const saved =
-    arrangement && MODES.includes(arrangement.mode) && Array.isArray(arrangement.positions)
+    arrangement && typeof arrangement === "object" && Array.isArray(arrangement.positions)
       ? arrangement
       : null;
   if (saved) {
@@ -619,12 +560,13 @@ export function placementFromLayout(groups, arrangement, crossings) {
         return null;
       positions[entry.display] = [entry.x, entry.y];
     }
-    const placement = { mode: saved.mode, positions };
+    const placement = { positions };
     if (isPlacement(groups, placement)) {
-      if (saved.mode === "grouped" && !placementOffset(groups, placement)) return null;
+      if (!placementOffset(groups, placement)) return null;
       return !crossings || matchesCrossings(groups, placement, crossings) ? placement : null;
     }
-    if (saved.mode === "free") return null;
+    // Positions that do not cover every display (a save from before positions existed) fall back
+    // to reconstructing the translation from the crossings alone.
   }
   return placementFromCrossings(groups, crossings);
 }
@@ -635,7 +577,7 @@ export function layoutArrangement(placement, hidden = []) {
     .toSorted(([a], [b]) => a.localeCompare(b))
     .map(([display, [x, y]]) => ({ display, x, y }));
   // Always listed, even empty: a layout that shows every display must restore that way.
-  return { mode: placement.mode, positions, hidden: hidden.toSorted((a, b) => a.localeCompare(b)) };
+  return { positions, hidden: hidden.toSorted((a, b) => a.localeCompare(b)) };
 }
 
 // --- plain-language description -----------------------------------------
@@ -643,8 +585,8 @@ export function layoutArrangement(placement, hidden = []) {
 export function describeArrangement(arrangement) {
   if (!arrangement?.connected || !arrangement.seams?.length) return arrangement?.message ?? "";
   const [first] = arrangement.seams;
-  const from = displayName(arrangement.groups?.source, first.fromDisplay);
-  const to = displayName(arrangement.groups?.destination, first.toDisplay);
+  const from = displayName(arrangement.groups?.local, first.fromDisplay);
+  const to = displayName(arrangement.groups?.peer, first.toDisplay);
   return arrangement.seams.length === 1
     ? `The pointer crosses on the ${first.fromEdge} edge of ${from}, into ${to}.`
     : `The pointer crosses on ${arrangement.seams.length} edges, starting at the ${first.fromEdge} edge of ${from}.`;

@@ -3,7 +3,11 @@
 //! Pairing must compare [`CertificateFingerprint`] values out of band on both
 //! physical machines. A pin is never learned from a connection attempt.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use rcgen::{
     CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
@@ -134,6 +138,13 @@ impl CertificateFingerprint {
             use fmt::Write as _;
             let _ = write!(value, "{byte:02X}");
         }
+        value
+    }
+
+    /// The first eight hexadecimal characters: enough to tell identities apart in a log line.
+    pub(crate) fn short_hex(self) -> String {
+        let mut value = self.full_hex();
+        value.truncate(8);
         value
     }
 }
@@ -518,12 +529,25 @@ fn peer_root_store(verified_peer: &VerifiedPeer) -> Result<RootCertStore, Crypto
     Ok(roots)
 }
 
+/// The certificate a pin last refused in this process, kept only for one diagnostic log line.
+static LAST_REFUSED: Mutex<Option<CertificateFingerprint>> = Mutex::new(None);
+
+/// The certificate a pin refused since the last call, if any.
+pub(crate) fn take_refused_certificate() -> Option<CertificateFingerprint> {
+    LAST_REFUSED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+}
+
 fn verify_exact_leaf(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
     expected_certificate: &[u8],
 ) -> Result<(), RustlsError> {
     if !intermediates.is_empty() || end_entity.as_ref() != expected_certificate {
+        *LAST_REFUSED.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(CertificateFingerprint::from_certificate_der(end_entity));
         return Err(RustlsError::InvalidCertificate(
             CertificateError::ApplicationVerificationFailure,
         ));

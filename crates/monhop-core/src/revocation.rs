@@ -14,6 +14,9 @@ use futures_util::task::AtomicWaker;
 struct RevocationState {
     revoked: AtomicBool,
     stopping: AtomicBool,
+    // A stop specifically for a control-change resync; distinct so the close reason can tell it
+    // apart from every other deliberate stop.
+    control_change: AtomicBool,
     observer: AtomicWaker,
     // The first revocation wins; a session that ends "Revoked" names this call site.
     origin: OnceLock<&'static Location<'static>>,
@@ -27,6 +30,7 @@ impl Default for RevocationSignal {
         Self(Arc::new(RevocationState {
             revoked: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            control_change: AtomicBool::new(false),
             observer: AtomicWaker::new(),
             origin: OnceLock::new(),
         }))
@@ -62,6 +66,15 @@ impl RevocationSignal {
         self.0.stopping.store(true, Ordering::Release);
     }
 
+    /// Same as [`Self::request_stop`], marked so the close path can send a control-change reason
+    /// instead of the ordinary ended one.
+    #[track_caller]
+    pub fn request_stop_for_control_change(&self) {
+        let _ = self.0.origin.set(Location::caller());
+        self.0.control_change.store(true, Ordering::Release);
+        self.0.stopping.store(true, Ordering::Release);
+    }
+
     /// The call site of the first stop request or revocation, if any.
     pub fn origin(&self) -> Option<&'static Location<'static>> {
         self.0.origin.get().copied()
@@ -74,6 +87,11 @@ impl RevocationSignal {
     /// What a session loop polls: a stop request or a revocation both end it.
     pub fn is_stopping(&self) -> bool {
         self.0.stopping.load(Ordering::Acquire) || self.is_revoked()
+    }
+
+    /// True once [`Self::request_stop_for_control_change`] was called on this signal.
+    pub fn is_stopping_for_control_change(&self) -> bool {
+        self.0.control_change.load(Ordering::Acquire)
     }
 
     /// Waits for permanent revocation. One task may observe; competing pollers replace its waker.
@@ -203,6 +221,21 @@ mod tests {
         signal.revoke();
         assert!(signal.is_revoked());
         assert!(signal.is_stopping());
+    }
+
+    #[test]
+    fn a_control_change_stop_is_stopping_and_distinguishable_from_a_plain_stop() {
+        let signal = RevocationSignal::default();
+        assert!(!signal.is_stopping_for_control_change());
+        signal.request_stop_for_control_change();
+        assert!(signal.is_stopping());
+        assert!(signal.is_stopping_for_control_change());
+        assert!(!signal.is_revoked());
+
+        let plain = RevocationSignal::default();
+        plain.request_stop();
+        assert!(plain.is_stopping());
+        assert!(!plain.is_stopping_for_control_change());
     }
 
     #[test]

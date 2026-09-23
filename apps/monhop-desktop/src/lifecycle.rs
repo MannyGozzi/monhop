@@ -15,10 +15,11 @@ use crate::{
     pairing::{PairingController, PairingView},
     sharing::{
         ARRANGEMENTS_FILE, DisplayNotice, LayoutRequest, SharingController, SharingView,
-        current_local_displays,
+        current_local_displays, still_unsettled,
     },
     sharing_preferences::{
-        SetupFile, SharingPreferences, adapt_to_inspection, fingerprint_key, parse_fingerprint,
+        DisplayGeometry, SetupFile, SharingPreferences, adapt_to_inspection, fingerprint_key,
+        local_decides, parse_fingerprint,
     },
 };
 
@@ -90,7 +91,6 @@ struct CachedSetup {
 pub struct AppController {
     pub pairing: Arc<PairingController>,
     pub sharing: Arc<SharingController>,
-    pub trial: Arc<crate::trial::TrialController>,
     gate: Arc<ActionGate>,
     /// Resolved once at startup so actions with fixed signatures can still reach the setup file.
     setup_path: Mutex<Option<PathBuf>>,
@@ -98,6 +98,8 @@ pub struct AppController {
     sharing_retry_after: Mutex<Option<Instant>>,
     /// The supervisor's last parse of the setup file; see `cached_setup`.
     setup_cache: Mutex<Option<CachedSetup>>,
+    /// When this computer's displays first failed to read in a row; see `local_displays_fit`.
+    displays_unreadable_since: Mutex<Option<Instant>>,
 }
 
 /// The sharing session and the setup link share one port, so a link waits for the session to stop.
@@ -115,7 +117,6 @@ impl AppController {
         if !self.sharing.shutdown_ready()
             || !self.pairing.shutdown_ready()
             || self.pairing.occupies_port()
-            || self.trial.is_open()
         {
             return Err(
                 "Pause sharing and finish pairing before checking or installing updates.".into(),
@@ -307,9 +308,6 @@ impl AppController {
         if !self.pairing.shutdown_ready() || self.pairing.occupies_port() {
             return Err("Finish or cancel pairing before arranging displays.".into());
         }
-        if self.trial.is_open() {
-            return Err("Close the test window before arranging displays.".into());
-        }
         let fingerprint = parse_fingerprint(fingerprint)?;
         let path = self.setup_path()?;
         log::info!("user: started arranging with {}", short(fingerprint));
@@ -343,18 +341,42 @@ impl AppController {
     pub fn apply_setup(
         &self,
         revision: String,
-        source: String,
         layout: LayoutRequest,
     ) -> Result<SharingView, String> {
         let _lease = self.gate.begin()?;
         if !self.pairing.shutdown_ready() {
             return Err("Finish or cancel pairing before applying a layout.".into());
         }
-        if self.trial.is_open() {
-            return Err("Close the test window before applying a layout.".into());
-        }
         log::info!("user: applied a layout");
-        self.sharing.apply_setup(&revision, &source, layout)
+        self.sharing.apply_setup(&revision, layout)
+    }
+
+    /// Flips one of the two switches for the active computer. The session ends on the next
+    /// pass and the change travels over the link to both computers' records.
+    pub fn set_control(
+        &self,
+        fingerprint: &str,
+        direction: &str,
+        allowed: bool,
+    ) -> Result<SharingView, String> {
+        {
+            let _lease = self.gate.begin()?;
+            if !self.pairing.shutdown_ready() {
+                return Err(
+                    "Finish or cancel pairing before changing who can control which computer."
+                        .into(),
+                );
+            }
+            let path = self.setup_path()?;
+            self.sharing
+                .set_control(&path, fingerprint, direction, allowed)?;
+            log::info!(
+                "user: {} {direction}",
+                if allowed { "allowed" } else { "turned off" }
+            );
+        }
+        self.nudge();
+        Ok(self.sharing.status())
     }
 
     /// Runs on every supervisor tick: keeps the active computer connected while nothing else
@@ -373,7 +395,7 @@ impl AppController {
             return;
         };
         match self.keep_connected(&path) {
-            Ok(Some(started)) => log::info!("supervisor: {started}"),
+            Ok(Some(transition)) => log::info!("supervisor: {transition}"),
             Ok(None) => {}
             Err(message) => {
                 log::warn!("supervisor: could not connect: {message}");
@@ -384,10 +406,10 @@ impl AppController {
     }
 
     /// Ok(None) means nothing to do: no active computer, or another action owns input or the port.
-    /// A saved layout that fits both computers' displays runs as a session; anything else keeps a
-    /// standing link so the displays can be arranged.
-    fn keep_connected(&self, path: &Path) -> Result<Option<&'static str>, String> {
-        if self.trial.is_open() || !self.pairing.shutdown_ready() || self.pairing.occupies_port() {
+    /// A record that fits this computer's displays runs as a session; anything else keeps a link,
+    /// on which the decider picks the record both computers hold. Ok(Some) is the log line.
+    fn keep_connected(&self, path: &Path) -> Result<Option<String>, String> {
+        if !self.pairing.shutdown_ready() || self.pairing.occupies_port() {
             return Ok(None);
         }
         let file = self.cached_setup(
@@ -401,10 +423,12 @@ impl AppController {
         let peer = parse_fingerprint(active)?;
         let saved = file.computer(active);
         if self.sharing.live_peer().is_some() {
-            if saved.is_some_and(|saved| self.sharing.yield_link_when_layout_fits(saved)) {
-                return Ok(Some(
-                    "the displays fit the saved layout again; ending the link",
-                ));
+            if self.sharing.end_session_for_control() {
+                return Ok(Some(transition(
+                    "ending the session to change who can control which computer",
+                    saved,
+                    None,
+                )));
             }
             let Some((saved, inspection)) = saved.zip(self.sharing.inspection_for_switch()) else {
                 return Ok(None);
@@ -419,22 +443,20 @@ impl AppController {
         if self.sharing.within_failure_backoff(SUPERVISOR_BACKOFF) {
             return Ok(None);
         }
-        let candidate = saved.filter(|_| !self.sharing.editing() && !self.sharing.holds_link());
-        let current = candidate.map(current_local_displays).transpose()?;
-        if let Some((saved, current)) = candidate.zip(current.as_ref()) {
-            if saved.matches_local_displays(current) {
-                // A layout applied before memories existed is remembered from its first session.
-                crate::sharing::remember_applied(path, saved);
-                self.sharing.start_sharing(saved.clone())?;
-                return Ok(Some("started sharing with the active computer"));
-            }
-            if let Some(remembered) = self.remembered_for_local_displays(path, saved, current) {
-                self.sharing.write_active_setup(path, remembered.clone())?;
-                *lock(&self.setup_cache) = None;
-                self.sharing.start_sharing(remembered)?;
-                return Ok(Some(
-                    "started sharing with the arrangement remembered for these displays",
-                ));
+        if let Some(saved) = saved.filter(|_| !self.sharing.editing() && !self.sharing.holds_link())
+        {
+            match self.local_displays_fit(saved)? {
+                None => return Ok(None),
+                Some(true) => {
+                    self.sharing.start_sharing(saved.clone())?;
+                    return Ok(Some(transition(
+                        "started sharing with the active computer",
+                        Some(saved),
+                        None,
+                    )));
+                }
+                // Never promoted here: only the decider picks a record, and only on the link.
+                Some(false) => self.sharing.note_local_misfit(),
             }
         }
         let interface_id = file
@@ -443,44 +465,90 @@ impl AppController {
             .to_owned();
         self.sharing
             .connect_link(path.to_path_buf(), interface_id, peer)?;
-        Ok(Some(if self.sharing.editing() {
-            "reopened the link for arranging"
-        } else {
-            "opened a standing link; no layout fits yet"
-        }))
+        Ok(Some(transition(
+            if self.sharing.editing() {
+                "reopened the link for arranging"
+            } else {
+                "opened a standing link"
+            },
+            saved,
+            None,
+        )))
     }
 
-    /// The active record no longer fits the connected displays. The computer with the keyboard
-    /// picks what runs next and sends it over the link; the other one only waits for it, so a
-    /// display change can never leave the two computers holding different records. The library
-    /// is read only here, never while the applied layout still fits.
+    /// Whether this computer still shows the record's displays. None while a read that failed
+    /// mid-change is retried quietly; past the unsettled window it is a failure again.
+    fn local_displays_fit(&self, saved: &SharingPreferences) -> Result<Option<bool>, String> {
+        let mut since = lock(&self.displays_unreadable_since);
+        match current_local_displays(saved) {
+            Ok(current) => {
+                *since = None;
+                Ok(Some(saved.matches_local_displays(&current)))
+            }
+            Err(_) if still_unsettled(&mut since, Instant::now()) => Ok(None),
+            Err(message) => {
+                *since = None;
+                Err(message)
+            }
+        }
+    }
+
+    /// The link's decision pass. Only the decider (lower DeviceId) picks the record, leaving via
+    /// the close after its commit; the other computer only proposes a flip over a fitting record.
     fn switch_or_continue(
         &self,
         path: &Path,
         saved: &SharingPreferences,
         inspection: &InspectedPeer,
-    ) -> Result<Option<&'static str>, String> {
-        // Only two answers end this pass: a proposal already in flight for exactly these
-        // displays, and these displays already answered with "nothing fits". A raised banner is
-        // neither, because it survives the link a proposal went down with.
+    ) -> Result<Option<String>, String> {
+        // In flight, answered "nothing fits", or refused too recently. A banner is none of these:
+        // it outlives the link a proposal died with.
         if self.sharing.proposal_pending_for(inspection)
             || self.sharing.waiting_notice_for(inspection)
+            || self.sharing.retry_wait_for(inspection)
         {
             return Ok(None);
         }
-        // The saved record says which computer holds the keyboard; the live inspection's source
-        // is only what this connection was opened with and can disagree with the record.
-        if saved.source_side() != "local" {
-            self.sharing
-                .raise_display_notice(DisplayNotice::PeerDeciding, inspection);
+        let fits = saved.fits_displays(inspection);
+        if !local_decides(inspection) {
+            if fits && self.sharing.control_pending() {
+                return Ok(self.send(
+                    saved,
+                    None,
+                    inspection,
+                    "sent the other computer a control change",
+                ));
+            }
+            if !fits
+                && self
+                    .sharing
+                    .raise_display_notice(DisplayNotice::PeerDeciding, inspection)
+            {
+                return Ok(Some(transition(
+                    "waiting for the other computer to choose the layout",
+                    Some(saved),
+                    Some(inspection),
+                )));
+            }
             return Ok(None);
+        }
+        // Every in-between display state would otherwise be proposed and committed in turn.
+        if !self.sharing.displays_settled() {
+            return Ok(None);
+        }
+        if fits {
+            return Ok(self.send(
+                saved,
+                None,
+                inspection,
+                "sent the other computer this computer's layout",
+            ));
         }
         let library = self.library(path);
         // The memory that fits exactly wins and loses nothing; otherwise the record is rebuilt
         // from the memory made with exactly these monitors, so a display that only moved keeps
         // every crossing made for it, and from the running record when there is no such memory.
-        // A rebuild reports whether it had to leave anything out, which is what Home tells the
-        // user about once both computers hold the new layout.
+        // Who may control whom is the pair's current choice, never a memory's.
         let next = library
             .as_ref()
             .and_then(|library| library.automatic_fit(inspection))
@@ -495,37 +563,54 @@ impl AppController {
             .or_else(|| {
                 adapt_to_inspection(saved, inspection)
                     .map(|adapted| (adapted.record, adapted.left_out))
+            })
+            .and_then(|(record, left_out)| {
+                record
+                    .with_control(saved.control().clone())
+                    .map(|record| (record, left_out))
             });
         let Some((next, left_out)) = next else {
-            self.sharing
-                .raise_display_notice(DisplayNotice::Waiting, inspection);
+            if self
+                .sharing
+                .raise_display_notice(DisplayNotice::Waiting, inspection)
+            {
+                return Ok(Some(transition(
+                    "no layout fits these displays; waiting for arranging",
+                    Some(saved),
+                    Some(inspection),
+                )));
+            }
             return Ok(None);
         };
-        // Both computers write the agreed bytes at the link's commit, which also remembers the
-        // record and closes the link; the next supervisor pass then starts the session. A
-        // proposal that cannot leave this moment must not back the supervisor off. The send
-        // records itself and raises the banner under its own lock.
-        if let Err(message) = self.sharing.propose_layout(&next, left_out) {
-            log::warn!("supervisor: the layout for the new displays was not sent: {message}");
-            self.sharing
-                .raise_display_notice(DisplayNotice::Waiting, inspection);
-            return Ok(None);
-        }
-        Ok(Some(
+        Ok(self.send(
+            &next,
+            Some(left_out),
+            inspection,
             "sent the other computer a layout for the displays it shows now",
         ))
     }
 
-    /// An arrangement remembered for the displays this computer shows now; the other computer's
-    /// displays are checked when the session connects.
-    fn remembered_for_local_displays(
+    /// Both computers commit the agreed bytes, then the sender closes the link. A proposal that
+    /// cannot leave is retried like a passing refusal and never backs the supervisor off.
+    fn send(
         &self,
-        path: &Path,
-        saved: &SharingPreferences,
-        current: &monhop_transport::session_setup::DisplayTopology,
-    ) -> Option<SharingPreferences> {
-        self.library(path)
-            .and_then(|library| library.automatic_for_local(saved, current))
+        next: &SharingPreferences,
+        display_change: Option<bool>,
+        inspection: &InspectedPeer,
+        action: &'static str,
+    ) -> Option<String> {
+        let sent = match display_change {
+            Some(left_out) => self.sharing.propose_layout(next, left_out),
+            None => self.sharing.propose_record(next),
+        };
+        match sent {
+            Ok(()) => Some(transition(action, Some(next), Some(inspection))),
+            Err(message) => {
+                log::warn!("supervisor: the proposal was not sent: {message}");
+                self.sharing.note_proposal_failed(inspection);
+                None
+            }
+        }
     }
 
     fn library(&self, path: &Path) -> Option<ArrangementLibrary> {
@@ -595,66 +680,6 @@ impl AppController {
             live,
             &self.sharing.revision(),
         ))
-    }
-
-    pub fn select_source(&self, revision: &str, source: &str) -> Result<SharingView, String> {
-        let _lease = self.gate.begin()?;
-        if self.trial.is_open() || !self.pairing.shutdown_ready() {
-            return Err("Finish the current connection before changing the input computer.".into());
-        }
-        self.sharing.select_source(revision, source)
-    }
-
-    /// Resolves the setup file for callers that hold only the ticket.
-    pub fn validate_trial_setup(
-        &self,
-        revision: &str,
-        layout: &LayoutRequest,
-    ) -> Result<(), String> {
-        let path = self.setup_path()?;
-        self.sharing
-            .validate_trial_setup(&path, revision, layout)
-            .map(|_| ())
-    }
-
-    pub fn prepare_trial(
-        &self,
-        revision: String,
-        layout: LayoutRequest,
-        peer_name: String,
-    ) -> Result<(), String> {
-        let _lease = self.gate.begin()?;
-        if !self.pairing.shutdown_ready() || !self.sharing.shutdown_ready() {
-            return Err("Finish the current connection before opening a test window.".into());
-        }
-        if !self.sharing.link_is_off() {
-            return Err("Stop the connection before opening the test window.".into());
-        }
-        self.validate_trial_setup(&revision, &layout)?;
-        self.trial.prepare(revision, layout, peer_name)
-    }
-
-    pub fn start_trial(
-        &self,
-        revision: String,
-        layout: LayoutRequest,
-        authorization: monhop_transport::session_trial::TrialAuthorization,
-    ) -> Result<SharingView, String> {
-        let _lease = self.gate.begin()?;
-        if !self.pairing.shutdown_ready() {
-            return Err("Finish pairing before starting the test.".into());
-        }
-        let path = self.setup_path()?;
-        self.sharing
-            .enable_trial(&path, revision, layout, authorization)
-    }
-
-    pub(crate) fn metadata_action<T>(
-        &self,
-        action: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
-        let _lease = self.gate.begin()?;
-        action()
     }
 
     pub fn save_setup(
@@ -737,7 +762,6 @@ impl AppController {
 
     pub fn request_shutdown(&self) -> bool {
         let first = self.gate.request_shutdown();
-        self.trial.revoke();
         self.pairing.request_shutdown();
         self.sharing.request_shutdown();
         first
@@ -766,6 +790,34 @@ impl AppController {
 /// How long a quit waits for held input and sockets to let go before the process ends anyway.
 const EXIT_DRAIN_LIMIT: Duration = Duration::from_secs(5);
 
+/// One log line per supervisor step: each side's display count and geometry digest, the record's
+/// digest and the decider. Nothing in it names a key or typed text.
+fn transition(
+    action: &str,
+    saved: Option<&SharingPreferences>,
+    inspection: Option<&InspectedPeer>,
+) -> String {
+    let displays = inspection.map_or_else(
+        || {
+            saved.map_or_else(
+                || "no displays known".to_owned(),
+                SharingPreferences::describe,
+            )
+        },
+        |inspection| DisplayGeometry::of(inspection).describe(),
+    );
+    let record = saved.map_or_else(|| "none".to_owned(), |saved| format!("#{}", saved.digest()));
+    let decider = match inspection
+        .map(local_decides)
+        .or_else(|| saved.map(SharingPreferences::local_decides))
+    {
+        Some(true) => "this computer",
+        Some(false) => "the other computer",
+        None => "unknown",
+    };
+    format!("{action} [{displays}; record {record}; decider {decider}]")
+}
+
 /// The first hex digits of a fingerprint: enough to tell computers apart in a log line.
 fn short(fingerprint: CertificateFingerprint) -> String {
     fingerprint.full_hex()[..8].to_ascii_lowercase()
@@ -780,6 +832,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sharing::tests::{
+        LinkFixture, fake_link, join_finished_worker, open_fake_link, settle_displays, sync_state,
+        wait_for,
+    };
+    use crate::sharing_preferences::tests::{file_with, inspection, opposite, preferences};
+    use monhop_transport::session_link::{LinkDisconnect, LinkEvent};
 
     #[test]
     fn actions_are_exclusive_and_shutdown_does_not_wait_for_a_prompt() {
@@ -856,24 +914,37 @@ mod tests {
         path
     }
 
+    fn fingerprint(letter: char) -> CertificateFingerprint {
+        CertificateFingerprint::parse_full(&letter.to_string().repeat(64)).unwrap()
+    }
+
+    /// The fixture pair's record as the other computer holds it, made while this computer's
+    /// display 1 sat elsewhere: it no longer fits.
+    fn stale_record_of_the_other_computer() -> SharingPreferences {
+        let mut moved = preferences();
+        moved.move_local_display_for_test("1", [0.0, 240.0]);
+        SharingPreferences::from_inspection(
+            &opposite(&inspection(&moved)),
+            preferences().layout().clone(),
+        )
+        .expect("a valid record from the other computer's side")
+    }
+
     #[test]
-    fn the_computer_without_the_keyboard_waits_while_the_other_one_chooses_the_layout() {
+    fn the_non_decider_waits_while_the_decider_chooses_the_layout() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let controller = AppController::default();
         let folder = folder("peer-decides");
         let path = folder.join("sharing.json");
-        let saved = crate::sharing_preferences::tests::preferences();
-        assert_eq!(saved.source_side(), "peer");
-        // The connection was opened naming this computer as the source; the saved record, not
-        // that, says who decides, so this side still waits.
-        let mut inspection = crate::sharing_preferences::tests::inspection(&saved);
-        inspection.source = inspection.local_device;
-        assert!(inspection.source_is_local());
-        assert_eq!(
+        let here = opposite(&inspection(&preferences()));
+        assert!(!local_decides(&here));
+        let stale = stale_record_of_the_other_computer();
+        assert!(!stale.fits_displays(&here));
+        assert!(
             controller
-                .switch_or_continue(&path, &saved, &inspection)
-                .unwrap(),
-            None
+                .switch_or_continue(&path, &stale, &here)
+                .unwrap()
+                .is_some()
         );
         assert_eq!(
             controller.sharing.status().display_notice,
@@ -883,34 +954,175 @@ mod tests {
         assert!(!path.exists());
         assert!(!folder.join(ARRANGEMENTS_FILE).exists());
         assert_eq!(
-            controller
-                .switch_or_continue(&path, &saved, &inspection)
-                .unwrap(),
+            controller.switch_or_continue(&path, &stale, &here).unwrap(),
             None
         );
-
-        // With the keyboard here the record is chosen and sent; no link means it cannot go out,
-        // and the banner asks for arranging instead of backing the supervisor off.
-        let keyboard_here = crate::sharing_preferences::tests::preferences_with_local_source();
+        // A record that fits is not proposed from this side either, unless a switch flip rides
+        // on it; it waits for the decider's.
         controller.sharing.clear_display_notice();
+        let fitting =
+            SharingPreferences::from_inspection(&here, preferences().layout().clone()).unwrap();
         assert_eq!(
             controller
-                .switch_or_continue(&path, &keyboard_here, &inspection)
+                .switch_or_continue(&path, &fitting, &here)
                 .unwrap(),
             None
         );
-        assert_eq!(
-            controller.sharing.status().display_notice,
-            Some(DisplayNotice::Waiting)
-        );
-        // These displays are answered, so the next pass proposes nothing more for them.
-        assert_eq!(
-            controller
-                .switch_or_continue(&path, &keyboard_here, &inspection)
-                .unwrap(),
-            None
-        );
+        assert!(controller.sharing.status().display_notice.is_none());
         let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// An app controller with a connected fake link to `peer` showing `inspection`.
+    fn linked_controller(
+        path: &Path,
+        peer: CertificateFingerprint,
+        inspection: &InspectedPeer,
+    ) -> (AppController, LinkFixture) {
+        let controller = AppController {
+            sharing: Arc::new(SharingController::with_link_runner(
+                fake_link,
+                Duration::from_secs(600),
+            )),
+            ..AppController::default()
+        };
+        controller.use_setup_path(path.to_path_buf());
+        let fixture = open_fake_link(&controller.sharing, path.to_path_buf(), peer);
+        fixture
+            .events
+            .send(LinkEvent::Connected {
+                inspection: inspection.clone(),
+            })
+            .unwrap();
+        wait_for(&controller.sharing, |view| view.phase == "connected");
+        (controller, fixture)
+    }
+
+    #[test]
+    fn two_computers_make_one_proposal_and_one_commit_before_a_session() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let folder = folder("two-computers");
+        let decider_path = folder.join("decider").join("sharing.json");
+        let other_path = folder.join("other").join("sharing.json");
+        let fitting = preferences();
+        let decider_view = inspection(&fitting);
+        let other_view = opposite(&decider_view);
+        assert!(local_decides(&decider_view));
+        assert!(!local_decides(&other_view));
+        let stale = stale_record_of_the_other_computer();
+        file_with(fitting.clone()).save(&decider_path).unwrap();
+        file_with(stale.clone()).save(&other_path).unwrap();
+        let (decider, decider_link) =
+            linked_controller(&decider_path, fingerprint('B'), &decider_view);
+        let (other, other_link) = linked_controller(&other_path, fingerprint('A'), &other_view);
+
+        // The other computer's record is stale: it waits and proposes nothing.
+        assert!(
+            other
+                .switch_or_continue(&other_path, &stale, &other_view)
+                .unwrap()
+                .is_some()
+        );
+        // The decider waits for the displays to hold still, then proposes its record once.
+        assert_eq!(
+            decider
+                .switch_or_continue(&decider_path, &fitting, &decider_view)
+                .unwrap(),
+            None
+        );
+        settle_displays(&decider.sharing);
+        assert!(
+            decider
+                .switch_or_continue(&decider_path, &fitting, &decider_view)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            decider
+                .switch_or_continue(&decider_path, &fitting, &decider_view)
+                .unwrap(),
+            None
+        );
+        let bytes = decider_link
+            .proposals
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the decider proposes its record");
+        assert!(decider_link.proposals.try_recv().is_err());
+        assert!(other_link.proposals.try_recv().is_err());
+
+        // The link commits the same bytes on both computers.
+        for (link, view) in [(&decider_link, &decider_view), (&other_link, &other_view)] {
+            (link.persist.stage)(view, &bytes).unwrap();
+            (link.persist.commit)(view, &bytes).unwrap();
+        }
+        other_link
+            .events
+            .send(LinkEvent::SyncCompleted {
+                inspection: other_view.clone(),
+                bytes: bytes.clone(),
+                sending: false,
+            })
+            .unwrap();
+        wait_for(&other.sharing, |view| sync_state(view) == "applied");
+        // Only the decider leaves, after the commit; the other computer waits for that close.
+        assert_eq!(other.sharing.status().phase, "connected");
+        decider_link
+            .events
+            .send(LinkEvent::SyncCompleted {
+                inspection: decider_view.clone(),
+                bytes,
+                sending: true,
+            })
+            .unwrap();
+        wait_for(&decider.sharing, |view| view.phase == "off");
+        other_link
+            .events
+            .send(LinkEvent::Disconnected {
+                reason: LinkDisconnect::PeerClosed,
+            })
+            .unwrap();
+        wait_for(&other.sharing, |view| view.phase == "off");
+        join_finished_worker(&decider.sharing);
+        join_finished_worker(&other.sharing);
+
+        // Both hold one record that fits and nothing holds a link, so each next pass starts the
+        // session.
+        for (controller, path, view) in [
+            (&decider, &decider_path, &decider_view),
+            (&other, &other_path, &other_view),
+        ] {
+            let file = SetupFile::load(path).unwrap();
+            assert!(file.active_computer().unwrap().fits_displays(view));
+            assert!(!controller.sharing.holds_link());
+            assert!(controller.sharing.link_is_off());
+            assert!(controller.sharing.status().display_notice.is_none());
+        }
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn a_transition_line_names_displays_record_and_decider_but_no_identity() {
+        let saved = preferences();
+        let here = inspection(&saved);
+        let line = transition("sent", Some(&saved), Some(&here));
+        assert!(
+            line.starts_with("sent [this computer 1 display #"),
+            "{line}"
+        );
+        assert!(line.contains(", other computer 1 display #"), "{line}");
+        assert!(
+            line.contains(&format!("; record #{}; ", saved.digest())),
+            "{line}"
+        );
+        assert!(line.ends_with("; decider this computer]"), "{line}");
+        for identity in ["aaaaaaaa", "AAAAAAAA", "bbbbbbbb", "BBBBBBBB"] {
+            assert!(!line.contains(identity), "{line}");
+        }
+        let there = transition("waiting", Some(&saved), Some(&opposite(&here)));
+        assert!(there.ends_with("; decider the other computer]"), "{there}");
+        assert_eq!(
+            transition("idle", None, None),
+            "idle [no displays known; record none; decider unknown]"
+        );
     }
 
     #[test]
@@ -978,19 +1190,13 @@ mod tests {
     fn metadata_updates_drain_before_exit_and_cannot_restart_after_quit() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let controller = AppController::default();
-        controller
-            .metadata_action(|| {
-                assert!(controller.request_shutdown());
-                assert!(!controller.shutdown_ready());
-                Ok(())
-            })
-            .unwrap();
+        {
+            let _lease = controller.gate.begin().unwrap();
+            assert!(controller.request_shutdown());
+            assert!(!controller.shutdown_ready());
+        }
         assert!(controller.shutdown_ready());
-        assert!(
-            controller
-                .metadata_action(|| -> Result<(), String> { panic!("must not write after quit") })
-                .is_err()
-        );
+        assert!(controller.gate.begin().is_err());
     }
 
     #[test]
@@ -1005,7 +1211,7 @@ mod tests {
         );
         assert!(controller.edit_end().is_ok());
         controller.use_setup_path(std::env::temp_dir().join("monhop-lifecycle-unused.json"));
-        controller.sharing.stop();
+        controller.sharing.stop_with("Stopped.");
         assert!(controller.sharing.shutdown_ready());
     }
 
@@ -1013,7 +1219,7 @@ mod tests {
     fn retained_input_cleanup_blocks_pairing_mutations_and_exit() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let controller = AppController::default();
-        let ownership = monhop_core::NativeInputOwnership::claim().unwrap();
+        let ownership = monhop_core::NativeSessionClaim::claim().unwrap();
         assert!(
             controller
                 .pairing_action(|_| panic!("must not mutate trust"))
@@ -1029,22 +1235,14 @@ mod tests {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let controller = AppController::default();
         let update = controller.begin_update(false).unwrap();
-        assert!(
-            controller
-                .metadata_action(|| -> Result<(), String> {
-                    panic!("action cannot start during update work")
-                })
-                .is_err()
-        );
+        assert!(controller.gate.begin().is_err());
         assert!(controller.begin_update(true).is_err());
         drop(update);
-        controller
-            .metadata_action(|| {
-                assert!(controller.begin_update(false).is_err());
-                assert!(controller.begin_update(true).is_err());
-                Ok(())
-            })
-            .unwrap();
+        {
+            let _lease = controller.gate.begin().unwrap();
+            assert!(controller.begin_update(false).is_err());
+            assert!(controller.begin_update(true).is_err());
+        }
         assert!(controller.begin_update(false).is_ok());
     }
 
@@ -1052,7 +1250,7 @@ mod tests {
     fn native_cleanup_blocks_checks_even_when_the_view_is_not_sharing() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let controller = AppController::default();
-        let ownership = monhop_core::NativeInputOwnership::claim().unwrap();
+        let ownership = monhop_core::NativeSessionClaim::claim().unwrap();
         assert!(!controller.sharing.status().sharing_active);
         assert!(controller.begin_update(false).is_err());
         assert!(controller.begin_update(true).is_err());

@@ -1,5 +1,4 @@
 import {
-  MODES,
   arrangementGeometry,
   displayGroups,
   drawnDisplays,
@@ -19,8 +18,6 @@ import {
   seamCrossings,
   sharedMonitors,
   snapPlacement,
-  toFree,
-  toGrouped,
 } from "./arrangement-model.mjs";
 
 export const MAX_CROSSINGS = 32;
@@ -30,7 +27,6 @@ export const MAX_ARRANGEMENT_NAME = 64;
 
 const PLATFORMS = new Set(["macos", "windows"]);
 const SIDES = new Set(["local", "peer"]);
-const ARRANGEMENT_SIDES = new Set(["source", "destination"]);
 const DISPLAY_NOTICE_KINDS = new Set(["continued", "waiting", "updating", "peerDeciding"]);
 const PHASES = new Set([
   "off",
@@ -45,7 +41,6 @@ const PHASES = new Set([
 // The setup link carries topology and layout proposals; a sharing session runs on its own and outlives it.
 const LINK_PHASES = new Set(["connecting", "connected", "reconnecting"]);
 const SESSION_PHASES = new Set([...LINK_PHASES, "stopping", "starting", "sharing"]);
-const ROLES = new Set(["sends", "receives"]);
 const SYNC_STATES = new Set(["idle", "sending", "receiving", "applied", "rejected"]);
 const EDGES = new Set(["left", "right", "top", "bottom"]);
 const WHOLE_EDGE = [0, 1];
@@ -59,7 +54,6 @@ export function initialSharingState() {
     generation: 0,
     pending: null,
     view: null,
-    source: null,
     layout: emptyLayout(),
     appliedRevision: null,
     appliedSignature: null,
@@ -71,7 +65,7 @@ export function initialSharingState() {
 
 function emptyLayout() {
   // `hidden` names the displays marked not in use; null means the default choice.
-  return { sourceDisplay: null, placement: null, crossings: [], hidden: null };
+  return { placement: null, crossings: [], hidden: null };
 }
 
 // One in-flight native command at a time; the generation lets late replies be ignored.
@@ -109,7 +103,6 @@ export function applySharingView(state, value) {
   const previous = state.view;
   // The view narrates its own phase on every poll; state.message stays for what only the UI can report.
   let next = { ...state, view, message: "" };
-  if (view.sourceSide) next.source = view.sourceSide;
   // Apply closes the link with the sync still "applied", so only a live link with no applied sync clears it.
   next.syncApplied =
     view.sync.state === "applied" || (!LINK_PHASES.has(view.phase) && state.syncApplied === true);
@@ -209,50 +202,25 @@ export function canEditLayout(state, interfaceId) {
   );
 }
 
-export function canChooseSource(state) {
-  return isConnected(state) && state.pending === null && !isSyncing(state);
-}
-
-export function setSource(state, side) {
-  if (!SIDES.has(side) || state.source === side) return state;
-  // Which computer shows on a shared monitor is physical, so the mark outlives the choice of input computer.
-  return {
-    ...state,
-    source: side,
-    layout: { ...emptyLayout(), hidden: state.layout.hidden },
-    syncApplied: false,
-  };
-}
-
-// Every display each side reports, before shared monitors are folded into one.
+// Every display each computer reports, before shared monitors are folded into one.
 function allDisplays(state) {
-  if (!isConnected(state) || !state.source) return { source: [], destination: [] };
+  if (!isConnected(state)) return { local: [], peer: [] };
   const { localDisplays, peerDisplays } = state.view;
-  return state.source === "local"
-    ? { source: localDisplays, destination: peerDisplays }
-    : { source: peerDisplays, destination: localDisplays };
+  return { local: localDisplays, peer: peerDisplays };
 }
 
 // The displays the arrangement works with: the ones in use, each shared monitor once by default.
 function arrangedDisplays(state, layout = state.layout) {
   const all = allDisplays(state);
-  const pairs = sharedMonitors(all.source, all.destination);
-  const hidden = hiddenDisplays(all.source, all.destination, layout?.hidden ?? null);
+  const pairs = sharedMonitors(all.local, all.peer);
+  const hidden = hiddenDisplays(all.local, all.peer, layout?.hidden ?? null);
   return {
-    source: drawnDisplays(all.source, hidden, pairs),
-    destination: drawnDisplays(all.destination, hidden, pairs),
+    local: drawnDisplays(all.local, hidden, pairs),
+    peer: drawnDisplays(all.peer, hidden, pairs),
     hidden,
     pairs,
     all,
   };
-}
-
-export function sourceDisplays(state) {
-  return arrangedDisplays(state).source;
-}
-
-export function destinationDisplays(state) {
-  return arrangedDisplays(state).destination;
 }
 
 export function hiddenDisplayIds(state, layout = state.layout) {
@@ -264,11 +232,11 @@ export function sharedMonitorChoices(state) {
   const { hidden, pairs, all } = arrangedDisplays(state);
   const gone = new Set(hidden);
   return pairs
-    .filter((pair) => gone.has(pair.source.id) !== gone.has(pair.destination.id))
+    .filter((pair) => gone.has(pair.local.id) !== gone.has(pair.peer.id))
     .map((pair) => {
-      const side = gone.has(pair.source.id) ? "destination" : "source";
+      const side = gone.has(pair.local.id) ? "peer" : "local";
       const other = oppositeSide(side);
-      const swapped = hiddenDisplays(all.source, all.destination, [
+      const swapped = hiddenDisplays(all.local, all.peer, [
         ...hidden.filter((id) => id !== pair[other].id),
         pair[side].id,
       ]);
@@ -283,13 +251,13 @@ export function sharedMonitorChoices(state) {
 
 // Marks which computer shows on a shared monitor: its tile keeps its place and the other copy leaves the picture.
 export function setMonitorSide(state, monitor, side) {
-  if (!isConnected(state) || isBusySharing(state) || !ARRANGEMENT_SIDES.has(side)) return state;
+  if (!isConnected(state) || isBusySharing(state) || !SIDES.has(side)) return state;
   const { hidden: before, pairs, all } = arrangedDisplays(state);
   const pair = pairs.find((candidate) => candidate.monitor === monitor);
   if (!pair || !before.includes(pair[side].id)) return state;
   const shown = pair[side].id;
   const leaving = pair[oppositeSide(side)].id;
-  const hidden = hiddenDisplays(all.source, all.destination, [
+  const hidden = hiddenDisplays(all.local, all.peer, [
     ...before.filter((id) => id !== shown),
     leaving,
   ]);
@@ -298,14 +266,14 @@ export function setMonitorSide(state, monitor, side) {
       ...state,
       message: `${pair[side].name} is the only display ${ownerName(side)} has left, so it cannot be shown on this one.`,
     };
-  return withHidden(state, hidden, { shown, leaving });
+  return withHidden(state, hidden);
 }
 
 // Every display each computer reports, whether it is in the picture, and whether it could leave it.
 export function displayUseChoices(state) {
   const { hidden, pairs, all } = arrangedDisplays(state);
   const gone = new Set(hidden);
-  const cabled = new Set(pairs.flatMap((pair) => [pair.source.id, pair.destination.id]));
+  const cabled = new Set(pairs.flatMap((pair) => [pair.local.id, pair.peer.id]));
   const choices = (side) => {
     const inUse = all[side].filter((display) => !gone.has(display.id)).length;
     return all[side].map((display) => ({
@@ -319,14 +287,14 @@ export function displayUseChoices(state) {
       canLeave: gone.has(display.id) || inUse > 1,
     }));
   };
-  return { source: choices("source"), destination: choices("destination") };
+  return { local: choices("local"), peer: choices("peer") };
 }
 
 // Marks a display in use or not, whatever monitor it is on. The last display a computer has stays.
 export function setDisplayInUse(state, id, inUse) {
   if (!isConnected(state) || isBusySharing(state)) return state;
   const { hidden: before, all } = arrangedDisplays(state);
-  const side = [...ARRANGEMENT_SIDES].find((s) => all[s].some((d) => d.id === id));
+  const side = [...SIDES].find((s) => all[s].some((d) => d.id === id));
   if (!side || before.includes(id) !== inUse) return state;
   // Checked before the list is rebuilt, so the displays already marked keep their mark.
   if (!inUse && all[side].filter((d) => !before.includes(d.id)).length <= 1) {
@@ -337,54 +305,28 @@ export function setDisplayInUse(state, id, inUse) {
     };
   }
   const hidden = hiddenDisplays(
-    all.source,
-    all.destination,
+    all.local,
+    all.peer,
     inUse ? before.filter((other) => other !== id) : [...before, id],
   );
-  return withHidden(state, hidden, inUse ? { shown: id } : { leaving: id });
+  return withHidden(state, hidden);
 }
 
 function ownerName(side) {
-  return side === "source" ? "the input computer" : "the other computer";
+  return side === "local" ? "this computer" : "the other computer";
 }
 
-// Redraws the picture with `hidden` changed. A shown display takes the place of the copy it replaces,
-// or its own spot beside its computer's other displays; the rest keep their arrangement where it still fits.
-function withHidden(state, hidden, { shown = null, leaving = null }) {
+// Redraws the picture with `hidden` changed. Each computer's own block keeps its internal layout,
+// so hiding or showing a display only ever needs the same translation between the two blocks.
+function withHidden(state, hidden) {
   const next = { ...state, layout: { ...state.layout, hidden } };
   const groups = currentGroups(next);
   const current = arrangementForSharing(state).placement;
-  let placement = null;
-  let moving = { side: "destination" };
-  if (current?.mode === "free") {
-    const positions = { ...current.positions };
-    if (shown) {
-      const side = [...ARRANGEMENT_SIDES].find((s) =>
-        groups[s].displays.some((d) => d.id === shown),
-      );
-      const own = groups[side].displays;
-      const tile = own.find((d) => d.id === shown);
-      const anchor = own.find((d) => d.id !== shown && positions[d.id]);
-      positions[shown] = leaving
-        ? positions[leaving]
-        : anchor
-          ? [
-              positions[anchor.id][0] + tile.x - anchor.x,
-              positions[anchor.id][1] + tile.y - anchor.y,
-            ]
-          : [tile.x, tile.y];
-      moving = { id: shown };
-    }
-    if (leaving) delete positions[leaving];
-    placement =
-      resolvePlacement(groups, { mode: "free", positions }, moving) ??
-      toFree(placeGroup(groups, "right"));
-  } else {
-    const offset = current ? placementOffset(currentGroups(state), current) : null;
-    placement =
-      (offset && resolvePlacement(groups, groupedPlacement(groups, offset), moving)) ||
-      placeGroup(groups, "right");
-  }
+  const moving = { side: "peer" };
+  const offset = current ? placementOffset(currentGroups(state), current) : null;
+  const placement =
+    (offset && resolvePlacement(groups, groupedPlacement(groups, offset), moving)) ||
+    placeGroup(groups, "right");
   const placed = placement ? setArrangement(next, placement, moving) : next;
   return placed !== next
     ? placed
@@ -396,26 +338,16 @@ function withHidden(state, hidden, { shown = null, leaving = null }) {
 }
 
 function oppositeSide(side) {
-  return side === "source" ? "destination" : "source";
+  return side === "local" ? "peer" : "local";
 }
 
 function sameIds(left, right) {
   return left.length === right.length && left.every((id) => right.includes(id));
 }
 
-export function sourcePlatform(state) {
-  const view = state.view;
-  if (!view || !state.source) return null;
-  return state.source === "local" ? view.localPlatform : view.peerPlatform;
-}
-
 function currentGroups(state, layout = state.layout) {
-  const { source, destination } = arrangedDisplays(state, layout);
-  return displayGroups(source, destination);
-}
-
-export function arrangementMode(state) {
-  return state.layout?.placement?.mode ?? "grouped";
+  const { local, peer } = arrangedDisplays(state, layout);
+  return displayGroups(local, peer);
 }
 
 export function arrangementForSharing(state) {
@@ -443,23 +375,13 @@ export function arrangementForSharing(state) {
 }
 
 export function initializeArrangement(state) {
-  if (
-    !isConnected(state) ||
-    !state.source ||
-    state.layout?.placement ||
-    state.layout?.crossings?.length
-  )
+  if (!isConnected(state) || state.layout?.placement || state.layout?.crossings?.length)
     return state;
   return placeArrangement(state, "right");
 }
 
-// `moving` names what was dragged: one display in free mode, one whole computer in grouped mode.
-export function setArrangement(
-  state,
-  placement,
-  moving = { side: "destination" },
-  snapDistance = 0,
-) {
+// `moving` names the computer block that was dragged; the other one stays fixed.
+export function setArrangement(state, placement, moving = { side: "peer" }, snapDistance = 0) {
   if (!isConnected(state) || isBusySharing(state)) return state;
   const groups = currentGroups(state);
   if (!isPlacement(groups, placement)) return state;
@@ -471,14 +393,9 @@ export function setArrangement(
   );
   if (!target) return state;
   const geometry = arrangementGeometry(groups, target);
-  const primary = sourceDisplays(state).find((d) => d.primary) ?? sourceDisplays(state)[0];
   const layout = {
-    sourceDisplay: sourceDisplays(state).some((d) => d.id === state.layout.sourceDisplay)
-      ? state.layout.sourceDisplay
-      : (primary?.id ?? null),
     placement: target,
     crossings: geometry.connected ? seamCrossings(geometry.seams) : [],
-    // The first placement pins the default choice, so switching the input computer keeps the same copies visible.
     hidden: state.layout.hidden ?? hiddenDisplayIds(state),
   };
   // A move that resolves back to the same picture changes nothing.
@@ -487,11 +404,7 @@ export function setArrangement(
 }
 
 function sameDraft(current, next) {
-  if (
-    current?.sourceDisplay !== next.sourceDisplay ||
-    !sameIds(current.hidden ?? [], next.hidden ?? [])
-  )
-    return false;
+  if (!sameIds(current.hidden ?? [], next.hidden ?? [])) return false;
   if (current.placement && !samePlacement(current.placement, next.placement)) return false;
   const currentCrossings = current.crossings ?? [];
   // A draft loaded from crossings alone is pinned by them; identical crossings mean the same picture.
@@ -515,25 +428,10 @@ function sameCrossing(left, right) {
   );
 }
 
-// Quick placement moves the whole other computer, in whichever mode the draft is in.
+// Quick placement moves the peer computer's whole block.
 export function placeArrangement(state, side) {
   const placement = placeGroup(currentGroups(state), side);
-  if (!placement) return state;
-  return setArrangement(state, arrangementMode(state) === "free" ? toFree(placement) : placement);
-}
-
-export function setArrangementMode(state, mode) {
-  if (
-    !MODES.includes(mode) ||
-    !isConnected(state) ||
-    isBusySharing(state) ||
-    arrangementMode(state) === mode
-  )
-    return state;
-  const groups = currentGroups(state);
-  const current = state.layout.placement ?? arrangementForSharing(state).placement;
-  const placement = mode === "free" ? toFree(current) : toGrouped(groups, current);
-  return placement ? setArrangement(state, placement, { side: "destination" }) : state;
+  return placement ? setArrangement(state, placement) : state;
 }
 
 // Reset restores what both computers already run, and falls back to the default placement before anything is applied.
@@ -541,22 +439,9 @@ export function arrangementResetTarget(state) {
   const groups = currentGroups(state);
   if (!groups) return null;
   const applied = appliedDraft(state);
-  if (applied)
-    return {
-      placement: applied.placement,
-      hidden: applied.hidden,
-      sourceDisplay: applied.sourceDisplay,
-      origin: "applied",
-    };
+  if (applied) return { placement: applied.placement, hidden: applied.hidden, origin: "applied" };
   const placement = placeGroup(groups, "right");
-  return placement
-    ? {
-        placement,
-        hidden: hiddenDisplayIds(state),
-        sourceDisplay: state.layout.sourceDisplay,
-        origin: "default",
-      }
-    : null;
+  return placement ? { placement, hidden: hiddenDisplayIds(state), origin: "default" } : null;
 }
 
 export function canResetArrangement(state) {
@@ -564,22 +449,15 @@ export function canResetArrangement(state) {
   const target = arrangementResetTarget(state);
   if (!target) return false;
   const current = arrangementForSharing(state).placement;
-  return !(
-    samePlacement(target.placement, current) &&
-    sameIds(target.hidden, hiddenDisplayIds(state)) &&
-    target.sourceDisplay === state.layout.sourceDisplay
-  );
+  return !(samePlacement(target.placement, current) && sameIds(target.hidden, hiddenDisplayIds(state)));
 }
 
-// Reset takes the whole applied picture back: placement, hidden copies, and the starting display.
+// Reset takes the whole applied picture back: placement and hidden copies.
 export function resetArrangement(state) {
   const target = arrangementResetTarget(state);
   if (!target || !canResetArrangement(state)) return state;
-  const base = {
-    ...state,
-    layout: { ...emptyLayout(), hidden: target.hidden, sourceDisplay: target.sourceDisplay },
-  };
-  const placed = setArrangement(base, target.placement, { side: "destination" });
+  const base = { ...state, layout: { ...emptyLayout(), hidden: target.hidden } };
+  const placed = setArrangement(base, target.placement, { side: "peer" });
   return placed === base ? state : placed;
 }
 
@@ -596,7 +474,7 @@ export function layoutForSave(state) {
 }
 
 export function validateLayout(state, layout = state.layout) {
-  if (!isConnected(state) || !state.source)
+  if (!isConnected(state))
     return invalidLayout("Wait until both computers are connected, then arrange the displays.");
   if (
     !layout ||
@@ -606,19 +484,17 @@ export function validateLayout(state, layout = state.layout) {
     layout.crossings.length > MAX_CROSSINGS
   )
     return invalidLayout("Move the displays together until they touch.");
-  const { source, destination, hidden, all } = arrangedDisplays(state, layout);
-  const sourceIds = new Set(source.map((display) => display.id));
-  const destinationIds = new Set(destination.map((display) => display.id));
-  if (!sourceIds.has(layout.sourceDisplay))
-    return invalidLayout("Choose the starting display for the keyboard and mouse.");
+  const { local, peer, hidden, all } = arrangedDisplays(state, layout);
+  const localIds = new Set(local.map((display) => display.id));
+  const peerIds = new Set(peer.map((display) => display.id));
 
   const links = [];
   const fromEdges = [];
   for (const crossing of layout.crossings) {
     if (
       !isCrossing(crossing) ||
-      !sourceIds.has(crossing.fromDisplay) ||
-      !destinationIds.has(crossing.toDisplay) ||
+      !localIds.has(crossing.fromDisplay) ||
+      !peerIds.has(crossing.toDisplay) ||
       crossing.fromDisplay === crossing.toDisplay
     )
       return invalidLayout("Choose current displays on opposite computers for every crossing.");
@@ -651,14 +527,14 @@ export function validateLayout(state, layout = state.layout) {
   }
   if (links.length > MAX_LINKS)
     return invalidLayout("The layout supports at most 64 directed edges.");
-  // Only the input computer's cursor moves by its own OS, so only its desktop adjacency is physical;
-  // the destination's cursor only goes where MonHop puts it, so the picture is the truth there.
-  const own = ownSeams(all.source, hidden);
+  // Either computer's cursor can cross now, so a crossing may not share an edge span either
+  // computer's own desktop already routes to one of its own neighbours.
+  const ownSeamsEitherSide = [...ownSeams(all.local, hidden), ...ownSeams(all.peer, hidden)];
   for (const link of links) {
-    const seam = own.find((other) => edgeSpansOverlap(link, other));
-    if (seam) return invalidLayout(ownSeamMessage(seam, [...all.source, ...all.destination]));
+    const seam = ownSeamsEitherSide.find((other) => edgeSpansOverlap(link, other));
+    if (seam) return invalidLayout(ownSeamMessage(seam, [...all.local, ...all.peer]));
   }
-  const groups = displayGroups(source, destination);
+  const groups = displayGroups(local, peer);
   if (
     layout.placement &&
     (!isPlacement(groups, layout.placement) ||
@@ -666,7 +542,7 @@ export function validateLayout(state, layout = state.layout) {
   ) {
     return invalidLayout("Place the displays so their highlighted edges meet.");
   }
-  const native = { sourceDisplay: layout.sourceDisplay, links };
+  const native = { links };
   if (layout.placement) native.arrangement = layoutArrangement(layout.placement, hidden);
   return { ok: true, layout: native, message: "" };
 }
@@ -694,7 +570,7 @@ export function hasAppliedCurrentLayout(state) {
 }
 
 export function layoutSignature(layout) {
-  if (!layout?.sourceDisplay || !Array.isArray(layout.links)) return "";
+  if (!Array.isArray(layout?.links)) return "";
   const links = layout.links
     .map((link) =>
       JSON.stringify([
@@ -709,13 +585,9 @@ export function layoutSignature(layout) {
     )
     .toSorted();
   const arrangement = layout.arrangement
-    ? [
-        layout.arrangement.mode,
-        layout.arrangement.positions.map((p) => [p.display, p.x, p.y]),
-        layout.arrangement.hidden ?? [],
-      ]
+    ? [layout.arrangement.positions.map((p) => [p.display, p.x, p.y]), layout.arrangement.hidden ?? []]
     : null;
-  return JSON.stringify([layout.sourceDisplay, links, arrangement]);
+  return JSON.stringify([links, arrangement]);
 }
 
 // --- named arrangements --------------------------------------------------
@@ -727,15 +599,12 @@ export function normalizeArrangements(value) {
   for (const item of value) {
     const source = item && typeof item === "object" ? item : {};
     const name = normalizeArrangementName(source.name);
-    if (!name || seen.has(name) || !SIDES.has(source.sourceSide) || !MODES.includes(source.mode))
-      continue;
+    if (!name || seen.has(name)) continue;
     seen.add(name);
     const crossings =
       Number.isSafeInteger(source.crossings) && source.crossings >= 0 ? source.crossings : 0;
     entries.push({
       name,
-      sourceSide: source.sourceSide,
-      mode: source.mode,
       crossings,
       layout: normalizeStoredLayout(source.layout),
       automatic: source.automatic === true,
@@ -778,13 +647,12 @@ export function canSaveArrangement(state, name) {
 }
 
 export function loadArrangement(state, name) {
-  const entry = arrangementByName(state, name);
-  if (!canLoadArrangement(state, name) || entry.sourceSide !== state.source)
+  if (!canLoadArrangement(state, name))
     return {
       ...state,
-      message: "Choose the input computer this arrangement was saved with, then load it again.",
+      message: "This arrangement no longer fits the connected displays. Arrange them again.",
     };
-  return loadArrangementLayout(state, entry.layout);
+  return loadArrangementLayout(state, arrangementByName(state, name).layout);
 }
 
 // The one place a stored layout becomes the draft. The connected editor arrives here by name and
@@ -910,7 +778,6 @@ export function normalizeSharingView(value) {
       recognized: false,
       phase: "error",
       revision: null,
-      sourceSide: null,
       localPlatform: null,
       peerPlatform: null,
       localDisplays: [],
@@ -920,7 +787,7 @@ export function normalizeSharingView(value) {
       peerFingerprint: null,
       active: null,
       editing: false,
-      sharingRole: null,
+      control: null,
       lastFailure: "",
       link: { attempt: 0, since: "" },
       sync: { state: "idle", message: "" },
@@ -933,7 +800,6 @@ export function normalizeSharingView(value) {
     recognized: true,
     phase,
     revision: revision(source.revision),
-    sourceSide: SIDES.has(source.sourceSide) ? source.sourceSide : null,
     localPlatform: PLATFORMS.has(source.localPlatform) ? source.localPlatform : null,
     peerPlatform: PLATFORMS.has(source.peerPlatform) ? source.peerPlatform : null,
     localDisplays: localDisplays ?? [],
@@ -943,7 +809,7 @@ export function normalizeSharingView(value) {
     peerFingerprint: fingerprint(source.peerFingerprint),
     active: fingerprint(source.active),
     editing: source.editing === true,
-    sharingRole: ROLES.has(source.sharingRole) ? source.sharingRole : null,
+    control: normalizeControl(source.control),
     lastFailure: boundedText(source.lastFailure, 1000),
     message: boundedText(source.message, 1000),
     link: {
@@ -956,6 +822,23 @@ export function normalizeSharingView(value) {
     },
     synchronizedLayout: normalizeStoredLayout(source.synchronizedLayout),
     displayNotice: normalizeDisplayNotice(source.displayNotice),
+  };
+}
+
+// At least one direction must stay on; a reply claiming neither is damaged, not a real state.
+function normalizeControl(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    typeof value.localToPeer !== "boolean" ||
+    typeof value.peerToLocal !== "boolean" ||
+    (!value.localToPeer && !value.peerToLocal)
+  )
+    return null;
+  return {
+    localToPeer: value.localToPeer,
+    peerToLocal: value.peerToLocal,
+    syncing: value.syncing === true,
   };
 }
 
@@ -996,7 +879,6 @@ export function normalizeStoredLayout(value) {
   if (
     !value ||
     typeof value !== "object" ||
-    !isDisplayId(value.sourceDisplay) ||
     !Array.isArray(value.links) ||
     value.links.length > MAX_LINKS
   )
@@ -1008,7 +890,7 @@ export function normalizeStoredLayout(value) {
     if (fromEdges.some((other) => edgeSpansOverlap(link, other))) return null;
     fromEdges.push(link);
   }
-  const layout = { sourceDisplay: value.sourceDisplay, links };
+  const layout = { links };
   if (value.arrangement !== undefined && value.arrangement !== null) {
     const arrangement = normalizeArrangement(value.arrangement);
     if (!arrangement) return null;
@@ -1021,7 +903,6 @@ function normalizeArrangement(value) {
   if (
     !value ||
     typeof value !== "object" ||
-    !MODES.includes(value.mode) ||
     !Array.isArray(value.positions) ||
     value.positions.length > MAX_ARRANGEMENTS
   )
@@ -1036,7 +917,7 @@ function normalizeArrangement(value) {
     positions.push({ display, x: entry.x, y: entry.y });
   }
   // A layout saved before displays could be marked not in use carries no list, and stays that way.
-  if (value.hidden === undefined) return { mode: value.mode, positions };
+  if (value.hidden === undefined) return { positions };
   if (!Array.isArray(value.hidden) || value.hidden.length > MAX_ARRANGEMENTS) return null;
   const hidden = [];
   for (const display of value.hidden) {
@@ -1044,7 +925,7 @@ function normalizeArrangement(value) {
     seen.add(display);
     hidden.push(display);
   }
-  return { mode: value.mode, positions, hidden };
+  return { positions, hidden };
 }
 
 function normalizeLink(value) {
@@ -1084,8 +965,8 @@ function draftFromStoredLayout(layout, state) {
     const second = unused.splice(reverseIndex, 1)[0];
     const forward = [first, second].find(
       (link) =>
-        all.source.some((display) => display.id === link.fromDisplay) &&
-        all.destination.some((display) => display.id === link.toDisplay),
+        all.local.some((display) => display.id === link.fromDisplay) &&
+        all.peer.some((display) => display.id === link.toDisplay),
     );
     if (!forward || forward.hysteresis !== DEFAULT_HYSTERESIS) return null;
     crossings.push({
@@ -1098,18 +979,13 @@ function draftFromStoredLayout(layout, state) {
       toSpan: [...forward.toSpan],
     });
   }
-  if (
-    layout.sourceDisplay !== undefined &&
-    !all.source.some((display) => display.id === layout.sourceDisplay)
-  )
-    return null;
-  const hidden = hiddenFromLayout(layout, all.source, all.destination);
+  const hidden = hiddenFromLayout(layout, all.local, all.peer);
   const placement = placementFromLayout(
     currentGroups(state, { hidden }),
     layout.arrangement ?? null,
     crossings,
   );
-  return { sourceDisplay: layout.sourceDisplay, placement, crossings, hidden };
+  return { placement, crossings, hidden };
 }
 
 function reciprocal(left, right) {
@@ -1150,7 +1026,7 @@ function wholeEdgeLink(fromDisplay, fromEdge, toDisplay, toEdge) {
   };
 }
 
-// A crossing cannot sit on an edge span the computer's own desktop already routes to a neighbour.
+// A crossing cannot sit on an edge span either computer's own desktop already routes to a neighbour.
 function ownSeamMessage(seam, displays) {
   const name = (id) => displays.find((d) => d.id === id)?.name ?? "a display";
   return `The ${seam.fromEdge} edge of ${name(seam.fromDisplay)} already leads to ${name(seam.toDisplay)} on the same computer. Use a free edge, or mark which computer shows on a monitor cabled to both.`;

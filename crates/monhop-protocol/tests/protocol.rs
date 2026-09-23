@@ -2,12 +2,12 @@ use monhop_core::{
     DeviceId, DisplayId, HidUsage, ModifierState, MonitorIdentity, MouseButton, Platform, Point,
 };
 use monhop_protocol::{
-    Button, Capabilities, DatagramDecodeError, DecodeError, DeliveryClass, DisconnectCode,
-    DisplayDescription, DisplayTopology, EncodeError, ErrorCode, Frame, Hello, Key,
-    MAX_DISPLAY_NAME_BYTES, MAX_FRAME_LEN, MAX_LOGICAL_ORIGIN_ABS, MAX_LOGICAL_SIZE,
-    MAX_NATIVE_DIMENSION, MAX_SCALE_FACTOR, Message, Motion, PROTOCOL_VERSION, RateLimitError,
-    RateLimiter, Scroll, SequenceGate, SequenceGateError, SessionEpoch, SessionPurpose,
-    SessionSetup, TopologyError, decode, decode_datagram,
+    Button, Capabilities, ControlPermissions, DatagramDecodeError, DeclineReason, DecodeError,
+    DeliveryClass, DisconnectCode, DisplayDescription, DisplayTopology, EncodeError, ErrorCode,
+    Frame, FrameScope, Hello, Key, MAX_DISPLAY_NAME_BYTES, MAX_FRAME_LEN, MAX_LOGICAL_ORIGIN_ABS,
+    MAX_LOGICAL_SIZE, MAX_NATIVE_DIMENSION, MAX_SCALE_FACTOR, Message, Motion, PROTOCOL_VERSION,
+    RateLimitError, RateLimiter, Scroll, SequenceGate, SequenceGateError, SessionEpoch,
+    SessionPurpose, SessionSetup, TopologyError, decode, decode_datagram,
 };
 
 fn epoch() -> SessionEpoch {
@@ -45,8 +45,8 @@ fn all_messages() -> Vec<Message> {
             .expect("known capability bits"),
         }),
         Message::SessionSetup(SessionSetup {
-            source: DeviceId([8; 16]),
-            purpose: SessionPurpose::Inspect,
+            purpose: SessionPurpose::Share,
+            control: ControlPermissions::BOTH,
         }),
         Message::DisplayTopology(display_topology()),
         Message::Motion(Motion::Absolute(Point::new(-50.25, 99.5))),
@@ -72,9 +72,14 @@ fn all_messages() -> Vec<Message> {
             position: Point::new(-1_920.0, 1_080.0),
         },
         Message::ActivationAck(DisplayId(12)),
+        Message::ActivationDeclined {
+            display_id: DisplayId(12),
+            reason: DeclineReason::Busy,
+        },
         Message::ReleaseAll,
         Message::ReleaseAck,
         Message::SessionReady,
+        Message::TakeBack,
         Message::Ping(44),
         Message::Pong(45),
         Message::Disconnect(DisconnectCode::TransportLost),
@@ -186,9 +191,9 @@ fn strict_header_and_body_guards_reject_malicious_values() {
     .encode_into(&mut encoded)
     .expect("encode valid key frame");
 
-    let mut reserved = encoded.clone();
-    reserved[7] = 1;
-    assert!(decode(&reserved).is_err());
+    let mut invalid_scope = encoded.clone();
+    invalid_scope[7] = 3;
+    assert_eq!(decode(&invalid_scope), Err(DecodeError::InvalidScope));
 
     let mut invalid_boolean = encoded.clone();
     invalid_boolean[30] = 2;
@@ -271,10 +276,10 @@ fn activation_protocol_v2_has_exact_bodies_and_reliable_delivery() {
     let messages = [
         (
             14_u8,
-            24_u16,
+            8_u16,
             Message::SessionSetup(SessionSetup {
-                source: DeviceId([3; 16]),
                 purpose: SessionPurpose::Share,
+                control: ControlPermissions::BOTH,
             }),
         ),
         (
@@ -301,68 +306,106 @@ fn activation_protocol_v2_has_exact_bodies_and_reliable_delivery() {
 }
 
 #[test]
-fn session_setup_purpose_has_a_fixed_strict_body() {
-    let source = frame(
-        1,
-        Message::SessionSetup(SessionSetup {
-            source: DeviceId([3; 16]),
-            purpose: SessionPurpose::Inspect,
-        }),
-    );
+fn session_setup_round_trips_every_valid_control() {
     let mut encoded = Vec::new();
-    source
-        .encode_into(&mut encoded)
-        .expect("encode session setup");
-    assert_eq!(u16::from_be_bytes([encoded[8], encoded[9]]), 24);
-    assert_eq!(decode(&encoded), Ok(source));
-
-    let trial = frame(
-        2,
-        Message::SessionSetup(SessionSetup {
-            source: DeviceId([4; 16]),
-            purpose: SessionPurpose::ControlledTrial,
-        }),
-    );
-    trial
-        .encode_into(&mut encoded)
-        .expect("encode controlled trial setup");
-    assert_eq!(encoded[44], 3);
-    assert_eq!(decode(&encoded), Ok(trial));
-
-    let configure = frame(
-        3,
-        Message::SessionSetup(SessionSetup {
-            source: DeviceId([5; 16]),
-            purpose: SessionPurpose::Configure,
-        }),
-    );
-    configure
-        .encode_into(&mut encoded)
-        .expect("encode configure setup");
-    assert_eq!(encoded[44], 4);
-    assert_eq!(decode(&encoded), Ok(configure));
+    for raw_control in 1_u8..=3 {
+        let control = ControlPermissions::from_wire(raw_control).expect("valid control bits");
+        let source = frame(
+            1,
+            Message::SessionSetup(SessionSetup {
+                purpose: SessionPurpose::Share,
+                control,
+            }),
+        );
+        source
+            .encode_into(&mut encoded)
+            .expect("encode session setup");
+        assert_eq!(u16::from_be_bytes([encoded[8], encoded[9]]), 8);
+        assert_eq!(encoded[29], raw_control);
+        assert_eq!(decode(&encoded), Ok(source));
+    }
 
     let setup = frame(
-        4,
+        2,
         Message::SessionSetup(SessionSetup {
-            source: DeviceId([6; 16]),
             purpose: SessionPurpose::Setup,
+            control: ControlPermissions::BOTH,
         }),
     );
     setup.encode_into(&mut encoded).expect("encode setup link");
-    assert_eq!(encoded[44], 5);
     assert_eq!(decode(&encoded), Ok(setup));
+}
 
-    let mut invalid_purpose = encoded.clone();
-    invalid_purpose[44] = 6;
-    assert_eq!(decode(&invalid_purpose), Err(DecodeError::InvalidEnum));
-
-    let mut nonzero_reserved = encoded;
-    nonzero_reserved[45] = 1;
+#[test]
+fn session_setup_rejects_zero_and_high_control_bits() {
     assert_eq!(
-        decode(&nonzero_reserved),
-        Err(DecodeError::NonZeroReservedField)
+        ControlPermissions::from_wire(0),
+        Err(DecodeError::InvalidControl)
     );
+    for raw_control in 4_u8..=255 {
+        assert_eq!(
+            ControlPermissions::from_wire(raw_control),
+            Err(DecodeError::InvalidControl)
+        );
+    }
+
+    let mut encoded = Vec::new();
+    frame(
+        1,
+        Message::SessionSetup(SessionSetup {
+            purpose: SessionPurpose::Share,
+            control: ControlPermissions::BOTH,
+        }),
+    )
+    .encode_into(&mut encoded)
+    .expect("encode session setup");
+
+    let mut zero_control = encoded.clone();
+    zero_control[29] = 0;
+    assert_eq!(decode(&zero_control), Err(DecodeError::InvalidControl));
+
+    let mut high_control = encoded;
+    high_control[29] = 4;
+    assert_eq!(decode(&high_control), Err(DecodeError::InvalidControl));
+}
+
+#[test]
+fn setup_purpose_requires_both() {
+    let mut encoded = Vec::new();
+    let source = frame(
+        1,
+        Message::SessionSetup(SessionSetup {
+            purpose: SessionPurpose::Setup,
+            control: ControlPermissions::BOTH,
+        }),
+    );
+    source.encode_into(&mut encoded).expect("encode setup link");
+    assert_eq!(decode(&encoded), Ok(source));
+
+    let mut partial_control = encoded;
+    partial_control[29] = 1;
+    assert_eq!(decode(&partial_control), Err(DecodeError::InvalidControl));
+}
+
+#[test]
+fn removed_purposes_do_not_decode() {
+    let mut encoded = Vec::new();
+    frame(
+        1,
+        Message::SessionSetup(SessionSetup {
+            purpose: SessionPurpose::Share,
+            control: ControlPermissions::BOTH,
+        }),
+    )
+    .encode_into(&mut encoded)
+    .expect("encode session setup");
+
+    // Byte values 3 (ControlledTrial), 4 (Configure), 5 (v8 Setup) no longer decode.
+    for removed_purpose in [3_u8, 4, 5] {
+        let mut corrupted = encoded.clone();
+        corrupted[28] = removed_purpose;
+        assert_eq!(decode(&corrupted), Err(DecodeError::InvalidEnum));
+    }
 }
 
 #[test]
@@ -514,7 +557,7 @@ fn activation_protocol_rejects_nonfinite_out_of_range_and_malformed_frames() {
     assert_eq!(decode(&old_version), Err(DecodeError::UnsupportedVersion));
 
     let mut unknown_kind = encoded;
-    unknown_kind[6] = 19;
+    unknown_kind[6] = 21;
     assert_eq!(decode(&unknown_kind), Err(DecodeError::UnknownMessageType));
 }
 
@@ -626,10 +669,10 @@ fn readiness_requires_the_current_protocol_and_an_empty_reliable_body() {
     let ready = frame(3, Message::SessionReady);
     let mut bytes = Vec::new();
     ready.encode_into(&mut bytes).unwrap();
-    assert_eq!(PROTOCOL_VERSION, 8);
+    assert_eq!(PROTOCOL_VERSION, 9);
     assert_eq!(ready.delivery(), DeliveryClass::Reliable);
     assert_eq!(decode(&bytes), Ok(ready));
-    for version in [1_u16, 2, 3, 4, 5, 6, 7] {
+    for version in [1_u16, 2, 3, 4, 5, 6, 7, 8] {
         let mut old = bytes.clone();
         old[4..6].copy_from_slice(&version.to_be_bytes());
         assert_eq!(decode(&old), Err(DecodeError::UnsupportedVersion));
@@ -637,6 +680,139 @@ fn readiness_requires_the_current_protocol_and_an_empty_reliable_body() {
     bytes.push(0);
     bytes[8..10].copy_from_slice(&1_u16.to_be_bytes());
     assert_eq!(decode(&bytes), Err(DecodeError::TrailingBytes));
+}
+
+#[test]
+fn version_8_frame_is_unsupported() {
+    let mut encoded = Vec::new();
+    frame(1, Message::ReleaseAll)
+        .encode_into(&mut encoded)
+        .expect("encode valid frame");
+    encoded[4..6].copy_from_slice(&8_u16.to_be_bytes());
+    assert_eq!(decode(&encoded), Err(DecodeError::UnsupportedVersion));
+}
+
+#[test]
+fn v9_frame_round_trips_every_scope() {
+    let mut encoded = Vec::new();
+    for (sequence, scope) in [
+        FrameScope::Connection,
+        FrameScope::LowerControlsHigher,
+        FrameScope::HigherControlsLower,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = frame(sequence as u64, Message::ReleaseAll).with_scope(scope);
+        source.encode_into(&mut encoded).expect("encode frame");
+        let decoded = decode(&encoded).expect("decode frame");
+        assert_eq!(decoded, source);
+        assert_eq!(decoded.scope, scope);
+    }
+}
+
+#[test]
+fn unknown_scope_byte_is_rejected() {
+    let mut encoded = Vec::new();
+    frame(1, Message::ReleaseAll)
+        .encode_into(&mut encoded)
+        .expect("encode valid frame");
+    for byte in 3_u16..=255 {
+        let mut corrupted = encoded.clone();
+        corrupted[7] = byte as u8;
+        assert_eq!(
+            decode(&corrupted),
+            Err(DecodeError::InvalidScope),
+            "scope byte {byte} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn activation_declined_round_trips_each_reason() {
+    let mut encoded = Vec::new();
+    for (sequence, reason) in [
+        DeclineReason::Contended,
+        DeclineReason::Busy,
+        DeclineReason::Disabled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = frame(
+            sequence as u64,
+            Message::ActivationDeclined {
+                display_id: DisplayId(12),
+                reason,
+            },
+        );
+        source.encode_into(&mut encoded).expect("encode decline");
+        assert_eq!(u16::from_be_bytes([encoded[8], encoded[9]]), 16);
+        assert_eq!(decode(&encoded), Ok(source));
+    }
+}
+
+#[test]
+fn unknown_decline_reason_is_rejected() {
+    let mut encoded = Vec::new();
+    frame(
+        1,
+        Message::ActivationDeclined {
+            display_id: DisplayId(12),
+            reason: DeclineReason::Busy,
+        },
+    )
+    .encode_into(&mut encoded)
+    .expect("encode decline");
+
+    let mut zero_reason = encoded.clone();
+    zero_reason[36] = 0;
+    assert_eq!(decode(&zero_reason), Err(DecodeError::InvalidDeclineReason));
+
+    let mut high_reason = encoded;
+    high_reason[36] = 4;
+    assert_eq!(decode(&high_reason), Err(DecodeError::InvalidDeclineReason));
+}
+
+#[test]
+fn take_back_has_empty_body() {
+    let mut encoded = Vec::new();
+    let source = frame(1, Message::TakeBack);
+    source.encode_into(&mut encoded).expect("encode take back");
+    assert_eq!(u16::from_be_bytes([encoded[8], encoded[9]]), 0);
+    assert_eq!(decode(&encoded), Ok(source));
+
+    encoded.push(0);
+    encoded[8..10].copy_from_slice(&1_u16.to_be_bytes());
+    assert_eq!(decode(&encoded), Err(DecodeError::TrailingBytes));
+}
+
+#[test]
+fn new_messages_are_not_datagrams() {
+    let mut encoded = Vec::new();
+    let declined = frame(
+        1,
+        Message::ActivationDeclined {
+            display_id: DisplayId(12),
+            reason: DeclineReason::Contended,
+        },
+    );
+    declined.encode_into(&mut encoded).expect("encode declined");
+    assert_eq!(declined.delivery(), DeliveryClass::Reliable);
+    assert_eq!(
+        decode_datagram(&encoded),
+        Err(DatagramDecodeError::ReliableMessage)
+    );
+
+    let take_back = frame(2, Message::TakeBack);
+    take_back
+        .encode_into(&mut encoded)
+        .expect("encode take back");
+    assert_eq!(take_back.delivery(), DeliveryClass::Reliable);
+    assert_eq!(
+        decode_datagram(&encoded),
+        Err(DatagramDecodeError::ReliableMessage)
+    );
 }
 
 #[test]

@@ -24,33 +24,81 @@ pub const WHEEL_UNITS_PER_DETENT: i32 = 120;
 /// A suppression lease may be renewed for at most this long.
 pub const MAX_SUPPRESSION_TTL: Duration = Duration::from_millis(120);
 
+/// A seam whose crossing the peer declined is retried only after this much continued pressure.
+pub const DECLINE_RETRY_AFTER: Duration = Duration::from_millis(50);
+
 static NATIVE_INPUT_OWNED: AtomicBool = AtomicBool::new(false);
 
-/// Process-wide ownership of native input effects.
-///
-/// A capture source or native destination must hold this guard from before its first native side
-/// effect until all locally injected input is known to be released.
-#[must_use]
-pub struct NativeInputOwnership {
-    _private: (),
+/// Clears the process-wide flag when the claim and every permit split from it have dropped.
+struct ClaimInner;
+
+impl Drop for ClaimInner {
+    fn drop(&mut self) {
+        NATIVE_INPUT_OWNED.store(false, Ordering::Release);
+    }
 }
 
-impl NativeInputOwnership {
+/// Process-wide ownership of native input effects for one session.
+///
+/// Capture and injection each hold their permit from before their first native side effect until
+/// all input they suppressed or injected is known to be released.
+#[must_use]
+pub struct NativeSessionClaim {
+    inner: Arc<ClaimInner>,
+}
+
+impl fmt::Debug for NativeSessionClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NativeSessionClaim")
+    }
+}
+
+impl NativeSessionClaim {
     pub fn is_claimed() -> bool {
         NATIVE_INPUT_OWNED.load(Ordering::Acquire)
     }
+
     /// Claims exclusive native input ownership for this process.
     pub fn claim() -> Option<Self> {
         NATIVE_INPUT_OWNED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| Self { _private: () })
+            .map(|_| Self {
+                inner: Arc::new(ClaimInner),
+            })
+    }
+
+    pub fn split(self) -> (CapturePermit, InjectionPermit) {
+        (
+            CapturePermit {
+                _claim: Arc::clone(&self.inner),
+            },
+            InjectionPermit { _claim: self.inner },
+        )
     }
 }
 
-impl Drop for NativeInputOwnership {
-    fn drop(&mut self) {
-        NATIVE_INPUT_OWNED.store(false, Ordering::Release);
+/// The native capture's share of a [`NativeSessionClaim`].
+#[must_use]
+pub struct CapturePermit {
+    _claim: Arc<ClaimInner>,
+}
+
+impl fmt::Debug for CapturePermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CapturePermit")
+    }
+}
+
+/// The native injector's share of a [`NativeSessionClaim`].
+#[must_use]
+pub struct InjectionPermit {
+    _claim: Arc<ClaimInner>,
+}
+
+impl fmt::Debug for InjectionPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InjectionPermit")
     }
 }
 
@@ -167,6 +215,8 @@ pub enum StopReason {
     InvalidInput,
     EmergencyEscape,
     NativeFailure,
+    /// The OS reported a completed display reconfiguration.
+    DisplaysChanged,
 }
 
 impl StopReason {
@@ -181,6 +231,7 @@ impl StopReason {
             Self::InvalidInput => 7,
             Self::EmergencyEscape => 8,
             Self::NativeFailure => 9,
+            Self::DisplaysChanged => 10,
         }
     }
 
@@ -195,6 +246,7 @@ impl StopReason {
             7 => Some(Self::InvalidInput),
             8 => Some(Self::EmergencyEscape),
             9 => Some(Self::NativeFailure),
+            10 => Some(Self::DisplaysChanged),
             _ => None,
         }
     }
@@ -271,6 +323,8 @@ pub struct CapturedEvent {
     pub event: CaptureEvent,
     pub routing_revision: u64,
     pub remote: bool,
+    /// The session floor's generation when the event was captured; 0 without a take-back gate.
+    pub floor_generation: u64,
 }
 
 impl fmt::Debug for CapturedEvent {
@@ -310,7 +364,7 @@ struct CaptureQueue {
     waker: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
-/// Six atomic words keep slot publication and every copied field data-race-free without unsafe
+/// Seven atomic words keep slot publication and every copied field data-race-free without unsafe
 /// storage. Only `publish` establishes ownership; payload words are read after its acquire load.
 struct QueueSlot {
     publish: AtomicU64,
@@ -319,6 +373,7 @@ struct QueueSlot {
     event_revision: AtomicU64,
     routing_revision: AtomicU64,
     routing_remote: AtomicU64,
+    floor_generation: AtomicU64,
 }
 
 impl QueueSlot {
@@ -330,6 +385,7 @@ impl QueueSlot {
             event_revision: AtomicU64::new(0),
             routing_revision: AtomicU64::new(0),
             routing_remote: AtomicU64::new(0),
+            floor_generation: AtomicU64::new(0),
         }
     }
 }
@@ -358,6 +414,7 @@ impl CaptureProducer {
             event,
             routing_revision: 0,
             remote: false,
+            floor_generation: 0,
         })
     }
 
@@ -392,6 +449,8 @@ impl CaptureProducer {
             .store(record.routing_revision, Ordering::Relaxed);
         slot.routing_remote
             .store(u64::from(record.remote), Ordering::Relaxed);
+        slot.floor_generation
+            .store(record.floor_generation, Ordering::Relaxed);
         slot.publish
             .store(position.wrapping_add(1), Ordering::Release);
         self.tail = position.wrapping_add(1);
@@ -464,6 +523,7 @@ impl CaptureConsumer {
             slot.event_revision.load(Ordering::Relaxed),
             slot.routing_revision.load(Ordering::Relaxed),
             slot.routing_remote.load(Ordering::Relaxed),
+            slot.floor_generation.load(Ordering::Relaxed),
         );
         slot.publish.store(
             position.wrapping_add(CAPTURE_QUEUE_CAPACITY as u64),
@@ -577,6 +637,7 @@ impl CapturedEvent {
         event_revision: u64,
         routing_revision: u64,
         routing_remote: u64,
+        floor_generation: u64,
     ) -> Option<Self> {
         let remote = match routing_remote {
             0 => false,
@@ -636,6 +697,7 @@ impl CapturedEvent {
             event,
             routing_revision,
             remote,
+            floor_generation,
         })
     }
 }
@@ -754,14 +816,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_input_ownership_is_exclusive_until_the_owner_drops() {
-        let owner = NativeInputOwnership::claim().expect("first native owner");
-        assert!(NativeInputOwnership::claim().is_none());
-        drop(owner);
-        assert!(NativeInputOwnership::claim().is_some());
-    }
-
-    #[test]
     fn the_producer_wakes_the_registered_consumer_once_per_publish() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (mut producer, consumer) = capture_channel(CaptureStop::new());
@@ -783,5 +837,13 @@ mod tests {
         producer.try_push(key(true)).unwrap();
         producer.try_push(key(false)).unwrap();
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_display_change_stop_keeps_its_own_reason() {
+        let stop = CaptureStop::new();
+        stop.stop(StopReason::DisplaysChanged);
+        stop.stop(StopReason::NativeFailure);
+        assert_eq!(stop.reason(), Some(StopReason::DisplaysChanged));
     }
 }

@@ -18,7 +18,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::{
     crypto::CertificateFingerprint,
     session_handshake::{ControlStreams, NegotiatedSession, SessionPurpose},
-    session_layout::MAX_LAYOUT_PAYLOAD_BYTES,
     session_native::current_displays,
     session_setup::{
         InspectedPeer, PreparedEndpoint, SetupFailure, is_transient, prepare_endpoint,
@@ -36,9 +35,11 @@ pub const LINK_SILENCE_DEADLINE: Duration = Duration::from_secs(5);
 pub const LINK_ACK_DEADLINE: Duration = Duration::from_secs(10);
 pub const LINK_TOPOLOGY_POLL: Duration = Duration::from_secs(2);
 
+pub const MAX_LAYOUT_PAYLOAD_BYTES: usize = 32 * 1024;
+
 const LINK_MAGIC: [u8; 4] = *b"LKLC";
 const LINK_FORMAT_VERSION: u8 = 1;
-/// Matches the Setup purpose wire value, so a Configure frame can never decode as a link frame.
+/// Matches the Setup purpose wire value.
 const LINK_PURPOSE: u8 = 5;
 const LINK_HEADER_LEN: usize = 64;
 /// The three handshake frames occupy sequences 0 through 2 in each direction.
@@ -132,9 +133,13 @@ pub async fn run_setup_link(
     events: UnboundedSender<LinkEvent>,
     mut commands: UnboundedReceiver<LinkCommand>,
 ) -> Result<(), SetupFailure> {
-    // The link carries no input authority, so both sides name the dialing computer as the source
-    // and agree on it without asking the user anything.
-    let prepared = prepare_endpoint(interface_id, None, cancel, peer)?;
+    // The setup link carries no input authority.
+    let prepared = prepare_endpoint(
+        interface_id,
+        monhop_protocol::ControlPermissions::BOTH,
+        cancel,
+        peer,
+    )?;
     let connector = EndpointConnector { prepared };
     run_link(&connector, cancel, &persist, &events, &mut commands).await
 }
@@ -681,7 +686,10 @@ fn encode_topology(
 
 fn decode_topology(payload: &[u8], epoch: SessionEpoch) -> Result<DisplayTopology, LinkDisconnect> {
     let frame = decode(payload).map_err(|_| LinkDisconnect::Transport)?;
-    if frame.epoch != epoch || frame.sequence != TOPOLOGY_FRAME_SEQUENCE {
+    if frame.scope != monhop_protocol::FrameScope::Connection
+        || frame.epoch != epoch
+        || frame.sequence != TOPOLOGY_FRAME_SEQUENCE
+    {
         return Err(LinkDisconnect::Transport);
     }
     match frame.message {
@@ -842,7 +850,8 @@ struct Link<'a> {
     pending: VecDeque<LinkFrame>,
     last_peer: Instant,
     sync: SyncState,
-    /// Digest of a proposal dropped after losing the tie-break; its reject unwinds nothing.
+    /// Digest of a transaction dropped locally (a lost tie-break, a topology change); the one
+    /// answer the peer sent before learning so unwinds nothing.
     abandoned: Option<[u8; 32]>,
     /// Digest this computer committed as receiver; a later reject for it means the pair disagrees.
     committed: Option<[u8; 32]>,
@@ -1018,7 +1027,7 @@ impl<'a> Link<'a> {
             .ok_or(LinkExit::Disconnected(LinkDisconnect::Transport))?;
         match frame.kind {
             LinkKind::Heartbeat => {}
-            LinkKind::Topology => self.accept_peer_topology(&frame.payload)?,
+            LinkKind::Topology => self.accept_peer_topology(&frame.payload).await?,
             LinkKind::Proposal => self.accept_proposal(frame).await?,
             LinkKind::Ack => self.accept_acknowledgement(&frame).await?,
             LinkKind::Complete => self.accept_completion(&frame).await?,
@@ -1036,15 +1045,40 @@ impl<'a> Link<'a> {
         Ok(None)
     }
 
-    fn accept_peer_topology(&mut self, payload: &[u8]) -> Result<(), LinkExit> {
+    async fn accept_peer_topology(&mut self, payload: &[u8]) -> Result<(), LinkExit> {
         let topology = decode_topology(payload, self.epoch).map_err(LinkExit::Disconnected)?;
         if topology.same_geometry(&self.inspection.peer_displays) {
             return Ok(());
         }
+        self.unwind_for_topology().await?;
         self.inspection.peer_displays = topology;
         self.emit(LinkEvent::TopologyChanged {
             inspection: self.inspection.clone(),
         })
+    }
+
+    /// A proposal made for the old displays is void on both computers before anyone hears of the
+    /// new ones, so the next proposal finds both idle instead of Busy.
+    async fn unwind_for_topology(&mut self) -> Result<(), LinkExit> {
+        let digest = match &self.sync {
+            SyncState::Idle => return Ok(()),
+            SyncState::Sending { digest, .. }
+            | SyncState::Confirming { digest, .. }
+            | SyncState::Receiving { digest, .. } => *digest,
+        };
+        self.close_transaction(LinkRejectReason::InspectionChanged)?;
+        self.abandoned = Some(digest);
+        self.reject(digest, LinkRejectReason::InspectionChanged)
+            .await
+    }
+
+    /// The peer's answer to a transaction this computer already unwound.
+    fn answers_abandoned(&mut self, frame: &LinkFrame) -> bool {
+        let late = self.abandoned == Some(frame.digest);
+        if late {
+            self.abandoned = None;
+        }
+        late
     }
 
     async fn accept_proposal(&mut self, frame: LinkFrame) -> Result<(), LinkExit> {
@@ -1100,6 +1134,9 @@ impl<'a> Link<'a> {
     }
 
     async fn accept_acknowledgement(&mut self, frame: &LinkFrame) -> Result<(), LinkExit> {
+        if self.answers_abandoned(frame) {
+            return Ok(());
+        }
         let SyncState::Sending { bytes, digest, .. } = &self.sync else {
             return Err(LinkExit::Disconnected(LinkDisconnect::Transport));
         };
@@ -1143,6 +1180,9 @@ impl<'a> Link<'a> {
     }
 
     async fn accept_completion(&mut self, frame: &LinkFrame) -> Result<(), LinkExit> {
+        if self.answers_abandoned(frame) {
+            return Ok(());
+        }
         let SyncState::Receiving { bytes, digest, .. } = &self.sync else {
             return Err(LinkExit::Disconnected(LinkDisconnect::Transport));
         };
@@ -1186,6 +1226,9 @@ impl<'a> Link<'a> {
 
     /// The peer has committed, so the sender's own staged file can be renamed into place.
     async fn accept_confirmation(&mut self, frame: &LinkFrame) -> Result<(), LinkExit> {
+        if self.answers_abandoned(frame) {
+            return Ok(());
+        }
         let SyncState::Confirming { bytes, digest, .. } = &self.sync else {
             return Err(LinkExit::Disconnected(LinkDisconnect::Transport));
         };
@@ -1223,8 +1266,7 @@ impl<'a> Link<'a> {
         let reason = frame
             .reason
             .ok_or(LinkExit::Disconnected(LinkDisconnect::Transport))?;
-        if self.abandoned == Some(frame.digest) {
-            self.abandoned = None;
+        if self.answers_abandoned(frame) {
             return Ok(());
         }
         match &self.sync {
@@ -1291,6 +1333,7 @@ impl<'a> Link<'a> {
             return Ok(());
         }
         let payload = encode_topology(&current, self.epoch).map_err(LinkExit::Disconnected)?;
+        self.unwind_for_topology().await?;
         self.inspection.local_displays = current;
         self.write(LinkFrame::with_payload(
             LinkKind::Topology,
@@ -1449,7 +1492,6 @@ mod tests {
         peer: VerifiedPeer,
         local_platform: Platform,
         peer_platform: Platform,
-        source: DeviceId,
         displays: Arc<Mutex<DisplayTopology>>,
         connection: Arc<Mutex<Option<quinn::Connection>>>,
     }
@@ -1503,7 +1545,7 @@ mod tests {
                 capabilities,
                 capabilities,
                 &local_displays,
-                self.source,
+                monhop_protocol::ControlPermissions::BOTH,
                 SessionPurpose::Setup,
             )
             .map_err(|_| SetupFailure::Handshake)?;
@@ -1513,7 +1555,6 @@ mod tests {
             let inspection = InspectedPeer {
                 local_device: device_id_from_fingerprint(self.identity.fingerprint()),
                 peer_device: device_id_from_fingerprint(self.peer.fingerprint()),
-                source: self.source,
                 local_fingerprint: self.identity.fingerprint(),
                 peer_fingerprint: self.peer.fingerprint(),
                 local_platform: self.local_platform,
@@ -1544,6 +1585,8 @@ mod tests {
         stage_result: Mutex<Result<(), LinkRejectReason>>,
         commit_result: Mutex<Result<(), LinkRejectReason>>,
         saved: Mutex<Vec<u8>>,
+        /// The next stage blocks until the test releases it, keeping a transaction in flight.
+        stage_hold: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     }
 
     impl Recorder {
@@ -1557,6 +1600,7 @@ mod tests {
                 stage_result: Mutex::new(Ok(())),
                 commit_result: Mutex::new(Ok(())),
                 saved: Mutex::new(Vec::new()),
+                stage_hold: Mutex::new(None),
             }
         }
 
@@ -1579,6 +1623,10 @@ mod tests {
         let discard = Arc::clone(recorder);
         LinkPersist {
             stage: Arc::new(move |_, bytes| {
+                let hold = stage.stage_hold.lock().unwrap().take();
+                if let Some(release) = hold {
+                    let _ = release.recv_timeout(TEST_DEADLINE);
+                }
                 stage.staged.fetch_add(1, Ordering::AcqRel);
                 *stage.saved.lock().unwrap() = bytes.to_vec();
                 *stage.stage_result.lock().unwrap()
@@ -1636,7 +1684,6 @@ mod tests {
             SecureQuicConfig::client(&client_identity, &server_pin).unwrap(),
         );
         let server_address = server.local_addr().unwrap();
-        let source = device_id_from_fingerprint(client_identity.fingerprint());
         (
             Loopback {
                 endpoint: client,
@@ -1645,7 +1692,6 @@ mod tests {
                 peer: server_pin,
                 local_platform: Platform::Windows,
                 peer_platform: Platform::MacOs,
-                source,
                 displays: Arc::new(Mutex::new(topology(1, 100))),
                 connection: Arc::new(Mutex::new(None)),
             },
@@ -1656,7 +1702,6 @@ mod tests {
                 peer: client_pin,
                 local_platform: Platform::MacOs,
                 peer_platform: Platform::Windows,
-                source,
                 displays: Arc::new(Mutex::new(topology(2, 200))),
                 connection: Arc::new(Mutex::new(None)),
             },
@@ -2263,6 +2308,82 @@ mod tests {
                 };
                 assert!(inspection.peer_displays.same_geometry(&topology(1, 300)));
                 assert_eq!(inspection.peer_device, driver.dialer.device);
+                driver.dialer.close();
+                driver.listener.close();
+                driver
+            })
+            .await;
+        assert_eq!(dialer, Ok(()));
+        assert_eq!(listener, Ok(()));
+    }
+
+    /// The next transaction outcome or topology report, so a dropped link fails instead of hanging.
+    async fn next_sync_or_topology(inbox: &mut UnboundedReceiver<LinkEvent>) -> LinkEvent {
+        wait_for(inbox, |event| {
+            matches!(
+                event,
+                LinkEvent::SyncCompleted { .. }
+                    | LinkEvent::SyncRejected { .. }
+                    | LinkEvent::TopologyChanged { .. }
+                    | LinkEvent::Disconnected { .. }
+            )
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_topology_change_unwinds_the_proposal_in_flight_so_the_next_is_not_busy() {
+        let (dialer, listener) =
+            with_link((Duration::ZERO, Duration::ZERO), |mut driver| async move {
+                wait_connected(&mut driver.dialer.inbox).await;
+                wait_connected(&mut driver.listener.inbox).await;
+                let (release, held) = std::sync::mpsc::channel();
+                *driver.listener.recorder.stage_hold.lock().unwrap() = Some(held);
+                driver.dialer.propose(b"layout for the old displays");
+                wait_for(&mut driver.listener.inbox, |event| {
+                    matches!(event, LinkEvent::SyncStarted { sending: false })
+                })
+                .await;
+                // The receiver is staging and the sender awaits its acknowledgement.
+                *driver.dialer.displays.lock().unwrap() = topology(1, 300);
+                assert!(matches!(
+                    next_sync_or_topology(&mut driver.dialer.inbox).await,
+                    LinkEvent::SyncRejected {
+                        reason: LinkRejectReason::InspectionChanged,
+                        sending: true
+                    }
+                ));
+                assert!(matches!(
+                    next_sync_or_topology(&mut driver.dialer.inbox).await,
+                    LinkEvent::TopologyChanged { .. }
+                ));
+                release.send(()).unwrap();
+                assert!(matches!(
+                    next_sync_or_topology(&mut driver.listener.inbox).await,
+                    LinkEvent::SyncRejected {
+                        reason: LinkRejectReason::InspectionChanged,
+                        sending: false
+                    }
+                ));
+                assert!(matches!(
+                    next_sync_or_topology(&mut driver.listener.inbox).await,
+                    LinkEvent::TopologyChanged { .. }
+                ));
+                driver.dialer.propose(b"layout for the new displays");
+                assert!(matches!(
+                    next_sync_or_topology(&mut driver.listener.inbox).await,
+                    LinkEvent::SyncCompleted { sending: false, .. }
+                ));
+                assert!(matches!(
+                    next_sync_or_topology(&mut driver.dialer.inbox).await,
+                    LinkEvent::SyncCompleted { sending: true, .. }
+                ));
+                assert_eq!(driver.dialer.recorder.counts(), (1, 1, 0));
+                assert_eq!(driver.listener.recorder.counts(), (2, 1, 1));
+                assert_eq!(
+                    *driver.listener.recorder.saved.lock().unwrap(),
+                    b"layout for the new displays".to_vec()
+                );
                 driver.dialer.close();
                 driver.listener.close();
                 driver

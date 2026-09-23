@@ -1,12 +1,16 @@
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
 use monhop_core::{
     DestinationModifier, DestinationModifierKey, DeviceId, Display, DisplayId, Edge, EdgeLink,
-    EmergencyEscape, FailureReason, HeldInput, HidUsage, InputAction, LogicalSize, Machine,
-    MouseButton, NativeSize, NormalizedSpan, OwnershipCommand, OwnershipError, OwnershipState,
-    Platform, Point, PointerOwnership, PointerTarget, Topology, TopologyError,
-    TransitionAcknowledgement, map_modifier_for_destination,
+    EmergencyEscape, FailureReason, FloorOwner, FloorSnapshot, FloorState, HeldInput, HidUsage,
+    InputAction, LogicalSize, Machine, MouseButton, NativeSessionClaim, NativeSize, NormalizedSpan,
+    OwnershipCommand, OwnershipError, OwnershipState, Platform, Point, PointerOwnership,
+    PointerTarget, SharedFloor, Topology, TopologyError, TransitionAcknowledgement,
+    map_modifier_for_destination,
 };
+
+// The native claim is one process-wide flag; tests that touch it run one at a time.
+static CLAIM_TESTS: Mutex<()> = Mutex::new(());
 
 fn device(value: u8) -> DeviceId {
     DeviceId([value; 16])
@@ -833,4 +837,249 @@ fn lost_ack_disconnect_plans_release_for_pending_remote_target() {
     assert_eq!(recovery.reason, FailureReason::Disconnected);
     assert_eq!(recovery.remote_to_release, Some(remote));
     assert_eq!(ownership.active_destination(), local);
+}
+
+#[test]
+fn claim_clears_only_after_both_permits_drop() {
+    let _serial = CLAIM_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(!NativeSessionClaim::is_claimed());
+
+    let claim = NativeSessionClaim::claim().expect("first claim");
+    assert!(NativeSessionClaim::is_claimed());
+    drop(claim);
+    assert!(
+        !NativeSessionClaim::is_claimed(),
+        "an unsplit claim clears on drop"
+    );
+
+    let (capture, injection) = NativeSessionClaim::claim().expect("claim").split();
+    assert!(NativeSessionClaim::is_claimed());
+    drop(capture);
+    assert!(
+        NativeSessionClaim::is_claimed(),
+        "the injection permit still holds"
+    );
+    drop(injection);
+    assert!(!NativeSessionClaim::is_claimed());
+
+    let (capture, injection) = NativeSessionClaim::claim().expect("claim").split();
+    drop(injection);
+    assert!(
+        NativeSessionClaim::is_claimed(),
+        "the capture permit still holds"
+    );
+    drop(capture);
+    assert!(!NativeSessionClaim::is_claimed());
+}
+
+#[test]
+fn second_claim_fails_while_a_permit_lives() {
+    let _serial = CLAIM_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let claim = NativeSessionClaim::claim().expect("first claim");
+    assert!(NativeSessionClaim::claim().is_none());
+
+    let (capture, injection) = claim.split();
+    assert!(NativeSessionClaim::claim().is_none());
+    drop(injection);
+    assert!(NativeSessionClaim::claim().is_none());
+    drop(capture);
+
+    let again = NativeSessionClaim::claim().expect("claim after both permits dropped");
+    drop(again);
+}
+
+const FLOOR_STATES: [FloorState; 6] = [
+    FloorState::Free,
+    FloorState::Requesting,
+    FloorState::Sending,
+    FloorState::Returning,
+    FloorState::Receiving,
+    FloorState::Yielding,
+];
+
+/// Drives a fresh floor to `state` through legal edges only.
+fn floor_at(state: FloorState) -> (SharedFloor, FloorSnapshot) {
+    let path: &[FloorState] = match state {
+        FloorState::Free => &[],
+        FloorState::Requesting => &[FloorState::Requesting],
+        FloorState::Sending => &[FloorState::Requesting, FloorState::Sending],
+        FloorState::Returning => &[
+            FloorState::Requesting,
+            FloorState::Sending,
+            FloorState::Returning,
+        ],
+        FloorState::Receiving => &[FloorState::Receiving],
+        FloorState::Yielding => &[FloorState::Receiving, FloorState::Yielding],
+    };
+    let floor = SharedFloor::new();
+    let mut snapshot = floor.snapshot();
+    for next in path {
+        snapshot = floor
+            .transition(snapshot, *next)
+            .expect("path uses legal edges");
+    }
+    (floor, snapshot)
+}
+
+#[test]
+fn floor_rejects_illegal_edges() {
+    use FloorState::*;
+    let legal = [
+        (Free, Requesting),
+        (Free, Receiving),
+        (Requesting, Sending),
+        (Requesting, Free),
+        (Requesting, Receiving),
+        (Sending, Returning),
+        (Returning, Free),
+        (Receiving, Yielding),
+        (Receiving, Free),
+        (Yielding, Free),
+    ];
+    assert_eq!(
+        SharedFloor::new().snapshot(),
+        FloorSnapshot {
+            state: Free,
+            generation: 1
+        }
+    );
+    for from in FLOOR_STATES {
+        for to in FLOOR_STATES {
+            let (floor, before) = floor_at(from);
+            let result = floor.transition(before, to);
+            if legal.contains(&(from, to)) {
+                let after = FloorSnapshot {
+                    state: to,
+                    generation: before.generation + 1,
+                };
+                assert_eq!(result, Ok(after), "{from:?} -> {to:?} is legal");
+                assert_eq!(floor.snapshot(), after);
+            } else {
+                assert_eq!(result, Err(before), "{from:?} -> {to:?} is illegal");
+                assert_eq!(floor.snapshot(), before, "a refused edge changes nothing");
+            }
+        }
+    }
+
+    let (floor, current) = floor_at(Sending);
+    let stale = FloorSnapshot {
+        state: Sending,
+        generation: current.generation - 1,
+    };
+    assert_eq!(floor.transition(stale, Returning), Err(current));
+    assert_eq!(floor.snapshot(), current);
+}
+
+#[test]
+fn floor_release_requires_owner_and_generation() {
+    assert_eq!(FloorState::Free.owner(), None);
+    for state in [
+        FloorState::Requesting,
+        FloorState::Sending,
+        FloorState::Returning,
+    ] {
+        assert_eq!(state.owner(), Some(FloorOwner::Outbound));
+    }
+    for state in [FloorState::Receiving, FloorState::Yielding] {
+        assert_eq!(state.owner(), Some(FloorOwner::Inbound));
+    }
+
+    for state in FLOOR_STATES {
+        let (floor, held) = floor_at(state);
+        let Some(owner) = state.owner() else {
+            assert!(!floor.release(FloorOwner::Outbound, held.generation));
+            assert!(!floor.release(FloorOwner::Inbound, held.generation));
+            assert_eq!(
+                floor.snapshot(),
+                held,
+                "a free floor has no owner to release it"
+            );
+            continue;
+        };
+        let other = match owner {
+            FloorOwner::Outbound => FloorOwner::Inbound,
+            FloorOwner::Inbound => FloorOwner::Outbound,
+        };
+        assert!(!floor.release(other, held.generation));
+        assert!(!floor.release(owner, held.generation - 1));
+        assert!(!floor.release(owner, held.generation + 1));
+        assert_eq!(floor.snapshot(), held);
+        assert!(floor.release(owner, held.generation));
+        assert_eq!(
+            floor.snapshot(),
+            FloorSnapshot {
+                state: FloorState::Free,
+                generation: held.generation + 1
+            }
+        );
+        assert!(
+            !floor.release(owner, held.generation),
+            "release is one-shot"
+        );
+    }
+
+    let (floor, sending) = floor_at(FloorState::Sending);
+    floor.reset();
+    assert_eq!(
+        floor.snapshot(),
+        FloorSnapshot {
+            state: FloorState::Free,
+            generation: sending.generation + 1
+        }
+    );
+    floor.reset();
+    assert_eq!(floor.snapshot().generation, sending.generation + 2);
+}
+
+#[test]
+fn idle_inbound_release_cannot_free_outbound_floor() {
+    let floor = SharedFloor::new();
+    let receiving = floor
+        .transition(floor.snapshot(), FloorState::Receiving)
+        .expect("inbound acquires the free floor");
+    assert!(floor.release(FloorOwner::Inbound, receiving.generation));
+    let requesting = floor
+        .transition(floor.snapshot(), FloorState::Requesting)
+        .expect("outbound acquires the free floor");
+    let sending = floor
+        .transition(requesting, FloorState::Sending)
+        .expect("outbound activation completes");
+
+    // The idle inbound half holds or cleans up with its last generation, or even the current one.
+    assert!(!floor.release(FloorOwner::Inbound, receiving.generation));
+    assert!(!floor.release(FloorOwner::Inbound, sending.generation));
+    assert_eq!(floor.snapshot(), sending);
+
+    let clone = floor.clone();
+    assert!(clone.release(FloorOwner::Outbound, sending.generation));
+    assert_eq!(
+        floor.snapshot().state,
+        FloorState::Free,
+        "clones share one floor"
+    );
+}
+
+#[test]
+fn tie_break_edge_requesting_to_receiving() {
+    let floor = SharedFloor::new();
+    let requesting = floor
+        .transition(floor.snapshot(), FloorState::Requesting)
+        .expect("outbound requests");
+    let receiving = floor
+        .transition(requesting, FloorState::Receiving)
+        .expect("the tie-break loser becomes the receiver");
+    assert_eq!(receiving.state.owner(), Some(FloorOwner::Inbound));
+    assert_eq!(receiving.generation, requesting.generation + 1);
+
+    assert!(!floor.release(FloorOwner::Outbound, requesting.generation));
+    assert_eq!(
+        floor.transition(requesting, FloorState::Sending),
+        Err(receiving),
+        "the losing request can no longer complete"
+    );
+    assert!(floor.release(FloorOwner::Inbound, receiving.generation));
 }

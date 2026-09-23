@@ -29,10 +29,10 @@ function labelSize(label, placement = "above") {
 
 // Place both labels together so the second one never lands on top of the first.
 export function labelBoxes(rects, labels, stage, insets) {
-  const source = box(rects.source, rects.destination, labels.source, stage, insets, []);
+  const local = box(rects.local, rects.peer, labels.local, stage, insets, []);
   return {
-    source,
-    destination: box(rects.destination, rects.source, labels.destination, stage, insets, [source]),
+    local,
+    peer: box(rects.peer, rects.local, labels.peer, stage, insets, [local]),
   };
 }
 
@@ -55,13 +55,11 @@ export function createGroupNode({
   focusable = false,
   focusTiles = false,
   ariaLabel,
-  source = false,
   tileAria,
 }) {
   const node = svgNode("g");
   node.classList.add("arrangement-group", `is-${platform}`);
   if (side) node.classList.add(`is-${side}`);
-  if (source) node.classList.add("is-input");
   node.dataset.group = groupKey;
   node.setAttribute("role", focusable ? "button" : "group");
   node.setAttribute("aria-label", ariaLabel ?? label);

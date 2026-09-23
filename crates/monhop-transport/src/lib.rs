@@ -15,12 +15,12 @@ pub(crate) mod session_clock;
 pub mod session_handshake;
 pub mod session_health;
 #[cfg(any(windows, target_os = "macos"))]
-pub mod session_layout;
-#[cfg(any(windows, target_os = "macos"))]
 pub mod session_link;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod session_native;
 pub mod session_receiver;
+#[cfg(any(windows, target_os = "macos"))]
+mod session_runtime;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod session_setup;
 pub mod session_source;
@@ -28,7 +28,6 @@ pub mod session_source;
 mod session_source_runtime;
 pub(crate) mod session_startup;
 pub mod session_threads;
-pub mod session_trial;
 pub mod session_wire;
 
 #[cfg(test)]

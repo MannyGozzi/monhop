@@ -344,6 +344,26 @@ mod tests {
     use super::*;
     use monhop_protocol::{Message, PROTOCOL_VERSION, SessionEpoch};
 
+    #[test]
+    fn v9_datagrams_preserve_scope_and_reject_unknown_scope_bytes() {
+        use monhop_protocol::FrameScope;
+        for scope in [
+            FrameScope::Connection,
+            FrameScope::LowerControlsHigher,
+            FrameScope::HigherControlsLower,
+        ] {
+            let frame =
+                Frame::new(SessionEpoch::new(1).unwrap(), 0, Message::Ping(1)).with_scope(scope);
+            let mut bytes = Vec::new();
+            frame.encode_into(&mut bytes).unwrap();
+            assert_eq!(decode_datagram(&bytes).unwrap(), frame);
+            for unknown in 3..=255 {
+                bytes[7] = unknown;
+                assert!(decode_datagram(&bytes).is_err());
+            }
+        }
+    }
+
     fn frame(sequence: u64) -> Frame {
         Frame::new(
             SessionEpoch::new(1).expect("nonzero test epoch"),

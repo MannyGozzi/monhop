@@ -24,7 +24,8 @@ import { normalizeStoredLayout } from "./sharing-model.mjs";
 
 const MAX_U64 = "18446744073709551615";
 const MAX_COORDINATE = 20_000_000;
-const VIEW = { width: 420, height: 190 };
+const VIEW = { width: 640, height: 150 };
+const PREVIEW_INSETS = VIEW_INSETS;
 const STALE = "Saved arrangement details need a fresh review.";
 // Below this a move is a rounding difference, not a rearrangement worth animating.
 const MOVE_EPSILON = 0.5;
@@ -57,31 +58,17 @@ export function savedDashboardArrangement(setup) {
   if (new Set(all.map((display) => display.id)).size !== all.length)
     return unavailable("Saved display identifiers are not valid.");
 
-  const localIds = new Set(local.map((display) => display.id));
-  const peerIds = new Set(peer.map((display) => display.id));
-  const sourceSide = localIds.has(layout.sourceDisplay)
-    ? "local"
-    : peerIds.has(layout.sourceDisplay)
-      ? "peer"
-      : null;
-  if (!sourceSide || (setup.sourceSide && setup.sourceSide !== sourceSide))
-    return unavailable(STALE);
-  const destinationSide = sourceSide === "local" ? "peer" : "local";
-  const every = {
-    source: sourceSide === "local" ? local : peer,
-    destination: destinationSide === "local" ? local : peer,
-  };
   // A monitor cabled to both computers is drawn once, on the side the saved layout uses.
-  const shared = sharedMonitors(every.source, every.destination);
-  const hidden = hiddenFromLayout(layout, every.source, every.destination);
-  const source = drawnDisplays(every.source, hidden, shared);
-  const destination = drawnDisplays(every.destination, hidden, shared);
+  const shared = sharedMonitors(local, peer);
+  const hidden = hiddenFromLayout(layout, local, peer);
+  const drawnLocal = drawnDisplays(local, hidden, shared);
+  const drawnPeer = drawnDisplays(peer, hidden, shared);
   const crossings = crossingsFromLinks(
     layout.links,
-    new Set(source.map((display) => display.id)),
-    new Set(destination.map((display) => display.id)),
+    new Set(drawnLocal.map((display) => display.id)),
+    new Set(drawnPeer.map((display) => display.id)),
   );
-  const groups = displayGroups(source, destination);
+  const groups = displayGroups(drawnLocal, drawnPeer);
   if (!crossings || !groups) return unavailable(STALE);
   // No link was ever recorded: place the two groups the same way a fresh arrangement would, and
   // draw them unconnected rather than inventing a crossing that was never saved.
@@ -94,8 +81,6 @@ export function savedDashboardArrangement(setup) {
     return unavailable("Saved arrangement cannot be shown without changing its display geometry.");
   return {
     available: true,
-    sourceSide,
-    destinationSide,
     noCrossingYet,
     groups: geometry.groups,
     placement: structuredClone(geometry.placement),
@@ -110,9 +95,7 @@ export function savedDashboardArrangement(setup) {
 // missing instead of warning that the details need a review.
 export function dashboardCaption(arrangement) {
   if (arrangement?.noCrossingYet) return "No crossing yet. Arrange the displays to connect them.";
-  return arrangement?.placement?.mode === "free"
-    ? "Saved display positions, placed one by one. Not a current display check."
-    : "Saved display positions. Not a current display check.";
+  return "Saved display positions. Not a current display check.";
 }
 
 // What changed between two drawings of one viewport: how far each display moved, as the inverse
@@ -171,8 +154,10 @@ export function createDashboardArrangement(setup, names = {}) {
   const arrangement = savedDashboardArrangement(setup);
   const root = document.createElement("figure");
   root.className = "dashboard-arrangement-preview";
+  if (typeof names.transitionName === "string") root.dataset.sharedTransition = names.transitionName;
   root.dataset.state = arrangement.available ? "saved" : "unavailable";
   if (names.compact) root.dataset.size = "compact";
+  if (names.compactLegend) root.dataset.size = "home";
   if (!arrangement.available) {
     // Nothing is drawn, so the remembered positions would only make the next drawing slide in
     // from where a different arrangement once sat.
@@ -192,13 +177,7 @@ export function createDashboardArrangement(setup, names = {}) {
     local: platform(names.localPlatform, "macos"),
     peer: platform(names.peerPlatform, "windows"),
   };
-  const sides = { source: arrangement.sourceSide, destination: arrangement.destinationSide };
-  const groupLabels = {
-    source: `${labels[sides.source]} · Input`,
-    destination: labels[sides.destination],
-  };
   const seamCount = arrangement.seams.length;
-  const free = arrangement.placement.mode === "free";
 
   const svg = svgNode("svg");
   svg.classList.add("dashboard-arrangement-canvas");
@@ -207,29 +186,28 @@ export function createDashboardArrangement(setup, names = {}) {
   svg.setAttribute("role", "img");
   svg.setAttribute(
     "aria-label",
-    `${labels.local} and ${labels.peer}. ${arrangement.noCrossingYet ? "No crossing yet." : `${seamCount} saved display seam${seamCount === 1 ? "" : "s"}.`} ${labels[arrangement.sourceSide]} is the input source.${free ? " Displays were placed one by one." : ""}`,
+    `${labels.local} and ${labels.peer}. ${arrangement.noCrossingYet ? "No crossing yet." : `${seamCount} saved display seam${seamCount === 1 ? "" : "s"}.`}`,
   );
 
-  const transform = fitTransform(arrangement.tiles, VIEW, VIEW_INSETS);
+  const transform = fitTransform(arrangement.tiles, VIEW, PREVIEW_INSETS);
   const rects = {
     tiles: tileRects(arrangement.tiles, transform),
     sides: sideRects(arrangement.tiles, transform),
   };
-  const boxes = labelBoxes(rects.sides, groupLabels, VIEW, VIEW_INSETS);
+  const boxes = labelBoxes(rects.sides, labels, VIEW, PREVIEW_INSETS);
   const groups = svgNode("g");
   groups.classList.add("arrangement-groups");
-  for (const key of ["source", "destination"]) {
+  for (const key of ["local", "peer"]) {
     groups.append(
       createGroupNode({
         tiles: arrangement.tiles.filter((tile) => tile.side === key),
         tileRects: rects.tiles,
         groupKey: key,
-        platform: platforms[sides[key]],
-        side: sides[key],
-        label: groupLabels[key],
+        platform: platforms[key],
+        side: key,
+        label: labels[key],
         rect: rects.sides[key],
         labelBox: boxes[key],
-        source: key === "source",
       }),
     );
   }
@@ -249,29 +227,30 @@ export function createDashboardArrangement(setup, names = {}) {
 
   // The compact viewport rides inside a computer card, where the legend would cost more room
   // than it explains; the picture and one caption are what that card needs.
-  const legend = names.compact
-    ? null
-    : createLegend([
-        { kind: "group", label: groupLabels.source, side: sides.source },
-        { kind: "group", label: groupLabels.destination, side: sides.destination },
-        { kind: "primary", label: "Primary display" },
-        ...(arrangement.tiles.some((tile) => tile.shared)
-          ? [{ kind: "shared", label: "Cabled to both computers" }]
-          : []),
-        ...(seamCount ? [{ kind: "seam", label: "Pointer crossing" }] : []),
-      ]);
-  const caption = document.createElement("figcaption");
-  // A caller's short caption replaces the standing one, except while the arrangement itself has
-  // something to ask for; what is missing outranks how fresh the picture is.
-  caption.textContent =
-    names.caption && !arrangement.noCrossingYet ? names.caption : dashboardCaption(arrangement);
-  root.append(svg, ...(legend ? [legend] : []), caption);
+  const legendItems = [
+    { kind: "group", label: labels.local, side: "local" },
+    { kind: "group", label: labels.peer, side: "peer" },
+    ...(names.compactLegend ? [] : [{ kind: "primary", label: "Primary display" }]),
+    ...(arrangement.tiles.some((tile) => tile.shared)
+      ? [{ kind: "shared", label: "Cabled to both computers" }]
+      : []),
+    ...(seamCount ? [{ kind: "seam", label: "Pointer crossing" }] : []),
+  ];
+  const legend = names.compact ? null : createLegend(legendItems);
+  const captionText = names.hideCaption && !arrangement.noCrossingYet
+    ? ""
+    : names.caption && !arrangement.noCrossingYet
+      ? names.caption
+      : dashboardCaption(arrangement);
+  const caption = captionText ? document.createElement("figcaption") : null;
+  if (caption) caption.textContent = captionText;
+  root.append(svg, ...(legend ? [legend] : []), ...(caption ? [caption] : []));
   // Real text metrics need a laid-out canvas, so the estimated truncation is corrected on the next frame.
   if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => refineText(svg));
   return root;
 }
 
-function crossingsFromLinks(links, sourceIds, destinationIds) {
+function crossingsFromLinks(links, localIds, peerIds) {
   if (links.length % 2 !== 0) return null;
   const unused = [...links];
   const crossings = [];
@@ -281,7 +260,7 @@ function crossingsFromLinks(links, sourceIds, destinationIds) {
     if (reciprocalIndex < 0) return null;
     const second = unused.splice(reciprocalIndex, 1)[0];
     const forward = [first, second].find(
-      (link) => sourceIds.has(link.fromDisplay) && destinationIds.has(link.toDisplay),
+      (link) => localIds.has(link.fromDisplay) && peerIds.has(link.toDisplay),
     );
     if (!forward) return null;
     crossings.push({

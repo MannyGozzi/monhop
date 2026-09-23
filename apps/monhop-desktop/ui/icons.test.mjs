@@ -13,10 +13,7 @@ async function appSources() {
   const dir = new URL("./", import.meta.url);
   const names = (await readdir(dir)).filter(
     (file) =>
-      /\.(mjs|js|html)$/.test(file) &&
-      !file.endsWith(".test.mjs") &&
-      file !== "harness.html" &&
-      !file.startsWith("trial"),
+      /\.(mjs|js|html)$/.test(file) && !file.endsWith(".test.mjs") && file !== "harness.html",
   );
   return Promise.all(names.map(async (file) => [file, await readFile(new URL(file, dir), "utf8")]));
 }

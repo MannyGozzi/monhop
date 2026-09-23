@@ -1,26 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  displayGroups,
-  groupedPlacement,
-  movePlacement,
-  placementOffset,
-} from "./arrangement-model.mjs";
+import { groupedPlacement, placementOffset } from "./arrangement-model.mjs";
 import {
   MAX_CROSSINGS,
   applySharingView,
   arrangementForSharing,
-  arrangementMode,
   arrangementResetTarget,
   beginPending,
   canApplySetup,
-  canChooseSource,
   canEditLayout,
   canLoadArrangement,
   canResetArrangement,
   canSaveArrangement,
-  destinationDisplays,
   displayNoticeCopy,
   failPending,
   hasAppliedCurrentLayout,
@@ -49,12 +41,8 @@ import {
   sharedMonitorChoices,
   shouldPollSharing,
   setArrangement,
-  setArrangementMode,
   setArrangements,
-  setSource,
   settlePending,
-  sourceDisplays,
-  sourcePlatform,
   validateLayout,
 } from "./sharing-model.mjs";
 
@@ -64,7 +52,6 @@ const peerId = "18446744073709551614";
 const connectedView = {
   phase: "connected",
   revision: "42",
-  sourceSide: "peer",
   localPlatform: "macos",
   peerPlatform: "windows",
   busy: false,
@@ -97,10 +84,9 @@ const connectedView = {
 const offView = {
   ...connectedView,
   phase: "off",
-  sourceSide: null,
   localDisplays: [],
   peerDisplays: [],
-  message: "Not connected. Input is local.",
+  message: "Not connected.",
 };
 
 function connected(patch = {}) {
@@ -109,7 +95,6 @@ function connected(patch = {}) {
 
 function savedLayout() {
   return {
-    sourceDisplay: peerId,
     links: [
       {
         fromDisplay: peerId,
@@ -133,16 +118,11 @@ function savedLayout() {
   };
 }
 
-const groupsOf = (state) => displayGroups(sourceDisplays(state), destinationDisplays(state));
-// Drops the other computer's group at a translation from the input computer's group.
+const groupsOf = (state) => arrangementForSharing(state).groups;
+// Drops the peer computer's whole block at an offset from the local computer's block.
 const place = (state, offset) => setArrangement(state, groupedPlacement(groupsOf(state), offset));
 const offsetOf = (state) =>
   placementOffset(groupsOf(state), arrangementForSharing(state).placement);
-const applied = (state) => ({
-  ...connectedView,
-  sync: { state: "applied", message: "" },
-  synchronizedLayout: layoutForSave(state),
-});
 
 test("the view names which computer is live and which one is in use, in one case", () => {
   const view = normalizeSharingView({
@@ -194,6 +174,34 @@ test("native link views reject malformed IDs, coordinates, phases, and empty con
   assert.equal(normalizeSharingView(offView).recognized, true);
 });
 
+test("control names which directions are allowed and preserves the backend sync window", () => {
+  const view = normalizeSharingView({
+    ...offView,
+    phase: "sharing",
+    sharingActive: true,
+    control: { localToPeer: true, peerToLocal: false, syncing: true },
+  });
+  assert.equal(view.recognized, true);
+  assert.deepEqual(view.control, { localToPeer: true, peerToLocal: false, syncing: true });
+  const bothOff = normalizeSharingView({
+    ...offView,
+    control: { localToPeer: false, peerToLocal: false, syncing: false },
+  });
+  assert.equal(bothOff.control, null);
+  const malformed = normalizeSharingView({
+    ...offView,
+    control: { localToPeer: "yes", peerToLocal: true, syncing: false },
+  });
+  assert.equal(malformed.control, null);
+  // No active record yet: control is null, not a guess.
+  assert.equal(normalizeSharingView(offView).control, null);
+  assert.equal(normalizeSharingView(connectedView).control, null);
+  assert.deepEqual(
+    normalizeSharingView({ ...offView, control: { localToPeer: true, peerToLocal: true } }).control,
+    { localToPeer: true, peerToLocal: true, syncing: false },
+  );
+});
+
 test("the display notice normalizes to a known kind or drops to null", () => {
   assert.deepEqual(normalizeDisplayNotice({ kind: "waiting" }), { kind: "waiting" });
   assert.deepEqual(normalizeDisplayNotice({ kind: "continued" }), { kind: "continued" });
@@ -234,8 +242,6 @@ test("a display change the user must settle gets the banner; one MonHop is settl
   const continued = displayNoticeCopy("continued", "Office Windows PC");
   assert.equal(continued.presentation, "banner");
   assert.equal(continued.title, "Your displays changed");
-  // A dropped crossing or an unplugged monitor raises this too, so the copy claims no display
-  // is missing from the layout; it says the layout was adapted and offers to change it.
   assert.equal(
     continued.body,
     "Sharing continues with a layout adapted to them. Arrange the displays if you want something different.",
@@ -243,7 +249,6 @@ test("a display change the user must settle gets the banner; one MonHop is settl
   assert.equal(continued.primaryLabel, "Arrange displays");
   assert.equal(continued.secondaryLabel, "Keep going");
 
-  // An inline notice reports; it names no buttons because it asks the user for nothing.
   const updating = displayNoticeCopy("updating", "Office Windows PC");
   assert.equal(updating.presentation, "inline");
   assert.equal(updating.body, "Updating the layout…");
@@ -276,12 +281,8 @@ test("the link phases decide what the user can do", () => {
   // A dialing link is the supervisor's; the editor may open on it (the backend adopts the link).
   assert.equal(canEditLayout(state, "en0"), true);
   assert.equal(isBusySharing(state), false);
-  assert.equal(canChooseSource(state), false);
   state = applySharingView(state, connectedView);
   assert.equal(isConnected(state), true);
-  assert.equal(canChooseSource(state), true);
-  assert.equal(state.source, "peer");
-  assert.equal(sourcePlatform(state), "windows");
   state = applySharingView(state, {
     ...connectedView,
     phase: "reconnecting",
@@ -322,72 +323,50 @@ test("polling the same applied layout keeps the local draft", () => {
     synchronizedLayout: layoutForSave(state),
   };
   state = applySharingView(state, appliedView);
-  state = place(state, [1920, 0]);
+  state = place(state, [1512, 300]);
   const edited = state.layout;
   state = applySharingView(state, appliedView);
   assert.deepEqual(state.layout, edited);
 });
 
-test("choosing the input computer by side flips the display groups and clears the draft", () => {
-  let state = initializeArrangement(connected());
-  assert.deepEqual(
-    sourceDisplays(state).map((display) => display.id),
-    [peerId],
-  );
-  assert.equal(state.layout.crossings.length, 1);
-  state = setSource(state, "local");
-  assert.deepEqual(
-    sourceDisplays(state).map((display) => display.id),
-    [localId],
-  );
-  assert.equal(sourcePlatform(state), "macos");
-  assert.equal(state.layout.crossings.length, 0);
-  assert.equal(setSource(state, "elsewhere"), state);
-});
-
-test("a same-platform pair still names both sides distinctly", () => {
-  const state = connected({ localPlatform: "macos", peerPlatform: "macos", sourceSide: "local" });
-  assert.equal(sourcePlatform(state), "macos");
-  assert.equal(sourcePlatform(setSource(state, "peer")), "macos");
-});
-
-test("simple crossings create two full-edge reciprocal native links", () => {
+test("every seam emits forward and reverse links", () => {
   const state = initializeArrangement(connected());
   const result = validateLayout(state);
   assert.equal(result.ok, true);
-  assert.equal(result.layout.sourceDisplay, peerId);
+  assert.equal(result.layout.source, undefined);
   assert.deepEqual(
     result.layout.links.map((link) => [
       link.fromDisplay,
       link.fromEdge,
       link.toDisplay,
       link.toEdge,
-      link.toSpan,
       link.hysteresis,
     ]),
     [
-      [peerId, "right", localId, "left", [0, 1], 1],
-      [localId, "left", peerId, "right", [49 / 1080, 1031 / 1080], 1],
+      [localId, "right", peerId, "left", 1],
+      [peerId, "left", localId, "right", 1],
     ],
   );
-  assert.deepEqual(result.layout.links[0].fromSpan, [49 / 1080, 1031 / 1080]);
+  assert.deepEqual(result.layout.links[0].fromSpan, [0, 1]);
+  assert.deepEqual(result.layout.links[0].toSpan, [49 / 1080, 1031 / 1080]);
+  assert.deepEqual(result.layout.links[1].fromSpan, [49 / 1080, 1031 / 1080]);
+  assert.deepEqual(result.layout.links[1].toSpan, [0, 1]);
 });
 
 test("layouts reject duplicate directed edges, foreign displays, identical IDs, and too many crossings", () => {
   const state = connected();
   const crossing = {
     id: "one",
-    fromDisplay: peerId,
+    fromDisplay: localId,
     fromEdge: "right",
-    toDisplay: localId,
+    toDisplay: peerId,
     toEdge: "left",
   };
   for (const layout of [
-    { sourceDisplay: peerId, crossings: [crossing, { ...crossing, id: "two" }] },
-    { sourceDisplay: peerId, crossings: [{ ...crossing, fromDisplay: "999" }] },
-    { sourceDisplay: peerId, crossings: [{ ...crossing, toDisplay: peerId }] },
+    { crossings: [crossing, { ...crossing, id: "two" }] },
+    { crossings: [{ ...crossing, fromDisplay: "999" }] },
+    { crossings: [{ ...crossing, toDisplay: localId }] },
     {
-      sourceDisplay: peerId,
       crossings: Array.from({ length: MAX_CROSSINGS + 1 }, (_, index) => ({
         ...crossing,
         id: String(index),
@@ -399,7 +378,7 @@ test("layouts reject duplicate directed edges, foreign displays, identical IDs, 
   assert.equal(validateLayout(applySharingView(state, offView)).ok, false);
 });
 
-test("a crossing cannot use an edge the computer's own desktop already routes", () => {
+test("a crossing on the peer's own native seam is rejected", () => {
   const lg = { id: "301", name: "LG", origin: [0, 0], size: [2560, 1440], scale: 1, primary: true };
   const dell = {
     id: "302",
@@ -411,9 +390,8 @@ test("a crossing cannot use an edge the computer's own desktop already routes", 
   };
   const mac = { ...connectedView.localDisplays[0], monitor: "10ac-d0e5-30305455" };
   const layout = {
-    sourceDisplay: lg.id,
     crossings: [
-      { id: "one", fromDisplay: lg.id, fromEdge: "left", toDisplay: mac.id, toEdge: "right" },
+      { id: "one", fromDisplay: mac.id, fromEdge: "right", toDisplay: lg.id, toEdge: "left" },
     ],
   };
   const blocked = validateLayout(
@@ -422,6 +400,7 @@ test("a crossing cannot use an edge the computer's own desktop already routes", 
   );
   assert.equal(blocked.ok, false);
   assert.match(blocked.message, /left edge of LG already leads to Dell/);
+  // Marking the two as the same physical monitor removes the peer's own seam entirely.
   const shared = connected({
     peerDisplays: [lg, { ...dell, monitor: mac.monitor }],
     localDisplays: [mac],
@@ -429,7 +408,7 @@ test("a crossing cannot use an edge the computer's own desktop already routes", 
   assert.equal(validateLayout(shared, layout).ok, true);
 });
 
-test("a crossing may reuse an edge only the destination's own desktop already routes", () => {
+test("a crossing on the local computer's own native seam is rejected too", () => {
   // The Mac's own OS stacks these two displays: the top one directly above the bottom one, touching.
   const macTop = {
     id: "401",
@@ -447,23 +426,14 @@ test("a crossing may reuse an edge only the destination's own desktop already ro
     scale: 2,
     primary: false,
   };
-  let state = initializeArrangement(connected({ localDisplays: [macTop, macBottom] }));
-  state = setArrangementMode(state, "free");
-  // Drag the bottom display under the Windows display so it touches on the same edge its own desktop
-  // uses; the top display moves off to the side, touching nothing.
-  const placement = {
-    mode: "free",
-    positions: {
-      [peerId]: [0, 0],
-      [macTop.id]: [5000, 5000],
-      [macBottom.id]: [0, 1080],
-    },
+  const layout = {
+    crossings: [
+      { id: "one", fromDisplay: macBottom.id, fromEdge: "top", toDisplay: peerId, toEdge: "bottom" },
+    ],
   };
-  state = setArrangement(state, placement, { id: macBottom.id });
-  assert.equal(arrangementForSharing(state).connected, true);
-  const validation = validateLayout(state);
-  assert.equal(validation.ok, true);
-  assert.equal(validation.message, "");
+  const blocked = validateLayout(connected({ localDisplays: [macTop, macBottom] }), layout);
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.message, /top edge of Mac Bottom already leads to Mac Top/);
 });
 
 test("apply needs a connected link and no sync in flight", () => {
@@ -479,7 +449,7 @@ test("apply needs a connected link and no sync in flight", () => {
   assert.equal(canApplySetup(applySharingView(state, { ...connectedView, busy: true })), false);
 });
 
-test("an applied sync becomes the current layout on both sides and stays applied until it changes", () => {
+test("an applied sync becomes the current layout and stays applied until it changes", () => {
   let state = initializeArrangement(connected());
   const native = layoutForSave(state);
   state = applySharingView(state, {
@@ -489,25 +459,11 @@ test("an applied sync becomes the current layout on both sides and stays applied
   });
   assert.equal(hasAppliedCurrentLayout(state), true);
   assert.equal(layoutSignature(layoutForSave(state)), layoutSignature(native));
-  state = place(state, [1920, 0]);
+  state = place(state, [1512, 300]);
   assert.equal(hasAppliedCurrentLayout(state), false);
 });
 
-test("a peer-applied layout with the other side as source is adopted with that source", () => {
-  let state = connected();
-  const layout = { ...savedLayout(), sourceDisplay: localId };
-  state = applySharingView(state, {
-    ...connectedView,
-    sourceSide: "local",
-    sync: { state: "applied", message: "" },
-    synchronizedLayout: layout,
-  });
-  assert.equal(state.source, "local");
-  assert.equal(state.layout.sourceDisplay, localId);
-  assert.equal(hasAppliedCurrentLayout(state), true);
-});
-
-test("a rejected sync leaves the draft and the chosen side untouched", () => {
+test("a rejected sync leaves the draft untouched", () => {
   let state = initializeArrangement(connected());
   const draft = state.layout;
   state = applySharingView(state, {
@@ -515,7 +471,6 @@ test("a rejected sync leaves the draft and the chosen side untouched", () => {
     sync: { state: "rejected", message: "The displays changed. Arrange again." },
   });
   assert.deepEqual(state.layout, draft);
-  assert.equal(state.source, "peer");
   assert.equal(hasAppliedCurrentLayout(state), false);
   // The rejection belongs to the sync it describes; the alert channel is for what only the UI knows.
   assert.equal(state.view.sync.message, "The displays changed. Arrange again.");
@@ -534,28 +489,6 @@ test("a topology change invalidates a draft that no longer fits and asks to arra
   let same = initializeArrangement(connected());
   same = applySharingView(same, { ...connectedView, revision: "43" });
   assert.equal(same.layout.crossings.length, 1);
-  // A free draft with the displays apart has no crossings, yet it still names a display that is gone.
-  let apart = setArrangementMode(initializeArrangement(connected()), "free");
-  apart = setArrangement(
-    apart,
-    movePlacement(
-      groupsOf(apart),
-      arrangementForSharing(apart).placement,
-      { id: localId },
-      [500, 0],
-    ),
-    { id: localId },
-  );
-  assert.equal(apart.layout.crossings.length, 0);
-  assert.equal(apart.layout.placement.mode, "free");
-  apart = applySharingView(apart, {
-    ...connectedView,
-    revision: "43",
-    peerDisplays: [{ ...connectedView.peerDisplays[0], id: "77" }],
-  });
-  assert.equal(apart.layout.placement, null);
-  assert.match(apart.message, /displays changed/i);
-  assert.equal(arrangementForSharing(initializeArrangement(apart)).connected, true);
 });
 
 test("losing the link keeps the draft but nothing can be applied until it returns", () => {
@@ -576,21 +509,20 @@ test("losing the link keeps the draft but nothing can be applied until it return
   assert.equal(validateLayout(state).ok, true);
 });
 
-test("visual arrangement saves contact spans and restores its exact group pose", () => {
+test("an applied layout carries only links and positions, no source display and no mode, and restores the exact pose", () => {
   let state = initializeArrangement(connected());
-  assert.equal(state.layout.sourceDisplay, peerId);
   assert.equal(arrangementForSharing(state).connected, true);
-  state = place(state, [1920, 49]);
+  state = place(state, [1512, 0]);
   const placement = arrangementForSharing(state).placement;
   assert.equal(canApplySetup(state), true);
   const native = layoutForSave(state);
-  assert.deepEqual(native.links[0].toSpan, [0, 1]);
-  assert.deepEqual(native.links[0].fromSpan, [49 / 1080, 1031 / 1080]);
+  assert.deepEqual(Object.keys(native).toSorted(), ["arrangement", "links"]);
+  assert.deepEqual(Object.keys(native.arrangement).toSorted(), ["hidden", "positions"]);
+  assert.deepEqual(native.links[0].toSpan, [0, 982 / 1080]);
   assert.deepEqual(native.arrangement, {
-    mode: "grouped",
     positions: [
-      { display: peerId, x: 0, y: 0 },
-      { display: localId, x: 1920, y: 49 },
+      { display: peerId, x: 1512, y: 0 },
+      { display: localId, x: 0, y: 0 },
     ],
     hidden: [],
   });
@@ -603,109 +535,36 @@ test("visual arrangement saves contact spans and restores its exact group pose",
   });
   assert.deepEqual(arrangementForSharing(peer).placement, placement);
   assert.equal(hasAppliedCurrentLayout(peer), true);
-  state = place(state, [1925, 49]);
-  assert.deepEqual(offsetOf(state), [1920, 49]);
+  state = place(state, [1517, 0]);
+  assert.deepEqual(offsetOf(state), [1512, 0]);
   assert.equal(arrangementForSharing(state).connected, true);
 });
 
-test("free mode places each display on its own and both computers restore the exact positions", () => {
-  let state = initializeArrangement(
-    connected({
-      localDisplays: [
-        connectedView.localDisplays[0],
-        {
-          ...connectedView.localDisplays[0],
-          id: "77",
-          name: "Mac Side",
-          origin: [1512, 0],
-          size: [1000, 982],
-          primary: false,
-        },
-      ],
-    }),
-  );
-  assert.equal(arrangementMode(state), "grouped");
-  const before = arrangementForSharing(state).placement;
-  state = setArrangementMode(state, "free");
-  assert.equal(arrangementMode(state), "free");
-  assert.deepEqual(arrangementForSharing(state).placement.positions, before.positions);
-  assert.equal(setArrangementMode(state, "free"), state);
-  // Pull the Mac's second display under the Windows display: a crossing the OS layout cannot express.
-  const groups = groupsOf(state);
-  const moved = movePlacement(groups, arrangementForSharing(state).placement, { id: "77" }, [
-    920 - 3432,
-    1080 - 49,
-  ]);
-  state = setArrangement(state, moved, { id: "77" });
-  const geometry = arrangementForSharing(state);
-  assert.equal(geometry.valid, true);
-  assert.deepEqual(geometry.seams.map((s) => [s.fromDisplay, s.fromEdge, s.toDisplay]).toSorted(), [
-    [peerId, "bottom", "77"],
-    [peerId, "right", localId],
-  ]);
-  const native = layoutForSave(state);
-  assert.equal(native.arrangement.mode, "free");
-  assert.equal(native.arrangement.positions.length, 3);
-  assert.equal(native.links.length, 4);
-  let peer = applySharingView(connected({ localDisplays: state.view.localDisplays }), {
-    ...connectedView,
-    localDisplays: state.view.localDisplays,
-    sync: { state: "applied", message: "" },
-    synchronizedLayout: native,
-  });
-  assert.equal(arrangementMode(peer), "free");
-  assert.deepEqual(arrangementForSharing(peer).placement, geometry.placement);
-  assert.equal(hasAppliedCurrentLayout(peer), true);
-  // Moving a display somewhere that changes no crossing still counts as an edit to apply again.
-  const drifted = movePlacement(groups, geometry.placement, { id: "77" }, [0, 500]);
-  peer = setArrangement(peer, drifted, { id: "77" });
-  assert.equal(arrangementForSharing(peer).seams.length, 1);
-  assert.notEqual(layoutSignature(layoutForSave(peer)), layoutSignature(native));
-  assert.equal(hasAppliedCurrentLayout(peer), false);
-  // Back to grouped: each computer's own layout returns and the draft stays connected.
-  const grouped = setArrangementMode(state, "grouped");
-  assert.equal(arrangementMode(grouped), "grouped");
-  assert.ok(placementOffset(groupsOf(grouped), arrangementForSharing(grouped).placement));
-  assert.equal(arrangementForSharing(grouped).connected, true);
-});
-
-test("named arrangements list only well-formed entries and load only for their input computer", () => {
-  let state = place(initializeArrangement(connected()), [1920, 300]);
+test("named arrangements list only well-formed entries and load only while they still fit", () => {
+  let state = place(initializeArrangement(connected()), [1512, 300]);
   const native = layoutForSave(state);
   const listed = normalizeArrangements([
-    { name: "  Desk  ", sourceSide: "peer", mode: "grouped", crossings: 1, layout: native },
-    { name: "Desk", sourceSide: "peer", mode: "grouped", crossings: 1, layout: native },
-    { name: "Couch", sourceSide: "local", mode: "free", crossings: 2, layout: null },
-    { name: "", sourceSide: "peer", mode: "grouped", crossings: 1, layout: native },
-    { name: "Sideways", sourceSide: "peer", mode: "diagonal", crossings: 1, layout: native },
-    { name: "x".repeat(65), sourceSide: "peer", mode: "grouped", crossings: 1, layout: native },
+    { name: "  Desk  ", crossings: 1, layout: native },
+    { name: "Desk", crossings: 1, layout: native },
+    { name: "Couch", crossings: 2, layout: null },
+    { name: "", crossings: 1, layout: native },
+    { name: "x".repeat(65), crossings: 1, layout: native },
   ]);
   assert.deepEqual(
-    listed.map((entry) => [
-      entry.name,
-      entry.sourceSide,
-      entry.mode,
-      entry.crossings,
-      Boolean(entry.layout),
-    ]),
+    listed.map((entry) => [entry.name, entry.crossings, Boolean(entry.layout)]),
     [
-      ["Desk", "peer", "grouped", 1, true],
-      ["Couch", "local", "free", 2, false],
+      ["Desk", 1, true],
+      ["Couch", 2, false],
     ],
   );
   assert.deepEqual(normalizeArrangements("nope"), []);
-  state = setArrangements(place(state, [1920, 49]), listed);
+  state = setArrangements(place(state, [1512, 49]), listed);
   assert.equal(canLoadArrangement(state, "Desk"), true);
   assert.equal(canLoadArrangement(state, "Couch"), false);
   assert.equal(canLoadArrangement(state, "Nope"), false);
   const loaded = loadArrangement(state, "Desk");
-  assert.deepEqual(offsetOf(loaded), [1920, 300]);
+  assert.deepEqual(offsetOf(loaded), [1512, 300]);
   assert.equal(loaded.message, "");
-  const wrongSide = loadArrangement(
-    setArrangements(setSource(state, "local"), [{ ...listed[0], sourceSide: "peer" }]),
-    "Desk",
-  );
-  assert.match(wrongSide.message, /input computer/i);
   assert.equal(canSaveArrangement(state, "Desk"), true);
   assert.equal(canSaveArrangement(state, "   "), false);
   assert.equal(canSaveArrangement(applySharingView(state, offView), "Desk"), false);
@@ -713,32 +572,11 @@ test("named arrangements list only well-formed entries and load only for their i
 });
 
 test("an arrangement is automatic only when the native reply says so exactly", () => {
-  const native = layoutForSave(place(initializeArrangement(connected()), [1920, 300]));
+  const native = layoutForSave(place(initializeArrangement(connected()), [1512, 300]));
   const [remembered, named, defaulted] = normalizeArrangements([
-    {
-      name: "Desk",
-      sourceSide: "peer",
-      mode: "grouped",
-      crossings: 1,
-      layout: native,
-      automatic: true,
-    },
-    {
-      name: "Couch",
-      sourceSide: "local",
-      mode: "free",
-      crossings: 2,
-      layout: native,
-      automatic: false,
-    },
-    {
-      name: "Loft",
-      sourceSide: "local",
-      mode: "free",
-      crossings: 2,
-      layout: native,
-      automatic: "yes",
-    },
+    { name: "Desk", crossings: 1, layout: native, automatic: true },
+    { name: "Couch", crossings: 2, layout: native, automatic: false },
+    { name: "Loft", crossings: 2, layout: native, automatic: "yes" },
   ]);
   assert.equal(remembered.automatic, true);
   assert.equal(named.automatic, false);
@@ -746,11 +584,11 @@ test("an arrangement is automatic only when the native reply says so exactly", (
 });
 
 test("an arrangement fits only when the native reply says so exactly", () => {
-  const native = layoutForSave(place(initializeArrangement(connected()), [1920, 300]));
+  const native = layoutForSave(place(initializeArrangement(connected()), [1512, 300]));
   const [fits, doesNotFit, defaulted] = normalizeArrangements([
-    { name: "Desk", sourceSide: "peer", mode: "grouped", crossings: 1, layout: native, fits: true },
-    { name: "Couch", sourceSide: "local", mode: "free", crossings: 2, layout: null, fits: false },
-    { name: "Loft", sourceSide: "local", mode: "free", crossings: 2, layout: null },
+    { name: "Desk", crossings: 1, layout: native, fits: true },
+    { name: "Couch", crossings: 2, layout: null, fits: false },
+    { name: "Loft", crossings: 2, layout: null },
   ]);
   assert.equal(fits.fits, true);
   assert.equal(doesNotFit.fits, false);
@@ -762,26 +600,24 @@ test("stored layouts carry their arrangement only when it is well-formed", () =>
   assert.equal(normalizeStoredLayout(layout).arrangement, undefined);
   const positions = [
     { display: peerId, x: 0, y: 0 },
-    { display: localId, x: 1920, y: 0.5 },
+    { display: localId, x: 1512, y: 0.5 },
   ];
   assert.deepEqual(
-    normalizeStoredLayout({ ...layout, arrangement: { mode: "free", positions } }).arrangement,
-    { mode: "free", positions },
+    normalizeStoredLayout({ ...layout, arrangement: { positions } }).arrangement,
+    { positions },
   );
   assert.deepEqual(
-    normalizeStoredLayout({ ...layout, arrangement: { mode: "free", positions, hidden: ["7"] } })
-      .arrangement,
-    { mode: "free", positions, hidden: ["7"] },
+    normalizeStoredLayout({ ...layout, arrangement: { positions, hidden: ["7"] } }).arrangement,
+    { positions, hidden: ["7"] },
   );
   for (const arrangement of [
-    { mode: "loose", positions },
-    { mode: "free", positions, hidden: [peerId] },
-    { mode: "free", positions, hidden: ["7", "7"] },
-    { mode: "free", positions, hidden: "none" },
-    { mode: "free", positions: [...positions, { display: peerId, x: 1, y: 1 }] },
-    { mode: "free", positions: [{ display: "01", x: 0, y: 0 }] },
-    { mode: "free", positions: [{ display: peerId, x: Infinity, y: 0 }] },
-    { mode: "free", positions: "everywhere" },
+    { positions, hidden: [peerId] },
+    { positions, hidden: ["7", "7"] },
+    { positions, hidden: "none" },
+    { positions: [...positions, { display: peerId, x: 1, y: 1 }] },
+    { positions: [{ display: "01", x: 0, y: 0 }] },
+    { positions: [{ display: peerId, x: Infinity, y: 0 }] },
+    { positions: "everywhere" },
   ]) {
     assert.equal(normalizeStoredLayout({ ...layout, arrangement }), null);
   }
@@ -820,30 +656,11 @@ test("two partial contacts may share an edge endpoint but not overlap their inte
   assert.equal(place(off, [100, 0]), off);
 });
 
-test("this computer's role and the last drop survive normalization or default off", () => {
-  const sharing = normalizeSharingView({
-    ...offView,
-    phase: "sharing",
-    sharingActive: true,
-    sharingRole: "sends",
-    lastFailure: "The other computer stopped answering. [Session: Wire]",
-  });
-  assert.equal(sharing.recognized, true);
-  assert.equal(sharing.sharingRole, "sends");
-  assert.match(sharing.lastFailure, /stopped answering/);
-  const defaults = normalizeSharingView(offView);
-  assert.equal(defaults.sharingRole, null);
-  assert.equal(defaults.lastFailure, "");
-  assert.equal(normalizeSharingView({ ...offView, sharingRole: "both" }).sharingRole, null);
-  assert.equal(normalizeSharingView({ ...offView, lastFailure: "x".repeat(1001) }).lastFailure, "");
-});
-
 test("a running sharing session leaves the screen usable and still accepts a new setup link", () => {
   const live = applySharingView(initialSharingState(), {
     ...offView,
     phase: "sharing",
     sharingActive: true,
-    sharingRole: "sends",
   });
   assert.equal(isSessionActive(live), true);
   assert.equal(isBusySharing(live), false);
@@ -901,10 +718,9 @@ test("the applied receipt outlives the link that carried it and a later edit cle
     ...offView,
     phase: "sharing",
     sharingActive: true,
-    sharingRole: "sends",
   });
   assert.equal(hasAppliedLayout(shared), true);
-  assert.equal(hasAppliedLayout(place(state, [1920, 300])), false);
+  assert.equal(hasAppliedLayout(place(state, [1512, 300])), false);
   const reconnected = applySharingView(shared, connectedView);
   assert.equal(reconnected.syncApplied, false);
   assert.equal(hasAppliedLayout(reconnected), false);
@@ -920,17 +736,11 @@ test("the applied receipt survives the link closing itself, even if no poll saw 
     ...offView,
     phase: "stopping",
     busy: true,
-    sharingRole: "sends",
     sync: appliedSync,
   });
   assert.equal(stopping.syncApplied, true);
   assert.equal(hasAppliedLayout(stopping), true);
-  const off = applySharingView(stopping, {
-    ...offView,
-    phase: "off",
-    sharingRole: "sends",
-    sync: appliedSync,
-  });
+  const off = applySharingView(stopping, { ...offView, phase: "off", sync: appliedSync });
   assert.equal(hasAppliedLayout(off), true);
   // The supervisor takes over: still applied, and still not an error.
   assert.equal(
@@ -938,7 +748,6 @@ test("the applied receipt survives the link closing itself, even if no poll saw 
       applySharingView(off, {
         ...offView,
         phase: "starting",
-        sharingRole: "sends",
         message: "Connecting to the other computer for sharing.",
       }),
     ),
@@ -946,41 +755,48 @@ test("the applied receipt survives the link closing itself, even if no poll saw 
   );
 });
 
-test("an overlapping or unusable drop is never stored as the layout", () => {
+test("an overlapping drop snaps to a touching one, and an unusable drop is never stored", () => {
   let state = initializeArrangement(connected());
-  const overlapping = place(state, [960, 100]);
-  const geometry = arrangementForSharing(overlapping);
+  // The requested offset overlaps the local group; it snaps to the nearest offset that only touches.
+  const resolved = place(state, [960, 100]);
+  assert.notEqual(resolved, state);
+  const geometry = arrangementForSharing(resolved);
   assert.equal(geometry.valid, true);
   assert.equal(geometry.connected, true);
-  assert.ok(overlapping.layout.crossings.length > 0);
-  assert.equal(validateLayout(overlapping).ok, true);
+  assert.deepEqual(offsetOf(resolved), [1512, 100]);
+  assert.equal(validateLayout(resolved).ok, true);
   assert.equal(place(state, [NaN, 0]), state);
   assert.equal(place(state, [Infinity, 0]), state);
-  assert.equal(setArrangement(state, { mode: "free", positions: { [peerId]: [0, 0] } }), state);
+  // A placement missing one computer's positions is not a placement at all.
+  assert.equal(setArrangement(state, { positions: { [peerId]: [0, 0] } }), state);
 });
 
 test("reset goes back to the applied arrangement, and is unavailable while nothing differs", () => {
   let state = initializeArrangement(connected());
   assert.equal(arrangementResetTarget(state).origin, "default");
   assert.equal(canResetArrangement(state), false);
-  state = place(state, [1920, 300]);
+  state = place(state, [1512, 300]);
   assert.equal(canResetArrangement(state), true);
   assert.deepEqual(
     placementOffset(groupsOf(state), arrangementResetTarget(state).placement),
-    [1920, 49],
+    [1512, -49],
   );
   state = setArrangement(state, arrangementResetTarget(state).placement);
   assert.equal(canResetArrangement(state), false);
 
-  state = place(state, [1920, 300]);
-  state = applySharingView(state, applied(state));
+  state = place(state, [1512, 300]);
+  state = applySharingView(state, {
+    ...connectedView,
+    sync: { state: "applied", message: "" },
+    synchronizedLayout: layoutForSave(state),
+  });
   assert.equal(canResetArrangement(state), false);
-  state = place(state, [1920, 49]);
+  state = place(state, [1512, 0]);
   const target = arrangementResetTarget(state);
   assert.equal(target.origin, "applied");
-  assert.deepEqual(placementOffset(groupsOf(state), target.placement), [1920, 300]);
+  assert.deepEqual(placementOffset(groupsOf(state), target.placement), [1512, 300]);
   assert.equal(canResetArrangement(state), true);
-  assert.deepEqual(offsetOf(setArrangement(state, target.placement)), [1920, 300]);
+  assert.deepEqual(offsetOf(setArrangement(state, target.placement)), [1512, 300]);
 });
 
 const sharedKey = "10ac-4123-0000abcd";
@@ -1009,139 +825,63 @@ const twinView = {
 
 test("a monitor cabled to both computers is arranged once and either computer can be marked as showing on it", () => {
   let state = initializeArrangement(connected(twinView));
-  // The input computer (Windows) keeps its copy by default; the Mac's copy leaves the picture.
-  assert.deepEqual(hiddenDisplayIds(state), ["77"]);
-  assert.deepEqual(
-    sourceDisplays(state).map((d) => [d.id, d.shared === true]),
-    [
-      [peerId, false],
-      ["88", true],
-    ],
-  );
-  assert.deepEqual(
-    destinationDisplays(state).map((d) => d.id),
-    [localId],
-  );
+  // This computer keeps its own copy by default; the peer's copy leaves the picture.
+  assert.deepEqual(hiddenDisplayIds(state), ["88"]);
   assert.deepEqual(sharedMonitorChoices(state), [
-    { monitor: sharedKey, name: "Desk Monitor", side: "source", canSwap: true },
+    { monitor: sharedKey, name: "Desk Monitor", side: "local", canSwap: true },
   ]);
   assert.equal(arrangementForSharing(state).connected, true);
   const native = layoutForSave(state);
-  assert.deepEqual(native.arrangement.hidden, ["77"]);
-  assert.ok(native.links.every((link) => link.fromDisplay !== "77" && link.toDisplay !== "77"));
-  // Mark the Mac as the computer showing on it: the tile changes sides and the picture stays connected.
-  const marked = setMonitorSide(state, sharedKey, "destination");
-  assert.deepEqual(hiddenDisplayIds(marked), ["88"]);
-  assert.deepEqual(
-    sourceDisplays(marked).map((d) => d.id),
-    [peerId],
-  );
-  assert.deepEqual(
-    destinationDisplays(marked).map((d) => [d.id, d.shared === true]),
-    [
-      [localId, false],
-      ["77", true],
-    ],
-  );
+  assert.deepEqual(native.arrangement.hidden, ["88"]);
+  assert.ok(native.links.every((link) => link.fromDisplay !== "88" && link.toDisplay !== "88"));
+  // Mark the peer as the computer showing on it: the tile changes sides and stays connected.
+  const marked = setMonitorSide(state, sharedKey, "peer");
+  assert.deepEqual(hiddenDisplayIds(marked), ["77"]);
   assert.deepEqual(sharedMonitorChoices(marked), [
-    { monitor: sharedKey, name: "Desk Monitor", side: "destination", canSwap: true },
+    { monitor: sharedKey, name: "Desk Monitor", side: "peer", canSwap: true },
   ]);
   assert.equal(arrangementForSharing(marked).connected, true);
-  assert.equal(setMonitorSide(marked, sharedKey, "destination"), marked);
-  assert.equal(setMonitorSide(marked, "0000-0000-00000000", "source"), marked);
+  assert.equal(setMonitorSide(marked, sharedKey, "peer"), marked);
+  assert.equal(setMonitorSide(marked, "0000-0000-00000000", "local"), marked);
   // The other computer adopts the applied layout with the same copy hidden.
   const appliedLayout = layoutForSave(marked);
-  assert.deepEqual(appliedLayout.arrangement.hidden, ["88"]);
+  assert.deepEqual(appliedLayout.arrangement.hidden, ["77"]);
   let peer = applySharingView(connected(twinView), {
     ...connectedView,
     ...twinView,
     sync: { state: "applied", message: "" },
     synchronizedLayout: appliedLayout,
   });
-  assert.deepEqual(hiddenDisplayIds(peer), ["88"]);
+  assert.deepEqual(hiddenDisplayIds(peer), ["77"]);
   assert.equal(hasAppliedCurrentLayout(peer), true);
   // Reset goes back to the applied picture, including which computer shows on the monitor.
-  const flipped = setMonitorSide(peer, sharedKey, "source");
-  assert.deepEqual(hiddenDisplayIds(flipped), ["77"]);
+  const flipped = setMonitorSide(peer, sharedKey, "local");
+  assert.deepEqual(hiddenDisplayIds(flipped), ["88"]);
   assert.equal(hasAppliedCurrentLayout(flipped), false);
   assert.equal(canResetArrangement(flipped), true);
   const reset = resetArrangement(flipped);
-  assert.deepEqual(hiddenDisplayIds(reset), ["88"]);
+  assert.deepEqual(hiddenDisplayIds(reset), ["77"]);
   assert.equal(hasAppliedCurrentLayout(reset), true);
   assert.equal(canResetArrangement(reset), false);
-  // Reset also brings back the applied starting display when the draft had picked another one.
-  const otherStart = applySharingView(connected(twinView), {
-    ...connectedView,
-    ...twinView,
-    sync: { state: "applied", message: "" },
-    synchronizedLayout: { ...native, sourceDisplay: "88" },
-  });
-  assert.equal(otherStart.layout.sourceDisplay, "88");
-  const roundTrip = setMonitorSide(
-    setMonitorSide(otherStart, sharedKey, "destination"),
-    sharedKey,
-    "source",
-  );
-  assert.equal(roundTrip.layout.sourceDisplay, peerId);
-  const restarted = resetArrangement(roundTrip);
-  assert.equal(restarted.layout.sourceDisplay, "88");
-  assert.equal(hasAppliedCurrentLayout(restarted), true);
-  // Choosing the other input computer keeps the mark, because it describes the cabling; so does the default once placed.
-  assert.deepEqual(hiddenDisplayIds(initializeArrangement(setSource(marked, "local"))), ["88"]);
-  assert.deepEqual(
-    hiddenDisplayIds(
-      initializeArrangement(setSource(initializeArrangement(connected(twinView)), "local")),
-    ),
-    ["77"],
-  );
 });
 
-test("free placement keeps a shared monitor's tile in place when the other computer is marked as showing on it", () => {
-  let state = setArrangementMode(initializeArrangement(connected(twinView)), "free");
-  const before = arrangementForSharing(state).placement.positions["88"];
-  state = setMonitorSide(state, sharedKey, "destination");
-  assert.equal(arrangementMode(state), "free");
-  assert.deepEqual(arrangementForSharing(state).placement.positions["77"], before);
-  assert.equal(arrangementForSharing(state).placement.positions["88"], undefined);
-  assert.equal(arrangementForSharing(state).valid, true);
-});
-
-test("a computer with only the shared monitor cannot give it away, and older layouts still hide the unused copy", () => {
+test("a computer with only the shared monitor cannot give it away", () => {
   const lone = { ...windowsTwin, primary: true };
   let state = initializeArrangement(
     connected({ localDisplays: twinView.localDisplays, peerDisplays: [lone] }),
   );
   assert.deepEqual(hiddenDisplayIds(state), ["77"]);
   assert.deepEqual(sharedMonitorChoices(state), [
-    { monitor: sharedKey, name: "Desk Monitor", side: "source", canSwap: false },
+    { monitor: sharedKey, name: "Desk Monitor", side: "peer", canSwap: false },
   ]);
-  const refused = setMonitorSide(state, sharedKey, "destination");
+  const refused = setMonitorSide(state, sharedKey, "local");
   assert.deepEqual(hiddenDisplayIds(refused), ["77"]);
   assert.match(refused.message, /only display/);
-  // Links alone say which copy an older layout used: the Windows copy on the Mac's left is the one it crossed into.
-  const macSends = { ...twinView, sourceSide: "local" };
-  const marked = placeArrangement(
-    setMonitorSide(initializeArrangement(connected(macSends)), sharedKey, "destination"),
-    "left",
-  );
-  const { arrangement, ...older } = layoutForSave(marked);
-  assert.deepEqual(arrangement.hidden, ["77"]);
-  assert.ok(older.links.some((link) => link.toDisplay === "88"));
-  const adopted = applySharingView(connected(macSends), {
-    ...connectedView,
-    ...macSends,
-    sync: { state: "applied", message: "" },
-    synchronizedLayout: older,
-  });
-  assert.deepEqual(hiddenDisplayIds(adopted), ["77"]);
-  assert.equal(arrangementForSharing(adopted).connected, true);
-  // Any display can be marked not in use, not only a copy of a shared monitor.
-  assert.deepEqual(hiddenDisplayIds(adopted, { hidden: [localId] }), [localId]);
 });
 
 test("any display can be marked not in use, and the last one a computer has stays", () => {
   let state = initializeArrangement(connected(twinView));
-  assert.deepEqual(hiddenDisplayIds(state), ["77"]);
+  assert.deepEqual(hiddenDisplayIds(state), ["88"]);
   const choice = (id, side, patch) => ({
     id,
     side,
@@ -1154,75 +894,32 @@ test("any display can be marked not in use, and the last one a computer has stay
     ...patch,
   });
   assert.deepEqual(displayUseChoices(state), {
-    source: [choice(peerId, "source"), choice("88", "source")],
-    destination: [
-      choice(localId, "destination", { canLeave: false }),
-      choice("77", "destination", { inUse: false }),
-    ],
+    local: [choice(localId, "local"), choice("77", "local")],
+    peer: [choice(peerId, "peer", { canLeave: false }), choice("88", "peer", { inUse: false })],
   });
   // Both copies of the shared monitor can be in use at once; the picture stays connected.
-  const both = setDisplayInUse(state, "77", true);
+  const both = setDisplayInUse(state, "88", true);
   assert.deepEqual(hiddenDisplayIds(both), []);
   assert.equal(arrangementForSharing(both).connected, true);
-  assert.deepEqual(
-    destinationDisplays(both).map((d) => d.id),
-    [localId, "77"],
-  );
   assert.deepEqual(sharedMonitorChoices(both), []);
   assert.deepEqual(layoutForSave(both).arrangement.hidden, []);
-  // Turning the Windows copy off then reads like the mark on the shared monitor.
-  const flipped = setDisplayInUse(both, "88", false);
-  assert.deepEqual(hiddenDisplayIds(flipped), ["88"]);
-  assert.deepEqual(sharedMonitorChoices(flipped), [
-    { monitor: sharedKey, name: "Desk Monitor", side: "destination", canSwap: true },
-  ]);
-  // A primary display can leave too, but not the last one its computer has.
-  const noDesk = setDisplayInUse(state, peerId, false);
-  assert.deepEqual(hiddenDisplayIds(noDesk), [peerId, "77"]);
-  assert.deepEqual(
-    sourceDisplays(noDesk).map((d) => d.id),
-    ["88"],
-  );
-  assert.equal(noDesk.layout.sourceDisplay, "88");
-  assert.equal(arrangementForSharing(noDesk).connected, true);
-  assert.deepEqual(
-    displayUseChoices(noDesk).source.map((d) => [d.id, d.inUse, d.canLeave]),
-    [
-      [peerId, false, true],
-      ["88", true, false],
-    ],
-  );
-  const refused = setDisplayInUse(noDesk, "88", false);
-  assert.deepEqual(hiddenDisplayIds(refused), [peerId, "77"]);
-  assert.match(refused.message, /only display/);
-  // The refusal never trades a marked display for the one being turned off, whatever their order.
-  const keepMac = setDisplayInUse(state, localId, false);
-  assert.deepEqual(hiddenDisplayIds(keepMac), ["77"]);
-  assert.match(keepMac.message, /only display/);
-  assert.deepEqual(
-    displayUseChoices(state).destination.map((d) => [d.id, d.inUse, d.canLeave]),
-    [
-      [localId, true, false],
-      ["77", false, true],
-    ],
-  );
+  // Turning the peer's own display off while both shared copies show still protects its last one.
+  const noPeerMain = setDisplayInUse(both, peerId, false);
+  assert.deepEqual(hiddenDisplayIds(noPeerMain), [peerId]);
+  assert.equal(arrangementForSharing(noPeerMain).connected, true);
+  const refusedPeer = setDisplayInUse(noPeerMain, "88", false);
+  assert.deepEqual(hiddenDisplayIds(refusedPeer), [peerId]);
+  assert.match(refusedPeer.message, /only display/);
+  // The same protection holds for the local computer, whichever display was hidden first.
+  const hideTwin = setDisplayInUse(state, "77", false);
+  assert.deepEqual(hiddenDisplayIds(hideTwin), ["77", "88"]);
+  const refusedLocal = setDisplayInUse(hideTwin, localId, false);
+  assert.deepEqual(hiddenDisplayIds(refusedLocal), ["77", "88"]);
+  assert.match(refusedLocal.message, /only display/);
   // Nothing changes for a mark that already holds or a display nobody reports.
-  assert.equal(setDisplayInUse(state, "77", false), state);
-  assert.equal(setDisplayInUse(state, "88", true), state);
+  assert.equal(setDisplayInUse(state, "88", false), state);
+  assert.equal(setDisplayInUse(state, "77", true), state);
   assert.equal(setDisplayInUse(state, "9", false), state);
-  assert.equal(
-    setDisplayInUse(applySharingView(state, offView), "88", false).layout.hidden,
-    state.layout.hidden,
-  );
-  // Placed one by one, a display coming back lands beside its computer's others at its own offset.
-  const free = setArrangementMode(state, "free");
-  const back = setDisplayInUse(free, "77", true);
-  const positions = arrangementForSharing(back).placement.positions;
-  assert.deepEqual(
-    [positions["77"][0] - positions[localId][0], positions["77"][1] - positions[localId][1]],
-    [1512, 0],
-  );
-  assert.equal(arrangementForSharing(back).valid, true);
   // The other computer adopts an applied layout that shows every display, and reset keeps it that way.
   const everyDisplay = layoutForSave(both);
   const peer = applySharingView(connected(twinView), {
@@ -1233,8 +930,8 @@ test("any display can be marked not in use, and the last one a computer has stay
   });
   assert.deepEqual(hiddenDisplayIds(peer), []);
   assert.equal(hasAppliedCurrentLayout(peer), true);
-  const hiddenAgain = setDisplayInUse(peer, "77", false);
-  assert.deepEqual(hiddenDisplayIds(hiddenAgain), ["77"]);
+  const hiddenAgain = setDisplayInUse(peer, "88", false);
+  assert.deepEqual(hiddenDisplayIds(hiddenAgain), ["88"]);
   assert.equal(canResetArrangement(hiddenAgain), true);
   assert.deepEqual(hiddenDisplayIds(resetArrangement(hiddenAgain)), []);
 });
@@ -1248,9 +945,9 @@ test("sameSharingView compares nested arrays and null fields structurally, not b
   assert.notEqual(a, b);
   assert.equal(sameSharingView(a, b), true);
   assert.equal(sameSharingView(a, a), true);
-  // offView carries a null sourceSide and empty display arrays where connectedView has neither.
+  // offView carries a null control and empty display arrays where connectedView has neither.
   const off = normalizeSharingView(offView);
-  assert.equal(off.sourceSide, null);
+  assert.equal(off.control, null);
   assert.equal(sameSharingView(a, off), false);
   // A change buried inside a nested display array is still detected.
   const movedDisplay = normalizeSharingView({
@@ -1262,4 +959,13 @@ test("sameSharingView compares nested arrays and null fields structurally, not b
   assert.equal(sameSharingView({ x: 1 }, { x: 1, y: null }), false);
   assert.equal(sameSharingView(null, off), false);
   assert.equal(sameSharingView(null, null), true);
+});
+
+test("no input-computer or source wording remains in this model", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("sharing-model.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(
+    source,
+    new RegExp(["source" + "Side", "sharing" + "Role", "choose" + "Source", "input" + "Source"].join("|")),
+  );
 });

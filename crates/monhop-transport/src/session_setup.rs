@@ -1,11 +1,17 @@
 //! Explicit paired metadata inspection and fresh session checks before input starts.
 
-use std::{future::Future, net::SocketAddrV4, sync::mpsc, thread::JoinHandle, time::Duration};
+use std::{
+    future::Future,
+    net::SocketAddrV4,
+    sync::{Mutex, PoisonError, mpsc},
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use monhop_core::{
     DeviceId, DisplayId, EdgeLink, Machine, Platform, Point, RevocationSignal, Topology,
 };
-use monhop_protocol::{Capabilities, DeliveryClass, Frame, Message};
+use monhop_protocol::{Capabilities, ControlPermissions};
 
 pub use monhop_protocol::{
     DisplayDescription, DisplayTopology, MAX_DISPLAY_NAME_BYTES, MAX_LOGICAL_ORIGIN_ABS,
@@ -13,7 +19,7 @@ pub use monhop_protocol::{
 };
 
 use crate::{
-    crypto::{CertificateFingerprint, DeviceIdentity, VerifiedPeer},
+    crypto::{CertificateFingerprint, DeviceIdentity, VerifiedPeer, take_refused_certificate},
     guarded_endpoint::{GuardedEndpoint, NetworkSelection},
     identity_store::{ProtectedPeerStore, load_identity},
     native_storage::{NativeIdentityStore, NativePeerStore},
@@ -23,19 +29,14 @@ use crate::{
         device_id_from_fingerprint, negotiate,
     },
     session_native::current_displays,
-    session_wire::write_frame,
 };
 
-const METADATA_COMPLETION_DEADLINE: Duration = Duration::from_secs(1);
 /// The whole rendezvous for one explicit local action, unchanged by the dial retry below.
 const CONNECT_WINDOW: Duration = Duration::from_secs(120);
 /// One Windows dial attempt covers connect plus negotiate; the Mac may not be listening yet.
 const DIAL_ATTEMPT_DEADLINE: Duration = Duration::from_secs(4);
 const DIAL_INTERVAL: Duration = Duration::from_secs(2);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const METADATA_COMPLETION_TOKEN: u64 = 0x4c4b_4d49_4e53_5043;
-const METADATA_CLOSE_CODE: u32 = 3;
-const METADATA_CLOSE_REASON: &[u8] = b"metadata inspection failed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupFailure {
@@ -46,30 +47,21 @@ pub enum SetupFailure {
     /// The pinned port is still closing from a previous session on this computer.
     PortBusy,
     Connection,
+    /// The other computer presented an identity other than the paired one; pairing again fixes it.
+    PeerIdentityChanged,
     Handshake,
     Cancelled,
     Displays,
     ChangedSinceInspection,
     Layout,
-    LayoutSyncConflict,
-    LayoutSyncIncomplete,
     PurposeMismatch,
     VersionMismatch,
-}
-
-/// Which computer supplies the physical keyboard and mouse, named by side rather than platform.
-/// Two Macs or two Windows machines can be paired, so "macOS" no longer identifies a computer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SourceSide {
-    Local,
-    Peer,
 }
 
 #[derive(Clone)]
 pub struct InspectedPeer {
     pub local_device: DeviceId,
     pub peer_device: DeviceId,
-    pub source: DeviceId,
     pub local_fingerprint: CertificateFingerprint,
     pub peer_fingerprint: CertificateFingerprint,
     pub local_platform: Platform,
@@ -86,6 +78,9 @@ pub struct PairedSession {
     pub inspection: InspectedPeer,
 }
 
+/// A sharing connection with its reusable pinned endpoint lease.
+pub type PairedShare = PairedSession;
+
 /// The bound endpoint behind one session, kept opaque so it can only go back to its holder.
 pub struct EndpointLease {
     prepared: PreparedEndpoint,
@@ -100,11 +95,6 @@ impl EndpointLease {
 impl PairedSession {
     pub fn endpoint(&self) -> &GuardedEndpoint {
         self.lease.endpoint()
-    }
-
-    /// Split borrows for exchanges that drive the session while watching the endpoint.
-    pub(crate) fn parts(&mut self) -> (&mut NegotiatedSession, &InspectedPeer, &GuardedEndpoint) {
-        (&mut self.session, &self.inspection, self.lease.endpoint())
     }
 }
 
@@ -204,43 +194,6 @@ pub fn selected_network(interface_id: &str) -> Result<NetworkSelection, SetupFai
     })
 }
 
-/// Opens a share-purpose session after local authorization.
-///
-/// The source choice describes where the physical devices are attached, independently of dialing.
-/// Both computers must name the same one, so the two sides pass opposite sides.
-pub async fn connect_after_local_action(
-    interface_id: &str,
-    source: SourceSide,
-    cancel: &RevocationSignal,
-    peer: CertificateFingerprint,
-) -> Result<PairedSession, SetupFailure> {
-    connect_for_purpose(
-        interface_id,
-        Some(source),
-        cancel,
-        peer,
-        SessionPurpose::Share,
-    )
-    .await
-}
-
-/// Opens the separately authenticated controlled trial after local authorization.
-pub async fn connect_trial_after_local_action(
-    interface_id: &str,
-    source: SourceSide,
-    cancel: &RevocationSignal,
-    peer: CertificateFingerprint,
-) -> Result<PairedSession, SetupFailure> {
-    connect_for_purpose(
-        interface_id,
-        Some(source),
-        cancel,
-        peer,
-        SessionPurpose::ControlledTrial,
-    )
-    .await
-}
-
 /// A bound, interface-pinned endpoint that can dial or accept repeatedly without rebinding.
 ///
 /// Binding loads the stored identity and the one confirmed peer it is for. Every connection made
@@ -256,18 +209,17 @@ pub(crate) struct PreparedEndpoint {
     peer_device: DeviceId,
     local_platform: Platform,
     peer_platform: Platform,
-    source: DeviceId,
+    control: ControlPermissions,
     dials: bool,
     interface_id: String,
 }
 
 /// Binds the one selected interface for repeated use.
 ///
-/// `source` names the computer that supplies input. `None` is for metadata purposes that carry no
-/// input authority: they name the dialing computer, so both sides agree without asking the user.
+/// Control permissions bind every sharing connection. Setup always carries BOTH.
 pub(crate) fn prepare_endpoint(
     interface_id: &str,
-    source: Option<SourceSide>,
+    control: ControlPermissions,
     cancel: &RevocationSignal,
     peer_fingerprint: CertificateFingerprint,
 ) -> Result<PreparedEndpoint, SetupFailure> {
@@ -300,14 +252,6 @@ pub(crate) fn prepare_endpoint(
         record.peer().platform(),
         peer.fingerprint(),
     );
-    let source = match source.unwrap_or(if dials {
-        SourceSide::Local
-    } else {
-        SourceSide::Peer
-    }) {
-        SourceSide::Local => local_device,
-        SourceSide::Peer => peer_device,
-    };
     check_cancel(cancel)?;
     let mut selection = selected_network(interface_id)?;
     selection.peer = record.peer().endpoint();
@@ -336,7 +280,7 @@ pub(crate) fn prepare_endpoint(
         peer_device,
         local_platform,
         peer_platform,
-        source,
+        control,
         dials,
         interface_id: interface_id.to_owned(),
     })
@@ -377,14 +321,13 @@ impl PreparedEndpoint {
         cancel: &RevocationSignal,
     ) -> Result<quinn::Connection, SetupFailure> {
         let connecting = self.endpoint.connect().map_err(|error| {
-            log::debug!("share dial could not start: {error}");
+            note_attempt_failure(format!("share dial could not start: {error}"));
             SetupFailure::Connection
         })?;
         self.while_active(cancel, async move {
-            connecting.await.map_err(|error| {
-                log::debug!("share dial failed: {error}");
-                SetupFailure::Connection
-            })
+            connecting
+                .await
+                .map_err(|error| connection_failure("share dial failed", &error, Some(&error)))
         })
         .await
     }
@@ -396,8 +339,7 @@ impl PreparedEndpoint {
     ) -> Result<quinn::Connection, SetupFailure> {
         self.while_active(cancel, async {
             self.endpoint.accept().await.map_err(|error| {
-                log::debug!("share accept failed: {error}");
-                SetupFailure::Connection
+                connection_failure("share accept failed", &error, accept_cause(&error))
             })
         })
         .await
@@ -422,20 +364,31 @@ impl PreparedEndpoint {
             capabilities,
             capabilities,
             &local_displays,
-            self.source,
+            if purpose == SessionPurpose::Setup {
+                ControlPermissions::BOTH
+            } else {
+                self.control
+            },
             purpose,
         )
         .map_err(|_| SetupFailure::Handshake)?;
-        let session = negotiate(connection, config)
-            .await
-            .map_err(handshake_failure)?;
+        // A pin refused after the client finished its handshake surfaces here, as the close.
+        let closing = connection.clone();
+        let session =
+            negotiate(connection, config)
+                .await
+                .map_err(|error| match closing.close_reason() {
+                    Some(reason) if refused_identity(&reason) => {
+                        identity_changed("share handshake closed", &reason)
+                    }
+                    _ => handshake_failure(error),
+                })?;
         if cancel_or_endpoint_revoked(None, &self.endpoint) {
             return Err(SetupFailure::Cancelled);
         }
         let inspection = InspectedPeer {
             local_device: self.local_device,
             peer_device: self.peer_device,
-            source: self.source,
             local_fingerprint: self.identity.fingerprint(),
             peer_fingerprint: self.peer.fingerprint(),
             local_platform: self.local_platform,
@@ -486,13 +439,148 @@ fn cancel_or_endpoint_revoked(
     cancel.is_some_and(RevocationSignal::is_revoked) || endpoint.is_revoked()
 }
 
+/// A pin refusal on either side. Locally, `verify_exact_leaf`'s ApplicationVerificationFailure
+/// is sent as AccessDenied; a peer refusing this computer's certificate closes with that alert or
+/// BadCertificate.
+pub(crate) fn refused_identity(error: &quinn::ConnectionError) -> bool {
+    use rustls::AlertDescription;
+    let alert =
+        |description: AlertDescription| quinn::TransportErrorCode::crypto(description.into());
+    match error {
+        quinn::ConnectionError::TransportError(local) => {
+            local.code == alert(AlertDescription::AccessDenied)
+        }
+        quinn::ConnectionError::ConnectionClosed(peer) => {
+            peer.error_code == alert(AlertDescription::AccessDenied)
+                || peer.error_code == alert(AlertDescription::BadCertificate)
+        }
+        _ => false,
+    }
+}
+
+/// The endpoint wraps a failed incoming handshake in an I/O error.
+fn accept_cause(error: &std::io::Error) -> Option<&quinn::ConnectionError> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<quinn::ConnectionError>())
+}
+
+fn connection_failure(
+    what: &str,
+    error: &dyn std::fmt::Display,
+    cause: Option<&quinn::ConnectionError>,
+) -> SetupFailure {
+    match cause {
+        Some(cause) if refused_identity(cause) => identity_changed(what, error),
+        _ => {
+            note_attempt_failure(format!("{what}: {error}"));
+            SetupFailure::Connection
+        }
+    }
+}
+
+/// Warns once per refused identity with its short fingerprint; repeats go to the collapsed DEBUG
+/// log.
+fn identity_changed(what: &str, error: &dyn std::fmt::Display) -> SetupFailure {
+    let refused = take_refused_certificate();
+    let line = format!("{what}: {error}");
+    let mut log = ATTEMPT_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+    let now = Instant::now();
+    if log.first_refusal(refused) {
+        match refused {
+            Some(certificate) => log::warn!(
+                "session setup: the other computer presented certificate {}, not the paired \
+                 identity; pairing the computers again fixes this",
+                certificate.short_hex()
+            ),
+            None => log::warn!(
+                "session setup: the other computer refused this computer's identity; pairing the \
+                 computers again fixes this"
+            ),
+        }
+        // The warning stands for this line's first occurrence.
+        let _ = log.repeated(line, now);
+    } else if let Some(line) = log.repeated(line, now) {
+        log::debug!("{line}");
+    }
+    SetupFailure::PeerIdentityChanged
+}
+
+fn note_attempt_failure(line: String) {
+    let collapsed = ATTEMPT_LOG
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .repeated(line, Instant::now());
+    if let Some(line) = collapsed {
+        log::debug!("{line}");
+    }
+}
+
+/// Identical attempt failures repeat every few seconds for as long as the peer stays wrong.
+const REPEAT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+static ATTEMPT_LOG: Mutex<AttemptLog> = Mutex::new(AttemptLog::new());
+
+/// Keeps a failing retry loop from rotating every earlier line out of the bounded log.
+struct AttemptLog {
+    line: Option<String>,
+    logged_at: Option<Instant>,
+    repeats: u64,
+    /// The last refusal warned about: the refused certificate, or None when the peer refused ours.
+    warned: Option<Option<CertificateFingerprint>>,
+}
+
+impl AttemptLog {
+    const fn new() -> Self {
+        Self {
+            line: None,
+            logged_at: None,
+            repeats: 0,
+            warned: None,
+        }
+    }
+
+    /// The line to log now, if any: a run's first line, then one a minute carrying its count.
+    fn repeated(&mut self, line: String, now: Instant) -> Option<String> {
+        if self.line.as_deref() == Some(line.as_str()) {
+            self.repeats += 1;
+            if self
+                .logged_at
+                .is_some_and(|at| now.duration_since(at) < REPEAT_LOG_INTERVAL)
+            {
+                return None;
+            }
+            let summary = format!(
+                "{line} (repeated {} times since the last report)",
+                self.repeats
+            );
+            self.repeats = 0;
+            self.logged_at = Some(now);
+            return Some(summary);
+        }
+        let summary = match self.repeats {
+            0 => line.clone(),
+            unreported => format!("{line} (the previous failure repeated {unreported} more times)"),
+        };
+        self.line = Some(line);
+        self.logged_at = Some(now);
+        self.repeats = 0;
+        Some(summary)
+    }
+
+    fn first_refusal(&mut self, refused: Option<CertificateFingerprint>) -> bool {
+        let first = self.warned != Some(refused);
+        self.warned = Some(refused);
+        first
+    }
+}
+
 /// Distinguishes a peer that answered but disagrees from a peer that could not be reached.
 pub(crate) const fn handshake_failure(error: HandshakeError) -> SetupFailure {
     match error {
         HandshakeError::PurposeMismatch => SetupFailure::PurposeMismatch,
-        // Purposes agree, so both sides opened a session and their saved records name different
-        // keyboard sides. Dialing again repeats it; only a fresh agreed record clears it.
-        HandshakeError::SourceMismatch => SetupFailure::ChangedSinceInspection,
+        // A changed saved control map must be agreed over the setup link.
+        HandshakeError::ControlMismatch => SetupFailure::ChangedSinceInspection,
         HandshakeError::PeerHelloMismatch => SetupFailure::VersionMismatch,
         _ => SetupFailure::Handshake,
     }
@@ -508,19 +596,6 @@ pub(crate) const fn is_transient(error: SetupFailure) -> bool {
     )
 }
 
-pub(crate) async fn connect_for_purpose(
-    interface_id: &str,
-    source: Option<SourceSide>,
-    cancel: &RevocationSignal,
-    peer: CertificateFingerprint,
-    purpose: SessionPurpose,
-) -> Result<PairedSession, SetupFailure> {
-    let prepared = prepare_endpoint(interface_id, source, cancel, peer)?;
-    connect_prepared(prepared, cancel, purpose)
-        .await
-        .map_err(|failed| failed.1)
-}
-
 /// A failed window hands the endpoint back so the next attempt needs no new identity read.
 async fn connect_prepared(
     prepared: PreparedEndpoint,
@@ -528,11 +603,7 @@ async fn connect_prepared(
     purpose: SessionPurpose,
 ) -> Result<PairedSession, Box<(PreparedEndpoint, SetupFailure)>> {
     // Start order must not decide a test window or a share, and only the dialing side can retry.
-    let retry_dial = prepared.dials()
-        && matches!(
-            purpose,
-            SessionPurpose::ControlledTrial | SessionPurpose::Share
-        );
+    let retry_dial = prepared.dials() && purpose == SessionPurpose::Share;
     let attempt = tokio::time::timeout(CONNECT_WINDOW, async {
         if retry_dial {
             return dial_until_negotiated(&prepared, cancel, purpose).await;
@@ -564,16 +635,20 @@ const REVOKED_ENDPOINT_DRAIN: Duration = Duration::from_secs(3);
 /// session reconnects on the same socket without a rebind.
 pub struct StandingShareEndpoint {
     interface_id: String,
-    source: SourceSide,
+    control: ControlPermissions,
     peer: CertificateFingerprint,
     prepared: Option<PreparedEndpoint>,
 }
 
 impl StandingShareEndpoint {
-    pub fn new(interface_id: &str, source: SourceSide, peer: CertificateFingerprint) -> Self {
+    pub fn new(
+        interface_id: &str,
+        peer: CertificateFingerprint,
+        control: ControlPermissions,
+    ) -> Self {
         Self {
             interface_id: interface_id.to_owned(),
-            source,
+            control,
             peer,
             prepared: None,
         }
@@ -583,10 +658,10 @@ impl StandingShareEndpoint {
     pub async fn connect(
         &mut self,
         cancel: &RevocationSignal,
-    ) -> Result<PairedSession, SetupFailure> {
+    ) -> Result<PairedShare, SetupFailure> {
         let prepared = match self.prepared.take() {
             Some(prepared) if !prepared.endpoint().is_revoked() => prepared,
-            _ => prepare_endpoint(&self.interface_id, Some(self.source), cancel, self.peer)?,
+            _ => prepare_endpoint(&self.interface_id, self.control, cancel, self.peer)?,
         };
         match connect_prepared(prepared, cancel, SessionPurpose::Share).await {
             Ok(paired) => Ok(paired),
@@ -628,8 +703,11 @@ async fn dial_until_negotiated(
         match attempt {
             Ok(Ok(established)) => return Ok(established),
             Ok(Err(error)) if !is_transient(error) => return Err(error),
-            Ok(Err(error)) => log::debug!("share dial attempt failed: {error:?}"),
-            Err(_) => log::debug!("share dial attempt passed {DIAL_ATTEMPT_DEADLINE:?}"),
+            // The dial or the handshake already logged why.
+            Ok(Err(_)) => {}
+            Err(_) => note_attempt_failure(format!(
+                "share dial attempt passed {DIAL_ATTEMPT_DEADLINE:?}"
+            )),
         }
         check_cancel(cancel)?;
         tokio::time::sleep(DIAL_INTERVAL).await;
@@ -637,179 +715,10 @@ async fn dial_until_negotiated(
     }
 }
 
-/// Exchanges a bilateral completion barrier for a metadata-only session.
-///
-/// This accepts only the two expected baseline-epoch Ping/Pong frames and then requires a clean
-/// stream end. Any input frame, unexpected control message, stale sequence, or trailing byte
-/// fails closed before a caller can treat the inspection as complete.
-pub async fn complete_metadata_inspection(
-    session: &mut NegotiatedSession,
-) -> Result<(), SetupFailure> {
-    let result = tokio::time::timeout(
-        METADATA_COMPLETION_DEADLINE,
-        complete_metadata_inspection_inner(session),
-    )
-    .await;
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            session
-                .connection
-                .close(METADATA_CLOSE_CODE.into(), METADATA_CLOSE_REASON);
-            Err(error)
-        }
-        Err(_) => {
-            session
-                .connection
-                .close(METADATA_CLOSE_CODE.into(), METADATA_CLOSE_REASON);
-            Err(SetupFailure::Connection)
-        }
-    }
-}
-
-async fn complete_metadata_inspection_inner(
-    session: &mut NegotiatedSession,
-) -> Result<(), SetupFailure> {
-    if session.purpose() != SessionPurpose::Inspect {
-        return Err(SetupFailure::Handshake);
-    }
-    let first_sequence = session.control.next_sequence();
-    let ping = session
-        .control
-        .next_heartbeat(Message::Ping(METADATA_COMPLETION_TOKEN))
-        .map_err(|_| SetupFailure::Handshake)?;
-    write_frame(
-        &session.connection,
-        &mut session.control_streams.send,
-        &ping,
-    )
-    .await
-    .map_err(|_| SetupFailure::Connection)?;
-
-    let peer_ping = session
-        .control_streams
-        .reader
-        .read_frame(&mut session.control_streams.recv)
-        .await
-        .map_err(|_| SetupFailure::Handshake)?;
-    validate_metadata_frame(
-        &peer_ping,
-        session.initial_epoch,
-        first_sequence,
-        Message::Ping(METADATA_COMPLETION_TOKEN),
-    )?;
-
-    let pong = session
-        .control
-        .next_heartbeat(Message::Pong(METADATA_COMPLETION_TOKEN))
-        .map_err(|_| SetupFailure::Handshake)?;
-    write_frame(
-        &session.connection,
-        &mut session.control_streams.send,
-        &pong,
-    )
-    .await
-    .map_err(|_| SetupFailure::Connection)?;
-    session
-        .control_streams
-        .send
-        .finish()
-        .map_err(|_| SetupFailure::Connection)?;
-
-    let peer_pong = session
-        .control_streams
-        .reader
-        .read_frame(&mut session.control_streams.recv)
-        .await
-        .map_err(|_| SetupFailure::Handshake)?;
-    validate_metadata_frame(
-        &peer_pong,
-        session.initial_epoch,
-        first_sequence
-            .checked_add(1)
-            .ok_or(SetupFailure::Handshake)?,
-        Message::Pong(METADATA_COMPLETION_TOKEN),
-    )?;
-
-    session
-        .control_streams
-        .recv
-        .read_to_end(0)
-        .await
-        .map_err(|_| SetupFailure::Handshake)?;
-    // Endpoint teardown must not discard a locally queued FIN before the peer receives it.
-    if session
-        .control_streams
-        .send
-        .stopped()
-        .await
-        .map_err(|_| SetupFailure::Connection)?
-        .is_some()
-    {
-        return Err(SetupFailure::Handshake);
-    }
-    Ok(())
-}
-
-fn validate_metadata_frame(
-    frame: &Frame,
-    epoch: monhop_protocol::SessionEpoch,
-    sequence: u64,
-    expected: Message,
-) -> Result<(), SetupFailure> {
-    if frame.epoch != epoch
-        || frame.sequence != sequence
-        || frame.delivery() != DeliveryClass::Reliable
-        || frame.message != expected
-    {
-        return Err(SetupFailure::Handshake);
-    }
-    Ok(())
-}
-
-/// Exchanges public display metadata, then closes the connection without starting native input.
-pub async fn inspect_after_local_action(
-    interface_id: &str,
-    source: SourceSide,
-    cancel: &RevocationSignal,
-    peer: CertificateFingerprint,
-) -> Result<InspectedPeer, SetupFailure> {
-    let mut paired =
-        connect_for_purpose(interface_id, None, cancel, peer, SessionPurpose::Inspect).await?;
-    complete_metadata_inspection(&mut paired.session).await?;
-    check_cancel(cancel)?;
-    paired.endpoint().close_and_wait_idle().await.map_err(|_| {
-        if cancel.is_revoked() || paired.endpoint().is_revoked() {
-            SetupFailure::Cancelled
-        } else {
-            SetupFailure::Connection
-        }
-    })?;
-    if cancel.is_revoked() || paired.endpoint().is_revoked() {
-        return Err(SetupFailure::Cancelled);
-    }
-    // The inspection exchange agrees on the dialing computer; the user's own choice is local.
-    let mut inspection = paired.inspection;
-    inspection.source = inspection.device_for(source);
-    Ok(inspection)
-}
-
 impl InspectedPeer {
-    pub const fn device_for(&self, source: SourceSide) -> DeviceId {
-        match source {
-            SourceSide::Local => self.local_device,
-            SourceSide::Peer => self.peer_device,
-        }
-    }
-
-    pub fn source_is_local(&self) -> bool {
-        self.source == self.local_device
-    }
-
     pub fn matches(&self, fresh: &Self) -> bool {
         self.local_fingerprint == fresh.local_fingerprint
             && self.peer_fingerprint == fresh.peer_fingerprint
-            && self.source == fresh.source
             && self.local_device == fresh.local_device
             && self.peer_device == fresh.peer_device
             && self.local_platform == fresh.local_platform
@@ -819,25 +728,22 @@ impl InspectedPeer {
             && self.peer_displays.same_geometry(&fresh.peer_displays)
     }
 
-    /// `hidden` names displays marked not in use: they stay in the topology, not in use and with
-    /// no adjacency, so the pointer treats them as space past the edge of the display it left.
-    /// `placed` gives picture positions that replace OS origins for the computer whose cursor
-    /// MonHop moves; the input computer's OS geometry always stands.
-    pub fn topology(
+    /// Keeps local native geometry and translates the peer's entire display block.
+    pub fn outbound_topology(
         &self,
         links: Vec<EdgeLink>,
         hidden: &[DisplayId],
-        placed: &[(DisplayId, Point)],
+        peer_offset: Point,
     ) -> Result<Topology, SetupFailure> {
-        if links.len() > 64 {
+        if links.len() > 64 || !peer_offset.is_finite() {
             return Err(SetupFailure::Layout);
         }
         let displays: Vec<_> = [
-            (&self.local_displays, self.local_device),
-            (&self.peer_displays, self.peer_device),
+            (&self.local_displays, self.local_device, Point::default()),
+            (&self.peer_displays, self.peer_device, peer_offset),
         ]
         .into_iter()
-        .flat_map(|(topology, device)| {
+        .flat_map(|(topology, device, offset)| {
             topology.displays().iter().map(move |display| {
                 monhop_core::Display::new(
                     display.id,
@@ -845,7 +751,10 @@ impl InspectedPeer {
                     display.name.clone(),
                     monhop_core::NativeSize::new(display.native_width, display.native_height),
                     monhop_core::LogicalSize::new(display.logical_size.x, display.logical_size.y),
-                    display.logical_origin,
+                    Point::new(
+                        display.logical_origin.x + offset.x,
+                        display.logical_origin.y + offset.y,
+                    ),
                     f64::from(display.scale_factor),
                     None,
                     display.is_primary,
@@ -854,18 +763,14 @@ impl InspectedPeer {
             })
         })
         .collect();
-        let placed: Vec<(DisplayId, Point)> = placed
+        if hidden
             .iter()
-            .filter(|(id, _)| {
-                displays
-                    .iter()
-                    .any(|display| display.id == *id && display.machine != self.source)
-            })
-            .copied()
-            .collect();
-        let links =
-            crate::display_arrangement::inherit_display_edges(&displays, links, hidden, &placed)
-                .map_err(|_| SetupFailure::Layout)?;
+            .any(|id| !displays.iter().any(|display| display.id == *id))
+        {
+            return Err(SetupFailure::Layout);
+        }
+        let links = crate::display_arrangement::inherit_display_edges(&displays, links, hidden)
+            .map_err(|_| SetupFailure::Layout)?;
         if links.len() > 64 {
             return Err(SetupFailure::Layout);
         }
@@ -1063,8 +968,8 @@ mod cancellation_tests {
             capabilities,
             capabilities,
             &displays,
-            device_id_from_fingerprint(client_identity.fingerprint()),
-            SessionPurpose::Inspect,
+            ControlPermissions::BOTH,
+            SessionPurpose::Setup,
         )
         .unwrap();
         let cancel = RevocationSignal::default();
@@ -1110,10 +1015,9 @@ mod retry_policy_tests {
             handshake_failure(HandshakeError::PurposeMismatch),
             SetupFailure::PurposeMismatch
         );
-        // Two sessions whose records name different keyboard sides: the records must be agreed
-        // again, so this is the stale-record answer rather than a retryable reach failure.
+        // Different saved control maps must be agreed again over the setup link.
         assert_eq!(
-            handshake_failure(HandshakeError::SourceMismatch),
+            handshake_failure(HandshakeError::ControlMismatch),
             SetupFailure::ChangedSinceInspection
         );
         // A peer whose hello names another build: the answer says so, and dialing cannot fix it.
@@ -1122,5 +1026,120 @@ mod retry_policy_tests {
             SetupFailure::VersionMismatch
         );
         assert!(!is_transient(SetupFailure::VersionMismatch));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn identical_attempt_failures_log_once_then_once_a_minute_with_a_count() {
+        let mut log = AttemptLog::new();
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        assert_eq!(
+            log.repeated("refused".into(), at(0)),
+            Some("refused".into())
+        );
+        for second in 1..60 {
+            assert_eq!(log.repeated("refused".into(), at(second)), None);
+        }
+        assert_eq!(
+            log.repeated("refused".into(), at(60)),
+            Some("refused (repeated 60 times since the last report)".into())
+        );
+        assert_eq!(log.repeated("refused".into(), at(61)), None);
+        assert_eq!(
+            log.repeated("timed out".into(), at(62)),
+            Some("timed out (the previous failure repeated 1 more times)".into())
+        );
+    }
+
+    #[test]
+    fn each_refused_identity_is_warned_about_once() {
+        let mut log = AttemptLog::new();
+        let first = CertificateFingerprint::from_certificate_der(b"first");
+        let second = CertificateFingerprint::from_certificate_der(b"second");
+        assert!(log.first_refusal(Some(first)));
+        assert!(!log.first_refusal(Some(first)));
+        assert!(log.first_refusal(None));
+        assert!(!log.first_refusal(None));
+        assert!(log.first_refusal(Some(second)));
+    }
+
+    /// One pinned side sees a certificate other than the paired one; both sides must call it an
+    /// identity change, never a connection that may succeed on the next dial.
+    #[tokio::test]
+    async fn a_certificate_other_than_the_paired_one_is_an_identity_change_on_both_sides() {
+        use crate::crypto::{LOCAL_TLS_SERVER_NAME, SecureQuicConfig};
+        let pin = |identity: &DeviceIdentity| {
+            VerifiedPeer::from_certificate_der(
+                identity.certificate_der(),
+                &identity.fingerprint().full_hex(),
+            )
+            .unwrap()
+        };
+        for server_refuses in [true, false] {
+            let client = DeviceIdentity::generate().unwrap();
+            let server = DeviceIdentity::generate().unwrap();
+            let stale = DeviceIdentity::generate().unwrap();
+            let (client_pin, server_pin, refused) = if server_refuses {
+                (pin(&stale), pin(&server), client.fingerprint())
+            } else {
+                (pin(&client), pin(&stale), server.fingerprint())
+            };
+            let local: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let listener = quinn::Endpoint::server(
+                SecureQuicConfig::server(&server, &client_pin).unwrap(),
+                local,
+            )
+            .unwrap();
+            let mut dialer = quinn::Endpoint::client(local).unwrap();
+            dialer
+                .set_default_client_config(SecureQuicConfig::client(&client, &server_pin).unwrap());
+            let connecting = dialer
+                .connect(listener.local_addr().unwrap(), LOCAL_TLS_SERVER_NAME)
+                .unwrap();
+            let (dialed, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    async {
+                        match connecting.await {
+                            // The client can finish first; the server's refusal then closes it.
+                            Ok(connection) => connection.closed().await,
+                            Err(error) => error,
+                        }
+                    },
+                    async { listener.accept().await.unwrap().await.unwrap_err() }
+                )
+            })
+            .await
+            .expect("both sides settle the refused handshake");
+            assert!(take_refused_certificate() == Some(refused));
+            assert!(refused_identity(&dialed), "dialer saw {dialed}");
+            assert!(refused_identity(&accepted), "listener saw {accepted}");
+            let wrapped = std::io::Error::other(accepted.clone());
+            assert_eq!(
+                connection_failure("share accept failed", &wrapped, accept_cause(&wrapped)),
+                SetupFailure::PeerIdentityChanged
+            );
+            assert_eq!(
+                connection_failure("share dial failed", &dialed, Some(&dialed)),
+                SetupFailure::PeerIdentityChanged
+            );
+            assert!(!is_transient(SetupFailure::PeerIdentityChanged));
+            listener.close(0_u32.into(), b"fixture complete");
+            dialer.close(0_u32.into(), b"fixture complete");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_peer_is_still_a_connection_failure() {
+        let timed_out = quinn::ConnectionError::TimedOut;
+        assert!(!refused_identity(&timed_out));
+        assert_eq!(
+            connection_failure("share dial failed", &timed_out, Some(&timed_out)),
+            SetupFailure::Connection
+        );
     }
 }

@@ -10,7 +10,7 @@ use tauri::{
     tray::TrayIconBuilder,
 };
 
-use crate::{lifecycle::AppController, trial};
+use crate::lifecycle::AppController;
 
 const TRAY_ID: &str = "monhop-tray";
 const STATUS_ID: &str = "tray-status";
@@ -50,7 +50,6 @@ struct StatusInput {
     sharing_active: bool,
     busy: bool,
     sharing_phase: &'static str,
-    trial_phase: Option<&'static str>,
     /// Named so the menu can say which computer is on the other end of the link.
     peer_platform: Option<&'static str>,
 }
@@ -73,15 +72,10 @@ fn peer_name(platform: Option<&str>) -> &'static str {
 }
 
 fn presentation_for(input: StatusInput) -> TrayPresentation {
-    let (tone, label) = match input.trial_phase {
-        Some("prepared") => (IconTone::Monochrome, "Test ready".to_owned()),
-        Some("starting") => (IconTone::Amber, "Test starting".to_owned()),
-        Some("active") if input.sharing_active => (IconTone::Green, "Test running".to_owned()),
-        Some("stopping") => (IconTone::Amber, "Stopping test".to_owned()),
-        Some("finished") => (IconTone::Monochrome, "Test ended, input local".to_owned()),
-        Some(_) => (IconTone::Monochrome, "Needs attention".to_owned()),
-        None if input.sharing_active => (IconTone::Green, "Sharing active".to_owned()),
-        None => match input.sharing_phase {
+    let (tone, label) = if input.sharing_active {
+        (IconTone::Green, "Sharing active".to_owned())
+    } else {
+        match input.sharing_phase {
             "connecting" => (IconTone::Amber, "Connecting".to_owned()),
             "connected" => (
                 IconTone::Monochrome,
@@ -93,30 +87,18 @@ fn presentation_for(input: StatusInput) -> TrayPresentation {
             "error" => (IconTone::Monochrome, "Needs attention".to_owned()),
             _ if input.busy => (IconTone::Amber, "Working".to_owned()),
             _ => (IconTone::Monochrome, "Not connected".to_owned()),
-        },
+        }
     };
     TrayPresentation { tone, label }
 }
 
 fn presentation_from_controller(controller: &AppController) -> TrayPresentation {
     let sharing = controller.sharing.status();
-    let sharing_active = sharing.sharing_active;
-    let busy = sharing.busy;
-    let sharing_phase = sharing.phase;
-    let peer_platform = sharing.peer_platform;
-    // Feeds the already-computed status into the trial view instead of locking and cloning it again.
-    let trial_phase = controller.trial.is_open().then(|| {
-        controller
-            .trial
-            .view_from(sharing, &controller.sharing)
-            .phase
-    });
     presentation_for(StatusInput {
-        sharing_active,
-        busy,
-        sharing_phase,
-        trial_phase,
-        peer_platform,
+        sharing_active: sharing.sharing_active,
+        busy: sharing.busy,
+        sharing_phase: sharing.phase,
+        peer_platform: sharing.peer_platform,
     })
 }
 
@@ -227,27 +209,17 @@ pub fn refresh(app: &AppHandle) {
 }
 
 pub fn show_main_window(app: &AppHandle) -> Result<(), String> {
-    let controller = app.state::<Arc<AppController>>();
-    let label = if controller.trial.is_open() {
-        trial::WINDOW_LABEL
-    } else {
-        MAIN_WINDOW
-    };
     let window = app
-        .get_webview_window(label)
+        .get_webview_window(MAIN_WINDOW)
         .ok_or_else(|| "The MonHop window is unavailable.".to_owned())?;
     window.unminimize().map_err(|error| error.to_string())?;
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
 }
 
-/// Hiding never obscures the guarded controlled-test window.
 pub fn hide_main_window(app: &AppHandle) -> Result<(), String> {
     if !is_installed(app) {
         return Err("The menu-bar control is unavailable, so MonHop remains visible.".into());
-    }
-    if app.state::<Arc<AppController>>().trial.is_open() {
-        return Err("Stop the controlled test before hiding MonHop.".into());
     }
     app.get_webview_window(MAIN_WINDOW)
         .ok_or_else(|| "The MonHop window is unavailable.".to_owned())?
@@ -267,7 +239,6 @@ pub fn handle_menu_action(app: &AppHandle, id: &str) -> bool {
         PAUSE_ID => {
             let controller = app.state::<Arc<AppController>>().inner().clone();
             controller.pairing.cancel();
-            trial::close(app);
             // Pausing is the same choice as on Home: no computer is active until the user picks one.
             tauri::async_runtime::spawn_blocking(move || {
                 if let Err(message) = controller.set_active(None) {
@@ -381,46 +352,28 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
-    fn status(
-        sharing_active: bool,
-        busy: bool,
-        sharing_phase: &'static str,
-        trial_phase: Option<&'static str>,
-    ) -> TrayPresentation {
+    fn status(sharing_active: bool, busy: bool, sharing_phase: &'static str) -> TrayPresentation {
         presentation_for(StatusInput {
             sharing_active,
             busy,
             sharing_phase,
-            trial_phase,
             peer_platform: None,
         })
     }
 
     #[test]
-    fn controlled_test_activity_never_uses_the_unrestricted_sharing_label() {
-        let presentation = status(true, true, "sharing", Some("active"));
-        assert_eq!(presentation.label, "Test running");
-        assert_eq!(presentation.tone, IconTone::Green);
-        assert_eq!(presentation.tooltip(), "MonHop — Test running");
-    }
-
-    #[test]
     fn link_states_are_named_and_only_transitions_are_amber() {
-        assert_eq!(status(false, false, "off", None).label, "Not connected");
-        assert_eq!(status(false, false, "off", None).tone, IconTone::Monochrome);
-        let connecting = status(false, true, "connecting", None);
+        assert_eq!(status(false, false, "off").label, "Not connected");
+        assert_eq!(status(false, false, "off").tone, IconTone::Monochrome);
+        let connecting = status(false, true, "connecting");
         assert_eq!(connecting.label, "Connecting");
         assert_eq!(connecting.tone, IconTone::Amber);
-        assert_eq!(
-            status(false, true, "reconnecting", None).tone,
-            IconTone::Amber
-        );
-        assert_eq!(status(false, true, "stopping", None).tone, IconTone::Amber);
+        assert_eq!(status(false, true, "reconnecting").tone, IconTone::Amber);
+        assert_eq!(status(false, true, "stopping").tone, IconTone::Amber);
         let connected = presentation_for(StatusInput {
             sharing_active: false,
             busy: false,
             sharing_phase: "connected",
-            trial_phase: None,
             peer_platform: Some("macos"),
         });
         assert_eq!(connected.label, "Connected to Mac");
@@ -429,62 +382,30 @@ mod tests {
             sharing_active: false,
             busy: false,
             sharing_phase: "connected",
-            trial_phase: None,
             peer_platform: Some("windows"),
         });
         assert_eq!(windows_peer.label, "Connected to Windows PC");
-        let sharing = status(true, true, "sharing", None);
+        let sharing = status(true, true, "sharing");
         assert_eq!(sharing.label, "Sharing active");
         assert_eq!(sharing.tone, IconTone::Green);
     }
 
     #[test]
-    fn green_requires_both_native_sharing_and_an_active_test_phase() {
-        assert_ne!(
-            status(false, true, "sharing", Some("active")).tone,
-            IconTone::Green
-        );
-        assert_ne!(
-            status(true, true, "sharing", Some("starting")).tone,
-            IconTone::Green
-        );
-        assert_eq!(
-            status(true, true, "sharing", Some("active")).tone,
-            IconTone::Green
-        );
+    fn green_requires_native_sharing() {
+        assert_ne!(status(false, true, "sharing").tone, IconTone::Green);
+        let sharing = status(true, true, "sharing");
+        assert_eq!(sharing.tone, IconTone::Green);
+        assert_eq!(sharing.tooltip(), "MonHop — Sharing active");
     }
 
     #[test]
-    fn trial_phases_do_not_reopen_a_consumed_ticket_as_ready() {
+    fn busy_and_error_states_have_honest_textual_status() {
         assert_eq!(
-            status(false, false, "off", Some("prepared")).label,
-            "Test ready"
-        );
-        assert_eq!(
-            status(false, true, "starting", Some("starting")).label,
-            "Test starting"
-        );
-        assert_eq!(
-            status(false, true, "stopping", Some("stopping")).label,
-            "Stopping test"
-        );
-        assert_eq!(
-            status(false, false, "off", Some("error")).label,
-            "Needs attention"
-        );
-        let finished = status(false, false, "off", Some("finished"));
-        assert_eq!(finished.label, "Test ended, input local");
-        assert_eq!(finished.tone, IconTone::Monochrome);
-    }
-
-    #[test]
-    fn non_trial_busy_and_error_states_have_honest_textual_status() {
-        assert_eq!(
-            status(false, true, "starting", None).menu_label(),
+            status(false, true, "starting").menu_label(),
             "Status: Sharing starting"
         );
         assert_eq!(
-            status(false, false, "error", None).menu_label(),
+            status(false, false, "error").menu_label(),
             "Status: Needs attention"
         );
     }

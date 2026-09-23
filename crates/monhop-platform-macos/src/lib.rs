@@ -49,7 +49,6 @@ pub mod network;
 pub mod network_watch;
 #[cfg(target_os = "macos")]
 pub mod threads;
-pub mod trial_window;
 #[cfg(target_os = "macos")]
 pub mod udp_receive;
 #[cfg(not(target_os = "macos"))]

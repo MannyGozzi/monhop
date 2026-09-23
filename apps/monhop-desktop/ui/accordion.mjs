@@ -1,6 +1,4 @@
 import { icon } from "./icons.mjs";
-
-const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 let sequence = 0;
 
 // Fired on the accordion element when the user toggles it, never when a render reopens it.
@@ -8,18 +6,14 @@ export const ACCORDION_TOGGLE = "accordion-toggle";
 
 class AccordionManager {
   constructor() {
-    this.animations = new Map();
     this.handleClick = this.handleClick.bind(this);
-    this.handleMotionChange = this.handleMotionChange.bind(this);
     document.addEventListener("click", this.handleClick);
-    reducedMotion.addEventListener("change", this.handleMotionChange);
   }
 
   mount(root = document) {
-    this.disposeDetached();
     for (const accordion of root.querySelectorAll("[data-accordion]")) {
       const open = accordion.dataset.open === "true";
-      this.setOpen(accordion, open, { instant: true });
+      this.setOpen(accordion, open);
     }
   }
 
@@ -27,23 +21,12 @@ class AccordionManager {
     return accordion?.dataset.open === "true";
   }
 
-  setOpen(accordion, open, { instant = false } = {}) {
+  setOpen(accordion, open) {
     const parts = accordionParts(accordion);
     if (!parts) return;
     const { trigger, content } = parts;
     const target = open === true;
-    const running = this.animations.get(accordion);
-    if (!running && this.isOpen(accordion) === target && content.hidden === !target) return;
-
-    const start = running
-      ? content.getBoundingClientRect().height
-      : target
-        ? 0
-        : content.getBoundingClientRect().height;
-    if (running) {
-      running.animation.cancel();
-      this.animations.delete(accordion);
-    }
+    if (this.isOpen(accordion) === target && content.hidden === !target) return;
 
     accordion.dataset.open = String(target);
     trigger.setAttribute("aria-expanded", String(target));
@@ -55,47 +38,6 @@ class AccordionManager {
       content.inert = true;
     }
 
-    if (instant || reducedMotion.matches) {
-      this.finish(accordion, target);
-      return;
-    }
-
-    content.style.height = `${Math.max(0, start)}px`;
-    const end = target ? content.scrollHeight : 0;
-    if (start === end) {
-      this.finish(accordion, target);
-      return;
-    }
-    if (typeof content.animate !== "function") {
-      this.finish(accordion, target);
-      return;
-    }
-    const animation = content.animate(
-      { height: [`${Math.max(0, start)}px`, `${end}px`] },
-      { duration: 190, easing: "cubic-bezier(.2, .75, .25, 1)", fill: "both" },
-    );
-    this.animations.set(accordion, { animation, target });
-    animation.onfinish = () => {
-      if (this.animations.get(accordion)?.animation !== animation) return;
-      this.animations.delete(accordion);
-      this.finish(accordion, target);
-      animation.cancel();
-    };
-  }
-
-  disposeDetached() {
-    for (const [accordion, { animation }] of this.animations) {
-      if (accordion.isConnected) continue;
-      animation.cancel();
-      this.animations.delete(accordion);
-    }
-  }
-
-  finish(accordion, open) {
-    const parts = accordionParts(accordion);
-    if (!parts) return;
-    const { content } = parts;
-    content.style.height = "";
     content.hidden = !open;
     content.inert = !open;
   }
@@ -112,13 +54,6 @@ class AccordionManager {
     accordion.dispatchEvent(new CustomEvent(ACCORDION_TOGGLE, { detail: { open } }));
   }
 
-  handleMotionChange() {
-    for (const [accordion, { animation, target }] of this.animations) {
-      animation.cancel();
-      this.animations.delete(accordion);
-      this.finish(accordion, target);
-    }
-  }
 }
 
 export function createAccordion(key, className, label, ...children) {
