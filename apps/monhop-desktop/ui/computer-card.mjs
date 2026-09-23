@@ -175,6 +175,7 @@ function sharingPill(ctx, fingerprint, name, inUse) {
   control.disabled = ctx.busy;
   pill.press = () => ctx.actions.useComputer(inUse ? null : fingerprint);
   pill.want = { ...pill.want, inUse, busy: ctx.busy };
+  pill.moved = true;
   queuePills();
   return pill.wrap;
 }
@@ -256,6 +257,8 @@ function buildPill(fingerprint) {
     loops: [],
     comet: [],
     cometWidth: null,
+    cometLap: null,
+    moved: false,
     width: Number.NaN,
     sweepTween: null,
     pressTween: null,
@@ -367,22 +370,26 @@ function tweenParts(pill, from, to) {
   return tweens;
 }
 
-// The comet runs on the compositor along the capsule's edge; busy only speeds it up, so it never
-// jumps. It and the dot's breath start on the document clock, so no render restarts them. Leaving,
-// they keep going until the ring has faded.
+// The comet and the dot's breath run on the compositor, phased to the document clock. WebKit stops
+// compositing a running animation once its playbackRate leaves 1 or its node is re-inserted, so busy
+// rebuilds the comet on a shorter lap and every render rebuilds both in phase. Leaving, they keep
+// going until the ring has faded.
 function runOrbit(pill, look) {
   if (orbitShown(look)) {
     if (!Number.isFinite(pill.width)) return;
-    if (pill.width !== pill.cometWidth) runComet(pill);
-    const rate = look.busy ? motionMs("--loop-orbit") / motionMs("--loop-orbit-busy") : 1;
-    for (const dot of pill.comet) {
-      if (dot.playbackRate !== rate) dot.playbackRate = rate;
-      if (reducedMotion.matches) dot.pause();
+    const lap = motionMs(look.busy ? "--loop-orbit-busy" : "--loop-orbit");
+    if (pill.moved || pill.width !== pill.cometWidth || lap !== pill.cometLap) runComet(pill, lap);
+    if (reducedMotion.matches) for (const dot of pill.comet) dot.pause();
+    if (pill.moved) {
+      for (const animation of pill.loops) animation.cancel();
+      pill.loops = [];
     }
+    pill.moved = false;
     if (!reducedMotion.matches && !pill.loops.length)
       pill.loops = [loop(pill.pulse, livePulse(), "--loop-live", motionEase("--ease-out"))];
     return;
   }
+  pill.moved = false;
   const fade = pill.tweens.find((tween) => tween.effect.target === pill.ring);
   if (!fade) {
     stopLoops(pill);
@@ -393,10 +400,12 @@ function runOrbit(pill, look) {
   });
 }
 
-// A new width rebuilds the comet where the old head was, so the lap carries on unbroken.
-function runComet(pill) {
-  const duration = motionMs("--loop-orbit");
-  const head = (pill.comet[0]?.currentTime ?? document.timeline.currentTime) % duration;
+// A new width or lap rebuilds the comet at the old head's share of its lap, already running, so it
+// carries on unbroken without a held frame.
+function runComet(pill, duration) {
+  const now = document.timeline.currentTime;
+  const was = pill.comet[0]?.currentTime;
+  const head = was == null ? now % duration : ((was % pill.cometLap) / pill.cometLap) * duration;
   for (const dot of pill.comet) dot.cancel();
   const { perimeter, keyframes } = orbitPath({
     width: pill.width,
@@ -409,10 +418,11 @@ function runComet(pill) {
     node.style.setProperty("--comet-opacity", String(opacity));
     node.style.setProperty("--comet-scale", String(scale));
     const animation = node.animate(keyframes, { duration, iterations: Infinity });
-    animation.currentTime = head + duration * (1 - lag);
+    animation.startTime = now - (head + duration * (1 - lag));
     return animation;
   });
   pill.cometWidth = pill.width;
+  pill.cometLap = duration;
 }
 
 function livePulse() {
@@ -438,6 +448,7 @@ function stopLoops(pill) {
   pill.loops = [];
   pill.comet = [];
   pill.cometWidth = null;
+  pill.cometLap = null;
 }
 
 function stillPill(pill) {
