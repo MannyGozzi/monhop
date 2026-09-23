@@ -23,11 +23,8 @@ administrators_authorized_keys
 /node_modules/
 /.playwright-mcp/
 
-/scripts/agent-relay/token.txt
-/scripts/agent-relay/host.txt
-/scripts/agent-relay/peers.txt
-/scripts/agent-relay/log.jsonl
-/scripts/agent-relay/since.txt
+/scripts/pc/pc.conf
+/scripts/pc/.seen
 __pycache__/
 /site/node_modules/
 /site/dist/
