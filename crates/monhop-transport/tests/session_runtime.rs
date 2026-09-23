@@ -8,13 +8,17 @@ use monhop_transport::{
     session::SessionScopes,
     session_receiver::{DestinationAction, DestinationFailure, InputDestination, InputReceiver},
     session_source::{
-        NormalizedInput, PUSH_THROUGH_DISTANCE, SourceController, SourceEffect, SourceMode,
-        SourceOutcome, TaggedInput,
+        NormalizedInput, PUSH_THROUGH_DISTANCE, PUSH_THROUGH_SETTLE, SourceController,
+        SourceEffect, SourceMode, SourceOutcome, TaggedInput,
     },
 };
 use std::{collections::VecDeque, time::Duration};
 fn ms(t: u64) -> Duration {
     Duration::from_millis(t)
+}
+/// `t` ms after a computer's first [`Coordinator::cross`], which begins at zero.
+fn crossed(t: u64) -> Duration {
+    PUSH_THROUGH_SETTLE + ms(t)
 }
 fn device(id: u8) -> DeviceId {
     DeviceId([id; 16])
@@ -306,18 +310,32 @@ impl Coordinator {
         let o = self.source.on_captured(record, self.now);
         self.effects(o)
     }
-    /// Rests on the linked right edge and pushes through it; an arrival's own delta never counts.
+    /// Rests on the linked right edge and pushes through it, which takes PUSH_THROUGH_SETTLE.
     fn cross(&mut self) -> Vec<Frame> {
         let o = self
             .source
             .observe_pointer(Point::new(99.0, 50.0), self.now);
         assert!(self.effects(o).is_empty());
-        let mut frames = self.input(NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)));
-        frames.extend(self.input(NormalizedInput::RelativeMotion(Point::new(
-            PUSH_THROUGH_DISTANCE,
-            0.0,
-        ))));
+        self.push_on(Point::new(1.0, 0.0))
+    }
+    /// Pushes along the unit `along` every 10 ms until the push settles, then the full distance.
+    fn push_on(&mut self, along: Point) -> Vec<Frame> {
+        let settled = self.now + PUSH_THROUGH_SETTLE;
+        let mut frames = Vec::new();
+        while self.now < settled {
+            frames.extend(self.input(NormalizedInput::RelativeMotion(along)));
+            self.now += ms(10);
+        }
+        self.now = settled;
+        frames.extend(self.press(along));
         frames
+    }
+    /// One full distance more along the unit `along`.
+    fn press(&mut self, along: Point) -> Vec<Frame> {
+        self.input(NormalizedInput::RelativeMotion(Point::new(
+            along.x * PUSH_THROUGH_DISTANCE,
+            along.y * PUSH_THROUGH_DISTANCE,
+        )))
     }
     fn drain(&mut self) -> Vec<Frame> {
         let mut frames = Vec::new();
@@ -346,14 +364,18 @@ impl Pair {
         let frames = self.computers[id].cross();
         self.enqueue(id, frames);
     }
+    fn press(&mut self, id: usize) {
+        let frames = self.computers[id].press(Point::new(1.0, 0.0));
+        self.enqueue(id, frames);
+    }
     fn step(&mut self) {
         let (to, frame) = self.pipe.pop_front().unwrap();
         let frames = self.computers[to].receive(frame);
         self.enqueue(to, frames);
     }
-    fn at(&mut self, t: u64) {
+    fn at(&mut self, now: Duration) {
         for c in &mut self.computers {
-            c.now = ms(t);
+            c.now = now;
         }
     }
     fn home(&mut self, id: usize) {
@@ -481,17 +503,27 @@ fn stale_generation_motion_never_crosses() {
     let mut p = Pair::new();
     let c = &mut p.computers[0];
     c.source.observe_pointer(Point::new(99.0, 50.0), ms(0));
-    assert!(
-        c.input(NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)))
-            .is_empty()
-    );
+    while c.now < PUSH_THROUGH_SETTLE {
+        assert!(
+            c.input(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0)))
+                .is_empty()
+        );
+        c.now += ms(10);
+    }
     let record = TaggedInput {
         event: NormalizedInput::RelativeMotion(Point::new(PUSH_THROUGH_DISTANCE, 0.0)),
         routing_revision: 0,
         remote: false,
         floor_generation: 0,
     };
-    assert!(c.source.on_captured(record, ms(0)).effects.is_empty());
+    assert!(
+        c.source
+            .on_captured(record, PUSH_THROUGH_SETTLE)
+            .effects
+            .is_empty()
+    );
+    // The push was ready: the same press in the current generation crosses.
+    assert!(!c.press(Point::new(1.0, 0.0)).is_empty());
 }
 #[test]
 fn disabled_direction_is_a_wall_and_declined() {
@@ -543,14 +575,15 @@ fn reverse_request_during_returning_is_busy_then_retried() {
     p.pump();
     p.pipe.push_back(ack);
     p.pump();
+    // B keeps pushing: each press past the decline waits out its retry delay.
     for t in [10, 20, 30, 40] {
-        p.at(t);
-        p.cross(1);
+        p.at(crossed(t));
+        p.press(1);
         p.pump();
         assert_eq!(p.computers[1].source.mode(), SourceMode::Local);
     }
-    p.at(50);
-    p.cross(1);
+    p.at(crossed(50));
+    p.press(1);
     p.pump();
     assert_eq!(p.computers[1].source.mode(), SourceMode::Remote);
 }
@@ -567,11 +600,8 @@ fn reanchor_allowed_while_sending_and_receiving() {
     p.pump();
     let a = p.computers[0].floor.snapshot();
     let b = p.computers[1].floor.snapshot();
+    // Going on past the bottom of the other computer's display moves to its display below.
     p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
-    p.input(
-        0,
-        NormalizedInput::RelativeMotion(Point::new(0.0, PUSH_THROUGH_DISTANCE)),
-    );
     p.pump();
     assert_eq!(p.computers[0].floor.snapshot(), a);
     assert_eq!(p.computers[1].floor.snapshot(), b);
@@ -601,11 +631,6 @@ fn take_back_during_reanchor_applies_on_remote() {
     p.cross(0);
     p.pump();
     p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
-    p.pump();
-    p.input(
-        0,
-        NormalizedInput::RelativeMotion(Point::new(0.0, PUSH_THROUGH_DISTANCE)),
-    );
     // Capture takes back before the destination consumes the already queued reanchor.
     p.take_back(1);
     let take = p.pipe.pop_back().unwrap();
@@ -723,13 +748,7 @@ fn crossings_rearm_from_fresh_poll_after_free() {
             .effects
             .is_empty()
     );
-    assert!(
-        !c.input(NormalizedInput::RelativeMotion(Point::new(
-            PUSH_THROUGH_DISTANCE,
-            0.0
-        )))
-        .is_empty()
-    );
+    assert!(!c.push_on(Point::new(1.0, 0.0)).is_empty());
 }
 #[test]
 fn disconnect_mid_transition_releases_both_halves() {
@@ -816,9 +835,9 @@ fn quick_presses_in_place_reach_the_peer_numbered_on_press_and_release() {
     p.cross(0);
     p.pump();
     for t in [10, 20, 30] {
-        p.at(t);
+        p.at(crossed(t));
         for pressed in [true, false] {
-            p.input(0, left(pressed, ms(t)));
+            p.input(0, left(pressed, crossed(t)));
             p.pump();
         }
     }
@@ -1006,19 +1025,25 @@ fn a_pause_in_seam_pressure_restarts_the_decline_delay() {
     p.pump();
     p.home(0);
     p.pump();
-    p.at(10);
+    p.at(crossed(10));
+    p.press(1);
+    p.pump();
+    p.at(crossed(20));
+    p.computers[1].input(NormalizedInput::AbsoluteMotion(Point::new(50.0, 50.0)));
+    // Back on the seam the push settles again; its first retry restarts the decline delay.
+    p.at(crossed(30));
     p.cross(1);
     p.pump();
-    p.at(20);
-    p.computers[1].input(NormalizedInput::AbsoluteMotion(Point::new(50.0, 50.0)));
-    for t in [30, 40, 50, 60, 70] {
-        p.at(t);
-        p.cross(1);
+    assert_eq!(p.computers[1].source.mode(), SourceMode::Local);
+    let pressed = crossed(30) + PUSH_THROUGH_SETTLE;
+    for t in [10, 20, 30, 40] {
+        p.at(pressed + ms(t));
+        p.press(1);
         p.pump();
         assert_eq!(p.computers[1].source.mode(), SourceMode::Local);
     }
-    p.at(80);
-    p.cross(1);
+    p.at(pressed + ms(50));
+    p.press(1);
     p.pump();
     assert_eq!(p.computers[1].source.mode(), SourceMode::Remote);
 }
@@ -1113,17 +1138,12 @@ fn a_take_back_delayed_past_a_reanchor_and_a_hold_is_ignored() {
     p.cross(0);
     p.pump();
     p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
-    p.pump();
-    p.input(
-        0,
-        NormalizedInput::RelativeMotion(Point::new(0.0, PUSH_THROUGH_DISTANCE)),
-    );
     // The peer takes back in the old epoch; a stall delays its TakeBack past the reanchor.
     p.take_back(1);
     let (to, late) = p.pipe.pop_back().unwrap();
     assert_eq!(to, 0);
     assert!(matches!(late.message, Message::TakeBack));
-    p.at(500);
+    p.at(ms(500));
     let c = &mut p.computers[0];
     let held = c.source.tick(c.now);
     c.effects(held);
@@ -1144,11 +1164,5 @@ fn crossing_straight_back_after_an_own_return_needs_no_fresh_poll() {
     let c = &mut p.computers[0];
     assert_eq!(c.source.mode(), SourceMode::Local);
     assert_eq!(c.floor.snapshot().state, FloorState::Free);
-    assert!(
-        !c.input(NormalizedInput::RelativeMotion(Point::new(
-            PUSH_THROUGH_DISTANCE,
-            0.0
-        )))
-        .is_empty()
-    );
+    assert!(!c.push_on(Point::new(1.0, 0.0)).is_empty());
 }
