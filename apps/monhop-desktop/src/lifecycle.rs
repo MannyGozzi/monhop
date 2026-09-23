@@ -250,7 +250,7 @@ impl AppController {
         let file = self.load_setup(&setup_path, "The saved setup could not be read.")?;
         log::info!("user: forgot computer {}", short(fingerprint));
         if file.active() == Some(fingerprint_key(&fingerprint.full_hex()).as_str()) {
-            self.sharing.set_active(&setup_path, None)?;
+            self.sharing.set_active(&setup_path, None, None)?;
             self.quiesce_connection(crate::sharing::PAUSED)?;
         }
         self.pairing.forget(fingerprint)?;
@@ -266,7 +266,11 @@ impl AppController {
     /// Chooses the computer to share with; None pauses. A supervisor pass runs immediately; the
     /// connection itself follows within a tick, because the worker for the old computer has to
     /// stop before the port is free.
-    pub fn set_active(&self, fingerprint: Option<&str>) -> Result<SharingView, String> {
+    pub fn set_active(
+        &self,
+        fingerprint: Option<&str>,
+        interface_id: Option<&str>,
+    ) -> Result<SharingView, String> {
         let view = {
             let _lease = self.gate.begin()?;
             if !self.pairing.shutdown_ready() {
@@ -278,7 +282,7 @@ impl AppController {
                 None => log::info!("user: paused sharing"),
             }
             let path = self.setup_path()?;
-            let view = self.sharing.set_active(&path, fingerprint)?;
+            let view = self.sharing.set_active(&path, fingerprint, interface_id)?;
             *lock(&self.sharing_retry_after) = None;
             view
         };
@@ -889,8 +893,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
         controller.use_setup_path(folder.join("sharing.json"));
-        assert!(controller.set_active(Some("not a fingerprint")).is_err());
-        let chosen = controller.set_active(Some(&"B".repeat(64))).unwrap();
+        assert!(
+            controller
+                .set_active(Some("not a fingerprint"), None)
+                .is_err()
+        );
+        let chosen = controller.set_active(Some(&"B".repeat(64)), None).unwrap();
         assert_eq!(chosen.active.as_deref(), Some("b".repeat(64).as_str()));
         assert_eq!(
             SetupFile::load(&folder.join("sharing.json"))
@@ -898,7 +906,7 @@ mod tests {
                 .active(),
             Some("b".repeat(64).as_str())
         );
-        let paused = controller.set_active(None).unwrap();
+        let paused = controller.set_active(None, None).unwrap();
         assert!(paused.active.is_none());
         assert_eq!(paused.phase, "off");
         assert_eq!(paused.message, crate::sharing::PAUSED);
@@ -1183,7 +1191,7 @@ mod tests {
                 .edit_begin("invalid".into(), &"B".repeat(64))
                 .is_err()
         );
-        assert!(controller.set_active(None).is_err());
+        assert!(controller.set_active(None, None).is_err());
     }
 
     #[test]

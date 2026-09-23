@@ -241,7 +241,7 @@ pub fn handle_menu_action(app: &AppHandle, id: &str) -> bool {
             controller.pairing.cancel();
             // Pausing is the same choice as on Home: no computer is active until the user picks one.
             tauri::async_runtime::spawn_blocking(move || {
-                if let Err(message) = controller.set_active(None) {
+                if let Err(message) = controller.set_active(None, None) {
                     log::warn!("tray: pause did not apply: {message}");
                 }
             });

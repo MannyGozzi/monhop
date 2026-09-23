@@ -851,8 +851,17 @@ impl SharingController {
         &self,
         path: &Path,
         fingerprint: Option<CertificateFingerprint>,
+        interface_id: Option<&str>,
     ) -> Result<SharingView, String> {
-        self.update_setup_file(path, |file| file.set_active(fingerprint.as_ref()))?;
+        self.update_setup_file(path, |file| {
+            file.set_active(fingerprint.as_ref());
+            // The supervisor dials only over a recorded network, so choosing a computer records the chosen one.
+            if let Some(interface_id) =
+                interface_id.filter(|id| fingerprint.is_some() && !id.is_empty())
+            {
+                file.set_interface_id(interface_id);
+            }
+        })?;
         {
             let mut state = lock(&self.state);
             publish_arranging(&state, false);
@@ -3887,7 +3896,9 @@ pub(crate) mod tests {
         assert_eq!(controller.status().phase, "error");
         assert!(controller.within_failure_backoff(backoff));
         // Choosing the computer again is a fresh user intent, so the wait is over at once.
-        controller.set_active(&path, Some(fixture_peer())).unwrap();
+        controller
+            .set_active(&path, Some(fixture_peer()), None)
+            .unwrap();
         assert!(!controller.within_failure_backoff(backoff));
 
         // A misfit and a deliberate close are steps, not failures, and never hold anything off.
@@ -5210,11 +5221,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn choosing_a_computer_records_the_network_and_pausing_keeps_it() {
+        let controller = SharingController::default();
+        let (directory, path) = sync_test_path();
+        controller
+            .set_active(&path, Some(fixture_peer()), Some("en0"))
+            .unwrap();
+        assert_eq!(SetupFile::load(&path).unwrap().interface_id(), Some("en0"));
+        controller.set_active(&path, None, Some("en7")).unwrap();
+        let paused = SetupFile::load(&path).unwrap();
+        assert!(paused.active().is_none());
+        assert_eq!(paused.interface_id(), Some("en0"));
+        controller
+            .set_active(&path, Some(fixture_peer()), Some(""))
+            .unwrap();
+        assert_eq!(SetupFile::load(&path).unwrap().interface_id(), Some("en0"));
+        drop(directory);
+    }
+
+    #[test]
     fn pausing_ends_the_link_with_the_paused_wording() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let (controller, _fixture, _) = connected_link(Duration::from_secs(600));
         let (directory, path) = sync_test_path();
-        let paused = controller.set_active(&path, None).unwrap();
+        let paused = controller.set_active(&path, None, None).unwrap();
         assert_eq!(paused.phase, "stopping");
         assert!(paused.active.is_none());
         join_finished_worker(&controller);
@@ -5224,7 +5254,9 @@ pub(crate) mod tests {
         assert!(SetupFile::load(&path).unwrap().active().is_none());
         // Choosing the computer the link is already with keeps the link.
         let (controller, _fixture, _) = connected_link(Duration::from_secs(600));
-        let kept = controller.set_active(&path, Some(fixture_peer())).unwrap();
+        let kept = controller
+            .set_active(&path, Some(fixture_peer()), None)
+            .unwrap();
         assert_eq!(kept.phase, "connected");
         assert_eq!(kept.active.as_deref(), Some("b".repeat(64).as_str()));
         controller.stop_with(NOT_CONNECTED);
@@ -5697,7 +5729,9 @@ pub(crate) mod tests {
             Some((Instant::now() - Duration::from_secs(30), floor));
         assert!(controller.within_failure_backoff(Duration::from_secs(10)));
         // A user's choice ends the wait at once.
-        controller.set_active(&path, Some(fixture_peer())).unwrap();
+        controller
+            .set_active(&path, Some(fixture_peer()), None)
+            .unwrap();
         assert!(!controller.within_failure_backoff(Duration::from_secs(10)));
         drop(directory);
     }

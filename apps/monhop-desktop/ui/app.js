@@ -1280,7 +1280,8 @@ async function forgetComputer(fingerprint) {
 // ---------- the connection ----------
 
 async function useComputer(fingerprint) {
-  await runSharing("active", () => core.invoke("sharing_set_active", { fingerprint }));
+  const interfaceId = state.selectedInterfaceId ?? null;
+  await runSharing("active", () => core.invoke("sharing_set_active", { fingerprint, interfaceId }));
   await loadComputers();
 }
 

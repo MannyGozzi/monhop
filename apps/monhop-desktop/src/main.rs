@@ -175,10 +175,11 @@ async fn sharing_edit_end(app: tauri::AppHandle) -> Result<SharingView, String> 
 async fn sharing_set_active(
     app: tauri::AppHandle,
     fingerprint: Option<String>,
+    interface_id: Option<String>,
 ) -> Result<SharingView, String> {
     let controller = app.state::<Arc<AppController>>().inner().clone();
     spawn_blocking_command(
-        move || controller.set_active(fingerprint.as_deref()),
+        move || controller.set_active(fingerprint.as_deref(), interface_id.as_deref()),
         "The choice of computer did not apply. Try again.",
     )
     .await?
