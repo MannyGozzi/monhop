@@ -28,6 +28,8 @@
   --primary-foreground: oklch(.99 0 0);
   --success: light-dark(oklch(.58 .15 152), oklch(.77 .16 152));
   --success-tint: color-mix(in oklab, var(--success) var(--mix-tint), var(--card));
+  /* Success as text on its own tint: 5:1 or better in both themes, where --success is 3.4:1 in light. */
+  --success-text: light-dark(oklch(.46 .13 152), oklch(.8 .16 152));
   --warning: light-dark(oklch(.72 .15 70), oklch(.8 .14 76));
   --warning-text: light-dark(oklch(.52 .12 62), oklch(.84 .12 80));
   --destructive: light-dark(oklch(.57 .21 24), oklch(.7 .19 22));
@@ -38,6 +40,17 @@
   --switch-track-off: light-dark(oklch(.2 .01 275 / 16%), oklch(1 0 0 / 15%));
   --thumb: oklch(1 0 0);
   --live-line: linear-gradient(90deg, transparent, color-mix(in oklab, var(--success) var(--mix-live-line), transparent), transparent);
+  /* Link capsule: glass at rest, a live tint and glow, an orbiting arc with a fading tail, one light sweep. */
+  --glass-fill: linear-gradient(light-dark(oklch(.995 .002 275), oklch(1 0 0 / 9%)), light-dark(oklch(.955 .004 275), oklch(1 0 0 / 4%)));
+  --glass-edge: light-dark(oklch(.2 .01 275 / 12%), oklch(1 0 0 / 11%));
+  --glass-edge-hover: light-dark(oklch(.2 .01 275 / 26%), oklch(1 0 0 / 26%));
+  --glass-highlight: inset 0 1px 0 light-dark(oklch(1 0 0), oklch(1 0 0 / 9%));
+  --glass-lift: 0 1px 2px light-dark(oklch(.2 .01 275 / 8%), oklch(0 0 0 / 35%));
+  --live-fill: linear-gradient(color-mix(in oklab, var(--success) var(--mix-tint-strong), var(--card)), color-mix(in oklab, var(--success) var(--mix-faint), var(--card)));
+  --live-edge: color-mix(in oklab, var(--success) var(--mix-edge), transparent);
+  --live-glow: 0 0 var(--sharing-glow-blur) light-dark(color-mix(in oklab, var(--success) var(--mix-tint), transparent), color-mix(in oklab, var(--success) var(--mix-icon), transparent));
+  --orbit-arc: conic-gradient(transparent 0 55%, color-mix(in oklab, var(--success) var(--mix-tint), transparent) 70%, var(--success) 96%, transparent 96.5%);
+  --sweep-light: linear-gradient(100deg, transparent 35%, light-dark(oklch(1 0 0 / 75%), oklch(1 0 0 / 22%)) 50%, transparent 65%);
   /* Setup ladder: step markers, and the rail between them (coral once done, softening toward the next step). */
   --step-fill: color-mix(in oklab, var(--primary) var(--mix-faint), transparent);
   --step-glow: light-dark(color-mix(in oklab, var(--primary) var(--mix-edge), transparent), color-mix(in oklab, var(--primary) var(--mix-glow-strong), transparent));
@@ -142,8 +155,17 @@
   --slider-track: 4px;
   --slider-thumb: 18px;
   --slider-value-width: 40px;
-  --sharing-icon-size: 12px;
-  --sharing-pill-min-width: 128px;
+  /* Link capsule: two computer nodes that merge into the live dot, and an orbit wider than its diagonal. */
+  --sharing-mark-size: 14px;
+  --sharing-node-size: 5px;
+  --sharing-node-spread: 4px;
+  --sharing-node-lean: 1.25px;
+  --sharing-bar-width: 2.5px;
+  --sharing-bar-height: 9px;
+  --sharing-bar-offset: 2.25px;
+  --sharing-ring-width: 1.5px;
+  --sharing-orbit-size: 240px;
+  --sharing-glow-blur: 14px;
   --tooltip-max-width: 200px;
   --textarea-min-height: 64px;
   --scrollbar-size: 10px;
@@ -194,6 +216,7 @@
   --rotate-open: 90deg;
   --rotate-pop: 30deg;
   --opacity-dim: .4;
+  --opacity-orbit-dim: .3;
   --scale-pop: .8;
   --scale-enter: .96;
   --scale-thumb-hover: 1.08;
@@ -214,10 +237,13 @@
   --motion-rise: 4px;
   --motion-rise-page: 6px;
   --motion-demo: 1100ms;
+  --motion-sweep: 620ms;
   --loop-spin: 800ms;
   --loop-pulse: 1500ms;
   --loop-live: 2400ms;
   --loop-breathe: 3200ms;
+  --loop-orbit: 3600ms;
+  --loop-orbit-busy: 900ms;
   --ease-out: cubic-bezier(.22, 1, .36, 1);
   --ease-in-out: cubic-bezier(.65, 0, .35, 1);
   /* Height glides: --ease-out would cover a fifth of a tall panel in the first frame. No overshoot. */
@@ -289,12 +315,12 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .status-pill { display: inline-flex; align-items: center; gap: var(--gap-2); height: var(--status-pill-height); max-width: 100%; border-radius: var(--radius-pill); padding: 0 var(--gap-3); background: var(--surface-inset); color: var(--muted-foreground); font-size: var(--text-sm); font-weight: var(--weight-medium); white-space: nowrap; }
 .status-pill span:last-child { overflow: hidden; text-overflow: ellipsis; }
 .status-pill:is([data-tone="connected"], [data-tone="active"]) { color: var(--foreground); }
-.status-dot, .sharing-pill-live-dot { position: relative; flex: none; width: var(--dot-size); height: var(--dot-size); border-radius: var(--radius-circle); background: var(--subtle-foreground); }
+.status-dot { position: relative; flex: none; width: var(--dot-size); height: var(--dot-size); border-radius: var(--radius-circle); background: var(--subtle-foreground); }
 .status-pill:is([data-tone="checking"], [data-tone="stopping"], [data-tone="syncing"]) .status-dot { background: var(--warning); }
 .status-pill[data-tone="error"] .status-dot { background: var(--destructive); }
-.status-pill:is([data-tone="connected"], [data-tone="active"]) .status-dot, .sharing-pill-live-dot { background: var(--success); }
+.status-pill:is([data-tone="connected"], [data-tone="active"]) .status-dot { background: var(--success); }
 /* Live dot: a ring keeps leaving it. Only on controls that persist; a re-rendered chip would restart it. */
-.window-header-end .status-pill:is([data-tone="connected"], [data-tone="active"]) .status-dot::after, .sharing-pill-live-dot::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: inherit; opacity: 0; animation: live-ring var(--loop-live) var(--ease-out) var(--live-phase, 0ms) infinite; }
+.window-header-end .status-pill:is([data-tone="connected"], [data-tone="active"]) .status-dot::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: inherit; opacity: 0; animation: live-ring var(--loop-live) var(--ease-out) var(--live-phase, 0ms) infinite; }
 
 /* Page */
 .content-region { min-width: 0; min-height: 0; overflow: auto; overflow-x: hidden; overscroll-behavior: contain; padding: var(--gap-6) var(--gap-6) var(--gap-10); view-transition-name: content; }
@@ -411,7 +437,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .button svg { width: var(--icon-size); height: var(--icon-size); flex: none; stroke-width: var(--icon-stroke); pointer-events: none; }
 .button[data-size="sm"] svg { width: var(--icon-size-sm); height: var(--icon-size-sm); }
 /* Press is quick; release springs back through the control transition. */
-:is(.button, .sharing-pill, .arrangement-control, .segmented-option, .primary-nav button):active:not(:disabled) { transform: scale(var(--scale-press)); transition: var(--transition-control), var(--transition-press); }
+:is(.button, .arrangement-control, .segmented-option, .primary-nav button):active:not(:disabled) { transform: scale(var(--scale-press)); transition: var(--transition-control), var(--transition-press); }
 .arrangement-control { border: 0; border-radius: var(--radius); padding: 0 var(--gap-3); font-weight: var(--weight-semibold); transition: var(--transition-control); }
 .arrangement-control.is-current:not(:disabled) { color: var(--muted-foreground); }
 .icon-button.button { position: relative; width: var(--icon-button-size); height: var(--icon-button-size); border-radius: var(--radius-circle); padding: 0; background: transparent; color: var(--muted-foreground); box-shadow: none; }
@@ -563,37 +589,63 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .presence { display: grid; min-width: 0; }
 .presence[data-leave="true"] > * { pointer-events: none; }
 
-/* Sharing toggle: both surfaces, glyphs and labels are always drawn; state picks which shows.
-   Only the current label takes space, so mark and label stay centred together in either state. */
-.sharing-pill { position: relative; isolation: isolate; display: inline-flex; align-items: center; justify-content: center; gap: var(--gap-2); min-width: var(--sharing-pill-min-width); height: var(--control-height); overflow: hidden; border: 0; border-radius: var(--radius-pill); padding: 0 var(--gap-3); background: transparent; color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-semibold); line-height: var(--leading-none); transition: var(--transition-control); }
-.sharing-pill[data-state="active"] { color: var(--success); }
-.sharing-pill:disabled { cursor: default; }
-.sharing-pill-surfaces, .sharing-pill-surface { position: absolute; inset: 0; border-radius: inherit; }
-.sharing-pill-surfaces { z-index: -1; }
-.sharing-pill-surface { transition: background-color var(--motion-fast) var(--ease-out), opacity var(--motion-base) var(--ease-out); }
-.sharing-pill-surface.idle { background: var(--control-fill); }
-.sharing-pill-surface.active { background: var(--success-tint); opacity: 0; }
-.sharing-pill:hover:not(:disabled) .sharing-pill-surface.idle { background: var(--control-fill-hover); }
-.sharing-pill:hover:not(:disabled) .sharing-pill-surface.active { background: color-mix(in oklab, var(--success) var(--mix-tint-strong), var(--card)); }
-.sharing-pill[data-state="active"] .sharing-pill-surface.idle { opacity: 0; }
-.sharing-pill[data-state="active"] .sharing-pill-surface.active { opacity: 1; }
-.sharing-pill-icon, .sharing-pill-label { position: relative; z-index: 1; }
-.sharing-pill-icon { display: grid; flex: none; width: var(--sharing-icon-size); height: var(--sharing-icon-size); place-items: center; }
-.sharing-pill-glyph, .sharing-pill-label > span, .sharing-pill-live-dot { display: block; grid-area: 1 / 1; opacity: 0; transform: scale(var(--scale-pop)); transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring); }
-.sharing-pill-glyph { display: grid; place-items: center; }
-.sharing-pill-glyph svg { width: var(--sharing-icon-size); height: var(--sharing-icon-size); stroke-width: var(--icon-stroke-bold); }
-.sharing-pill-label { text-align: start; }
-.sharing-pill-label > span:not([data-current="true"]) { position: absolute; top: 0; left: 0; white-space: nowrap; }
-.sharing-pill-pause { pointer-events: none; }
-.sharing-pill-glyph[data-current="true"], .sharing-pill-label > span[data-current="true"] { opacity: 1; transform: none; }
-/* Live, the leading mark is the live dot; hovering trades it and the label for Pause. */
-.sharing-pill-live-dot { place-self: center; }
-.sharing-pill[data-state="active"] .sharing-pill-live-dot { opacity: 1; transform: none; }
-.sharing-pill[data-state="active"] .sharing-pill-glyph[data-current="true"] { opacity: 0; transform: scale(var(--scale-pop)); }
-.sharing-pill[data-state="active"]:is(:hover, :focus-visible) :is(.sharing-pill-live-dot, .sharing-pill-label > span[data-current="true"]) { opacity: 0; transform: scale(var(--scale-pop)); }
-.sharing-pill[data-state="active"]:is(:hover, :focus-visible) :is(.sharing-pill-glyph[data-current="true"], .sharing-pill-pause) { opacity: 1; transform: none; }
-.sharing-pill-spinner { position: absolute; right: var(--gap-3); width: var(--icon-size-sm); height: var(--icon-size-sm); border: var(--stroke-bold) solid color-mix(in oklab, currentColor var(--mix-edge), transparent); border-top-color: currentColor; border-radius: var(--radius-circle); opacity: 0; }
-.sharing-pill[data-busy="true"] .sharing-pill-spinner { opacity: 1; animation: spin var(--loop-spin) linear infinite; }
+/* Link capsule (Home): the two computers as nodes that merge into the live dot, on glass that tints
+   and gains an orbiting arc while sharing. computer-card.mjs tweens between these looks. */
+.sharing-pill-wrap { position: relative; display: inline-flex; flex: none; border-radius: var(--radius-pill); }
+.sharing-pill-wrap[data-busy="true"] { cursor: progress; }
+.sharing-pill-halo { position: absolute; inset: 0; border-radius: inherit; box-shadow: var(--live-glow); opacity: 0; pointer-events: none; }
+.sharing-pill { position: relative; isolation: isolate; display: inline-flex; align-items: center; gap: var(--gap-2); height: var(--control-height); overflow: hidden; border: 0; border-radius: var(--radius-pill); padding: 0 var(--gap-3) 0 var(--gap-2); background: transparent; box-shadow: var(--glass-lift); color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-semibold); line-height: var(--leading-none); white-space: nowrap; }
+.sharing-pill:disabled { cursor: inherit; }
+.sharing-pill:focus-visible { box-shadow: var(--shadow-focus), var(--glass-lift); }
+.sharing-pill-glass, .sharing-pill-tint, .sharing-pill-edge, .sharing-pill-sweep, .sharing-pill-ring { position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; }
+.sharing-pill-glass { background: var(--glass-fill); box-shadow: var(--glass-highlight), inset 0 0 0 var(--hairline-width) var(--glass-edge); }
+.sharing-pill-edge { box-shadow: inset 0 0 0 var(--hairline-width) var(--glass-edge-hover); opacity: 0; }
+.sharing-pill-tint { background: var(--live-fill); box-shadow: var(--glass-highlight), inset 0 0 0 var(--hairline-width) var(--live-edge); opacity: 0; }
+.sharing-pill-sweep { background: var(--sweep-light); transform: translateX(-100%); }
+/* The ring shows only the capsule's edge: the mask cuts its padding box down to the border ring. */
+.sharing-pill-ring { padding: var(--sharing-ring-width); opacity: 0; -webkit-mask: linear-gradient(black 0 0) content-box, linear-gradient(black 0 0); -webkit-mask-composite: xor; mask: linear-gradient(black 0 0) content-box exclude, linear-gradient(black 0 0); }
+.sharing-pill-orbit { position: absolute; top: 50%; left: 50%; width: var(--sharing-orbit-size); height: var(--sharing-orbit-size); margin: calc(var(--sharing-orbit-size) / -2) 0 0 calc(var(--sharing-orbit-size) / -2); background: var(--orbit-arc); opacity: 0; }
+.sharing-pill-mark { position: relative; flex: none; width: var(--sharing-mark-size); height: var(--sharing-mark-size); }
+.sharing-pill-mark > * { position: absolute; top: 50%; left: 50%; }
+.sharing-pill-node { width: var(--sharing-node-size); height: var(--sharing-node-size); margin: calc(var(--sharing-node-size) / -2) 0 0 calc(var(--sharing-node-size) / -2); border-radius: var(--radius-circle); }
+.sharing-pill-node.local { background: var(--display-local); transform: translateX(calc(var(--sharing-node-spread) * -1)); }
+.sharing-pill-node.peer { background: var(--display-peer); transform: translateX(var(--sharing-node-spread)); }
+.sharing-pill-dot { width: var(--dot-size); height: var(--dot-size); margin: calc(var(--dot-size) / -2) 0 0 calc(var(--dot-size) / -2); border-radius: var(--radius-circle); background: var(--success); opacity: 0; transform: scale(var(--scale-pop)); }
+.sharing-pill-pulse { position: absolute; inset: 0; border-radius: inherit; background: inherit; opacity: 0; }
+.sharing-pill-bar { width: var(--sharing-bar-width); height: var(--sharing-bar-height); margin: calc(var(--sharing-bar-height) / -2) 0 0 calc(var(--sharing-bar-width) / -2); border-radius: var(--radius-swatch); background: var(--foreground); opacity: 0; }
+.sharing-pill-bar.first { transform: translateX(calc(var(--sharing-bar-offset) * -1)) scaleY(var(--scale-pop)); }
+.sharing-pill-bar.second { transform: translateX(var(--sharing-bar-offset)) scaleY(var(--scale-pop)); }
+/* Labels share one cell; only the current state's labels take space, so the width follows them. */
+.sharing-pill-label { position: relative; display: grid; text-align: start; }
+.sharing-pill-label > span { grid-area: 1 / 1; opacity: 0; }
+.sharing-pill-wrap:not([data-state="active"]) .sharing-pill-label > :not(.start), .sharing-pill-wrap[data-state="active"] .sharing-pill-label > .start { position: absolute; top: 0; left: 0; }
+.sharing-pill-label > .start { color: var(--foreground); transform: translateY(calc(var(--motion-rise) * -1)); }
+.sharing-pill-label > .sharing { color: var(--success-text); transform: translateY(var(--motion-rise)); }
+.sharing-pill-label > .pause { color: var(--foreground); transform: translateY(var(--motion-rise)); }
+/* Idle: hover leans the nodes in and brightens the edge. */
+.sharing-pill-wrap:not([data-state="active"]) .sharing-pill-label > .start { opacity: 1; transform: none; }
+.sharing-pill-wrap[data-lean="true"] .sharing-pill-edge { opacity: 1; }
+.sharing-pill-wrap[data-lean="true"] .sharing-pill-node.local { transform: translateX(calc((var(--sharing-node-spread) - var(--sharing-node-lean)) * -1)); }
+.sharing-pill-wrap[data-lean="true"] .sharing-pill-node.peer { transform: translateX(calc(var(--sharing-node-spread) - var(--sharing-node-lean))); }
+/* Live: the nodes have merged into the dot, the glass is tinted and the arc orbits the edge. */
+.sharing-pill-wrap[data-state="active"] :is(.sharing-pill-halo, .sharing-pill-tint, .sharing-pill-ring, .sharing-pill-dot) { opacity: 1; }
+.sharing-pill-wrap[data-state="active"] .sharing-pill-node { opacity: 0; transform: none; }
+.sharing-pill-wrap[data-state="active"] .sharing-pill-dot { transform: none; }
+.sharing-pill-wrap[data-state="active"]:not([data-busy="true"]) .sharing-pill-orbit.slow { opacity: 1; }
+.sharing-pill-wrap[data-state="active"]:not([data-pause="true"]) .sharing-pill-label > .sharing { opacity: 1; transform: none; }
+/* Live and engaged: the orbit dims, the dot becomes Pause's two bars and the label rolls to Pause. */
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-orbit.slow { opacity: var(--opacity-orbit-dim); }
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-dot { opacity: 0; transform: scale(var(--scale-pop)); }
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-bar { opacity: 1; }
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-bar.first { transform: translateX(calc(var(--sharing-bar-offset) * -1)); }
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-bar.second { transform: translateX(var(--sharing-bar-offset)); }
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-label > .sharing { transform: translateY(calc(var(--motion-rise) * -1)); }
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-label > .pause { opacity: 1; transform: none; }
+/* Busy: the arc races as the progress indicator and the mark steps back. */
+.sharing-pill-wrap[data-busy="true"] .sharing-pill-ring, .sharing-pill-wrap[data-busy="true"] .sharing-pill-orbit.fast { opacity: 1; }
+.sharing-pill-wrap[data-busy="true"] .sharing-pill-mark { opacity: var(--opacity-disabled); }
+/* Without motion the busy arc stands still and the live ring is the tinted edge alone. */
+@media (prefers-reduced-motion: reduce) { .sharing-pill-orbit.slow { display: none; } }
 
 /* Use toggle: the setup card's play/stop icon button. */
 .use-toggle.icon-button.button { border-radius: var(--radius-pill); }
@@ -613,12 +665,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
   .switch[data-enter="true"][aria-checked="true"] { animation-name: switch-track-on; }
   .switch[data-enter="true"] .switch-thumb { animation: switch-thumb-off var(--motion-spring) var(--ease-spring) var(--motion-delay, 0ms); }
   .switch[data-enter="true"][aria-checked="true"] .switch-thumb { animation-name: switch-thumb-on; }
-  /* In: each part that may rest visible in the new state rises from hidden to its resting look. */
-  .sharing-pill[data-enter="true"] :is(.sharing-pill-glyph, .sharing-pill-label > span)[data-current="true"], .sharing-pill[data-enter="true"][data-state="active"] :is(.sharing-pill-live-dot, .sharing-pill-pause) { animation: fade-in var(--motion-base) var(--ease-out) var(--motion-delay, 0ms) both, scale-in var(--motion-spring) var(--ease-spring) var(--motion-delay, 0ms) both; }
-  /* Out: only idle's parts show whether or not the pill is hovered, so only they fade; live parts just go. */
-  .sharing-pill[data-enter="true"][data-state="active"] :is(.sharing-pill-glyph, .sharing-pill-label > span)[data-current="false"] { animation: fade-out var(--motion-fast) var(--ease-out) var(--motion-delay, 0ms) both, scale-out var(--motion-spring) var(--ease-spring) var(--motion-delay, 0ms) both; }
-  .sharing-pill[data-enter="true"] .sharing-pill-surface { animation: fade-out var(--motion-base) var(--ease-out) var(--motion-delay, 0ms) both; }
-  .sharing-pill[data-enter="true"][data-state="active"] .sharing-pill-surface.active, .sharing-pill[data-enter="true"][data-state="idle"] .sharing-pill-surface.idle { animation-name: fade-in; }
   .use-toggle[data-enter="true"] .use-glyph[data-current="true"] { animation: use-glyph-in var(--motion-spring) var(--ease-spring) var(--motion-delay, 0ms) both; }
   .use-toggle[data-enter="true"] .use-glyph[data-current="false"] { animation: use-glyph-out var(--motion-base) var(--ease-out) var(--motion-delay, 0ms) both; }
   .use-toggle[data-enter="true"][data-state="sharing"] .use-ring { animation: use-ring var(--motion-spring) var(--ease-out) var(--motion-delay, 0ms) both; }
@@ -759,9 +805,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 @keyframes fade-up { from { opacity: 0; transform: translateY(var(--motion-rise)); } }
 /* In/out pairs end on the element's own resting style, so one keyframe serves every state. */
 @keyframes fade-in { from { opacity: 0; } }
-@keyframes fade-out { from { opacity: 1; } }
-@keyframes scale-in { from { transform: scale(var(--scale-pop)); } }
-@keyframes scale-out { from { transform: none; } }
 @keyframes pop-in { from { opacity: 0; transform: scale(var(--scale-pop)); } }
 @keyframes tile-in { from { opacity: 0; transform: scale(var(--scale-enter)); } }
 @keyframes theme-pop { from { opacity: 0; transform: rotate(calc(var(--rotate-open) * -1)) scale(var(--scale-pop)); } }

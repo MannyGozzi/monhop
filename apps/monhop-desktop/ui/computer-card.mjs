@@ -16,17 +16,23 @@ import {
   el,
   icon,
   iconButton,
+  motionEase,
+  motionEnabled,
   motionMs,
+  motionToken,
   note,
   platformGlyph,
   presence,
+  reducedMotion,
   row,
   rows,
+  settle,
   sinceChanged,
   statusChip,
   swap,
   switchRow,
 } from "./dom.mjs";
+import { orbitShown, pillChange, pillLook, tweenTiming } from "./sharing-pill-model.mjs";
 
 // The longest of the play/stop animations. A card rebuilt inside this window starts its motion
 // where the last one left off, so a status poll mid-morph does not replay it from the top.
@@ -136,72 +142,280 @@ export function computerCard(
   return node;
 }
 
+// Each computer's Link capsule outlives renders: Home is rebuilt whenever a status poll changes it,
+// and a kept node keeps its tweens, orbit, hover and focus through each rebuild.
+const pills = new Map();
+const PILL_LABELS = { start: "Start sharing", sharing: "Sharing", pause: "Pause" };
+const GLYPH = ["opacity", "transform"];
+let pillsQueued = false;
+reducedMotion.addEventListener("change", () => {
+  for (const pill of pills.values()) {
+    stillPill(pill);
+    pill.shown = null;
+  }
+  queuePills();
+});
+
 function sharingPill(ctx, fingerprint, name, inUse) {
-  const { actions, busy } = ctx;
-  const state = inUse ? "active" : "idle";
-  const label = inUse ? "Pause sharing" : "Start sharing";
-  const node = el("button", {
+  const pill = pills.get(fingerprint) ?? buildPill(fingerprint);
+  pills.set(fingerprint, pill);
+  const control = pill.button;
+  control.setAttribute("aria-label", `${inUse ? "Pause sharing" : "Start sharing"} with ${name}`);
+  control.setAttribute("aria-pressed", String(inUse));
+  if (ctx.busy) control.setAttribute("aria-busy", "true");
+  else control.removeAttribute("aria-busy");
+  control.disabled = ctx.busy;
+  pill.press = () => ctx.actions.useComputer(inUse ? null : fingerprint);
+  pill.want = { ...pill.want, inUse, busy: ctx.busy };
+  queuePills();
+  return pill.wrap;
+}
+
+function pillLayer(className, children) {
+  return el("span", { className, children });
+}
+
+function buildPill(fingerprint) {
+  const [orbitSlow, orbitFast, pulse] = [
+    pillLayer("sharing-pill-orbit slow"),
+    pillLayer("sharing-pill-orbit fast"),
+    pillLayer("sharing-pill-pulse"),
+  ];
+  const [halo, tint, edge, ring, sweep] = [
+    pillLayer("sharing-pill-halo"),
+    pillLayer("sharing-pill-tint"),
+    pillLayer("sharing-pill-edge"),
+    pillLayer("sharing-pill-ring", [orbitSlow, orbitFast]),
+    pillLayer("sharing-pill-sweep"),
+  ];
+  const glyphs = [
+    ["node", pillLayer("sharing-pill-node local")],
+    ["node", pillLayer("sharing-pill-node peer")],
+    ["dot", pillLayer("sharing-pill-dot", [pulse])],
+    ["bar", pillLayer("sharing-pill-bar first")],
+    ["bar", pillLayer("sharing-pill-bar second")],
+  ];
+  const labels = Object.entries(PILL_LABELS).map(([kind, text]) =>
+    el("span", { className: kind, text }),
+  );
+  const mark = el("span", {
+    className: "sharing-pill-mark",
+    attrs: { "aria-hidden": "true" },
+    children: glyphs.map(([, node]) => node),
+  });
+  const control = el("button", {
     className: "sharing-pill",
-    attrs: {
-      type: "button",
-      "aria-label": `${label} with ${name}`,
-      "aria-pressed": String(inUse),
-      "aria-busy": busy ? "true" : null,
-    },
-    dataset: { state, busy: String(busy) },
+    attrs: { type: "button" },
+    dataset: { focusKey: `sharing-pill-${fingerprint}` },
     children: [
-      el("span", {
-        className: "sharing-pill-surfaces",
-        attrs: { "aria-hidden": "true" },
-        children: [
-          el("span", { className: "sharing-pill-surface idle" }),
-          el("span", { className: "sharing-pill-surface active" }),
-        ],
-      }),
-      el("span", {
-        className: "sharing-pill-icon",
-        attrs: { "aria-hidden": "true" },
-        children: [
-          sharingGlyph("play", !inUse),
-          sharingGlyph("square", inUse),
-          el("span", { className: "sharing-pill-live-dot", attrs: { "aria-hidden": "true" } }),
-        ],
-      }),
+      pillLayer("sharing-pill-glass"),
+      tint,
+      edge,
+      sweep,
+      ring,
+      mark,
       el("span", {
         className: "sharing-pill-label",
         attrs: { "aria-hidden": "true" },
-        children: [
-          el("span", { text: "Start sharing", dataset: { current: String(!inUse) } }),
-          el("span", { text: "Sharing", dataset: { current: String(inUse) } }),
-          el("span", {
-            className: "sharing-pill-pause",
-            text: "Pause",
-            attrs: { "aria-hidden": "true" },
-          }),
-        ],
+        children: labels,
       }),
-      el("span", { className: "sharing-pill-spinner", attrs: { "aria-hidden": "true" } }),
     ],
   });
-  node.disabled = busy;
-  node.addEventListener("click", () => actions.useComputer(inUse ? null : fingerprint));
-  // The live ring loops on the document clock, so a rebuilt pill continues it instead of restarting.
-  const loop = motionMs("--loop-live");
-  if (loop) node.style.setProperty("--live-phase", `${-Math.round(performance.now() % loop)}ms`);
-  const elapsed = sinceChanged(`home-sharing-state-${fingerprint}`, state);
-  if (elapsed < USE_MOTION_MS) {
-    node.dataset.enter = "true";
-    node.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
-  }
-  return node;
+  const wrap = el("span", { className: "sharing-pill-wrap", children: [halo, control] });
+  const parts = [
+    [control, "capsule", ["width"]],
+    [halo, "halo"],
+    [tint, "tint"],
+    [edge, "edge"],
+    [ring, "ring"],
+    [orbitSlow, "orbit"],
+    [orbitFast, "orbit"],
+    [mark, "mark"],
+    ...glyphs.map(([part, node]) => [node, part, GLYPH]),
+    ...labels.map((node) => [node, "label", GLYPH]),
+  ].map(([node, part, properties = ["opacity"]]) => ({ node, part, properties }));
+  const pill = {
+    key: fingerprint,
+    wrap,
+    button: control,
+    ring,
+    sweep,
+    orbitSlow,
+    orbitFast,
+    pulse,
+    parts,
+    want: { inUse: false, busy: false, hover: false, focus: false, rested: false },
+    shown: null,
+    tweens: [],
+    loops: [],
+    sweepTween: null,
+    pressTween: null,
+    pressed: false,
+    press: null,
+  };
+  const engage = (change) => {
+    pill.want = { ...pill.want, ...change };
+    queuePills();
+  };
+  // A render re-inserts the kept node, which re-fires enter and focus but never a leave, so only a
+  // real leave or a move of focus elsewhere ends the rest that follows a press.
+  wrap.addEventListener("pointerenter", () => engage({ hover: true }));
+  wrap.addEventListener("pointerleave", () => engage({ hover: false, rested: false }));
+  control.addEventListener("focus", () => engage({ focus: control.matches(":focus-visible") }));
+  control.addEventListener("blur", (event) =>
+    engage(event.relatedTarget ? { focus: false, rested: false } : { focus: false }),
+  );
+  control.addEventListener("click", () => {
+    engage({ rested: true });
+    pill.press?.();
+  });
+  control.addEventListener("pointerdown", (event) => {
+    if (event.button === 0) pressPill(pill, true);
+  });
+  for (const type of ["pointerup", "pointercancel", "pointerleave"])
+    control.addEventListener(type, () => pressPill(pill, false));
+  return pill;
 }
 
-function sharingGlyph(name, current) {
-  return el("span", {
-    className: "sharing-pill-glyph",
-    dataset: { current: String(current) },
-    children: [icon(name, 15)],
+// One pass after the render (or event) that asked for it, once the capsules are back in the page:
+// the look they show is read there before the new one is applied, so every change tweens from it.
+function queuePills() {
+  if (pillsQueued) return;
+  pillsQueued = true;
+  queueMicrotask(() => {
+    pillsQueued = false;
+    for (const pill of pills.values()) syncPill(pill);
   });
+}
+
+function syncPill(pill) {
+  if (!pill.wrap.isConnected) {
+    stillPill(pill);
+    pills.delete(pill.key);
+    return;
+  }
+  const next = pillLook(pill.want);
+  const change = pillChange(pill.shown, next);
+  if (!change) return;
+  const motion = change.animate && motionEnabled() && pill.wrap.getClientRects().length > 0;
+  const from = motion ? readParts(pill) : null;
+  for (const tween of pill.tweens) tween.cancel();
+  pill.tweens = [];
+  pill.wrap.dataset.state = next.state;
+  pill.wrap.dataset.busy = String(next.busy);
+  pill.wrap.dataset.pause = String(next.pause);
+  pill.wrap.dataset.lean = String(next.lean);
+  pill.shown = next;
+  if (motion) pill.tweens = tweenParts(pill, from, readParts(pill));
+  if (motion && change.sweep) {
+    pill.sweepTween?.cancel();
+    pill.sweepTween = pill.sweep.animate(
+      { transform: ["translateX(-100%)", "translateX(100%)"] },
+      { duration: motionMs("--motion-sweep"), easing: motionEase("--ease-in-out") },
+    );
+  }
+  runOrbit(pill, !reducedMotion.matches && orbitShown(next));
+}
+
+function readParts(pill) {
+  return pill.parts.map(({ node, properties }) => {
+    const style = getComputedStyle(node);
+    return Object.fromEntries(properties.map((property) => [property, style[property]]));
+  });
+}
+
+// Each value that differs glides from what was on screen, so a change mid-tween retargets.
+function tweenParts(pill, from, to) {
+  const tweens = [];
+  for (const [index, { node, part, properties }] of pill.parts.entries()) {
+    const rising = Number(to[index].opacity) > Number(from[index].opacity);
+    for (const property of properties) {
+      if (from[index][property] === to[index][property]) continue;
+      const timing = tweenTiming({ part, property, rising });
+      const tween = node.animate(
+        { [property]: [from[index][property], to[index][property]] },
+        {
+          duration: motionMs(timing.duration),
+          easing: motionEase(timing.easing),
+          delay: timing.delay ? motionMs(timing.delay) : 0,
+          fill: "both",
+        },
+      );
+      void settle(tween);
+      tweens.push(tween);
+    }
+  }
+  return tweens;
+}
+
+// The orbit, the busy arc and the dot's breath loop on the document clock, so no render restarts
+// them. Leaving, they keep turning until the ring has faded.
+function runOrbit(pill, on) {
+  if (on) {
+    if (!pill.loops.length)
+      pill.loops = [
+        loop(pill.orbitSlow, ORBIT_TURN, "--loop-orbit", "linear"),
+        loop(pill.orbitFast, ORBIT_TURN, "--loop-orbit-busy", "linear"),
+        loop(pill.pulse, livePulse(), "--loop-live", motionEase("--ease-out")),
+      ];
+    return;
+  }
+  const fade = pill.tweens.find((tween) => tween.effect.target === pill.ring);
+  if (!fade) {
+    stopLoops(pill);
+    return;
+  }
+  void settle(fade, () => {
+    if (!orbitShown(pill.shown)) stopLoops(pill);
+  });
+}
+
+const ORBIT_TURN = { transform: ["rotate(0turn)", "rotate(1turn)"] };
+
+function livePulse() {
+  const scale = motionToken("--scale-live-ring");
+  return {
+    opacity: [Number(motionToken("--opacity-live-ring")), 0],
+    transform: ["none", `scale(${scale})`],
+  };
+}
+
+function loop(node, keyframes, duration, easing) {
+  const animation = node.animate(keyframes, {
+    duration: motionMs(duration),
+    easing,
+    iterations: Infinity,
+  });
+  animation.startTime = 0;
+  return animation;
+}
+
+function stopLoops(pill) {
+  for (const animation of pill.loops) animation.cancel();
+  pill.loops = [];
+}
+
+function stillPill(pill) {
+  for (const animation of [...pill.tweens, pill.sweepTween, pill.pressTween]) animation?.cancel();
+  pill.tweens = [];
+  stopLoops(pill);
+}
+
+// Press is quick and release springs back, both on the kept node so a render mid-press keeps them.
+function pressPill(pill, down) {
+  if (down === pill.pressed || (down && pill.button.disabled)) return;
+  pill.pressed = down;
+  const from = getComputedStyle(pill.button).transform;
+  pill.pressTween?.cancel();
+  pill.pressTween = pill.button.animate(
+    { transform: [from, down ? `scale(${motionToken("--scale-press")})` : "none"] },
+    {
+      duration: motionEnabled() ? motionMs(down ? "--motion-instant" : "--motion-spring") : 0,
+      easing: motionEase(down ? "--ease-out" : "--ease-spring"),
+      fill: "forwards",
+    },
+  );
+  if (!down) void settle(pill.pressTween);
 }
 
 // One button for both states, so pressing it keeps the focus and the glyph morphs in place
