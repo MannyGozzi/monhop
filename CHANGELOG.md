@@ -10,6 +10,7 @@ Both computers can control each other. **Breaking:** update both computers, pair
 
 - Either computer's keyboard and mouse can cross to the other and back. Touching the computer being controlled (a key, a click, a scroll or a deliberate mouse movement) hands it back to its own keyboard and mouse at once.
 - Two switches on Home, "<A> can control <B>" and "<B> can control <A>", both on by default. Flipping one updates both computers; sharing reconnects for about two seconds.
+- Mac trackpad gestures work on the other computer. On Windows a pinch zooms, a three-finger swipe up or down opens Task View, and left or right switches virtual desktops. While you control the other computer, the Mac no longer zooms or opens Mission Control behind it.
 
 ### Changed
 

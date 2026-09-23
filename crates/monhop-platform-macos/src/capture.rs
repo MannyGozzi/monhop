@@ -35,23 +35,26 @@ use monhop_core::{
         control_channel,
     },
     capture_physical::{LocalTransfer, PhysicalCapture},
+    gesture_latch::{GestureLatch, TouchRecord},
 };
 
 use crate::{
     ContinuousInstant, MacError, PowerWatch, SYNTHETIC_EVENT_MARKER,
     capture_decode::{
-        ActiveDisplayBounds, CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
-        CG_EVENT_SCROLL_WHEEL, DecodedInput, DecodedPointer, EventSourceMetadata, HidKeyState,
-        LocalModifierState, PhysicalModifierLedger, PointerFields, decode_keyboard, decode_pointer,
-        decode_scroll, is_pointer_motion, should_ignore_source, should_keep_quarantine_tap,
+        ActiveDisplayBounds, CG_EVENT_DOCK_CONTROL, CG_EVENT_FLAGS_CHANGED,
+        CG_EVENT_FLUID_TOUCH_GESTURE, CG_EVENT_GESTURE, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
+        CG_EVENT_SCROLL_WHEEL, DecodedInput, DecodedPointer, EventSourceMetadata, GestureDecoder,
+        GestureFields, GestureOutput, HidKeyState, LocalModifierState, PhysicalModifierLedger,
+        PointerFields, decode_gesture, decode_keyboard, decode_pointer, decode_scroll,
+        is_pointer_motion, should_ignore_source, should_keep_quarantine_tap,
     },
     enumerate_active_displays,
     event_tap::{
         CFRelease, CG_EVENT_SOURCE_USER_DATA, CG_EVENT_TAP_OPTION_DEFAULT,
         CG_EVENT_TAP_OPTION_LISTEN_ONLY, CG_HEAD_INSERT_EVENT_TAP, CG_HID_EVENT_TAP, CGEventField,
         CGEventGetIntegerValueField, CGEventPost, CGEventRef, CGEventSetIntegerValueField,
-        CGEventTapProxy, CGEventType, EventTap, EventTapInstallError, finish_and_post_event,
-        full_input_event_mask, tap_disabled,
+        CGEventTapProxy, CGEventType, EventTap, EventTapInstallError, capture_event_mask,
+        finish_and_post_event, tap_disabled,
     },
     hid_to_mac_virtual_key, mac_virtual_key_to_hid, preflight_permissions,
 };
@@ -82,6 +85,16 @@ const CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2: CGEventField = 94;
 const CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS: CGEventField = 88;
 const CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1: CGEventField = 96;
 const CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2: CGEventField = 97;
+// Private gesture fields, named as in capture_decode::GestureFields.
+const CG_GESTURE_HID_TYPE: CGEventField = 110;
+const CG_GESTURE_ZOOM: CGEventField = 113;
+const CG_GESTURE_ROTATION: CGEventField = 114;
+const CG_GESTURE_SWIPE_MOTION: CGEventField = 123;
+const CG_GESTURE_SWIPE_PROGRESS: CGEventField = 124;
+const CG_GESTURE_SWIPE_VELOCITY_X: CGEventField = 129;
+const CG_GESTURE_SWIPE_VELOCITY_Y: CGEventField = 130;
+const CG_GESTURE_PHASE: CGEventField = 132;
+const CG_GESTURE_STAGE: CGEventField = 143;
 const CG_EVENT_SOURCE_STATE_HID_SYSTEM: CGEventSourceStateID = 1;
 const RUN_LOOP_SLICE: Duration = Duration::from_millis(10);
 const MAX_OWNER_THREAD_GAP: Duration = Duration::from_secs(5);
@@ -127,7 +140,10 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFPreferencesAnyApplication: CFStringRef;
-    fn CFPreferencesCopyAppValue(key: CFStringRef, application: CFStringRef) -> CFTypeRef;
+    pub(crate) fn CFPreferencesCopyAppValue(
+        key: CFStringRef,
+        application: CFStringRef,
+    ) -> CFTypeRef;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,10 +473,21 @@ impl Drop for NativeCapture {
 /// Coarse class of one callback record for episode tallies. Key identity is never carried.
 #[derive(Clone, Copy)]
 enum EpisodeEvent {
-    Motion { location: Point, zero_delta: bool },
-    Button { location: Point },
+    Motion {
+        location: Point,
+        zero_delta: bool,
+    },
+    Button {
+        location: Point,
+    },
     Key,
     Scroll,
+    Gesture {
+        unmapped: bool,
+        record: TouchRecord,
+        /// The latch closed an idle session before this record.
+        expired: bool,
+    },
 }
 
 impl EpisodeEvent {
@@ -476,12 +503,26 @@ impl EpisodeEvent {
     }
 }
 
-/// Everything the tap receives except keyboard and scroll records, the pointer's motion and buttons.
+const fn is_gesture_record(event_type: CGEventType) -> bool {
+    matches!(
+        event_type,
+        CG_EVENT_GESTURE | CG_EVENT_DOCK_CONTROL | CG_EVENT_FLUID_TOUCH_GESTURE
+    )
+}
+
+/// Everything the tap receives except keyboard, scroll and gesture records: the pointer's motion
+/// and buttons.
 const fn is_pointer_record(event_type: CGEventType) -> bool {
     !matches!(
         event_type,
         CG_EVENT_KEY_DOWN | CG_EVENT_KEY_UP | CG_EVENT_FLAGS_CHANGED | CG_EVENT_SCROLL_WHEEL
-    )
+    ) && !is_gesture_record(event_type)
+}
+
+/// Whether the latch, which expires an idle session only at its next record, dropped the session
+/// that was open at the `previous` gesture record by `now`.
+fn latch_expired(latch: &GestureLatch, previous: Duration, now: Duration) -> bool {
+    latch.latched(previous).is_some() && latch.latched(now).is_none()
 }
 
 /// Monotonic per-thread counts of records `should_ignore_source` skipped; episodes diff them.
@@ -491,6 +532,8 @@ struct IgnoredSources {
     foreign: u64,
     /// The subset of `foreign` that carries a cursor location.
     foreign_pointer: u64,
+    /// The subset of `foreign` that is a trackpad gesture record, which the latch never sees.
+    foreign_gesture: u64,
 }
 
 impl IgnoredSources {
@@ -499,6 +542,7 @@ impl IgnoredSources {
             own: self.own.wrapping_sub(start.own),
             foreign: self.foreign.wrapping_sub(start.foreign),
             foreign_pointer: self.foreign_pointer.wrapping_sub(start.foreign_pointer),
+            foreign_gesture: self.foreign_gesture.wrapping_sub(start.foreign_gesture),
         }
     }
 }
@@ -547,6 +591,11 @@ struct RemoteEpisode {
     key_passed: u64,
     button_passed: u64,
     scroll_passed: u64,
+    gesture_passed: u64,
+    gesture_unmapped: u64,
+    touch_opens: u64,
+    touch_closes: u64,
+    touch_expiries: u64,
     drift_max: f64,
     passed_drift_max: f64,
     last_location: Option<Point>,
@@ -574,6 +623,11 @@ impl RemoteEpisode {
             key_passed: 0,
             button_passed: 0,
             scroll_passed: 0,
+            gesture_passed: 0,
+            gesture_unmapped: 0,
+            touch_opens: 0,
+            touch_closes: 0,
+            touch_expiries: 0,
             drift_max: 0.0,
             passed_drift_max: 0.0,
             last_location: None,
@@ -624,6 +678,21 @@ impl RemoteEpisode {
             EpisodeEvent::Scroll if !withheld => {
                 self.scroll_passed = self.scroll_passed.saturating_add(1);
             }
+            EpisodeEvent::Gesture {
+                unmapped,
+                record,
+                expired,
+            } => {
+                self.gesture_unmapped = self.gesture_unmapped.saturating_add(u64::from(unmapped));
+                self.gesture_passed = self.gesture_passed.saturating_add(u64::from(!withheld));
+                self.touch_opens = self
+                    .touch_opens
+                    .saturating_add(u64::from(record == TouchRecord::Opens));
+                self.touch_closes = self
+                    .touch_closes
+                    .saturating_add(u64::from(record == TouchRecord::Closes));
+                self.touch_expiries = self.touch_expiries.saturating_add(u64::from(expired));
+            }
             EpisodeEvent::Button { .. } | EpisodeEvent::Key | EpisodeEvent::Scroll => {}
         }
     }
@@ -644,8 +713,10 @@ impl RemoteEpisode {
     fn summary(&self, now: Duration, ignored: IgnoredSources, end: EpisodeEnd) -> String {
         format!(
             "capture episode: {} ms remote, motion {} suppressed / {} passed ({} zero-delta), \
-             other passed key {} button {} scroll {}, ignored-source own {} foreign {} \
-             (pointer {}), location drift max {:.0} px last {}, passed-pointer drift max {:.0} px, \
+             other passed key {} button {} scroll {} gesture {}, unmapped gestures {}, \
+             touch latch opens {} closes {} idle expiries {}, \
+             ignored-source own {} foreign {} (pointer {}, gesture {}), \
+             location drift max {:.0} px last {}, passed-pointer drift max {:.0} px, \
              pinned {}, handoff posts {}, transfer posts {} (+{} cursor) last {}, ended by {}",
             self.lapsed
                 .unwrap_or(now)
@@ -657,9 +728,15 @@ impl RemoteEpisode {
             self.key_passed,
             self.button_passed,
             self.scroll_passed,
+            self.gesture_passed,
+            self.gesture_unmapped,
+            self.touch_opens,
+            self.touch_closes,
+            self.touch_expiries,
             ignored.own,
             ignored.foreign,
             ignored.foreign_pointer,
+            ignored.foreign_gesture,
             self.drift_max,
             ShownPoint(self.last_location),
             self.passed_drift_max,
@@ -685,6 +762,12 @@ struct CallbackState {
     local_modifiers: LocalModifierState,
     physical_modifiers: PhysicalModifierLedger,
     unsupported_events: u64,
+    /// Keeps each touch session's gesture records on the route it began on.
+    gesture_latch: GestureLatch,
+    /// When the previous gesture record arrived, to see the latch expire an idle session.
+    last_gesture_at: Duration,
+    gestures: GestureDecoder,
+    gestures_unmapped: u64,
     /// Where the cursor holds while remote; owed back to it if the route ends without a restore point.
     remote_pin: Option<Point>,
     episode: Option<RemoteEpisode>,
@@ -693,7 +776,12 @@ struct CallbackState {
 impl Drop for CallbackState {
     fn drop(&mut self) {
         self.end_episode(EpisodeEnd::Stopped(self.shared.stop.reason()));
-        log::info!("ignored {} unsupported events", self.unsupported_events);
+        self.log_finished_gestures();
+        log::info!(
+            "ignored {} unsupported events and {} unmapped gesture records",
+            self.unsupported_events,
+            self.gestures_unmapped
+        );
     }
 }
 
@@ -706,18 +794,24 @@ thread_local! {
             own: 0,
             foreign: 0,
             foreign_pointer: 0,
+            foreign_gesture: 0,
         })
     };
 }
 
-fn count_ignored_source(own: bool, pointer: bool) {
+fn count_ignored_source(own: bool, event_type: CGEventType) {
     let _ = IGNORED_SOURCES.try_with(|tally| {
         let mut next = tally.get();
         if own {
             next.own = next.own.wrapping_add(1);
         } else {
             next.foreign = next.foreign.wrapping_add(1);
-            next.foreign_pointer = next.foreign_pointer.wrapping_add(u64::from(pointer));
+            next.foreign_pointer = next
+                .foreign_pointer
+                .wrapping_add(u64::from(is_pointer_record(event_type)));
+            next.foreign_gesture = next
+                .foreign_gesture
+                .wrapping_add(u64::from(is_gesture_record(event_type)));
         }
         tally.set(next);
     });
@@ -852,6 +946,13 @@ impl CallbackState {
                 "{}",
                 episode.summary(self.shared.origin.elapsed(), ignored, end)
             );
+        }
+    }
+
+    /// Owner thread only: the tap callback leaves these lines for the next loop tick.
+    fn log_finished_gestures(&mut self) {
+        for finished in self.gestures.take_finished() {
+            log::info!("{finished}");
         }
     }
 
@@ -1032,6 +1133,52 @@ impl CallbackState {
         }
     }
 
+    /// Every record of a touch session follows the route the session began on, so a gesture meant
+    /// for the other computer never reaches local apps, and a local one never leaves.
+    fn gesture_event(&mut self, event_type: CGEventType, event: CGEventRef) -> bool {
+        // SAFETY: the live callback event exposes every field as a plain number; a private field
+        // this record lacks reads as zero.
+        let fields = unsafe {
+            GestureFields {
+                event_type,
+                hid_type: CGEventGetIntegerValueField(event, CG_GESTURE_HID_TYPE),
+                phase: CGEventGetIntegerValueField(event, CG_GESTURE_PHASE),
+                zoom: CGEventGetDoubleValueField(event, CG_GESTURE_ZOOM),
+                rotation: CGEventGetDoubleValueField(event, CG_GESTURE_ROTATION),
+                motion: CGEventGetIntegerValueField(event, CG_GESTURE_SWIPE_MOTION),
+                progress: CGEventGetDoubleValueField(event, CG_GESTURE_SWIPE_PROGRESS),
+                velocity_x: CGEventGetDoubleValueField(event, CG_GESTURE_SWIPE_VELOCITY_X),
+                velocity_y: CGEventGetDoubleValueField(event, CG_GESTURE_SWIPE_VELOCITY_Y),
+                stage: CGEventGetIntegerValueField(event, CG_GESTURE_STAGE),
+            }
+        };
+        let remote = self.remote();
+        let now = self.shared.origin.elapsed();
+        let decoded = decode_gesture(fields, &mut self.gestures);
+        let expired = latch_expired(&self.gesture_latch, self.last_gesture_at, now);
+        self.last_gesture_at = now;
+        let decision = self.gesture_latch.decide(decoded.record, remote, now);
+        match decoded.output {
+            GestureOutput::Event(event) if decision.publish => {
+                self.event_for_route(event, remote);
+            }
+            GestureOutput::Unmapped => {
+                self.gestures_unmapped = self.gestures_unmapped.saturating_add(1);
+            }
+            GestureOutput::Event(_) | GestureOutput::Quiet => {}
+        }
+        // A stopped capture fails open, as every other record does.
+        let withheld = !decision.deliver_locally && !self.shared.stop.is_stopped();
+        self.tally(
+            EpisodeEvent::Gesture {
+                unmapped: decoded.output == GestureOutput::Unmapped,
+                record: decoded.record,
+                expired,
+            },
+            withheld,
+        )
+    }
+
     fn refresh_active_display_bounds(&mut self) -> bool {
         let Ok(bounds) = current_active_display_bounds() else {
             return false;
@@ -1116,6 +1263,9 @@ impl CallbackState {
                     SYNTHETIC_EVENT_MARKER,
                 ));
                 self.tally(EpisodeEvent::Scroll, withheld)
+            }
+            CG_EVENT_GESTURE | CG_EVENT_DOCK_CONTROL | CG_EVENT_FLUID_TOUCH_GESTURE => {
+                self.gesture_event(event_type, event)
             }
             _ => {
                 // SAFETY: these getters borrow the event, which remains live for the callback.
@@ -1202,10 +1352,7 @@ unsafe extern "C" fn event_callback(
         }
     };
     if should_ignore_source(source, SYNTHETIC_EVENT_MARKER) {
-        count_ignored_source(
-            source.user_data == SYNTHETIC_EVENT_MARKER,
-            is_pointer_record(event_type),
-        );
+        count_ignored_source(source.user_data == SYNTHETIC_EVENT_MARKER, event_type);
         return event;
     }
     if with_callback(|state| state.native_event(event_type, event, source)) {
@@ -1265,6 +1412,10 @@ fn run(
             local_modifiers: LocalModifierState::default(),
             physical_modifiers: PhysicalModifierLedger::default(),
             unsupported_events: 0,
+            gesture_latch: GestureLatch::new(),
+            last_gesture_at: Duration::ZERO,
+            gestures: GestureDecoder::default(),
+            gestures_unmapped: 0,
             remote_pin: None,
             episode: None,
         });
@@ -1342,6 +1493,7 @@ fn run(
         let mut draining = false;
         with_callback(|state| {
             state.physical.tick(shared.origin.elapsed(), &shared.stop);
+            state.log_finished_gestures();
             if !state.remote() {
                 state.return_cursor_to_pin();
             }
@@ -1680,12 +1832,12 @@ impl Resources {
         } else {
             CG_EVENT_TAP_OPTION_DEFAULT
         };
-        // The event mask contains only documented input event constants and the callback uses
-        // thread-local state established before this explicit tap is created.
+        // The mask holds documented input types plus the private gesture types, and the callback
+        // uses thread-local state established before this explicit tap is created.
         let tap = EventTap::install(
             CG_HEAD_INSERT_EVENT_TAP,
             options,
-            full_input_event_mask(),
+            capture_event_mask(),
             Some(event_callback),
             ptr::null_mut(),
         )
@@ -1767,9 +1919,12 @@ mod callback_tests {
     use super::*;
     use crate::capture_decode::{
         CG_EVENT_MOUSE_MOVED, CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_UP,
-        CG_EVENT_SOURCE_STATE_HID_SYSTEM,
+        CG_EVENT_SOURCE_STATE_HID_SYSTEM, DOCK_SWIPE_COMMIT_PROGRESS, DOCK_SWIPE_VERTICAL_UP_SIGN,
     };
-    use monhop_core::{FloorState, LogicalRect, LogicalSize, SharedFloor};
+    use monhop_core::{
+        FloorState, GesturePhase, LogicalRect, LogicalSize, PointerGesture, SharedFloor,
+        SystemGesture, gesture_latch::TOUCH_STREAM_IDLE,
+    };
 
     fn callback_fixture() -> (CallbackState, CaptureConsumer) {
         callback_fixture_with(None)
@@ -1817,6 +1972,10 @@ mod callback_tests {
             local_modifiers: LocalModifierState::default(),
             physical_modifiers: PhysicalModifierLedger::default(),
             unsupported_events: 0,
+            gesture_latch: GestureLatch::new(),
+            last_gesture_at: Duration::ZERO,
+            gestures: GestureDecoder::default(),
+            gestures_unmapped: 0,
             remote_pin: None,
             episode: None,
         };
@@ -1923,7 +2082,7 @@ mod callback_tests {
         suppressed
     }
 
-    // SAFETY: matches the ApplicationServices SDK declaration.
+    // SAFETY: matches the ApplicationServices SDK declarations.
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         fn CGEventCreateScrollWheelEvent2(
@@ -1934,6 +2093,8 @@ mod callback_tests {
             wheel2: i32,
             wheel3: i32,
         ) -> CGEventRef;
+        fn CGEventSetType(event: CGEventRef, event_type: CGEventType);
+        fn CGEventSetDoubleValueField(event: CGEventRef, field: CGEventField, value: f64);
     }
 
     const CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
@@ -1960,6 +2121,124 @@ mod callback_tests {
         // SAFETY: event was created above and never transferred.
         unsafe { CFRelease(event) };
         suppressed
+    }
+
+    /// Returns whether the callback withheld one physical gesture record, built as WebKit builds
+    /// synthetic ones: a bare event given the private type and fields, never posted.
+    fn deliver_gesture(state: &mut CallbackState, fields: GestureFields) -> bool {
+        // SAFETY: a null source requests the default source; the owned event is never posted.
+        let event = unsafe { CGEventCreate(ptr::null()) };
+        assert!(!event.is_null());
+        // SAFETY: event is owned and non-null until the release below.
+        unsafe {
+            CGEventSetType(event, fields.event_type);
+            for (field, value) in [
+                (CG_GESTURE_HID_TYPE, fields.hid_type),
+                (CG_GESTURE_PHASE, fields.phase),
+                (CG_GESTURE_SWIPE_MOTION, fields.motion),
+                (CG_GESTURE_STAGE, fields.stage),
+            ] {
+                CGEventSetIntegerValueField(event, field, value);
+            }
+            // Zoom and rotation share one slot, as a real record carries only one of them.
+            for (field, value) in [
+                (CG_GESTURE_ZOOM, fields.zoom),
+                (CG_GESTURE_ROTATION, fields.rotation),
+                (CG_GESTURE_SWIPE_PROGRESS, fields.progress),
+                (CG_GESTURE_SWIPE_VELOCITY_X, fields.velocity_x),
+                (CG_GESTURE_SWIPE_VELOCITY_Y, fields.velocity_y),
+            ] {
+                if value != 0.0 {
+                    CGEventSetDoubleValueField(event, field, value);
+                }
+            }
+        }
+        let withheld = state.native_event(fields.event_type, event, physical_source());
+        // SAFETY: event was created above and never transferred.
+        unsafe { CFRelease(event) };
+        withheld
+    }
+
+    fn touch(hid_type: i64) -> GestureFields {
+        GestureFields {
+            event_type: CG_EVENT_GESTURE,
+            hid_type,
+            ..GestureFields::default()
+        }
+    }
+
+    const TOUCH_STARTED: i64 = 61;
+    const TOUCH_ENDED: i64 = 62;
+    const SCROLL_COMPANION: i64 = 6;
+    const PHASE_BEGAN: i64 = 1;
+    const PHASE_CHANGED: i64 = 2;
+    const PHASE_ENDED: i64 = 4;
+
+    fn pinch(phase: i64, zoom: f64) -> GestureFields {
+        GestureFields {
+            phase,
+            zoom,
+            ..touch(8)
+        }
+    }
+
+    /// A vertical Dock swipe record whose progress is a multiple of the commit.
+    fn swipe_up(phase: i64, commits: f64) -> GestureFields {
+        GestureFields {
+            event_type: CG_EVENT_DOCK_CONTROL,
+            hid_type: 23,
+            phase,
+            motion: 2,
+            progress: DOCK_SWIPE_VERTICAL_UP_SIGN * DOCK_SWIPE_COMMIT_PROGRESS * commits,
+            ..GestureFields::default()
+        }
+    }
+
+    /// One whole touch session: a pinch, a two-finger scroll's companion and a committed swipe up.
+    fn touch_session() -> [GestureFields; 9] {
+        [
+            touch(TOUCH_STARTED),
+            touch(SCROLL_COMPANION),
+            pinch(PHASE_BEGAN, 0.125),
+            pinch(PHASE_CHANGED, -0.25),
+            pinch(PHASE_ENDED, 0.0),
+            swipe_up(PHASE_BEGAN, 0.0),
+            swipe_up(PHASE_CHANGED, 2.0),
+            swipe_up(PHASE_ENDED, 3.0),
+            touch(TOUCH_ENDED),
+        ]
+    }
+
+    /// The capture events `touch_session` publishes, in order.
+    fn touch_session_events() -> [CaptureEvent; 4] {
+        [
+            CaptureEvent::gesture(PointerGesture::Magnify {
+                phase: GesturePhase::Began,
+                delta: 0.125,
+            }),
+            CaptureEvent::gesture(PointerGesture::Magnify {
+                phase: GesturePhase::Changed,
+                delta: -0.25,
+            }),
+            CaptureEvent::gesture(PointerGesture::Magnify {
+                phase: GesturePhase::Ended,
+                delta: 0.0,
+            }),
+            CaptureEvent::SystemGesture(SystemGesture::Overview),
+        ]
+    }
+
+    fn queued(consumer: &mut CaptureConsumer) -> Vec<(CaptureEvent, bool)> {
+        std::iter::from_fn(|| consumer.try_pop_tagged().unwrap())
+            .map(|record| (record.event, record.remote))
+            .collect()
+    }
+
+    /// `route_remote`, with the bare-event path warmed as well, so the lease outlasts the test.
+    fn route_remote_for_gestures(state: &mut CallbackState, consumer: &mut CaptureConsumer) {
+        // SAFETY: the owned event is released right away and never posted.
+        unsafe { CFRelease(CGEventCreate(ptr::null())) };
+        route_remote(state, consumer);
     }
 
     fn assert_capture_untouched(state: &CallbackState, consumer: &mut CaptureConsumer) {
@@ -2312,10 +2591,10 @@ mod callback_tests {
     }
 
     #[test]
-    fn foreign_pointer_records_are_counted_apart_from_other_foreign_records() {
+    fn foreign_pointer_and_gesture_records_are_counted_apart_from_other_foreign_records() {
         let before = ignored_sources().expect("live thread");
-        // SAFETY: fixed event types and a finite point; both owned events are released below and
-        // never posted.
+        // SAFETY: fixed event types, a finite point and a null default source; every owned event
+        // is released below and never posted.
         let events = unsafe {
             [
                 (
@@ -2331,6 +2610,7 @@ mod callback_tests {
                     CG_EVENT_KEY_DOWN,
                     CGEventCreateKeyboardEvent(ptr::null(), 0, true),
                 ),
+                (CG_EVENT_GESTURE, CGEventCreate(ptr::null())),
             ]
         };
         for (event_type, event) in events {
@@ -2348,8 +2628,9 @@ mod callback_tests {
             ignored_sources().expect("live thread").since(before),
             IgnoredSources {
                 own: 0,
-                foreign: 2,
+                foreign: 3,
                 foreign_pointer: 1,
+                foreign_gesture: 1,
             }
         );
     }
@@ -2360,6 +2641,220 @@ mod callback_tests {
         state.pointer_position = Some(Point::new(50.0, 50.0));
         assert!(!state.remote());
         state.return_cursor_to_pin_with(|_| panic!("the owner loop runs this every local tick"));
+    }
+
+    #[test]
+    fn a_remote_touch_session_is_withheld_whole_and_forwards_its_gestures() {
+        let (mut state, mut consumer) = callback_fixture();
+        route_remote_for_gestures(&mut state, &mut consumer);
+        for fields in touch_session() {
+            assert!(
+                deliver_gesture(&mut state, fields),
+                "the Mac never sees it: {fields:?}"
+            );
+        }
+        assert_eq!(
+            queued(&mut consumer),
+            touch_session_events().map(|event| (event, true))
+        );
+        assert_eq!(state.shared.stop.reason(), None);
+        let episode = state.episode.expect("activation opens an episode");
+        assert_eq!((episode.gesture_passed, episode.gesture_unmapped), (0, 0));
+        assert_eq!(
+            (
+                episode.touch_opens,
+                episode.touch_closes,
+                episode.touch_expiries
+            ),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_session_counts_as_expired_only_once_a_full_idle_limit_has_passed() {
+        let opened_at = Duration::from_millis(100);
+        let mut latch = GestureLatch::new();
+        assert!(
+            !latch_expired(&latch, Duration::ZERO, opened_at),
+            "none open"
+        );
+        latch.decide(TouchRecord::Opens, true, opened_at);
+        let idle = opened_at + TOUCH_STREAM_IDLE;
+        assert!(!latch_expired(
+            &latch,
+            opened_at,
+            idle - Duration::from_millis(1)
+        ));
+        assert!(latch_expired(&latch, opened_at, idle));
+        latch.decide(TouchRecord::Closes, true, opened_at);
+        assert!(
+            !latch_expired(&latch, opened_at, idle),
+            "closed, not expired"
+        );
+    }
+
+    #[test]
+    fn a_local_touch_session_passes_and_reaches_only_take_back() {
+        let (mut state, mut consumer) = callback_fixture();
+        for fields in touch_session() {
+            assert!(
+                !deliver_gesture(&mut state, fields),
+                "local apps receive it: {fields:?}"
+            );
+        }
+        assert_eq!(
+            queued(&mut consumer),
+            touch_session_events().map(|event| (event, false)),
+            "published tagged local, which the source controller ignores"
+        );
+        assert_eq!(state.shared.stop.reason(), None);
+    }
+
+    #[test]
+    fn a_touch_session_keeps_the_route_it_began_on_across_a_flip() {
+        let (mut state, mut consumer) = callback_fixture();
+        route_remote_for_gestures(&mut state, &mut consumer);
+        assert!(deliver_gesture(&mut state, touch(TOUCH_STARTED)));
+        assert!(deliver_gesture(&mut state, pinch(PHASE_BEGAN, 0.125)));
+        // Without a pin the owner-thread restore posts nothing to this machine.
+        state.remote_pin = None;
+        assert_eq!(
+            state.restore_local_without_transfer(2),
+            ControlCompletion::Applied
+        );
+        assert!(!state.remote());
+        for fields in [pinch(PHASE_CHANGED, 0.25), touch(TOUCH_ENDED)] {
+            assert!(
+                deliver_gesture(&mut state, fields),
+                "the local app never saw this session begin: {fields:?}"
+            );
+        }
+        assert!(!deliver_gesture(&mut state, touch(TOUCH_STARTED)));
+        assert!(!deliver_gesture(&mut state, pinch(PHASE_BEGAN, 0.5)));
+        let magnify =
+            |phase, delta| CaptureEvent::gesture(PointerGesture::Magnify { phase, delta });
+        assert_eq!(
+            queued(&mut consumer),
+            [
+                (magnify(GesturePhase::Began, 0.125), true),
+                (
+                    CaptureEvent::RouteChanged {
+                        remote: false,
+                        revision: 2,
+                    },
+                    false
+                ),
+                (magnify(GesturePhase::Began, 0.5), false),
+            ],
+            "the remote tail is neither forwarded nor delivered"
+        );
+
+        let (mut state, mut consumer) = callback_fixture();
+        assert!(!deliver_gesture(&mut state, touch(TOUCH_STARTED)));
+        assert!(!deliver_gesture(&mut state, pinch(PHASE_BEGAN, 0.125)));
+        assert_eq!(queued(&mut consumer).len(), 1);
+        route_remote_for_gestures(&mut state, &mut consumer);
+        for fields in [pinch(PHASE_CHANGED, 0.25), touch(TOUCH_ENDED)] {
+            assert!(
+                !deliver_gesture(&mut state, fields),
+                "a local session ends locally: {fields:?}"
+            );
+        }
+        assert!(queued(&mut consumer).is_empty(), "and is never forwarded");
+        assert!(deliver_gesture(&mut state, touch(TOUCH_STARTED)));
+        assert_eq!(state.shared.stop.reason(), None);
+    }
+
+    #[test]
+    fn unmapped_gestures_are_counted_withheld_while_remote_and_never_stop_capture() {
+        let unmapped = [
+            GestureFields {
+                event_type: CG_EVENT_FLUID_TOUCH_GESTURE,
+                hid_type: 16,
+                phase: PHASE_CHANGED,
+                ..GestureFields::default()
+            },
+            touch(16),
+            GestureFields {
+                event_type: CG_EVENT_DOCK_CONTROL,
+                phase: PHASE_CHANGED,
+                ..GestureFields::default()
+            },
+            pinch(PHASE_CHANGED, f64::NAN),
+        ];
+        for remote in [false, true] {
+            let (mut state, mut consumer) = callback_fixture();
+            if remote {
+                route_remote_for_gestures(&mut state, &mut consumer);
+            }
+            for fields in unmapped {
+                assert_eq!(deliver_gesture(&mut state, fields), remote, "{fields:?}");
+            }
+            assert_eq!(state.gestures_unmapped, 4);
+            assert_eq!(state.unsupported_events, 0);
+            assert_eq!(
+                state.episode.map(|episode| episode.gesture_unmapped),
+                remote.then_some(4)
+            );
+            assert_capture_untouched(&state, &mut consumer);
+        }
+    }
+
+    #[test]
+    fn a_stopped_capture_delivers_a_remote_session_locally() {
+        let (mut state, mut consumer) = callback_fixture();
+        route_remote_for_gestures(&mut state, &mut consumer);
+        assert!(deliver_gesture(&mut state, touch(TOUCH_STARTED)));
+        state.shared.stop.stop(StopReason::NativeFailure);
+        assert!(!deliver_gesture(&mut state, pinch(PHASE_CHANGED, 0.25)));
+    }
+
+    #[test]
+    fn a_physical_gesture_while_receiving_takes_back_and_still_reaches_local_apps() {
+        let receiving_gate = || {
+            let floor = SharedFloor::new();
+            let receiving = floor
+                .transition(floor.snapshot(), FloorState::Receiving)
+                .unwrap();
+            let gate = TakeBackGate::new(floor);
+            gate.open_injection(receiving.generation);
+            gate
+        };
+        let gate = receiving_gate();
+        let (mut state, _consumer) = callback_fixture_with(Some(gate.clone()));
+        for fields in [
+            touch(TOUCH_STARTED),
+            pinch(PHASE_BEGAN, 0.0),
+            swipe_up(PHASE_BEGAN, 0.0),
+        ] {
+            assert!(!deliver_gesture(&mut state, fields));
+        }
+        assert!(
+            gate.take_triggered().is_none(),
+            "a bare phase or a swipe short of its commit changes nothing"
+        );
+        assert!(!deliver_gesture(&mut state, swipe_up(PHASE_CHANGED, 2.0)));
+        assert!(gate.take_triggered().is_some(), "the committed swipe does");
+
+        let gate = receiving_gate();
+        let (mut state, _consumer) = callback_fixture_with(Some(gate.clone()));
+        assert!(!deliver_gesture(&mut state, pinch(PHASE_CHANGED, 0.05)));
+        assert!(
+            gate.take_triggered().is_some(),
+            "so does a pinch that zooms"
+        );
+    }
+
+    #[test]
+    fn gesture_records_are_not_pointer_records() {
+        for gesture in [
+            CG_EVENT_GESTURE,
+            CG_EVENT_DOCK_CONTROL,
+            CG_EVENT_FLUID_TOUCH_GESTURE,
+        ] {
+            assert!(!is_pointer_record(gesture));
+        }
+        assert!(is_pointer_record(CG_EVENT_MOUSE_MOVED));
     }
 }
 
@@ -2417,6 +2912,22 @@ mod episode_tests {
             false,
         );
         episode.record(EpisodeEvent::Scroll, false);
+        episode.record(
+            EpisodeEvent::Gesture {
+                unmapped: true,
+                record: TouchRecord::Opens,
+                expired: true,
+            },
+            true,
+        );
+        episode.record(
+            EpisodeEvent::Gesture {
+                unmapped: false,
+                record: TouchRecord::Closes,
+                expired: false,
+            },
+            false,
+        );
         episode.lapse(Duration::from_millis(4_100));
         episode.lapse(Duration::from_millis(5_000));
         episode.record(motion(0.0, 0.0, false), false);
@@ -2427,16 +2938,20 @@ mod episode_tests {
             own: 5,
             foreign: 4,
             foreign_pointer: 3,
+            foreign_gesture: 1,
         }
         .since(IgnoredSources {
             own: 3,
             foreign: 2,
             foreign_pointer: 2,
+            foreign_gesture: 0,
         });
         assert_eq!(
             episode.summary(Duration::from_millis(6_100), ignored, EpisodeEnd::Restored),
             "capture episode: 4000 ms remote, motion 2 suppressed / 1 passed (1 zero-delta), \
-             other passed key 1 button 1 scroll 1, ignored-source own 2 foreign 2 (pointer 1), \
+             other passed key 1 button 1 scroll 1 gesture 1, unmapped gestures 1, \
+             touch latch opens 1 closes 1 idle expiries 1, \
+             ignored-source own 2 foreign 2 (pointer 1, gesture 1), \
              location drift max 434 px last 1700,467, passed-pointer drift max 434 px, \
              pinned 1728,467, handoff posts 1, transfer posts 2 (+0 cursor) last 10,20, \
              ended by restore"

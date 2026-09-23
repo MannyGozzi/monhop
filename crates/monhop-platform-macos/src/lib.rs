@@ -12,12 +12,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use monhop_core::{
-    DeviceId, Display, DisplayId, HidUsage, LogicalRect, LogicalSize, MouseButton, NativeSize,
-    Point,
+    DeviceId, Display, DisplayId, GesturePhase, HidUsage, LogicalRect, LogicalSize, MouseButton,
+    NativeSize, Point, PointerGesture, SystemGesture,
+    chord::{MAC_LOOK_UP, MAC_ZOOM_IN, MAC_ZOOM_OUT},
 };
 
 pub use monhop_core::{capture, capture_control, capture_physical};
 pub mod capture_decode;
+pub mod gesture_inject;
+use gesture_inject::{
+    ChordKeyEvent, MacChord, PinchSteps, StuckChordKeys, SymbolicHotkeys, chord_key_events,
+    post_chord_events, system_gesture_chord,
+};
 #[cfg(target_os = "macos")]
 mod continuous_clock;
 #[cfg(target_os = "macos")]
@@ -69,6 +75,10 @@ pub const MAC_EVENT_FLAG_SHIFT: u64 = 0x0002_0000;
 pub const MAC_EVENT_FLAG_CONTROL: u64 = 0x0004_0000;
 pub const MAC_EVENT_FLAG_OPTION: u64 = 0x0008_0000;
 pub const MAC_EVENT_FLAG_COMMAND: u64 = 0x0010_0000;
+/// Set on arrow-key events, as on the numeric keypad's.
+pub const MAC_EVENT_FLAG_NUMERIC_PAD: u64 = 0x0020_0000;
+/// Set on function, arrow and navigation-key events.
+pub const MAC_EVENT_FLAG_SECONDARY_FN: u64 = 0x0080_0000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacDisplay {
@@ -269,6 +279,12 @@ pub struct MacInjector {
     held_buttons: BTreeMap<MouseButton, u8>,
     scroll_residual: ScrollResidual,
     cursor: CursorState,
+    pinch: PinchSteps,
+    stuck_chord_keys: StuckChordKeys,
+    /// Read once here, so a binding the user changes mid-session applies to the next session.
+    hotkeys: SymbolicHotkeys,
+    /// Gestures with no macOS action: rotations, smart zooms, system gestures with nothing bound.
+    unsupported_gestures: u64,
 }
 
 impl MacInjector {
@@ -289,12 +305,18 @@ impl MacInjector {
                 .into_iter()
                 .map(|display| display.logical_bounds),
         )?;
+        let hotkeys = backend::symbolic_hotkeys();
+        log::info!("system gesture hotkeys: {hotkeys}");
         Ok(Self {
             destination,
             held_keys: BTreeSet::new(),
             held_buttons: BTreeMap::new(),
             scroll_residual: ScrollResidual::default(),
             cursor,
+            pinch: PinchSteps::default(),
+            stuck_chord_keys: StuckChordKeys::default(),
+            hotkeys,
+            unsupported_gestures: 0,
         })
     }
 
@@ -319,6 +341,7 @@ impl MacInjector {
             SYNTHETIC_EVENT_MARKER,
             flags,
         )?;
+        self.stuck_chord_keys.forget(virtual_key);
         if is_down {
             self.held_keys.insert(usage);
         } else {
@@ -403,6 +426,77 @@ impl MacInjector {
         })
     }
 
+    /// Injects one validated gesture; phases arrive in order, normalized by the receiver. A pinch
+    /// zooms in Cmd± steps and a force click is Look Up; the rest have no macOS action.
+    pub fn gesture(&mut self, gesture: PointerGesture) -> Result<(), MacError> {
+        match gesture {
+            PointerGesture::Magnify { phase, delta } => {
+                let steps = self.pinch.steps(phase, delta);
+                let step = MacChord::new(if steps > 0 { MAC_ZOOM_IN } else { MAC_ZOOM_OUT });
+                for _ in 0..steps.unsigned_abs() {
+                    if let Err(error) = self.chord(step) {
+                        self.pinch.reset();
+                        return Err(error);
+                    }
+                }
+                Ok(())
+            }
+            PointerGesture::ForceClick => self.chord(MacChord::new(MAC_LOOK_UP)),
+            PointerGesture::Rotate { phase, .. } => {
+                if phase == GesturePhase::Began {
+                    self.count_unsupported_gesture();
+                }
+                Ok(())
+            }
+            PointerGesture::SmartMagnify => {
+                self.count_unsupported_gesture();
+                Ok(())
+            }
+        }
+    }
+
+    /// Posts the user's own binding for `gesture`; one with nothing bound is dropped and counted.
+    pub fn system_gesture(&mut self, gesture: SystemGesture) -> Result<(), MacError> {
+        match system_gesture_chord(gesture, &self.hotkeys) {
+            Some(chord) => self.chord(chord),
+            None => {
+                self.count_unsupported_gesture();
+                Ok(())
+            }
+        }
+    }
+
+    /// Closes every open synthetic gesture phase and releases any modifier a gesture pressed.
+    /// Runs before [`Self::release_all`], and on its own when the receiver ends gestures. A chord
+    /// leaves keys down only when a post and its release both failed; those are retried here.
+    pub fn end_gestures(&mut self) -> Result<(), MacError> {
+        self.pinch.reset();
+        self.release_stuck_chord_keys()
+    }
+
+    pub fn unsupported_gestures(&self) -> u64 {
+        self.unsupported_gestures
+    }
+
+    fn count_unsupported_gesture(&mut self) {
+        self.unsupported_gestures = self.unsupported_gestures.saturating_add(1);
+    }
+
+    /// Posts `chord` over the wire's held keys without tracking it as held.
+    fn chord(&mut self, chord: MacChord) -> Result<(), MacError> {
+        let destination = self.destination;
+        let events = chord_key_events(self.held_keys.iter().copied(), chord)?;
+        post_chord_events(&events, &mut self.stuck_chord_keys, |event| {
+            post_chord_key(destination, event)
+        })
+    }
+
+    fn release_stuck_chord_keys(&mut self) -> Result<(), MacError> {
+        let destination = self.destination;
+        self.stuck_chord_keys
+            .release(|event| post_chord_key(destination, event))
+    }
+
     /// Attempts every tracked release, preserving the first error after all
     /// cleanup attempts complete.
     pub fn release_all(&mut self) -> Result<(), MacError> {
@@ -413,7 +507,7 @@ impl MacInjector {
             .iter()
             .map(|(button, click_count)| (*button, *click_count))
             .collect();
-        let mut first_error = None;
+        let mut first_error = self.release_stuck_chord_keys().err();
 
         for usage in keys {
             if let Err(error) = self.key(usage, false) {
@@ -629,6 +723,12 @@ fn clear_cursor_after_button_recovery(
 impl Drop for MacInjector {
     fn drop(&mut self) {
         let _ = self.release_all();
+        if self.unsupported_gestures > 0 {
+            log::info!(
+                "dropped {} gestures with no macOS action",
+                self.unsupported_gestures
+            );
+        }
     }
 }
 
@@ -680,6 +780,19 @@ fn validate_bounded_point(point: Point, limit: f64) -> Result<(), MacError> {
         return Err(MacError::PointOutOfRange);
     }
     Ok(())
+}
+
+fn post_chord_key(
+    destination: backend::PostingDestination,
+    event: ChordKeyEvent,
+) -> Result<(), MacError> {
+    backend::post_key(
+        destination,
+        event.key,
+        event.pressed,
+        SYNTHETIC_EVENT_MARKER,
+        event.flags,
+    )
 }
 
 const fn should_post_held_state_event(is_down: bool, is_tracked: bool) -> bool {

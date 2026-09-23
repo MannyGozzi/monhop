@@ -6,7 +6,8 @@ use crate::{
     session_receiver::{DestinationAction, DestinationFailure, InputDestination},
 };
 use monhop_core::{
-    DeviceId, DisplayId, InjectionPermit, Point, RevocationSignal, TakeBackGate,
+    DeviceId, DisplayId, GesturePhase, InjectionPermit, Point, PointerGesture, RevocationSignal,
+    TakeBackGate,
     clicks::{ClickLanding, FALLBACK_DOUBLE_CLICK_INTERVAL},
 };
 use monhop_protocol::{DisplayDescription, DisplayTopology};
@@ -245,7 +246,7 @@ impl Sequencer {
     fn new(gate: TakeBackGate, revocation: RevocationSignal, displays: &DisplayTopology) -> Self {
         Self {
             revocation,
-            admission: InjectionLedger::new(gate),
+            admission: InjectionLedger::new(gate, PINCH_HOLDS_MODIFIER),
             landing: ClickLanding::new(
                 displays
                     .displays()
@@ -306,7 +307,11 @@ impl Sequencer {
                 ..
             } => self.landing.released(button),
             DestinationAction::ReleaseAll => self.landing.clear(),
-            DestinationAction::Key { .. } | DestinationAction::Scroll { .. } => {}
+            DestinationAction::Key { .. }
+            | DestinationAction::Scroll { .. }
+            | DestinationAction::Gesture(_)
+            | DestinationAction::System(_)
+            | DestinationAction::EndGestures => {}
         }
         match after {
             Some(source) if self.still_in_control() => post(DestinationAction::MoveTo(source)),
@@ -366,9 +371,29 @@ impl NativeInput {
                     self.scroll = next;
                     return Ok(());
                 }
+                DestinationAction::Gesture(gesture) => {
+                    return self
+                        .injector
+                        .gesture(gesture)
+                        .map_err(|_| DestinationFailure);
+                }
+                DestinationAction::System(gesture) => {
+                    return self
+                        .injector
+                        .system_gesture(gesture)
+                        .map_err(|_| DestinationFailure);
+                }
+                DestinationAction::EndGestures => {
+                    return self.injector.end_gestures().map_err(|_| DestinationFailure);
+                }
                 DestinationAction::ReleaseAll => {
                     self.scroll = WheelResidual::default();
-                    return self.injector.release_all().map_err(|_| DestinationFailure);
+                    let ended = self.injector.end_gestures();
+                    return self
+                        .injector
+                        .release_all()
+                        .and(ended)
+                        .map_err(|_| DestinationFailure);
                 }
             };
             self.injector
@@ -383,6 +408,9 @@ impl NativeInput {
                 DestinationAction::Button { .. } => 12,
                 DestinationAction::Scroll { .. } => 13,
                 DestinationAction::ReleaseAll => 14,
+                DestinationAction::Gesture(_) => 15,
+                DestinationAction::System(_) => 16,
+                DestinationAction::EndGestures => 17,
             };
             match action {
                 DestinationAction::MoveTo(point) => self.injector.move_to(point),
@@ -399,7 +427,13 @@ impl NativeInput {
                     -horizontal * MAC_POINTS_PER_DETENT,
                     vertical * MAC_POINTS_PER_DETENT,
                 ),
-                DestinationAction::ReleaseAll => self.injector.release_all(),
+                DestinationAction::Gesture(gesture) => self.injector.gesture(gesture),
+                DestinationAction::System(gesture) => self.injector.system_gesture(gesture),
+                DestinationAction::EndGestures => self.injector.end_gestures(),
+                DestinationAction::ReleaseAll => {
+                    let ended = self.injector.end_gestures();
+                    self.injector.release_all().and(ended)
+                }
             }
             .map_err(|_| note_step(step))
         }
@@ -411,24 +445,33 @@ impl NativeInput {
     }
 }
 
+/// Only the Windows injector keeps a key down through a pinch (its Ctrl); the Mac's zoom steps press
+/// and release at once.
+const PINCH_HOLDS_MODIFIER: bool = cfg!(windows);
+
 /// Tracks native transitions, not wire repeats, so the gate includes posts still in flight.
 struct InjectionLedger {
     gate: TakeBackGate,
     keys: [bool; 256],
     buttons: [bool; 5],
+    /// A pinch may hold a synthetic modifier from its Began until it ends.
+    magnify: bool,
+    pinch_holds_modifier: bool,
 }
 
 impl InjectionLedger {
-    fn new(gate: TakeBackGate) -> Self {
+    fn new(gate: TakeBackGate, pinch_holds_modifier: bool) -> Self {
         Self {
             gate,
             keys: [false; 256],
             buttons: [false; 5],
+            magnify: false,
+            pinch_holds_modifier,
         }
     }
 
     fn begin(&self, action: DestinationAction) -> bool {
-        if matches!(action, DestinationAction::ReleaseAll) {
+        if action.is_release() {
             return true;
         }
         if self.is_new_press(action) {
@@ -459,6 +502,11 @@ impl InjectionLedger {
                 pressed: true,
                 ..
             } => !self.buttons[button.index()],
+            DestinationAction::Gesture(PointerGesture::Magnify {
+                phase: GesturePhase::Began,
+                ..
+            }) => self.pinch_holds_modifier && !self.magnify,
+            DestinationAction::System(_) => true,
             _ => false,
         }
     }
@@ -481,12 +529,29 @@ impl InjectionLedger {
                 }
                 *held = pressed;
             }
+            DestinationAction::Gesture(PointerGesture::Magnify { phase, .. }) => {
+                if phase == GesturePhase::Began {
+                    self.magnify = self.pinch_holds_modifier;
+                } else if phase.is_terminal() {
+                    self.end_magnify();
+                }
+            }
+            // A chord releases every key it pressed before its post returns.
+            DestinationAction::System(_) => self.gate.note_injected_up(),
+            DestinationAction::EndGestures => self.end_magnify(),
             DestinationAction::ReleaseAll => {
                 self.keys.fill(false);
                 self.buttons.fill(false);
+                self.magnify = false;
                 self.gate.note_injected_released();
             }
             _ => {}
+        }
+    }
+
+    fn end_magnify(&mut self) {
+        if std::mem::take(&mut self.magnify) {
+            self.gate.note_injected_up();
         }
     }
 }
@@ -496,7 +561,7 @@ fn require_action_authorization(
     action: DestinationAction,
 ) -> Result<(), DestinationFailure> {
     // A stop or revocation forbids new input, but never ledger-owned release cleanup.
-    if revocation.is_stopping() && !matches!(action, DestinationAction::ReleaseAll) {
+    if revocation.is_stopping() && !action.is_release() {
         Err(note_step(9))
     } else {
         Ok(())
@@ -583,16 +648,23 @@ mod tests {
                 horizontal: 0.5,
                 vertical: -0.5,
             },
+            DestinationAction::Gesture(monhop_core::PointerGesture::Magnify {
+                phase: monhop_core::GesturePhase::Began,
+                delta: 0.0,
+            }),
+            DestinationAction::System(monhop_core::SystemGesture::Overview),
         ] {
             assert_eq!(
                 require_action_authorization(&signal, action),
                 Err(DestinationFailure)
             );
         }
-        assert_eq!(
-            require_action_authorization(&signal, DestinationAction::ReleaseAll),
-            Ok(())
-        );
+        for release in [
+            DestinationAction::EndGestures,
+            DestinationAction::ReleaseAll,
+        ] {
+            assert_eq!(require_action_authorization(&signal, release), Ok(()));
+        }
         assert!(signal.is_revoked());
     }
 
@@ -624,7 +696,7 @@ mod admission_tests {
             .unwrap();
         let gate = TakeBackGate::new(floor);
         gate.open_injection(receiving.generation);
-        let mut ledger = InjectionLedger::new(gate.clone());
+        let mut ledger = InjectionLedger::new(gate.clone(), true);
         let down = DestinationAction::Key {
             usage: HidUsage(4),
             pressed: true,
@@ -645,16 +717,71 @@ mod admission_tests {
     #[test]
     fn closed_admission_uncounts_a_down_and_release_is_still_allowed() {
         let gate = TakeBackGate::new(monhop_core::SharedFloor::new());
-        let mut ledger = InjectionLedger::new(gate.clone());
+        let mut ledger = InjectionLedger::new(gate.clone(), true);
         assert!(!ledger.begin(DestinationAction::Button {
             button: monhop_core::MouseButton::Left,
             pressed: true,
             click_count: 1,
         }));
         assert!(!gate.injected_held());
+        assert!(!ledger.begin(DestinationAction::System(
+            monhop_core::SystemGesture::Search
+        )));
         gate.note_injected_press();
+        assert!(ledger.begin(DestinationAction::EndGestures));
+        ledger.complete(DestinationAction::EndGestures);
+        assert!(
+            gate.injected_held(),
+            "ending gestures releases no key or button"
+        );
         assert!(ledger.begin(DestinationAction::ReleaseAll));
         ledger.complete(DestinationAction::ReleaseAll);
+        assert!(!gate.injected_held());
+    }
+
+    #[test]
+    fn a_pinch_counts_as_held_until_it_ends_and_a_chord_only_while_posting() {
+        use GesturePhase::{Began, Changed, Ended};
+        let floor = SharedFloor::new();
+        let receiving = floor
+            .transition(floor.snapshot(), FloorState::Receiving)
+            .unwrap();
+        let gate = TakeBackGate::new(floor);
+        gate.open_injection(receiving.generation);
+        let mut ledger = InjectionLedger::new(gate.clone(), true);
+        let pinch =
+            |phase| DestinationAction::Gesture(PointerGesture::Magnify { phase, delta: 0.0 });
+        for (phase, held) in [
+            (Began, true),
+            (Changed, true),
+            (Began, true),
+            (Ended, false),
+        ] {
+            assert!(ledger.begin(pinch(phase)));
+            ledger.complete(pinch(phase));
+            assert_eq!(gate.injected_held(), held, "{phase:?}");
+        }
+        assert!(ledger.begin(pinch(Began)));
+        ledger.complete(pinch(Began));
+        ledger.complete(DestinationAction::EndGestures);
+        assert!(
+            !gate.injected_held(),
+            "ending gestures ends the pinch's modifier"
+        );
+        let chord = DestinationAction::System(monhop_core::SystemGesture::Overview);
+        assert!(ledger.begin(chord));
+        assert!(gate.injected_held(), "a chord counts while it posts");
+        ledger.complete(chord);
+        assert!(!gate.injected_held());
+
+        let mut mac = InjectionLedger::new(gate.clone(), false);
+        assert!(mac.begin(pinch(Began)));
+        mac.complete(pinch(Began));
+        assert!(
+            !gate.injected_held(),
+            "a pinch that holds no key counts nothing"
+        );
+        mac.complete(pinch(Ended));
         assert!(!gate.injected_held());
     }
 }
@@ -680,7 +807,11 @@ mod landing_tests {
                 click_count,
             } => Posted::Button(button, pressed, click_count),
             DestinationAction::ReleaseAll => Posted::ReleaseAll,
-            DestinationAction::Key { .. } | DestinationAction::Scroll { .. } => {
+            DestinationAction::Key { .. }
+            | DestinationAction::Scroll { .. }
+            | DestinationAction::Gesture(_)
+            | DestinationAction::System(_)
+            | DestinationAction::EndGestures => {
                 unreachable!("not posted here")
             }
         }

@@ -13,7 +13,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{HidUsage, ModifierState, MouseButton, RevocationSignal};
+use crate::{
+    GestureKind, GesturePhase, HidUsage, ModifierState, MouseButton, PointerGesture,
+    RevocationSignal, SystemGesture,
+};
 
 /// The fixed number of events retained by a capture channel.
 pub const CAPTURE_QUEUE_CAPACITY: usize = 512;
@@ -113,6 +116,8 @@ impl fmt::Debug for InjectionPermit {
 /// normalized to logical points by the macOS adapter: continuous point deltas pass through and
 /// discrete line deltas use its explicit line-to-point conversion. They are intentionally distinct
 /// from the Windows integer variants; no adapter may round one representation into the other here.
+///
+/// `Gesture` holds a [`PointerGesture`]'s parts and is valid exactly when they form one.
 #[derive(Clone, Copy, PartialEq)]
 pub enum CaptureEvent {
     Key {
@@ -158,6 +163,12 @@ pub enum CaptureEvent {
         remote: bool,
         revision: u64,
     },
+    Gesture {
+        kind: GestureKind,
+        phase: Option<GesturePhase>,
+        value: f64,
+    },
+    SystemGesture(SystemGesture),
 }
 
 impl fmt::Debug for CaptureEvent {
@@ -172,6 +183,8 @@ impl fmt::Debug for CaptureEvent {
             Self::LogicalRelativeMotion { .. } => "LogicalRelativeMotion",
             Self::LogicalScroll { .. } => "LogicalScroll",
             Self::RouteChanged { .. } => "RouteChanged",
+            Self::Gesture { .. } => "Gesture",
+            Self::SystemGesture(_) => "SystemGesture",
         };
         write!(formatter, "CaptureEvent::{name}([redacted])")
     }
@@ -200,7 +213,18 @@ impl CaptureEvent {
                     && vertical.is_finite()
                     && (horizontal != 0.0 || vertical != 0.0)
             }
-            Self::RouteChanged { .. } => true,
+            Self::RouteChanged { .. } | Self::SystemGesture(_) => true,
+            Self::Gesture { kind, phase, value } => {
+                PointerGesture::from_parts(kind, phase, value).is_ok()
+            }
+        }
+    }
+
+    pub const fn gesture(gesture: PointerGesture) -> Self {
+        Self::Gesture {
+            kind: gesture.kind(),
+            phase: gesture.phase(),
+            value: gesture.value(),
         }
     }
 }
@@ -579,7 +603,11 @@ const EVENT_ROUTE_CHANGED: u64 = 6;
 const EVENT_LOGICAL_ABSOLUTE_MOTION: u64 = 7;
 const EVENT_LOGICAL_RELATIVE_MOTION: u64 = 8;
 const EVENT_LOGICAL_SCROLL: u64 = 9;
+const EVENT_GESTURE: u64 = 10;
+const EVENT_SYSTEM_GESTURE: u64 = 11;
 const EVENT_KIND_MASK: u64 = 0xff;
+/// A gesture's kind and phase each take four header bits; phase 0 is none.
+const GESTURE_FIELD_MASK: u64 = 0xf;
 
 struct EncodedEvent {
     header: u64,
@@ -654,6 +682,18 @@ impl From<CaptureEvent> for EncodedEvent {
                 payload: 0,
                 revision,
             },
+            CaptureEvent::Gesture { kind, phase, value } => Self {
+                header: EVENT_GESTURE
+                    | (u64::from(kind.to_wire()) << 8)
+                    | (u64::from(phase.map_or(0, GesturePhase::to_wire)) << 12),
+                payload: value.to_bits(),
+                revision: 0,
+            },
+            CaptureEvent::SystemGesture(gesture) => Self {
+                header: EVENT_SYSTEM_GESTURE | (u64::from(gesture.to_wire()) << 8),
+                payload: 0,
+                revision: 0,
+            },
         }
     }
 }
@@ -715,6 +755,17 @@ impl CapturedEvent {
                 remote: header & (1 << 8) != 0,
                 revision: event_revision,
             },
+            EVENT_GESTURE => CaptureEvent::Gesture {
+                kind: GestureKind::from_wire(((header >> 8) & GESTURE_FIELD_MASK) as u8)?,
+                phase: match (header >> 12) & GESTURE_FIELD_MASK {
+                    0 => None,
+                    phase => Some(GesturePhase::from_wire(phase as u8)?),
+                },
+                value: f64::from_bits(payload),
+            },
+            EVENT_SYSTEM_GESTURE => CaptureEvent::SystemGesture(SystemGesture::from_wire(
+                ((header >> 8) & u64::from(u8::MAX)) as u8,
+            )?),
             _ => return None,
         };
         if matches!(event, CaptureEvent::RouteChanged { remote: event_remote, revision }
@@ -888,6 +939,111 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn every_gesture_and_system_gesture_keeps_its_exact_value_through_the_ring() {
+        let (mut producer, mut consumer) = capture_channel(CaptureStop::new());
+        let mut events = vec![
+            CaptureEvent::gesture(PointerGesture::SmartMagnify),
+            CaptureEvent::gesture(PointerGesture::ForceClick),
+        ];
+        for phase in GesturePhase::ALL {
+            for delta in [0.0, -0.0, -0.999_999, 4.0, 0.015_625] {
+                events.push(CaptureEvent::gesture(PointerGesture::Magnify {
+                    phase,
+                    delta,
+                }));
+            }
+            for degrees in [-180.0, 0.0, 12.345_678_9, 180.0] {
+                events.push(CaptureEvent::gesture(PointerGesture::Rotate {
+                    phase,
+                    degrees,
+                }));
+            }
+        }
+        events.extend(SystemGesture::ALL.map(CaptureEvent::SystemGesture));
+        for event in events {
+            assert!(event.is_valid());
+            producer.try_push(event).unwrap();
+            let received = consumer.try_pop().unwrap().unwrap();
+            assert!(received == event);
+            if let (
+                CaptureEvent::Gesture { value, .. },
+                CaptureEvent::Gesture {
+                    value: received, ..
+                },
+            ) = (event, received)
+            {
+                assert_eq!(received.to_bits(), value.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_gesture_is_refused_before_it_enters_the_ring() {
+        let invalid = [
+            CaptureEvent::Gesture {
+                kind: GestureKind::Magnify,
+                phase: None,
+                value: 0.5,
+            },
+            CaptureEvent::Gesture {
+                kind: GestureKind::Magnify,
+                phase: Some(GesturePhase::Changed),
+                value: -1.0,
+            },
+            CaptureEvent::Gesture {
+                kind: GestureKind::Rotate,
+                phase: Some(GesturePhase::Changed),
+                value: f64::NAN,
+            },
+            CaptureEvent::Gesture {
+                kind: GestureKind::ForceClick,
+                phase: Some(GesturePhase::Began),
+                value: 0.0,
+            },
+        ];
+        for event in invalid {
+            assert!(!event.is_valid());
+            let stop = CaptureStop::new();
+            let (mut producer, _consumer) = capture_channel(stop.clone());
+            assert_eq!(producer.try_push(event), Err(StopReason::InvalidInput));
+        }
+    }
+
+    #[test]
+    fn an_unknown_gesture_slot_is_a_native_failure_not_an_event() {
+        let decode = |header, payload| CapturedEvent::decode(header, payload, 0, 0, 0, 0);
+        assert!(decode(EVENT_GESTURE | (1 << 8) | (2 << 12), 0).is_some());
+        for header in [
+            EVENT_GESTURE | (5 << 8) | (2 << 12),
+            EVENT_GESTURE | (1 << 8) | (5 << 12),
+            EVENT_SYSTEM_GESTURE,
+            EVENT_SYSTEM_GESTURE | (13 << 8),
+        ] {
+            assert!(decode(header, 0).is_none());
+        }
+        assert!(
+            decode(EVENT_GESTURE | (3 << 8), 1.0_f64.to_bits()).is_none(),
+            "a discrete kind with a value is invalid"
+        );
+    }
+
+    #[test]
+    fn gesture_debug_never_emits_input_values() {
+        let debug = format!(
+            "{:?}",
+            CaptureEvent::gesture(PointerGesture::Rotate {
+                phase: GesturePhase::Began,
+                degrees: 42.5,
+            })
+        );
+        assert_eq!(debug, "CaptureEvent::Gesture([redacted])");
+        assert_eq!(
+            format!("{:?}", CaptureEvent::SystemGesture(SystemGesture::Search)),
+            "CaptureEvent::SystemGesture([redacted])"
+        );
     }
 
     #[test]

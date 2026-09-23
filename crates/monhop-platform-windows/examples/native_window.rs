@@ -461,7 +461,9 @@ mod windows {
                 | CaptureEvent::AbsoluteMotion { .. }
                 | CaptureEvent::RelativeMotion { .. }
                 | CaptureEvent::LogicalAbsoluteMotion { .. }
-                | CaptureEvent::LogicalRelativeMotion { .. } => {
+                | CaptureEvent::LogicalRelativeMotion { .. }
+                | CaptureEvent::Gesture { .. }
+                | CaptureEvent::SystemGesture(_) => {
                     self.pointer = self.pointer.saturating_add(1);
                 }
                 CaptureEvent::Scroll { .. } | CaptureEvent::LogicalScroll { .. } => {

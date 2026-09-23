@@ -304,6 +304,8 @@ pub fn capture_counts(_duration: Duration) -> Result<CaptureStats, InputError> {
 
 #[cfg(windows)]
 pub use windows::Injector;
+#[cfg(windows)]
+pub(crate) use windows::{button_input, keyboard_input, mouse_input};
 
 #[cfg(not(windows))]
 #[derive(Default)]
@@ -316,6 +318,21 @@ impl Injector {
     }
 
     pub fn inject(&mut self, _operation: InjectionOperation) -> Result<(), InputError> {
+        Err(InputError::UnsupportedPlatform)
+    }
+
+    pub fn gesture(&mut self, _gesture: monhop_core::PointerGesture) -> Result<(), InputError> {
+        Err(InputError::UnsupportedPlatform)
+    }
+
+    pub fn system_gesture(
+        &mut self,
+        _gesture: monhop_core::SystemGesture,
+    ) -> Result<(), InputError> {
+        Err(InputError::UnsupportedPlatform)
+    }
+
+    pub fn end_gestures(&mut self) -> Result<(), InputError> {
         Err(InputError::UnsupportedPlatform)
     }
 
@@ -400,8 +417,11 @@ mod windows {
         time::{Duration, Instant},
     };
 
-    use crate::keymap::set1_from_hid_usage;
-    use monhop_core::{HidUsage, MouseButton};
+    use crate::{
+        gesture_inject::{Held, Operation, Stroke, Synthetic, pinch_quanta, plan, send_batch},
+        keymap::set1_from_hid_usage,
+    };
+    use monhop_core::{GesturePhase, HidUsage, MouseButton, PointerGesture, SystemGesture};
     use windows_sys::Win32::{
         Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
@@ -777,6 +797,9 @@ mod windows {
     pub struct Injector {
         held_keys: BTreeSet<HidUsage>,
         held_buttons: BTreeSet<MouseButton>,
+        synthetic: Synthetic,
+        /// Wheel units an open pinch has not posted yet; `None` while no pinch is open.
+        pinch_residual: Option<f64>,
     }
 
     impl Injector {
@@ -784,6 +807,8 @@ mod windows {
             Self {
                 held_keys: BTreeSet::new(),
                 held_buttons: BTreeSet::new(),
+                synthetic: Synthetic::new(),
+                pinch_residual: None,
             }
         }
 
@@ -793,7 +818,7 @@ mod windows {
                     if !pressed && !self.held_keys.contains(&usage) {
                         return Err(InputError::KeyNotHeld);
                     }
-                    dispatch_inputs(&[keyboard_input(usage, pressed)?])?;
+                    self.post(Operation::Wire(Stroke::Key { usage, pressed }))?;
                     if pressed {
                         self.held_keys.insert(usage);
                     } else {
@@ -804,7 +829,7 @@ mod windows {
                     if !pressed && !self.held_buttons.contains(&button) {
                         return Err(InputError::ButtonNotHeld);
                     }
-                    dispatch_inputs(&[button_input(button, pressed)])?;
+                    self.post(Operation::Wire(Stroke::Button { button, pressed }))?;
                     if pressed {
                         self.held_buttons.insert(button);
                     } else {
@@ -834,6 +859,11 @@ mod windows {
                     if vertical == 0 && horizontal == 0 {
                         return Err(InputError::EmptyScroll);
                     }
+                    // An open pinch owns the wheel: this scroll would reach apps as Ctrl+wheel and
+                    // zoom. A Windows touchpad likewise either pans or zooms.
+                    if self.pinch_residual.is_some() {
+                        return Ok(());
+                    }
                     let mut inputs = [mouse_input(0, 0, 0, 0), mouse_input(0, 0, 0, 0)];
                     let mut count = 0_usize;
                     if vertical != 0 {
@@ -850,7 +880,62 @@ mod windows {
             Ok(())
         }
 
+        /// Injects one validated gesture, phases in order. A pinch is Ctrl held plus wheel, as
+        /// Windows feeds a touchpad pinch to most apps; the other gestures post nothing.
+        pub fn gesture(&mut self, gesture: PointerGesture) -> Result<(), InputError> {
+            let PointerGesture::Magnify { phase, delta } = gesture else {
+                return Ok(());
+            };
+            match phase {
+                GesturePhase::Began => {
+                    self.pinch_residual = Some(0.0);
+                    Ok(())
+                }
+                GesturePhase::Changed => {
+                    let Some(residual) = self.pinch_residual else {
+                        return Ok(());
+                    };
+                    let (quanta, carried) = pinch_quanta(residual, delta);
+                    self.pinch_residual = Some(carried);
+                    self.post(Operation::PinchWheel { quanta })
+                }
+                GesturePhase::Ended | GesturePhase::Cancelled => self.end_gestures(),
+            }
+        }
+
+        /// Posts the gesture's chord, or its navigation click, as one batch.
+        pub fn system_gesture(&mut self, gesture: SystemGesture) -> Result<(), InputError> {
+            self.post(Operation::System(gesture))
+        }
+
+        /// Releases what gestures hold: a pinch's Ctrl and any chord key a failed release stranded.
+        /// Runs before [`Self::release_all`], and on its own when the receiver ends gestures.
+        pub fn end_gestures(&mut self) -> Result<(), InputError> {
+            self.post(Operation::EndGestures)
+        }
+
+        /// Ends gestures, then releases every wire key and button, attempting both.
         pub fn release_all(&mut self) -> Result<(), InputError> {
+            let ended = self.end_gestures();
+            self.release_wire().and(ended)
+        }
+
+        /// Posts `operation` as one batch planned from what is down now.
+        fn post(&mut self, operation: Operation) -> Result<(), InputError> {
+            if !matches!(operation, Operation::PinchWheel { .. }) {
+                // Every other batch releases the pinch's Ctrl, so it also ends the pinch.
+                self.pinch_residual = None;
+            }
+            let held = Held {
+                keys: &self.held_keys,
+                buttons: &self.held_buttons,
+                synthetic: &self.synthetic,
+            };
+            let strokes = plan(held, operation);
+            send_batch(&strokes, &mut self.synthetic, dispatch_inputs)
+        }
+
+        fn release_wire(&mut self) -> Result<(), InputError> {
             let mut inputs = Vec::with_capacity(self.held_keys.len() + self.held_buttons.len());
             let mut releases = Vec::with_capacity(inputs.capacity());
             for usage in &self.held_keys {
@@ -921,7 +1006,7 @@ mod windows {
         Button(MouseButton),
     }
 
-    fn keyboard_input(usage: HidUsage, pressed: bool) -> Result<INPUT, InputError> {
+    pub(crate) fn keyboard_input(usage: HidUsage, pressed: bool) -> Result<INPUT, InputError> {
         let scan_code = set1_from_hid_usage(usage).map_err(InputError::UnsupportedKey)?;
         let mut flags = KEYEVENTF_SCANCODE;
         if scan_code.is_extended() {
@@ -944,7 +1029,7 @@ mod windows {
         })
     }
 
-    fn button_input(button: MouseButton, pressed: bool) -> INPUT {
+    pub(crate) fn button_input(button: MouseButton, pressed: bool) -> INPUT {
         let (flags, mouse_data) = match (button, pressed) {
             (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
             (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
@@ -960,7 +1045,7 @@ mod windows {
         mouse_input(0, 0, flags, mouse_data)
     }
 
-    fn mouse_input(dx: i32, dy: i32, flags: u32, mouse_data: u32) -> INPUT {
+    pub(crate) fn mouse_input(dx: i32, dy: i32, flags: u32, mouse_data: u32) -> INPUT {
         INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {

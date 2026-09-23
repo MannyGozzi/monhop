@@ -4,8 +4,9 @@ use crate::session_clock::millis_u64;
 use crate::session_health::{HOLD_LIMIT, HealthError, PEER_LIVENESS, PeerHealth, hold_stats};
 use crate::session_startup::ReadyControl;
 use monhop_core::{
-    DisplayId, FloorSnapshot, FloorState, HidUsage, ModifierState, MouseButton, Point, SharedFloor,
-    TakeBackGate,
+    DisplayId, FloorSnapshot, FloorState, GesturePhase, HidUsage, ModifierState, MouseButton,
+    Point, PointerGesture, SharedFloor, SystemGesture, TakeBackGate,
+    gesture_latch::TOUCH_STREAM_IDLE,
 };
 use monhop_protocol::{
     DeclineReason, DeliveryClass, DisplayTopology, Frame, Message, Motion, RateLimiter,
@@ -13,7 +14,7 @@ use monhop_protocol::{
 };
 use std::time::Duration;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DestinationAction {
     MoveTo(Point),
     Key {
@@ -30,7 +31,21 @@ pub enum DestinationAction {
         horizontal: f64,
         vertical: f64,
     },
+    /// Validated, with each continuous kind's phases in order: Began, Changed..., one end.
+    Gesture(PointerGesture),
+    System(SystemGesture),
+    /// Closes every open synthetic gesture phase and releases any modifier a gesture pressed.
+    EndGestures,
+    /// Destinations end open gestures first, as [`Self::EndGestures`] does, then release every
+    /// injected key and button. The receiver also sends `EndGestures` just before each one.
     ReleaseAll,
+}
+
+impl DestinationAction {
+    /// Cleanup that ends injected state, admitted even after control or authorization has ended.
+    pub const fn is_release(self) -> bool {
+        matches!(self, Self::EndGestures | Self::ReleaseAll)
+    }
 }
 
 /// Implementations own their injected pressed state and retry incomplete release operations.
@@ -54,6 +69,7 @@ pub enum ReceiverFailure {
     UnexpectedMessage,
     NativeDelivery,
     PeerStopped,
+    InvalidGesture,
 }
 
 /// Construct only after matching SessionSetup proposals, full peer authentication and local enable.
@@ -81,6 +97,12 @@ pub struct InputReceiver {
     held_since: Option<Duration>,
     holds: u32,
     held_max: Duration,
+    /// Magnify then Rotate: whether the destination has one between its Began and its end.
+    open_gestures: [bool; 2],
+    /// When the last gesture record arrived; an open gesture silent for a touch stream's idle
+    /// time is ended, so a lost end never leaves a synthetic modifier held.
+    gesture_seen: Duration,
+    gesture_normalizations: u32,
 }
 
 impl InputReceiver {
@@ -115,6 +137,9 @@ impl InputReceiver {
             held_since: None,
             holds: 0,
             held_max: Duration::ZERO,
+            open_gestures: [false; 2],
+            gesture_seen: now,
+            gesture_normalizations: 0,
         }
     }
 
@@ -143,7 +168,7 @@ impl InputReceiver {
         self.floor_generation = Some(generation);
         self.yielding = true;
         self.pending_move = None;
-        if destination.apply(DestinationAction::ReleaseAll).is_err() {
+        if self.release_injected(destination).is_err() {
             return Err(self.stop(ReceiverFailure::NativeDelivery, destination));
         }
         self.gate.note_injected_released();
@@ -232,6 +257,10 @@ impl InputReceiver {
     pub fn failure(&self) -> Option<ReceiverFailure> {
         self.failure
     }
+    /// Gesture phases repaired so far: an implicit Began, an early end, or a dropped stray end.
+    pub fn gesture_normalizations(&self) -> u32 {
+        self.gesture_normalizations
+    }
 
     /// Time since the peer's last fresh reply, and the age of the unanswered challenge if any.
     pub fn reply_ages(&self, now: Duration) -> (Duration, Option<Duration>) {
@@ -292,6 +321,14 @@ impl InputReceiver {
                 Ok(token) => Ok(token.map(Message::Ping)),
                 Err(error) => Err(self.stop(ReceiverFailure::Health(error), destination)),
             };
+        }
+        if self.open_gestures.contains(&true)
+            && now.saturating_sub(self.gesture_seen) >= TOUCH_STREAM_IDLE
+        {
+            self.open_gestures = [false; 2];
+            if let Err(failure) = deliver(destination, DestinationAction::EndGestures) {
+                return Err(self.stop(failure, destination));
+            }
         }
         match self.health.poll(now) {
             Ok(token) => Ok(token.map(Message::Ping)),
@@ -448,8 +485,7 @@ impl InputReceiver {
                 if self.floor_generation.is_some() {
                     self.gate.open_injection(0);
                 }
-                destination
-                    .apply(DestinationAction::ReleaseAll)
+                self.release_injected(destination)
                     .map_err(|_| ReceiverFailure::NativeDelivery)?;
                 self.gate.note_injected_released();
                 self.release_floor();
@@ -464,7 +500,12 @@ impl InputReceiver {
                 Ok(Some(Message::ReleaseAck))
             }
             Message::Disconnect(_) | Message::Error(_) => Err(ReceiverFailure::PeerStopped),
-            Message::Key(_) | Message::Button(_) | Message::Scroll(_) | Message::Motion(_)
+            Message::Key(_)
+            | Message::Button(_)
+            | Message::Scroll(_)
+            | Message::Motion(_)
+            | Message::Gesture(_)
+            | Message::SystemGesture(_)
                 if held =>
             {
                 Ok(None)
@@ -531,6 +572,24 @@ impl InputReceiver {
                 }
                 Ok(None)
             }
+            Message::Gesture(gesture) => {
+                self.require_active()?;
+                gesture
+                    .validate()
+                    .map_err(|_| ReceiverFailure::InvalidGesture)?;
+                self.gesture_seen = now;
+                if !self.suppress_injection() {
+                    self.apply_gesture(*gesture, destination)?;
+                }
+                Ok(None)
+            }
+            Message::SystemGesture(gesture) => {
+                self.require_active()?;
+                if !self.suppress_injection() {
+                    deliver(destination, DestinationAction::System(*gesture))?;
+                }
+                Ok(None)
+            }
             Message::Motion(motion) => {
                 let (display_id, previous) = self.require_active()?;
                 let next = match motion {
@@ -566,13 +625,59 @@ impl InputReceiver {
     }
 
     pub fn retry_cleanup(&mut self, destination: &mut impl InputDestination) {
-        if self.cleanup_pending && destination.apply(DestinationAction::ReleaseAll).is_ok() {
+        if self.cleanup_pending && self.release_injected(destination).is_ok() {
             self.keys.fill(false);
             self.buttons.fill(false);
             self.cleanup_pending = false;
             self.gate.note_injected_released();
             self.release_floor();
         }
+    }
+
+    /// Ends gestures before keys and buttons, and attempts both even when the first fails.
+    fn release_injected(
+        &mut self,
+        destination: &mut impl InputDestination,
+    ) -> Result<(), DestinationFailure> {
+        self.open_gestures = [false; 2];
+        let ended = destination.apply(DestinationAction::EndGestures);
+        destination.apply(DestinationAction::ReleaseAll).and(ended)
+    }
+
+    /// Delivers `gesture` with its kind's phases in order. A Changed with nothing open gets an
+    /// implicit Began, a Began while one is open ends that one first, and an end with nothing open
+    /// is dropped: crossings cut gestures, so each repair is counted, never a failure.
+    fn apply_gesture(
+        &mut self,
+        gesture: PointerGesture,
+        destination: &mut impl InputDestination,
+    ) -> Result<(), ReceiverFailure> {
+        let (slot, phase) = match gesture {
+            PointerGesture::Magnify { phase, .. } => (0, phase),
+            PointerGesture::Rotate { phase, .. } => (1, phase),
+            PointerGesture::SmartMagnify | PointerGesture::ForceClick => {
+                return deliver(destination, DestinationAction::Gesture(gesture));
+            }
+        };
+        let open = self.open_gestures[slot];
+        let repair = match phase {
+            GesturePhase::Began if open => Some(GesturePhase::Ended),
+            GesturePhase::Changed if !open => Some(GesturePhase::Began),
+            GesturePhase::Ended | GesturePhase::Cancelled if !open => {
+                self.gesture_normalizations = self.gesture_normalizations.saturating_add(1);
+                return Ok(());
+            }
+            _ => None,
+        };
+        if let Some(boundary) = repair {
+            self.gesture_normalizations = self.gesture_normalizations.saturating_add(1);
+            deliver(
+                destination,
+                DestinationAction::Gesture(unchanged_at(gesture, boundary)),
+            )?;
+        }
+        self.open_gestures[slot] = !phase.is_terminal();
+        deliver(destination, DestinationAction::Gesture(gesture))
     }
 
     fn require_active(&self) -> Result<(DisplayId, Point), ReceiverFailure> {
@@ -600,6 +705,27 @@ impl InputReceiver {
             return Err(ReceiverFailure::InvalidPoint);
         }
         Ok(())
+    }
+}
+
+fn deliver(
+    destination: &mut impl InputDestination,
+    action: DestinationAction,
+) -> Result<(), ReceiverFailure> {
+    destination
+        .apply(action)
+        .map_err(|_| ReceiverFailure::NativeDelivery)
+}
+
+/// `gesture`'s continuous kind at `phase`, changing nothing.
+fn unchanged_at(gesture: PointerGesture, phase: GesturePhase) -> PointerGesture {
+    match gesture {
+        PointerGesture::Magnify { .. } => PointerGesture::Magnify { phase, delta: 0.0 },
+        PointerGesture::Rotate { .. } => PointerGesture::Rotate {
+            phase,
+            degrees: 0.0,
+        },
+        discrete => discrete,
     }
 }
 
@@ -636,12 +762,14 @@ mod tests {
         calls: Vec<DestinationAction>,
         fail_move: bool,
         fail_release: bool,
+        fail_end_gestures: bool,
     }
     impl InputDestination for Destination {
         fn apply(&mut self, action: DestinationAction) -> Result<(), DestinationFailure> {
             self.calls.push(action);
             if (matches!(action, DestinationAction::MoveTo(_)) && self.fail_move)
                 || (matches!(action, DestinationAction::ReleaseAll) && self.fail_release)
+                || (matches!(action, DestinationAction::EndGestures) && self.fail_end_gestures)
             {
                 return Err(DestinationFailure);
             }
@@ -744,12 +872,7 @@ mod tests {
             ),
             Err(ReceiverFailure::RateLimited)
         );
-        assert!(
-            target
-                .calls
-                .iter()
-                .all(|action| matches!(action, DestinationAction::ReleaseAll))
-        );
+        assert!(target.calls.iter().all(|action| action.is_release()));
         assert!(matches!(
             InputReceiver::after_startup(
                 receiver().displays,
@@ -828,12 +951,7 @@ mod tests {
             receiver.receive(&frame(1, 0, key(true)), Duration::ZERO, &mut target),
             Err(ReceiverFailure::NotActive)
         );
-        assert!(
-            target
-                .calls
-                .iter()
-                .all(|a| matches!(a, DestinationAction::ReleaseAll))
-        );
+        assert!(target.calls.iter().all(|a| a.is_release()));
     }
 
     #[test]
@@ -1155,12 +1273,7 @@ mod tests {
             receiver.receive(&activation, Duration::ZERO, &mut target),
             Err(ReceiverFailure::InvalidPoint)
         );
-        assert!(
-            target
-                .calls
-                .iter()
-                .all(|a| matches!(a, DestinationAction::ReleaseAll))
-        );
+        assert!(target.calls.iter().all(|a| a.is_release()));
     }
 
     fn motion(sequence: u64, dx: f64, dy: f64) -> Frame {
@@ -1338,5 +1451,337 @@ mod tests {
         assert_eq!(freed.state, FloorState::Free);
         assert_eq!(receiver.take_back(&mut target), Ok(None));
         assert_eq!(floor.snapshot(), freed);
+    }
+
+    use GesturePhase::{Began, Cancelled, Changed, Ended};
+
+    fn magnify(phase: GesturePhase, delta: f64) -> PointerGesture {
+        PointerGesture::Magnify { phase, delta }
+    }
+
+    fn rotate(phase: GesturePhase, degrees: f64) -> PointerGesture {
+        PointerGesture::Rotate { phase, degrees }
+    }
+
+    /// An active receiver that has received `gestures` in order, from input sequence 1.
+    fn gestured(target: &mut Destination, gestures: &[PointerGesture]) -> InputReceiver {
+        let mut receiver = receiver();
+        receiver
+            .receive(&activate(), Duration::ZERO, target)
+            .unwrap();
+        for (sequence, gesture) in (1..).zip(gestures) {
+            let gesture = frame(2, sequence, Message::Gesture(*gesture));
+            assert_eq!(receiver.receive(&gesture, Duration::ZERO, target), Ok(None));
+        }
+        receiver
+    }
+
+    fn delivered_gestures(calls: &[DestinationAction]) -> Vec<PointerGesture> {
+        calls
+            .iter()
+            .filter_map(|call| match call {
+                DestinationAction::Gesture(gesture) => Some(*gesture),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_open_gesture_silent_for_a_touch_streams_idle_time_is_ended() {
+        let mut receiver = receiver();
+        let mut target = Destination::default();
+        let Some(Message::Ping(token)) = receiver.tick(Duration::ZERO, &mut target).unwrap() else {
+            panic!("initial health challenge");
+        };
+        receiver
+            .receive(&activate(), Duration::ZERO, &mut target)
+            .unwrap();
+        let last = Duration::from_millis(100);
+        for (sequence, gesture) in [(1, magnify(Began, 0.0)), (2, magnify(Changed, 0.1))] {
+            let gesture = frame(2, sequence, Message::Gesture(gesture));
+            assert_eq!(receiver.receive(&gesture, last, &mut target), Ok(None));
+        }
+        // A fresh reply keeps the peer healthy, so only the gesture's silence can end it.
+        let replied = Duration::from_millis(400);
+        let pong = frame(1, 0, Message::Pong(token));
+        assert_eq!(receiver.receive(&pong, replied, &mut target), Ok(None));
+        let before = target.calls.len();
+        let _ = receiver.tick(
+            last + TOUCH_STREAM_IDLE - Duration::from_millis(1),
+            &mut target,
+        );
+        assert_eq!(target.calls.len(), before, "still inside the idle time");
+        let _ = receiver.tick(last + TOUCH_STREAM_IDLE, &mut target);
+        assert_eq!(target.calls[before..], [DestinationAction::EndGestures]);
+        assert!(receiver.held_since().is_none());
+        assert!(receiver.is_active());
+        let late = frame(2, 3, Message::Gesture(magnify(Changed, 0.1)));
+        let at = last + TOUCH_STREAM_IDLE;
+        assert_eq!(receiver.receive(&late, at, &mut target), Ok(None));
+        assert_eq!(
+            delivered_gestures(&target.calls[before..]),
+            [magnify(Began, 0.0), magnify(Changed, 0.1)],
+            "a late record reopens with an implicit Began"
+        );
+    }
+
+    fn assert_ended_then_released(calls: &[DestinationAction]) {
+        assert_eq!(
+            calls[calls.len() - 2..],
+            [
+                DestinationAction::EndGestures,
+                DestinationAction::ReleaseAll
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_phases_and_discrete_gestures_pass_through_unchanged() {
+        let sent = [
+            magnify(Began, 0.0),
+            magnify(Changed, 0.1),
+            rotate(Began, 0.0),
+            rotate(Changed, -3.0),
+            magnify(Ended, 0.0),
+            rotate(Cancelled, 0.0),
+            PointerGesture::SmartMagnify,
+            PointerGesture::ForceClick,
+        ];
+        let mut target = Destination::default();
+        let receiver = gestured(&mut target, &sent);
+        assert_eq!(delivered_gestures(&target.calls), sent);
+        assert_eq!(receiver.gesture_normalizations(), 0);
+    }
+
+    #[test]
+    fn a_change_without_a_began_gets_an_implicit_one() {
+        let mut target = Destination::default();
+        let receiver = gestured(&mut target, &[magnify(Changed, 0.2), magnify(Changed, 0.1)]);
+        assert_eq!(
+            delivered_gestures(&target.calls),
+            [
+                magnify(Began, 0.0),
+                magnify(Changed, 0.2),
+                magnify(Changed, 0.1)
+            ]
+        );
+        assert_eq!(receiver.gesture_normalizations(), 1);
+    }
+
+    #[test]
+    fn a_began_while_one_is_open_ends_the_open_one_first() {
+        let mut target = Destination::default();
+        let receiver = gestured(
+            &mut target,
+            &[rotate(Began, 0.0), rotate(Changed, 5.0), rotate(Began, 1.0)],
+        );
+        assert_eq!(
+            delivered_gestures(&target.calls),
+            [
+                rotate(Began, 0.0),
+                rotate(Changed, 5.0),
+                rotate(Ended, 0.0),
+                rotate(Began, 1.0)
+            ]
+        );
+        assert_eq!(receiver.gesture_normalizations(), 1);
+    }
+
+    #[test]
+    fn an_end_with_nothing_open_is_dropped() {
+        let mut target = Destination::default();
+        let receiver = gestured(
+            &mut target,
+            &[
+                magnify(Ended, 0.0),
+                rotate(Cancelled, 0.0),
+                magnify(Began, 0.0),
+                magnify(Ended, 0.0),
+                magnify(Ended, 0.0),
+            ],
+        );
+        assert_eq!(
+            delivered_gestures(&target.calls),
+            [magnify(Began, 0.0), magnify(Ended, 0.0)]
+        );
+        assert_eq!(receiver.gesture_normalizations(), 3);
+    }
+
+    #[test]
+    fn every_system_gesture_reaches_the_destination() {
+        let mut target = Destination::default();
+        let mut receiver = gestured(&mut target, &[]);
+        for (sequence, gesture) in (1..).zip(SystemGesture::ALL) {
+            let system = frame(2, sequence, Message::SystemGesture(gesture));
+            assert_eq!(
+                receiver.receive(&system, Duration::ZERO, &mut target),
+                Ok(None)
+            );
+            assert_eq!(
+                target.calls.last(),
+                Some(&DestinationAction::System(gesture))
+            );
+        }
+    }
+
+    #[test]
+    fn gestures_need_an_active_display_and_valid_values() {
+        let mut target = Destination::default();
+        let mut inactive = receiver();
+        assert_eq!(
+            inactive.receive(
+                &frame(1, 0, Message::SystemGesture(SystemGesture::Search)),
+                Duration::ZERO,
+                &mut target
+            ),
+            Err(ReceiverFailure::NotActive)
+        );
+        let mut target = Destination::default();
+        let mut receiver = gestured(&mut target, &[magnify(Began, 0.0)]);
+        assert_eq!(
+            receiver.receive(
+                &frame(2, 2, Message::Gesture(magnify(Changed, 9.0))),
+                Duration::ZERO,
+                &mut target
+            ),
+            Err(ReceiverFailure::InvalidGesture)
+        );
+        assert_eq!(delivered_gestures(&target.calls), [magnify(Began, 0.0)]);
+        assert_ended_then_released(&target.calls);
+    }
+
+    #[test]
+    fn gesture_frames_are_dropped_while_held() {
+        let mut target = Destination::default();
+        let mut receiver = gestured(&mut target, &[magnify(Began, 0.0)]);
+        assert_eq!(receiver.tick(PEER_LIVENESS, &mut target), Ok(None));
+        assert!(receiver.held_since().is_some());
+        let injected = target.calls.len();
+        for (sequence, message) in [
+            (2, Message::Gesture(magnify(Changed, 0.5))),
+            (3, Message::SystemGesture(SystemGesture::Overview)),
+        ] {
+            assert_eq!(
+                receiver.receive(&frame(2, sequence, message), PEER_LIVENESS, &mut target),
+                Ok(None)
+            );
+        }
+        assert_eq!(target.calls.len(), injected);
+    }
+
+    #[test]
+    fn a_return_ends_gestures_before_releasing_and_forgets_them() {
+        let mut target = Destination::default();
+        let mut receiver = gestured(&mut target, &[magnify(Began, 0.0)]);
+        assert_eq!(
+            receiver.receive(
+                &frame(2, 2, Message::ReleaseAll),
+                Duration::ZERO,
+                &mut target
+            ),
+            Ok(Some(Message::ReleaseAck))
+        );
+        assert_ended_then_released(&target.calls);
+        let again = frame(
+            3,
+            0,
+            Message::ActivateDisplayAt {
+                display_id: DisplayId(1),
+                position: Point::new(5.0, 5.0),
+            },
+        );
+        receiver
+            .receive(&again, Duration::ZERO, &mut target)
+            .unwrap();
+        receiver
+            .receive(
+                &frame(3, 1, Message::Gesture(magnify(Changed, 0.1))),
+                Duration::ZERO,
+                &mut target,
+            )
+            .unwrap();
+        assert_eq!(
+            delivered_gestures(&target.calls)[1..],
+            [magnify(Began, 0.0), magnify(Changed, 0.1)],
+            "the next control starts with nothing open"
+        );
+    }
+
+    #[test]
+    fn a_hold_ends_gestures_before_releasing() {
+        let mut target = Destination::default();
+        let mut receiver = gestured(&mut target, &[rotate(Began, 0.0)]);
+        assert_eq!(receiver.tick(PEER_LIVENESS, &mut target), Ok(None));
+        assert_ended_then_released(&target.calls);
+    }
+
+    #[test]
+    fn a_stop_ends_gestures_before_releasing_and_each_retry_repeats_both() {
+        let mut target = Destination {
+            fail_release: true,
+            ..Default::default()
+        };
+        let mut receiver = gestured(&mut target, &[magnify(Began, 0.0)]);
+        receiver.stop(ReceiverFailure::PeerStopped, &mut target);
+        assert_ended_then_released(&target.calls);
+        assert!(receiver.cleanup_pending());
+        target.fail_release = false;
+        receiver.retry_cleanup(&mut target);
+        assert_ended_then_released(&target.calls);
+        assert!(!receiver.cleanup_pending());
+    }
+
+    #[test]
+    fn a_failed_gesture_end_still_releases_keys_and_stays_pending() {
+        let mut target = Destination {
+            fail_end_gestures: true,
+            ..Default::default()
+        };
+        let mut receiver = gestured(&mut target, &[]);
+        receiver.stop(ReceiverFailure::PeerStopped, &mut target);
+        assert_ended_then_released(&target.calls);
+        assert!(receiver.cleanup_pending());
+    }
+
+    #[test]
+    fn a_take_back_by_a_local_gesture_ends_gestures_before_releasing() {
+        use monhop_core::capture::{CaptureEvent, CaptureStop, capture_channel};
+        let floor = SharedFloor::new();
+        let gate = TakeBackGate::new(floor.clone());
+        let mut receiver = receiver().with_floor(gate.clone(), false, true);
+        let mut target = Destination::default();
+        receiver
+            .receive(&activate(), Duration::ZERO, &mut target)
+            .unwrap();
+        receiver
+            .receive(
+                &frame(2, 1, Message::Gesture(magnify(Began, 0.0))),
+                Duration::ZERO,
+                &mut target,
+            )
+            .unwrap();
+        let stop = CaptureStop::new();
+        let (mut producer, _consumer) = capture_channel(stop.clone());
+        let mut physical = monhop_core::capture_physical::PhysicalCapture::new(Duration::ZERO)
+            .with_take_back(gate.clone());
+        physical.process(
+            CaptureEvent::gesture(rotate(Changed, 4.0)),
+            false,
+            Duration::ZERO,
+            &mut producer,
+            &stop,
+        );
+        assert_eq!(floor.snapshot().state, FloorState::Yielding);
+        assert_eq!(receiver.take_back(&mut target), Ok(Some(Message::TakeBack)));
+        assert_ended_then_released(&target.calls);
+        let released = target.calls.len();
+        receiver
+            .receive(
+                &frame(2, 2, Message::Gesture(magnify(Changed, 0.3))),
+                Duration::ZERO,
+                &mut target,
+            )
+            .unwrap();
+        assert_eq!(target.calls.len(), released, "nothing lands once yielded");
     }
 }

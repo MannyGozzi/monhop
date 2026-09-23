@@ -6,6 +6,8 @@ pub mod capture_decode;
 #[cfg(windows)]
 pub mod desktop_state;
 pub mod displays;
+#[cfg(windows)]
+mod gesture_inject;
 pub mod input;
 pub mod keymap;
 #[cfg(windows)]

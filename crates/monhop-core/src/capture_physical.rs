@@ -379,7 +379,10 @@ impl PhysicalCapture {
                 CaptureEvent::Key { .. }
                 | CaptureEvent::Button { .. }
                 | CaptureEvent::Scroll { .. }
-                | CaptureEvent::LogicalScroll { .. } => true,
+                | CaptureEvent::LogicalScroll { .. }
+                | CaptureEvent::SystemGesture(_) => true,
+                // A phase boundary without a change is not deliberate: it may end a local glide.
+                CaptureEvent::Gesture { kind, value, .. } => kind.is_discrete() || value != 0.0,
                 CaptureEvent::RelativeMotion { dx, dy } => self.motion.reaches_threshold(
                     floor.generation,
                     now,
@@ -867,6 +870,59 @@ mod tests {
             assert!(!input.process(logical, false, ms(at), &mut tx, &stop));
         }
         assert_still_receiving(&gate, receiving);
+    }
+
+    /// Whether `event` alone takes back a Receiving computer.
+    fn takes_back(event: CaptureEvent) -> bool {
+        let stop = CaptureStop::default();
+        let (mut tx, _rx) = capture_channel(stop.clone());
+        let (gate, receiving) = receiving_gate();
+        let mut input = PhysicalCapture::new(Duration::ZERO).with_take_back(gate.clone());
+        input.process(event, false, ms(0), &mut tx, &stop);
+        gate.floor().snapshot() != receiving
+    }
+
+    #[test]
+    fn a_gesture_that_changes_something_takes_back_and_a_bare_phase_does_not() {
+        use crate::{GesturePhase, PointerGesture, SystemGesture};
+        for phase in GesturePhase::ALL {
+            for (gesture, deliberate) in [
+                (PointerGesture::Magnify { phase, delta: 0.0 }, false),
+                (
+                    PointerGesture::Magnify {
+                        phase,
+                        delta: -0.01,
+                    },
+                    true,
+                ),
+                (
+                    PointerGesture::Rotate {
+                        phase,
+                        degrees: 0.0,
+                    },
+                    false,
+                ),
+                (
+                    PointerGesture::Rotate {
+                        phase,
+                        degrees: 3.0,
+                    },
+                    true,
+                ),
+            ] {
+                assert_eq!(
+                    takes_back(CaptureEvent::gesture(gesture)),
+                    deliberate,
+                    "{gesture:?}"
+                );
+            }
+        }
+        for discrete in [PointerGesture::SmartMagnify, PointerGesture::ForceClick] {
+            assert!(takes_back(CaptureEvent::gesture(discrete)));
+        }
+        for system in SystemGesture::ALL {
+            assert!(takes_back(CaptureEvent::SystemGesture(system)));
+        }
     }
 
     #[test]

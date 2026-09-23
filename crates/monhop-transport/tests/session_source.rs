@@ -3,8 +3,9 @@ use std::{cell::RefCell, sync::Once, time::Duration};
 use monhop_core::capture::DECLINE_RETRY_AFTER;
 use monhop_core::clicks::DOUBLE_CLICK_SLOP;
 use monhop_core::{
-    DeviceId, Display, DisplayId, Edge, EdgeLink, HidUsage, LogicalSize, Machine, ModifierState,
-    MouseButton, NativeSize, NormalizedSpan, Platform, Point, Topology,
+    DeviceId, Display, DisplayId, Edge, EdgeLink, GesturePhase, HidUsage, LogicalSize, Machine,
+    ModifierState, MouseButton, NativeSize, NormalizedSpan, Platform, Point, PointerGesture,
+    SystemGesture, Topology,
 };
 use monhop_protocol::{
     DeclineReason, DisconnectCode, DisplayDescription, DisplayTopology, Frame, Key, Message,
@@ -255,6 +256,9 @@ enum RecordedAction {
     Key(HidUsage, bool),
     Button(MouseButton, bool, u8),
     Scroll(f64, f64),
+    Gesture(PointerGesture),
+    System(SystemGesture),
+    EndGestures,
     ReleaseAll,
 }
 
@@ -278,6 +282,9 @@ impl InputDestination for RecordingDestination {
                 horizontal,
                 vertical,
             } => RecordedAction::Scroll(horizontal, vertical),
+            DestinationAction::Gesture(gesture) => RecordedAction::Gesture(gesture),
+            DestinationAction::System(gesture) => RecordedAction::System(gesture),
+            DestinationAction::EndGestures => RecordedAction::EndGestures,
             DestinationAction::ReleaseAll => RecordedAction::ReleaseAll,
         };
         let rejected = self.reject_key_down && matches!(&recorded, RecordedAction::Key(_, true));
@@ -5530,6 +5537,122 @@ fn a_guarded_entry_edge_takes_no_push_until_the_pointer_moves_away() {
         -1.0,
         shoved + ms(4)
     )));
+}
+
+/// One of each kind of gesture input the source can capture.
+fn gesture_inputs() -> [NormalizedInput; 3] {
+    [
+        NormalizedInput::Gesture(PointerGesture::Magnify {
+            phase: GesturePhase::Began,
+            delta: 0.0,
+        }),
+        NormalizedInput::Gesture(PointerGesture::ForceClick),
+        NormalizedInput::SystemGesture(SystemGesture::DesktopNext),
+    ]
+}
+
+fn sent_messages(outcome: &SourceOutcome) -> Vec<Message> {
+    outcome
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            SourceEffect::RemoteFrame(frame) => Some(frame.message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_gesture_while_local_is_never_sent_and_leaves_the_push_toward_the_peer_unchanged() {
+    let mut local = source();
+    rest_on_right_edge(&mut local, ms(0));
+    let short = PUSH_THROUGH_DISTANCE - 1.0;
+    assert!(
+        move_horizontally(&mut local, short - ARRIVAL, ms(1))
+            .effects
+            .is_empty()
+    );
+    for input in gesture_inputs() {
+        let gestured = capture_on_route(&mut local, input, ms(2));
+        assert_eq!(gestured.failure, None);
+        assert!(gestured.effects.is_empty(), "{input:?} sent while local");
+    }
+    assert_eq!(local.mode(), SourceMode::Local);
+    assert!(
+        sends_activation(&move_horizontally(&mut local, 1.0, ms(3))),
+        "the push kept its distance through the gestures"
+    );
+}
+
+#[test]
+fn a_gesture_while_remote_is_forwarded_and_leaves_the_push_home_unchanged() {
+    let mut remote = source();
+    activate_remote(&mut remote);
+    stay_alive(&mut remote, 3, after_crossing(0));
+    move_horizontally(&mut remote, ENTRY_GUARD_DISTANCE, after_crossing(1));
+    move_horizontally(&mut remote, -ENTRY_GUARD_DISTANCE - 3.0, after_crossing(2));
+    let short = PUSH_THROUGH_DISTANCE - 1.0;
+    assert!(
+        move_horizontally(&mut remote, -short, after_crossing(3))
+            .effects
+            .is_empty()
+    );
+    for input in gesture_inputs() {
+        let expected = match input {
+            NormalizedInput::Gesture(gesture) => Message::Gesture(gesture),
+            NormalizedInput::SystemGesture(gesture) => Message::SystemGesture(gesture),
+            _ => unreachable!("only gestures"),
+        };
+        let gestured = capture_on_route(&mut remote, input, after_crossing(4));
+        assert_eq!(gestured.failure, None);
+        assert_eq!(sent_messages(&gestured), [expected]);
+    }
+    assert_eq!(remote.mode(), SourceMode::Remote);
+    assert!(
+        sends_release_all(&move_horizontally(&mut remote, -1.0, after_crossing(5))),
+        "the push home kept its distance through the gestures"
+    );
+}
+
+#[test]
+fn a_gesture_reaches_the_receiver_and_the_return_ends_it_before_releasing() {
+    let (mut source, mut bridge) = controlling_a_wide_peer_display();
+    let pinch = |phase, delta| PointerGesture::Magnify { phase, delta };
+    for (at, gesture) in [
+        (1, pinch(GesturePhase::Began, 0.0)),
+        (2, pinch(GesturePhase::Changed, 0.25)),
+    ] {
+        let captured = capture_on_route(
+            &mut source,
+            NormalizedInput::Gesture(gesture),
+            after_crossing(at),
+        );
+        bridge
+            .pump(&mut source, captured, after_crossing(at))
+            .unwrap();
+    }
+    let recorded = &bridge.destination.actions;
+    assert_eq!(
+        recorded[recorded.len() - 2..],
+        [
+            RecordedAction::Gesture(pinch(GesturePhase::Began, 0.0)),
+            RecordedAction::Gesture(pinch(GesturePhase::Changed, 0.25)),
+        ]
+    );
+    let released = source.request_local(after_crossing(3));
+    bridge
+        .pump(&mut source, released, after_crossing(3))
+        .unwrap();
+    let ended = bridge
+        .destination
+        .actions
+        .iter()
+        .position(|action| *action == RecordedAction::EndGestures)
+        .expect("the return ends open gestures");
+    assert_eq!(
+        bridge.destination.actions[ended + 1],
+        RecordedAction::ReleaseAll
+    );
 }
 
 trait FreshCapture {

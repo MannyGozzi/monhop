@@ -8,7 +8,7 @@ use crate::{
     },
 };
 use monhop_core::{
-    Platform, Point,
+    Platform, Point, PointerGesture,
     capture::{CaptureEvent, CapturedEvent, StopReason},
 };
 #[cfg(target_os = "macos")]
@@ -237,6 +237,11 @@ pub(crate) fn normalize(
             horizontal: -horizontal / MAC_POINTS_PER_DETENT,
             vertical: vertical / MAC_POINTS_PER_DETENT,
         },
+        // The capture queue admits only valid parts, so a refusal here is a broken slot.
+        CaptureEvent::Gesture { kind, phase, value } => NormalizedInput::Gesture(
+            PointerGesture::from_parts(kind, phase, value).map_err(|_| SessionFailure::Source)?,
+        ),
+        CaptureEvent::SystemGesture(gesture) => NormalizedInput::SystemGesture(gesture),
     };
     Ok(Some(TaggedInput {
         event,
@@ -373,6 +378,37 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn captured_gestures_normalize_to_the_semantic_they_carry() {
+        let normalized = |event| {
+            normalize(
+                CapturedEvent {
+                    event,
+                    routing_revision: 2,
+                    remote: true,
+                    floor_generation: 1,
+                },
+                None,
+            )
+            .unwrap()
+            .unwrap()
+            .event
+        };
+        let pinch = PointerGesture::Magnify {
+            phase: monhop_core::GesturePhase::Changed,
+            delta: -0.25,
+        };
+        assert_eq!(
+            normalized(CaptureEvent::gesture(pinch)),
+            NormalizedInput::Gesture(pinch)
+        );
+        let system = monhop_core::SystemGesture::ShowDesktop;
+        assert_eq!(
+            normalized(CaptureEvent::SystemGesture(system)),
+            NormalizedInput::SystemGesture(system)
+        );
+    }
+
     #[test]
     fn remote_absolute_samples_cannot_duplicate_relative_motion() {
         assert!(

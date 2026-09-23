@@ -1,5 +1,7 @@
 use monhop_core::{
-    DeviceId, DisplayId, HidUsage, ModifierState, MonitorIdentity, MouseButton, Platform, Point,
+    DeviceId, DisplayId, GestureKind, GesturePhase, HidUsage, MAX_MAGNIFY_DELTA,
+    MAX_ROTATE_DEGREES, MIN_MAGNIFY_DELTA, ModifierState, MonitorIdentity, MouseButton, Platform,
+    Point, PointerGesture, SystemGesture,
 };
 use monhop_protocol::{
     Button, Capabilities, ControlPermissions, DatagramDecodeError, DeclineReason, DecodeError,
@@ -60,6 +62,12 @@ fn all_messages() -> Vec<Message> {
             horizontal: 0.25,
             vertical: -1.0,
         }),
+        Message::Gesture(PointerGesture::Magnify {
+            phase: GesturePhase::Changed,
+            delta: -0.125,
+        }),
+        Message::Gesture(PointerGesture::ForceClick),
+        Message::SystemGesture(SystemGesture::DesktopNext),
         Message::Key(Key {
             usage: HidUsage(0x04),
             is_down: true,
@@ -565,7 +573,7 @@ fn activation_protocol_rejects_nonfinite_out_of_range_and_malformed_frames() {
     assert_eq!(decode(&old_version), Err(DecodeError::UnsupportedVersion));
 
     let mut unknown_kind = encoded;
-    unknown_kind[6] = 21;
+    unknown_kind[6] = 23;
     assert_eq!(decode(&unknown_kind), Err(DecodeError::UnknownMessageType));
 }
 
@@ -677,10 +685,10 @@ fn readiness_requires_the_current_protocol_and_an_empty_reliable_body() {
     let ready = frame(3, Message::SessionReady);
     let mut bytes = Vec::new();
     ready.encode_into(&mut bytes).unwrap();
-    assert_eq!(PROTOCOL_VERSION, 10);
+    assert_eq!(PROTOCOL_VERSION, 11);
     assert_eq!(ready.delivery(), DeliveryClass::Reliable);
     assert_eq!(decode(&bytes), Ok(ready));
-    for version in 1_u16..=9 {
+    for version in 1_u16..=10 {
         let mut old = bytes.clone();
         old[4..6].copy_from_slice(&version.to_be_bytes());
         assert_eq!(decode(&old), Err(DecodeError::UnsupportedVersion));
@@ -904,4 +912,212 @@ fn display_topology_carries_the_monitor_identity() {
     assert_eq!(decoded.displays()[1].monitor, None);
     assert_eq!(MonitorIdentity::new(0, 7, 1), None);
     assert_eq!(MonitorIdentity::new(7, 0, 1), None);
+}
+
+fn every_gesture() -> Vec<PointerGesture> {
+    let mut gestures = vec![PointerGesture::SmartMagnify, PointerGesture::ForceClick];
+    for phase in GesturePhase::ALL {
+        for delta in [0.0, -0.999, MAX_MAGNIFY_DELTA, 0.031_25] {
+            gestures.push(PointerGesture::Magnify { phase, delta });
+        }
+        for degrees in [-MAX_ROTATE_DEGREES, 0.0, 7.5, MAX_ROTATE_DEGREES] {
+            gestures.push(PointerGesture::Rotate { phase, degrees });
+        }
+    }
+    gestures
+}
+
+/// A gesture frame's 16-byte body, as the wire lays it out.
+fn gesture_body(kind: u8, phase: u8, value: f64) -> Vec<u8> {
+    let mut body = vec![kind, phase, 0, 0, 0, 0, 0, 0];
+    body.extend_from_slice(&value.to_bits().to_be_bytes());
+    body
+}
+
+/// Decodes `body` as a frame of message kind `kind`, with a valid header around it.
+fn decode_body(kind: u8, body: &[u8]) -> Result<Frame, DecodeError> {
+    let mut encoded = Vec::new();
+    frame(1, Message::ReleaseAll)
+        .encode_into(&mut encoded)
+        .expect("encode header");
+    encoded[6] = kind;
+    encoded[8..10].copy_from_slice(&(body.len() as u16).to_be_bytes());
+    encoded.extend_from_slice(body);
+    decode(&encoded)
+}
+
+#[test]
+fn every_gesture_round_trips_in_its_exact_body() {
+    let mut encoded = Vec::new();
+    for (sequence, gesture) in every_gesture().into_iter().enumerate() {
+        let source = frame(sequence as u64, Message::Gesture(gesture));
+        source.encode_into(&mut encoded).expect("encode gesture");
+        assert_eq!(encoded[6], 21);
+        assert_eq!(
+            &encoded[28..],
+            gesture_body(
+                gesture.kind() as u8,
+                gesture.phase().map_or(0, |phase| phase as u8),
+                gesture.value()
+            )
+        );
+        assert_eq!(source.delivery(), DeliveryClass::Reliable);
+        assert_eq!(decode(&encoded), Ok(source));
+    }
+}
+
+#[test]
+fn every_system_gesture_round_trips_in_its_exact_body() {
+    let mut encoded = Vec::new();
+    for (sequence, gesture) in SystemGesture::ALL.into_iter().enumerate() {
+        let source = frame(sequence as u64, Message::SystemGesture(gesture));
+        source
+            .encode_into(&mut encoded)
+            .expect("encode system gesture");
+        assert_eq!(encoded[6], 22);
+        assert_eq!(&encoded[28..], &[gesture as u8, 0, 0, 0]);
+        assert_eq!(source.delivery(), DeliveryClass::Reliable);
+        assert_eq!(decode(&encoded), Ok(source));
+    }
+}
+
+#[test]
+fn a_gesture_with_an_unknown_kind_or_phase_is_rejected() {
+    for kind in [0, 5, u8::MAX] {
+        assert_eq!(
+            decode_body(21, &gesture_body(kind, 0, 0.0)),
+            Err(DecodeError::InvalidEnum)
+        );
+    }
+    for phase in [5, u8::MAX] {
+        assert_eq!(
+            decode_body(21, &gesture_body(GestureKind::Magnify as u8, phase, 0.0)),
+            Err(DecodeError::InvalidEnum)
+        );
+    }
+}
+
+#[test]
+fn a_gesture_with_a_nonzero_reserved_byte_is_rejected() {
+    for index in 2..8 {
+        let mut body = gesture_body(GestureKind::Rotate as u8, 1, 1.0);
+        body[index] = 1;
+        assert_eq!(
+            decode_body(21, &body),
+            Err(DecodeError::NonZeroReservedField),
+            "byte {index}"
+        );
+    }
+}
+
+#[test]
+fn a_gesture_value_must_be_finite_and_within_its_kinds_range() {
+    for kind in [GestureKind::Magnify, GestureKind::Rotate] {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                decode_body(21, &gesture_body(kind as u8, 2, value)),
+                Err(DecodeError::NonFiniteCoordinate)
+            );
+        }
+    }
+    for (kind, value) in [
+        (GestureKind::Magnify, MIN_MAGNIFY_DELTA),
+        (GestureKind::Magnify, -7.0),
+        (GestureKind::Magnify, MAX_MAGNIFY_DELTA + 0.001),
+        (GestureKind::Rotate, MAX_ROTATE_DEGREES + 0.001),
+        (GestureKind::Rotate, -MAX_ROTATE_DEGREES - 0.001),
+    ] {
+        assert_eq!(
+            decode_body(21, &gesture_body(kind as u8, 2, value)),
+            Err(DecodeError::InvalidGesture),
+            "{kind:?} {value}"
+        );
+    }
+}
+
+#[test]
+fn a_continuous_gesture_needs_a_phase_and_a_discrete_one_carries_neither_phase_nor_value() {
+    for kind in [GestureKind::Magnify, GestureKind::Rotate] {
+        assert_eq!(
+            decode_body(21, &gesture_body(kind as u8, 0, 0.5)),
+            Err(DecodeError::InvalidGesture)
+        );
+    }
+    for kind in [GestureKind::SmartMagnify, GestureKind::ForceClick] {
+        for (phase, value) in [
+            (1, 0.0),
+            (4, 0.0),
+            (0, 1.0),
+            (0, -0.0),
+            (0, f64::MIN_POSITIVE),
+        ] {
+            assert_eq!(
+                decode_body(21, &gesture_body(kind as u8, phase, value)),
+                Err(DecodeError::InvalidGesture),
+                "{kind:?} phase {phase} value {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_system_gesture_with_an_unknown_action_or_reserved_byte_is_rejected() {
+    for action in [0, 13, u8::MAX] {
+        assert_eq!(
+            decode_body(22, &[action, 0, 0, 0]),
+            Err(DecodeError::InvalidEnum)
+        );
+    }
+    for index in 1..4 {
+        let mut body = [SystemGesture::Search as u8, 0, 0, 0];
+        body[index] = 1;
+        assert_eq!(
+            decode_body(22, &body),
+            Err(DecodeError::NonZeroReservedField)
+        );
+    }
+    assert_eq!(
+        decode_body(22, &[SystemGesture::Search as u8, 0, 0, 0, 0]),
+        Err(DecodeError::TrailingBytes)
+    );
+    assert_eq!(
+        decode_body(
+            21,
+            &gesture_body(GestureKind::ForceClick as u8, 0, 0.0)[..15]
+        ),
+        Err(DecodeError::Truncated)
+    );
+}
+
+#[test]
+fn an_invalid_gesture_cannot_be_encoded() {
+    let mut buffer = Vec::new();
+    for (gesture, error) in [
+        (
+            PointerGesture::Magnify {
+                phase: GesturePhase::Began,
+                delta: MIN_MAGNIFY_DELTA,
+            },
+            EncodeError::InvalidGesture,
+        ),
+        (
+            PointerGesture::Rotate {
+                phase: GesturePhase::Changed,
+                degrees: 181.0,
+            },
+            EncodeError::InvalidGesture,
+        ),
+        (
+            PointerGesture::Magnify {
+                phase: GesturePhase::Changed,
+                delta: f64::NAN,
+            },
+            EncodeError::NonFiniteCoordinate,
+        ),
+    ] {
+        assert_eq!(
+            frame(1, Message::Gesture(gesture)).encode_into(&mut buffer),
+            Err(error)
+        );
+    }
 }

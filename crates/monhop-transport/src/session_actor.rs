@@ -47,6 +47,7 @@ pub const fn receiver_failure_code(failure: ReceiverFailure) -> u8 {
         ReceiverFailure::UnexpectedMessage => 31,
         ReceiverFailure::NativeDelivery => 32,
         ReceiverFailure::PeerStopped => 33,
+        ReceiverFailure::InvalidGesture => 34,
     }
 }
 
@@ -732,10 +733,8 @@ fn micros_since(origin: &SessionClock, start: Duration) -> u64 {
     micros_u64(origin.elapsed().saturating_sub(start))
 }
 
+/// Stats first: a reader that acquires `held` then sees the hold it counts.
 fn note_hold(status: &Status, receiver: &InputReceiver, now: Duration) {
-    status
-        .held
-        .store(receiver.held_since().is_some(), Ordering::Release);
     let (holds, held_max) = receiver.hold_stats(now);
     status
         .stats
@@ -745,6 +744,9 @@ fn note_hold(status: &Status, receiver: &InputReceiver, now: Duration) {
         .stats
         .held_max_millis
         .store(millis_u64(held_max), Ordering::Relaxed);
+    status
+        .held
+        .store(receiver.held_since().is_some(), Ordering::Release);
 }
 
 fn stop_receiver(
@@ -1051,11 +1053,7 @@ mod tests {
         assert_eq!(actor.try_submit(activation()), Err(ActorFailure::Startup));
         wait_until(|| actor.finish());
         let actions = received.try_iter().collect::<Vec<_>>();
-        assert!(
-            actions
-                .iter()
-                .all(|action| matches!(action, DestinationAction::ReleaseAll))
-        );
+        assert!(actions.iter().all(|action| action.is_release()));
         assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 
@@ -1089,6 +1087,10 @@ mod tests {
         assert!(matches!(
             rx.recv_timeout(PEER_LIVENESS + Duration::from_millis(200))
                 .unwrap(),
+            DestinationAction::EndGestures
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(100)).unwrap(),
             DestinationAction::ReleaseAll
         ));
         // The release does not wait for the network, and the session holds instead of ending.
@@ -1199,11 +1201,7 @@ mod tests {
         wait_until(|| actor.finish());
         let actions: Vec<_> = received.try_iter().collect();
         assert!(!actions.is_empty());
-        assert!(
-            actions
-                .iter()
-                .all(|action| matches!(action, DestinationAction::ReleaseAll))
-        );
+        assert!(actions.iter().all(|action| action.is_release()));
         assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 
@@ -1322,11 +1320,7 @@ mod tests {
                 pressed: true
             }
         ));
-        assert!(
-            actions[2..]
-                .iter()
-                .all(|action| matches!(action, DestinationAction::ReleaseAll))
-        );
+        assert!(actions[2..].iter().all(|action| action.is_release()));
         assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 

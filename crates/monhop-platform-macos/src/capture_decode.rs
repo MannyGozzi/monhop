@@ -3,9 +3,12 @@
 //! This module does not touch Core Graphics. The owned capture thread supplies copied fields from
 //! its event-tap callback, which keeps the policy testable on non-macOS hosts.
 
+use std::fmt;
+
 use monhop_core::{
-    HidUsage, LogicalRect, ModifierState, MouseButton, Point, TakeBackGate, capture::CaptureEvent,
-    capture_physical::LocalTransfer, clicks::capture_clock,
+    GestureKind, GesturePhase, HidUsage, LogicalRect, ModifierState, MouseButton, Point,
+    PointerGesture, SystemGesture, TakeBackGate, capture::CaptureEvent,
+    capture_physical::LocalTransfer, clicks::capture_clock, gesture_latch::TouchRecord,
 };
 
 use crate::{MacVirtualKey, mac_modifier_flags_from_held_keys, mac_virtual_key_to_hid};
@@ -38,6 +41,50 @@ pub const CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
 pub const CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
 /// Core Graphics `kCGEventOtherMouseDragged`.
 pub const CG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
+/// Private `kCGSEventGesture`: pinch, rotation, smart zoom, pressure and touch-session records.
+pub const CG_EVENT_GESTURE: u32 = 29;
+/// Private `kCGSEventDockControl`: the Dock's Spaces, Mission Control and Show Desktop swipes.
+pub const CG_EVENT_DOCK_CONTROL: u32 = 30;
+/// Private `kCGSEventFluidTouchGesture`.
+pub const CG_EVENT_FLUID_TOUCH_GESTURE: u32 = 31;
+
+/// Cumulative Dock-swipe progress at which the swipe fires its system gesture, mid-swipe.
+pub const DOCK_SWIPE_COMMIT_PROGRESS: f64 = 0.15;
+/// Axis velocity that still commits a swipe lifted short of its progress. Unverified units.
+pub const DOCK_SWIPE_COMMIT_VELOCITY: f64 = 0.5;
+// Progress sign (field 124) meaning the first gesture of each motion's pair; the opposite sign
+// means the second. Unverified on macOS 27, where these flipped before: flip them here.
+/// Horizontal: `DesktopNext`, else `DesktopPrevious`.
+pub const DOCK_SWIPE_HORIZONTAL_NEXT_SIGN: f64 = -1.0;
+/// Vertical: `Overview` (fingers up), else `AppWindows`.
+pub const DOCK_SWIPE_VERTICAL_UP_SIGN: f64 = -1.0;
+/// Thumb and three fingers: `ShowDesktop` (spread), else `Launcher`.
+pub const DOCK_SWIPE_SCALE_SPREAD_SIGN: f64 = 1.0;
+
+// Field 110, the IOHID event type behind a gesture record.
+const HID_ROTATION: i64 = 5;
+const HID_SCROLL: i64 = 6;
+const HID_ZOOM: i64 = 8;
+const HID_ZOOM_TOGGLE: i64 = 22;
+const HID_DOCK_SWIPE: i64 = 23;
+const HID_FORCE: i64 = 32;
+const HID_TOUCH_STARTED: i64 = 61;
+const HID_TOUCH_ENDED: i64 = 62;
+
+// Field 132.
+const NATIVE_PHASE_BEGAN: i64 = 1;
+const NATIVE_PHASE_CHANGED: i64 = 2;
+const NATIVE_PHASE_ENDED: i64 = 4;
+const NATIVE_PHASE_CANCELLED: i64 = 8;
+const NATIVE_PHASE_MAY_BEGIN: i64 = 128;
+
+// Field 123 on a Dock swipe.
+const MOTION_HORIZONTAL: i64 = 1;
+const MOTION_VERTICAL: i64 = 2;
+const MOTION_SCALE: i64 = 3;
+
+/// Field 143 once a press goes deep enough for Look Up.
+const FORCE_CLICK_STAGE: i64 = 2;
 
 /// Core Graphics `kCGEventSourceStateHIDSystemState`.
 pub const CG_EVENT_SOURCE_STATE_HID_SYSTEM: i64 = 1;
@@ -408,6 +455,396 @@ pub fn decode_scroll(
         horizontal,
         vertical,
     })
+}
+
+/// Copied fields of one private gesture record. Every one is private and may change meaning, so
+/// no value here can make decoding fail: an unknown one only makes the record unmapped.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GestureFields {
+    pub event_type: u32,
+    /// Field 110: the IOHID event type behind the record.
+    pub hid_type: i64,
+    /// Field 132.
+    pub phase: i64,
+    /// Field 113: the pinch delta; the view's scale multiplies by `1 + zoom`. It shares its slot
+    /// with field 114, so each is meaningful only on its own record kind.
+    pub zoom: f64,
+    /// Field 114: degrees, counterclockwise positive.
+    pub rotation: f64,
+    /// Field 123: the Dock swipe's axis.
+    pub motion: i64,
+    /// Field 124: cumulative Dock-swipe progress, signed by direction.
+    pub progress: f64,
+    /// Fields 129 and 130.
+    pub velocity_x: f64,
+    pub velocity_y: f64,
+    /// Field 143: the pressure stage of a click.
+    pub stage: i64,
+}
+
+/// What one gesture record means for local apps and for the other computer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecodedGesture {
+    /// How the record relates to the touch session the capture latch keeps on one route.
+    pub record: TouchRecord,
+    pub output: GestureOutput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GestureOutput {
+    /// Latch only: a session boundary, a scroll companion, or a swipe short of its commit.
+    Quiet,
+    /// Valid by construction: gestures come only from [`PointerGesture::from_parts`].
+    Event(CaptureEvent),
+    /// A native gesture MonHop cannot map. Withheld while remote and counted, never a failure.
+    Unmapped,
+}
+
+/// Why a Dock swipe or pinch ended, for its diagnostic line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GestureEnd {
+    Lifted,
+    Cancelled,
+    /// A new one began before this one's end arrived.
+    Lost,
+}
+
+impl fmt::Display for GestureEnd {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Lifted => "lift",
+            Self::Cancelled => "cancel",
+            Self::Lost => "lost end",
+        })
+    }
+}
+
+/// One finished Dock swipe or pinch, logged once so a hardware run can pin the unverified signs
+/// and thresholds. Values only: no position or key identity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GestureSummary {
+    DockSwipe {
+        motion: i64,
+        progress: f64,
+        peak_velocity_x: f64,
+        peak_velocity_y: f64,
+        fired: Option<SystemGesture>,
+        end: GestureEnd,
+    },
+    Pinch {
+        records: u32,
+        scale: f64,
+        end: GestureEnd,
+    },
+}
+
+impl fmt::Display for GestureSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::DockSwipe {
+                motion,
+                progress,
+                peak_velocity_x,
+                peak_velocity_y,
+                fired,
+                end,
+            } => {
+                write!(
+                    formatter,
+                    "dock swipe ended ({end}): motion {motion}, final progress {progress:.3}, \
+                     peak velocity x {peak_velocity_x:.3} y {peak_velocity_y:.3}, fired "
+                )?;
+                match fired {
+                    Some(gesture) => write!(formatter, "{gesture:?}"),
+                    None => formatter.write_str("none"),
+                }
+            }
+            Self::Pinch {
+                records,
+                scale,
+                end,
+            } => write!(
+                formatter,
+                "pinch ended ({end}): {records} records, total scale {scale:.3}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DockSwipe {
+    motion: i64,
+    progress: f64,
+    /// Along the motion's axis; a Scale swipe has none.
+    velocity: f64,
+    peak_velocity_x: f64,
+    peak_velocity_y: f64,
+    fired: Option<SystemGesture>,
+}
+
+impl DockSwipe {
+    const fn new(motion: i64) -> Self {
+        Self {
+            motion,
+            progress: 0.0,
+            velocity: 0.0,
+            peak_velocity_x: 0.0,
+            peak_velocity_y: 0.0,
+            fired: None,
+        }
+    }
+
+    /// A terminal record may carry zeroed values; the last real ones decide it.
+    fn observe(&mut self, fields: GestureFields, terminal: bool) {
+        let kept = |value: f64| value.is_finite() && !(terminal && value == 0.0);
+        if kept(fields.progress) {
+            self.progress = fields.progress;
+        }
+        let velocity = match self.motion {
+            MOTION_HORIZONTAL => fields.velocity_x,
+            MOTION_VERTICAL => fields.velocity_y,
+            _ => 0.0,
+        };
+        if kept(velocity) {
+            self.velocity = velocity;
+        }
+        if fields.velocity_x.is_finite() {
+            self.peak_velocity_x = self.peak_velocity_x.max(fields.velocity_x.abs());
+        }
+        if fields.velocity_y.is_finite() {
+            self.peak_velocity_y = self.peak_velocity_y.max(fields.velocity_y.abs());
+        }
+    }
+
+    fn commits(&self, phase: GesturePhase) -> bool {
+        match phase {
+            GesturePhase::Cancelled => false,
+            GesturePhase::Ended if self.progress.abs() < DOCK_SWIPE_COMMIT_PROGRESS => {
+                self.progress != 0.0
+                    && self.velocity * self.progress.signum() >= DOCK_SWIPE_COMMIT_VELOCITY
+            }
+            _ => self.progress.abs() >= DOCK_SWIPE_COMMIT_PROGRESS,
+        }
+    }
+
+    fn gesture(&self) -> SystemGesture {
+        let (sign, first, second) = match self.motion {
+            MOTION_HORIZONTAL => (
+                DOCK_SWIPE_HORIZONTAL_NEXT_SIGN,
+                SystemGesture::DesktopNext,
+                SystemGesture::DesktopPrevious,
+            ),
+            MOTION_VERTICAL => (
+                DOCK_SWIPE_VERTICAL_UP_SIGN,
+                SystemGesture::Overview,
+                SystemGesture::AppWindows,
+            ),
+            _ => (
+                DOCK_SWIPE_SCALE_SPREAD_SIGN,
+                SystemGesture::ShowDesktop,
+                SystemGesture::Launcher,
+            ),
+        };
+        if self.progress * sign > 0.0 {
+            first
+        } else {
+            second
+        }
+    }
+
+    const fn summary(self, end: GestureEnd) -> GestureSummary {
+        GestureSummary::DockSwipe {
+            motion: self.motion,
+            progress: self.progress,
+            peak_velocity_x: self.peak_velocity_x,
+            peak_velocity_y: self.peak_velocity_y,
+            fired: self.fired,
+            end,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Pinch {
+    records: u32,
+    scale: f64,
+}
+
+impl Pinch {
+    const fn summary(self, end: GestureEnd) -> GestureSummary {
+        GestureSummary::Pinch {
+            records: self.records,
+            scale: self.scale,
+            end,
+        }
+    }
+}
+
+/// Gesture state that spans records: the open Dock swipe and pinch and the current press.
+#[derive(Debug, Default)]
+pub struct GestureDecoder {
+    swipe: Option<DockSwipe>,
+    pinch: Option<Pinch>,
+    force_clicked: bool,
+    finished_swipe: Option<GestureSummary>,
+    finished_pinch: Option<GestureSummary>,
+}
+
+impl GestureDecoder {
+    /// Swipes and pinches finished since the last call, for the owner thread to log.
+    pub fn take_finished(&mut self) -> impl Iterator<Item = GestureSummary> + use<> {
+        [self.finished_swipe.take(), self.finished_pinch.take()]
+            .into_iter()
+            .flatten()
+    }
+
+    /// A Dock swipe fires its one system gesture at the first record whose progress reaches the
+    /// commit, or at a short lift whose velocity agrees; never on Cancelled.
+    fn dock_swipe(&mut self, fields: GestureFields) -> GestureOutput {
+        let phase = match native_phase(fields.phase) {
+            Some(NativePhase::Gesture(phase)) => phase,
+            Some(NativePhase::MayBegin) => return GestureOutput::Quiet,
+            None => return GestureOutput::Unmapped,
+        };
+        if phase == GesturePhase::Began || (self.swipe.is_none() && !phase.is_terminal()) {
+            // The motion is fixed when a swipe starts; an edge swipe's is one MonHop cannot map.
+            if !matches!(
+                fields.motion,
+                MOTION_HORIZONTAL | MOTION_VERTICAL | MOTION_SCALE
+            ) {
+                return GestureOutput::Unmapped;
+            }
+            if let Some(lost) = self.swipe.take() {
+                self.finished_swipe = Some(lost.summary(GestureEnd::Lost));
+            }
+            self.swipe = Some(DockSwipe::new(fields.motion));
+        }
+        let Some(swipe) = self.swipe.as_mut() else {
+            return GestureOutput::Quiet;
+        };
+        swipe.observe(fields, phase.is_terminal());
+        let fired = (swipe.fired.is_none() && swipe.commits(phase)).then(|| swipe.gesture());
+        if fired.is_some() {
+            swipe.fired = fired;
+        }
+        if let Some(end) = terminal_end(phase)
+            && let Some(done) = self.swipe.take()
+        {
+            self.finished_swipe = Some(done.summary(end));
+        }
+        fired.map_or(GestureOutput::Quiet, |gesture| {
+            GestureOutput::Event(CaptureEvent::SystemGesture(gesture))
+        })
+    }
+
+    fn magnify(&mut self, fields: GestureFields) -> GestureOutput {
+        let phase = match native_phase(fields.phase) {
+            Some(NativePhase::Gesture(phase)) => phase,
+            Some(NativePhase::MayBegin) => return GestureOutput::Quiet,
+            None => return GestureOutput::Unmapped,
+        };
+        let Ok(gesture) =
+            PointerGesture::from_parts(GestureKind::Magnify, Some(phase), fields.zoom)
+        else {
+            return GestureOutput::Unmapped;
+        };
+        if phase == GesturePhase::Began
+            && let Some(lost) = self.pinch.take()
+        {
+            self.finished_pinch = Some(lost.summary(GestureEnd::Lost));
+        }
+        let pinch = self.pinch.get_or_insert(Pinch {
+            records: 0,
+            scale: 1.0,
+        });
+        pinch.records = pinch.records.saturating_add(1);
+        pinch.scale *= 1.0 + fields.zoom;
+        if let Some(end) = terminal_end(phase)
+            && let Some(done) = self.pinch.take()
+        {
+            self.finished_pinch = Some(done.summary(end));
+        }
+        GestureOutput::Event(CaptureEvent::gesture(gesture))
+    }
+
+    /// Look Up fires once per press, when it first reaches the force-click stage.
+    fn force(&mut self, fields: GestureFields) -> DecodedGesture {
+        if fields.stage >= FORCE_CLICK_STAGE && !self.force_clicked {
+            self.force_clicked = true;
+            return DecodedGesture {
+                record: TouchRecord::Standalone,
+                output: GestureOutput::Event(CaptureEvent::gesture(PointerGesture::ForceClick)),
+            };
+        }
+        let ended = matches!(native_phase(fields.phase), Some(NativePhase::Gesture(phase)) if phase.is_terminal());
+        if fields.stage <= 0 || ended {
+            self.force_clicked = false;
+        }
+        continues(GestureOutput::Quiet)
+    }
+}
+
+enum NativePhase {
+    MayBegin,
+    Gesture(GesturePhase),
+}
+
+fn native_phase(value: i64) -> Option<NativePhase> {
+    Some(NativePhase::Gesture(match value {
+        NATIVE_PHASE_BEGAN => GesturePhase::Began,
+        NATIVE_PHASE_CHANGED => GesturePhase::Changed,
+        NATIVE_PHASE_ENDED => GesturePhase::Ended,
+        NATIVE_PHASE_CANCELLED => GesturePhase::Cancelled,
+        NATIVE_PHASE_MAY_BEGIN => return Some(NativePhase::MayBegin),
+        _ => return None,
+    }))
+}
+
+const fn terminal_end(phase: GesturePhase) -> Option<GestureEnd> {
+    match phase {
+        GesturePhase::Ended => Some(GestureEnd::Lifted),
+        GesturePhase::Cancelled => Some(GestureEnd::Cancelled),
+        GesturePhase::Began | GesturePhase::Changed => None,
+    }
+}
+
+const fn continues(output: GestureOutput) -> DecodedGesture {
+    DecodedGesture {
+        record: TouchRecord::Continues,
+        output,
+    }
+}
+
+/// Decodes one physical private gesture record (Core Graphics types 29 to 31). Pure but for
+/// `decoder`, and total: nothing a private field holds stops capture.
+pub fn decode_gesture(fields: GestureFields, decoder: &mut GestureDecoder) -> DecodedGesture {
+    let record = |record, output| DecodedGesture { record, output };
+    match (fields.event_type, fields.hid_type) {
+        (CG_EVENT_GESTURE, HID_TOUCH_STARTED) => record(TouchRecord::Opens, GestureOutput::Quiet),
+        (CG_EVENT_GESTURE, HID_TOUCH_ENDED) => record(TouchRecord::Closes, GestureOutput::Quiet),
+        (CG_EVENT_GESTURE, HID_SCROLL) => continues(GestureOutput::Quiet),
+        (CG_EVENT_GESTURE, HID_ZOOM) => continues(decoder.magnify(fields)),
+        (CG_EVENT_GESTURE, HID_ROTATION) => continues(rotate(fields)),
+        (CG_EVENT_GESTURE, HID_ZOOM_TOGGLE) => record(
+            TouchRecord::Standalone,
+            GestureOutput::Event(CaptureEvent::gesture(PointerGesture::SmartMagnify)),
+        ),
+        (CG_EVENT_GESTURE, HID_FORCE) => decoder.force(fields),
+        (CG_EVENT_DOCK_CONTROL, HID_DOCK_SWIPE) => continues(decoder.dock_swipe(fields)),
+        _ => continues(GestureOutput::Unmapped),
+    }
+}
+
+fn rotate(fields: GestureFields) -> GestureOutput {
+    let phase = match native_phase(fields.phase) {
+        Some(NativePhase::Gesture(phase)) => phase,
+        Some(NativePhase::MayBegin) => return GestureOutput::Quiet,
+        None => return GestureOutput::Unmapped,
+    };
+    PointerGesture::from_parts(GestureKind::Rotate, Some(phase), fields.rotation)
+        .map_or(GestureOutput::Unmapped, |gesture| {
+            GestureOutput::Event(CaptureEvent::gesture(gesture))
+        })
 }
 
 /// The event-tap callback's decode is where a button is stamped on the shared capture clock.
@@ -953,6 +1390,523 @@ mod tests {
             ),
             DecodedInput::Unsupported
         ));
+    }
+
+    fn record(event_type: u32, hid_type: i64) -> GestureFields {
+        GestureFields {
+            event_type,
+            hid_type,
+            ..GestureFields::default()
+        }
+    }
+
+    fn pinch(phase: i64, zoom: f64) -> GestureFields {
+        GestureFields {
+            phase,
+            zoom,
+            ..record(CG_EVENT_GESTURE, HID_ZOOM)
+        }
+    }
+
+    fn swipe(motion: i64, phase: i64, progress: f64, velocity: (f64, f64)) -> GestureFields {
+        GestureFields {
+            phase,
+            motion,
+            progress,
+            velocity_x: velocity.0,
+            velocity_y: velocity.1,
+            ..record(CG_EVENT_DOCK_CONTROL, HID_DOCK_SWIPE)
+        }
+    }
+
+    fn press(stage: i64) -> GestureFields {
+        GestureFields {
+            stage,
+            ..record(CG_EVENT_GESTURE, HID_FORCE)
+        }
+    }
+
+    const STILL: (f64, f64) = (0.0, 0.0);
+
+    fn gesture(gesture: PointerGesture) -> GestureOutput {
+        GestureOutput::Event(CaptureEvent::gesture(gesture))
+    }
+
+    fn system(gesture: SystemGesture) -> GestureOutput {
+        GestureOutput::Event(CaptureEvent::SystemGesture(gesture))
+    }
+
+    /// The outputs of `records` decoded in order by one decoder.
+    fn outputs(
+        decoder: &mut GestureDecoder,
+        records: impl IntoIterator<Item = GestureFields>,
+    ) -> Vec<GestureOutput> {
+        records
+            .into_iter()
+            .map(|fields| decode_gesture(fields, decoder).output)
+            .collect()
+    }
+
+    fn finished(decoder: &mut GestureDecoder) -> Vec<GestureSummary> {
+        decoder.take_finished().collect()
+    }
+
+    #[test]
+    fn the_decode_table_maps_each_known_record_and_leaves_the_rest_unmapped() {
+        let decode = |fields| decode_gesture(fields, &mut GestureDecoder::default());
+        let decoded = |record, output| DecodedGesture { record, output };
+        let changed = |fields: GestureFields| GestureFields {
+            phase: NATIVE_PHASE_CHANGED,
+            ..fields
+        };
+        for (fields, expected) in [
+            (
+                record(CG_EVENT_GESTURE, HID_TOUCH_STARTED),
+                decoded(TouchRecord::Opens, GestureOutput::Quiet),
+            ),
+            (
+                record(CG_EVENT_GESTURE, HID_TOUCH_ENDED),
+                decoded(TouchRecord::Closes, GestureOutput::Quiet),
+            ),
+            (
+                record(CG_EVENT_GESTURE, HID_SCROLL),
+                decoded(TouchRecord::Continues, GestureOutput::Quiet),
+            ),
+            (
+                pinch(NATIVE_PHASE_CHANGED, 0.125),
+                decoded(
+                    TouchRecord::Continues,
+                    gesture(PointerGesture::Magnify {
+                        phase: GesturePhase::Changed,
+                        delta: 0.125,
+                    }),
+                ),
+            ),
+            (
+                changed(GestureFields {
+                    rotation: -12.5,
+                    ..record(CG_EVENT_GESTURE, HID_ROTATION)
+                }),
+                decoded(
+                    TouchRecord::Continues,
+                    gesture(PointerGesture::Rotate {
+                        phase: GesturePhase::Changed,
+                        degrees: -12.5,
+                    }),
+                ),
+            ),
+            (
+                record(CG_EVENT_GESTURE, HID_ZOOM_TOGGLE),
+                decoded(
+                    TouchRecord::Standalone,
+                    gesture(PointerGesture::SmartMagnify),
+                ),
+            ),
+            (
+                press(FORCE_CLICK_STAGE),
+                decoded(TouchRecord::Standalone, gesture(PointerGesture::ForceClick)),
+            ),
+            (
+                press(1),
+                decoded(TouchRecord::Continues, GestureOutput::Quiet),
+            ),
+            (
+                swipe(MOTION_VERTICAL, NATIVE_PHASE_BEGAN, 0.0, STILL),
+                decoded(TouchRecord::Continues, GestureOutput::Quiet),
+            ),
+        ] {
+            assert_eq!(decode(fields), expected, "{fields:?}");
+        }
+        for (event_type, hid_type) in [
+            (CG_EVENT_GESTURE, 0),
+            (CG_EVENT_GESTURE, 16),
+            (CG_EVENT_GESTURE, HID_DOCK_SWIPE),
+            (CG_EVENT_GESTURE, 27),
+            (CG_EVENT_DOCK_CONTROL, 0),
+            (CG_EVENT_DOCK_CONTROL, HID_ZOOM),
+            (CG_EVENT_FLUID_TOUCH_GESTURE, 16),
+            (CG_EVENT_FLUID_TOUCH_GESTURE, 27),
+            (CG_EVENT_FLUID_TOUCH_GESTURE, HID_TOUCH_STARTED),
+        ] {
+            assert_eq!(
+                decode(changed(record(event_type, hid_type))),
+                decoded(TouchRecord::Continues, GestureOutput::Unmapped),
+                "type {event_type} hid {hid_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn gesture_phases_map_and_an_unknown_phase_or_value_is_unmapped() {
+        let mut decoder = GestureDecoder::default();
+        for (native, phase) in [
+            (NATIVE_PHASE_BEGAN, GesturePhase::Began),
+            (NATIVE_PHASE_CHANGED, GesturePhase::Changed),
+            (NATIVE_PHASE_ENDED, GesturePhase::Ended),
+            (NATIVE_PHASE_CANCELLED, GesturePhase::Cancelled),
+        ] {
+            assert_eq!(
+                outputs(&mut decoder, [pinch(native, 0.0)]),
+                [gesture(PointerGesture::Magnify { phase, delta: 0.0 })]
+            );
+        }
+        assert_eq!(
+            outputs(&mut decoder, [pinch(NATIVE_PHASE_MAY_BEGIN, 0.0)]),
+            [GestureOutput::Quiet]
+        );
+        for native in [0, 3, 16, -1] {
+            assert_eq!(
+                outputs(&mut decoder, [pinch(native, 0.1)]),
+                [GestureOutput::Unmapped]
+            );
+        }
+        for zoom in [-1.0, -1.5, 4.001, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                outputs(&mut decoder, [pinch(NATIVE_PHASE_CHANGED, zoom)]),
+                [GestureOutput::Unmapped]
+            );
+        }
+        let rotation = |rotation| GestureFields {
+            phase: NATIVE_PHASE_CHANGED,
+            rotation,
+            ..record(CG_EVENT_GESTURE, HID_ROTATION)
+        };
+        for degrees in [180.5, f64::NAN] {
+            assert_eq!(
+                outputs(&mut decoder, [rotation(degrees)]),
+                [GestureOutput::Unmapped]
+            );
+        }
+    }
+
+    #[test]
+    fn a_dock_swipe_fires_once_at_the_first_record_reaching_the_commit() {
+        let up = DOCK_SWIPE_VERTICAL_UP_SIGN;
+        let short = DOCK_SWIPE_COMMIT_PROGRESS * 0.9;
+        let mut decoder = GestureDecoder::default();
+        assert_eq!(
+            outputs(
+                &mut decoder,
+                [
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_BEGAN, 0.0, STILL),
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_CHANGED, up * short, (0.0, up)),
+                    swipe(
+                        MOTION_VERTICAL,
+                        NATIVE_PHASE_CHANGED,
+                        up * DOCK_SWIPE_COMMIT_PROGRESS,
+                        (0.0, up * 2.0),
+                    ),
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_CHANGED, up * 0.6, (0.5, up)),
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_ENDED, up * 0.9, STILL),
+                ]
+            ),
+            [
+                GestureOutput::Quiet,
+                GestureOutput::Quiet,
+                system(SystemGesture::Overview),
+                GestureOutput::Quiet,
+                GestureOutput::Quiet,
+            ]
+        );
+        assert_eq!(
+            finished(&mut decoder),
+            [GestureSummary::DockSwipe {
+                motion: MOTION_VERTICAL,
+                progress: up * 0.9,
+                peak_velocity_x: 0.5,
+                peak_velocity_y: 2.0,
+                fired: Some(SystemGesture::Overview),
+                end: GestureEnd::Lifted,
+            }]
+        );
+        assert!(finished(&mut decoder).is_empty(), "each line is taken once");
+    }
+
+    #[test]
+    fn a_short_swipe_fires_at_lift_only_when_its_velocity_agrees_fast_enough() {
+        let next = DOCK_SWIPE_HORIZONTAL_NEXT_SIGN;
+        let short = next * DOCK_SWIPE_COMMIT_PROGRESS * 0.5;
+        let lifted = |velocity_x| {
+            let mut decoder = GestureDecoder::default();
+            outputs(
+                &mut decoder,
+                [
+                    swipe(MOTION_HORIZONTAL, NATIVE_PHASE_BEGAN, 0.0, STILL),
+                    swipe(MOTION_HORIZONTAL, NATIVE_PHASE_CHANGED, short, STILL),
+                    swipe(
+                        MOTION_HORIZONTAL,
+                        NATIVE_PHASE_ENDED,
+                        short,
+                        (velocity_x, 0.0),
+                    ),
+                ],
+            )
+            .pop()
+        };
+        assert_eq!(
+            lifted(next * DOCK_SWIPE_COMMIT_VELOCITY),
+            Some(system(SystemGesture::DesktopNext))
+        );
+        for velocity_x in [
+            next * DOCK_SWIPE_COMMIT_VELOCITY * 0.9,
+            -next * DOCK_SWIPE_COMMIT_VELOCITY * 4.0,
+            0.0,
+        ] {
+            assert_eq!(
+                lifted(velocity_x),
+                Some(GestureOutput::Quiet),
+                "velocity {velocity_x}"
+            );
+        }
+        let mut decoder = GestureDecoder::default();
+        assert_eq!(
+            outputs(
+                &mut decoder,
+                [
+                    swipe(MOTION_HORIZONTAL, NATIVE_PHASE_BEGAN, 0.0, STILL),
+                    swipe(
+                        MOTION_HORIZONTAL,
+                        NATIVE_PHASE_CHANGED,
+                        -short,
+                        (-next, 0.0)
+                    ),
+                    swipe(MOTION_HORIZONTAL, NATIVE_PHASE_ENDED, 0.0, STILL),
+                ]
+            )
+            .pop(),
+            Some(system(SystemGesture::DesktopPrevious)),
+            "a lift that zeroes its values is judged on the last real ones"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_swipe_never_fires() {
+        let spread = DOCK_SWIPE_SCALE_SPREAD_SIGN;
+        let mut decoder = GestureDecoder::default();
+        assert_eq!(
+            outputs(
+                &mut decoder,
+                [
+                    swipe(MOTION_SCALE, NATIVE_PHASE_BEGAN, 0.0, STILL),
+                    swipe(MOTION_SCALE, NATIVE_PHASE_CHANGED, spread * 0.1, STILL),
+                    swipe(
+                        MOTION_SCALE,
+                        NATIVE_PHASE_CANCELLED,
+                        spread * 0.9,
+                        (9.0, 9.0)
+                    ),
+                ]
+            ),
+            [GestureOutput::Quiet; 3]
+        );
+        assert!(matches!(
+            finished(&mut decoder)[..],
+            [GestureSummary::DockSwipe {
+                fired: None,
+                end: GestureEnd::Cancelled,
+                ..
+            }]
+        ));
+        assert_eq!(
+            outputs(
+                &mut decoder,
+                [
+                    swipe(MOTION_SCALE, NATIVE_PHASE_BEGAN, spread * 0.5, STILL),
+                    swipe(MOTION_SCALE, NATIVE_PHASE_CANCELLED, 0.0, STILL),
+                ]
+            ),
+            [system(SystemGesture::ShowDesktop), GestureOutput::Quiet],
+            "a swipe that already fired cannot take it back"
+        );
+    }
+
+    #[test]
+    fn each_motion_fires_the_gesture_its_sign_constant_names() {
+        let commit = DOCK_SWIPE_COMMIT_PROGRESS;
+        for (motion, sign, first, second) in [
+            (
+                MOTION_HORIZONTAL,
+                DOCK_SWIPE_HORIZONTAL_NEXT_SIGN,
+                SystemGesture::DesktopNext,
+                SystemGesture::DesktopPrevious,
+            ),
+            (
+                MOTION_VERTICAL,
+                DOCK_SWIPE_VERTICAL_UP_SIGN,
+                SystemGesture::Overview,
+                SystemGesture::AppWindows,
+            ),
+            (
+                MOTION_SCALE,
+                DOCK_SWIPE_SCALE_SPREAD_SIGN,
+                SystemGesture::ShowDesktop,
+                SystemGesture::Launcher,
+            ),
+        ] {
+            for (progress, expected) in [(sign * commit, first), (-sign * commit, second)] {
+                let mut decoder = GestureDecoder::default();
+                assert_eq!(
+                    outputs(
+                        &mut decoder,
+                        [swipe(motion, NATIVE_PHASE_BEGAN, progress, STILL)]
+                    ),
+                    [system(expected)],
+                    "motion {motion} progress {progress}"
+                );
+            }
+        }
+        for motion in [0, 4, 7, 14] {
+            for phase in [NATIVE_PHASE_BEGAN, NATIVE_PHASE_CHANGED] {
+                assert_eq!(
+                    outputs(
+                        &mut GestureDecoder::default(),
+                        [swipe(motion, phase, 0.9, STILL)]
+                    ),
+                    [GestureOutput::Unmapped],
+                    "an edge swipe starts nothing"
+                );
+            }
+        }
+        let up = DOCK_SWIPE_VERTICAL_UP_SIGN;
+        let mut decoder = GestureDecoder::default();
+        assert_eq!(
+            outputs(
+                &mut decoder,
+                [
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_BEGAN, 0.0, STILL),
+                    swipe(0, NATIVE_PHASE_ENDED, up, STILL),
+                ]
+            ),
+            [GestureOutput::Quiet, system(SystemGesture::Overview)],
+            "a started swipe keeps its motion to the end"
+        );
+    }
+
+    #[test]
+    fn a_swipe_starts_without_its_began_and_a_new_began_replaces_a_lost_one() {
+        let up = DOCK_SWIPE_VERTICAL_UP_SIGN;
+        let mut decoder = GestureDecoder::default();
+        assert_eq!(
+            outputs(
+                &mut decoder,
+                [
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_ENDED, up, STILL),
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_MAY_BEGIN, up, STILL),
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_CHANGED, up * 0.5, STILL),
+                    swipe(MOTION_VERTICAL, NATIVE_PHASE_BEGAN, -up * 0.5, STILL),
+                ]
+            ),
+            [
+                GestureOutput::Quiet,
+                GestureOutput::Quiet,
+                system(SystemGesture::Overview),
+                system(SystemGesture::AppWindows),
+            ],
+            "a lift with nothing open and a may-begin start nothing"
+        );
+        assert!(matches!(
+            finished(&mut decoder)[..],
+            [GestureSummary::DockSwipe {
+                fired: Some(SystemGesture::Overview),
+                end: GestureEnd::Lost,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn force_click_fires_once_per_press() {
+        let mut decoder = GestureDecoder::default();
+        let look_up = gesture(PointerGesture::ForceClick);
+        let quiet = GestureOutput::Quiet;
+        assert_eq!(
+            outputs(&mut decoder, [1, 2, 2, 1, 2, 0, 1, 2].map(press)),
+            [quiet, look_up, quiet, quiet, quiet, quiet, quiet, look_up]
+        );
+        let lifted = GestureFields {
+            phase: NATIVE_PHASE_ENDED,
+            ..press(1)
+        };
+        assert_eq!(
+            outputs(&mut decoder, [lifted, press(2)]),
+            [quiet, look_up],
+            "an ended press also ends it"
+        );
+    }
+
+    #[test]
+    fn a_pinch_totals_its_scale_across_records() {
+        let mut decoder = GestureDecoder::default();
+        outputs(
+            &mut decoder,
+            [
+                pinch(NATIVE_PHASE_BEGAN, 0.5),
+                pinch(NATIVE_PHASE_CHANGED, 0.5),
+                pinch(NATIVE_PHASE_BEGAN, 0.25),
+            ],
+        );
+        assert_eq!(
+            finished(&mut decoder),
+            [GestureSummary::Pinch {
+                records: 2,
+                scale: 2.25,
+                end: GestureEnd::Lost,
+            }]
+        );
+        outputs(
+            &mut decoder,
+            [
+                pinch(NATIVE_PHASE_CHANGED, -0.5),
+                pinch(NATIVE_PHASE_ENDED, 0.0),
+            ],
+        );
+        assert_eq!(
+            finished(&mut decoder),
+            [GestureSummary::Pinch {
+                records: 3,
+                scale: 0.625,
+                end: GestureEnd::Lifted,
+            }]
+        );
+    }
+
+    #[test]
+    fn gesture_summaries_log_values_only() {
+        assert_eq!(
+            GestureSummary::DockSwipe {
+                motion: 2,
+                progress: -0.4123,
+                peak_velocity_x: 0.0,
+                peak_velocity_y: 1.8734,
+                fired: Some(SystemGesture::Overview),
+                end: GestureEnd::Lifted,
+            }
+            .to_string(),
+            "dock swipe ended (lift): motion 2, final progress -0.412, \
+             peak velocity x 0.000 y 1.873, fired Overview"
+        );
+        assert_eq!(
+            GestureSummary::DockSwipe {
+                motion: 1,
+                progress: 0.05,
+                peak_velocity_x: 0.2,
+                peak_velocity_y: 0.0,
+                fired: None,
+                end: GestureEnd::Cancelled,
+            }
+            .to_string(),
+            "dock swipe ended (cancel): motion 1, final progress 0.050, \
+             peak velocity x 0.200 y 0.000, fired none"
+        );
+        assert_eq!(
+            GestureSummary::Pinch {
+                records: 42,
+                scale: 1.5634,
+                end: GestureEnd::Lost,
+            }
+            .to_string(),
+            "pinch ended (lost end): 42 records, total scale 1.563"
+        );
     }
 
     #[test]

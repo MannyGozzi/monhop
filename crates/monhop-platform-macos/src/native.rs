@@ -4,6 +4,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use core_foundation::{
+    array::CFArray,
+    base::{CFType, TCFType},
+    boolean::CFBoolean,
+    dictionary::CFDictionary,
+    number::CFNumber,
+    string::CFString,
+};
 use monhop_core::{
     DisplayId, LogicalRect, LogicalSize, MAX_DISPLAYS, MouseButton, NativeSize, Point,
 };
@@ -23,6 +31,10 @@ use crate::event_tap::{
     finish_and_post_event, full_input_event_mask, tap_disabled,
 };
 
+use crate::gesture_inject::{
+    SYSTEM_GESTURE_HOTKEYS, StoredBinding, SymbolicHotkeyEntry, SymbolicHotkeys,
+};
+use crate::native_capture::CFPreferencesCopyAppValue;
 use crate::{
     MacDisplay, MacError, MacVirtualKey, PassiveDiagnosticCounts, PermissionState,
     validate_absolute_point,
@@ -447,6 +459,75 @@ pub fn post_motion(
     post_marked_event(destination, event, marker, flags)
 }
 
+/// The user's system-gesture hotkey bindings, read without changing them; unreadable means default.
+pub fn symbolic_hotkeys() -> SymbolicHotkeys {
+    let key = CFString::from_static_string("AppleSymbolicHotKeys");
+    let domain = CFString::from_static_string("com.apple.symbolichotkeys");
+    // SAFETY: both arguments are live CFStrings, and the Copy rule hands the result to us.
+    let table = unsafe {
+        CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), domain.as_concrete_TypeRef())
+    };
+    if table.is_null() {
+        return SymbolicHotkeys::default();
+    }
+    // SAFETY: table is a non-null Core Foundation object this function owns.
+    let table = unsafe { CFType::wrap_under_create_rule(table) };
+    let Some(table) = table.downcast::<CFDictionary>() else {
+        return SymbolicHotkeys::default();
+    };
+    SymbolicHotkeys::from_entries(SYSTEM_GESTURE_HOTKEYS.into_iter().filter_map(|id| {
+        let entry = dictionary_value(&table, &id.to_string())?;
+        Some((id, symbolic_hotkey_entry(&entry)))
+    }))
+}
+
+fn dictionary_value(dictionary: &CFDictionary, key: &str) -> Option<CFType> {
+    let key = CFString::new(key);
+    let value = dictionary.find(key.as_CFTypeRef())?;
+    // SAFETY: the dictionary keeps its value alive while borrowed; the get rule retains it again.
+    Some(unsafe { CFType::wrap_under_get_rule(*value) })
+}
+
+/// A missing `enabled` leaves the entry enabled; one of an unknown type disables it.
+fn symbolic_hotkey_entry(entry: &CFType) -> SymbolicHotkeyEntry {
+    let Some(entry) = entry.downcast::<CFDictionary>() else {
+        return SymbolicHotkeyEntry {
+            enabled: false,
+            binding: StoredBinding::Unreadable,
+        };
+    };
+    let enabled = dictionary_value(&entry, "enabled").is_none_or(|enabled| {
+        enabled
+            .downcast::<CFBoolean>()
+            .map(bool::from)
+            .unwrap_or_else(|| {
+                enabled
+                    .downcast::<CFNumber>()
+                    .and_then(|number| number.to_i64())
+                    .is_some_and(|number| number != 0)
+            })
+    });
+    let binding = dictionary_value(&entry, "value").map_or(StoredBinding::Default, |value| {
+        stored_parameters(&value).map_or(StoredBinding::Unreadable, StoredBinding::Parameters)
+    });
+    SymbolicHotkeyEntry { enabled, binding }
+}
+
+fn stored_parameters(value: &CFType) -> Option<[i64; 3]> {
+    let parameters = dictionary_value(&value.downcast::<CFDictionary>()?, "parameters")?
+        .downcast::<CFArray>()?;
+    if parameters.len() != 3 {
+        return None;
+    }
+    let mut numbers = [0; 3];
+    for (slot, item) in numbers.iter_mut().zip(parameters.iter()) {
+        // SAFETY: the array keeps its item alive while borrowed; the get rule retains it again.
+        let item = unsafe { CFType::wrap_under_get_rule(*item) };
+        *slot = item.downcast::<CFNumber>()?.to_i64()?;
+    }
+    Some(numbers)
+}
+
 fn display_metadata(display: CGDirectDisplayID) -> Result<MacDisplay, MacError> {
     // SAFETY: display IDs came directly from CGGetActiveDisplayList.
     let bounds = unsafe { CGDisplayBounds(display) };
@@ -781,6 +862,86 @@ mod tests {
         assert_eq!(counts.pointer_events, 1);
         assert_eq!(counts.scroll_events, 1);
         assert_eq!(counts.synthetic_events_filtered, 0);
+    }
+}
+
+#[cfg(test)]
+mod symbolic_hotkey_tests {
+    use core_foundation::{
+        array::CFArray,
+        base::{CFType, TCFType},
+        boolean::CFBoolean,
+        dictionary::CFDictionary,
+        number::CFNumber,
+        string::CFString,
+    };
+
+    use super::{StoredBinding, SymbolicHotkeyEntry, symbolic_hotkey_entry, symbolic_hotkeys};
+
+    fn dictionary(pairs: &[(&'static str, CFType)]) -> CFType {
+        let pairs: Vec<_> = pairs
+            .iter()
+            .map(|(key, value)| (CFString::from_static_string(key), value.clone()))
+            .collect();
+        CFDictionary::from_CFType_pairs(&pairs).as_CFType()
+    }
+
+    fn number(value: i64) -> CFType {
+        CFNumber::from(value).as_CFType()
+    }
+
+    fn parameters(values: &[i64]) -> CFType {
+        let values: Vec<_> = values.iter().map(|value| CFNumber::from(*value)).collect();
+        dictionary(&[
+            ("parameters", CFArray::from_CFTypes(&values).as_CFType()),
+            ("type", CFString::from_static_string("standard").as_CFType()),
+        ])
+    }
+
+    #[test]
+    fn entries_read_in_every_shape_the_preference_stores() {
+        let read = |pairs: &[(&'static str, CFType)]| symbolic_hotkey_entry(&dictionary(pairs));
+        let entry = |enabled, binding| SymbolicHotkeyEntry { enabled, binding };
+        // 79 on this Mac: enabled, no value.
+        assert_eq!(
+            read(&[("enabled", CFBoolean::true_value().as_CFType())]),
+            entry(true, StoredBinding::Default)
+        );
+        // 64 on this Mac: disabled Cmd+Space.
+        assert_eq!(
+            read(&[
+                ("enabled", CFBoolean::false_value().as_CFType()),
+                ("value", parameters(&[32, 49, 1_048_576])),
+            ]),
+            entry(false, StoredBinding::Parameters([32, 49, 1_048_576]))
+        );
+        assert_eq!(
+            read(&[
+                ("enabled", number(1)),
+                ("value", parameters(&[65_535, 126, 0x84_0000]))
+            ]),
+            entry(true, StoredBinding::Parameters([65_535, 126, 0x84_0000])),
+            "defaults write stores enabled as a number"
+        );
+        assert_eq!(read(&[]), entry(true, StoredBinding::Default));
+        assert_eq!(
+            read(&[("value", parameters(&[1, 2]))]),
+            entry(true, StoredBinding::Unreadable)
+        );
+        assert_eq!(
+            read(&[("enabled", CFString::from_static_string("yes").as_CFType())]),
+            entry(false, StoredBinding::Default)
+        );
+        assert_eq!(
+            symbolic_hotkey_entry(&number(1)),
+            entry(false, StoredBinding::Unreadable)
+        );
+    }
+
+    /// Only that the read survives whatever this Mac stores; the shapes are covered above.
+    #[test]
+    fn reading_the_live_preference_never_panics() {
+        symbolic_hotkeys();
     }
 }
 

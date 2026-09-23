@@ -9,13 +9,14 @@ use std::error::Error;
 use std::fmt;
 
 use monhop_core::{
-    DeviceId, DisplayId, HidUsage, LogicalRect, LogicalSize, ModifierState, MonitorIdentity,
-    MouseButton, Platform, Point,
+    DeviceId, DisplayId, GestureError, GestureKind, GesturePhase, HidUsage, LogicalRect,
+    LogicalSize, ModifierState, MonitorIdentity, MouseButton, Platform, Point, PointerGesture,
+    SystemGesture,
 };
 
 pub const MAGIC: [u8; 4] = *b"LKM!";
 /// Bumped whenever the wire changes shape; both computers must run the same build.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_LEN: usize = 8_192;
 pub use monhop_core::MAX_DISPLAYS;
@@ -380,6 +381,8 @@ pub enum Message {
     Motion(Motion),
     Button(Button),
     Scroll(Scroll),
+    Gesture(PointerGesture),
+    SystemGesture(SystemGesture),
     Key(Key),
     Modifiers(ModifierState),
     ActivateDisplay(DisplayId),
@@ -418,6 +421,8 @@ impl Message {
             | Self::Motion(Motion::Relative(_))
             | Self::Button(_)
             | Self::Scroll(_)
+            | Self::Gesture(_)
+            | Self::SystemGesture(_)
             | Self::Key(_)
             | Self::Modifiers(_)
             | Self::ActivateDisplay(_)
@@ -443,6 +448,8 @@ impl Message {
             Self::Motion(_) => MessageKind::Motion,
             Self::Button(_) => MessageKind::Button,
             Self::Scroll(_) => MessageKind::Scroll,
+            Self::Gesture(_) => MessageKind::Gesture,
+            Self::SystemGesture(_) => MessageKind::SystemGesture,
             Self::Key(_) => MessageKind::Key,
             Self::Modifiers(_) => MessageKind::Modifiers,
             Self::ActivateDisplay(_) => MessageKind::ActivateDisplay,
@@ -615,6 +622,7 @@ pub enum EncodeError {
     InvalidKeyUsage,
     InvalidKeyState,
     InvalidClickCount,
+    InvalidGesture,
 }
 
 impl fmt::Display for EncodeError {
@@ -650,6 +658,8 @@ pub enum DecodeError {
     InvalidControl,
     InvalidDeclineReason,
     InvalidClickCount,
+    /// A gesture's phase or value breaks its kind's rule; see [`PointerGesture::from_parts`].
+    InvalidGesture,
 }
 
 impl fmt::Display for DecodeError {
@@ -874,6 +884,8 @@ enum MessageKind {
     SessionReady = 18,
     ActivationDeclined = 19,
     TakeBack = 20,
+    Gesture = 21,
+    SystemGesture = 22,
 }
 
 impl MessageKind {
@@ -899,6 +911,8 @@ impl MessageKind {
             18 => Ok(Self::SessionReady),
             19 => Ok(Self::ActivationDeclined),
             20 => Ok(Self::TakeBack),
+            21 => Ok(Self::Gesture),
+            22 => Ok(Self::SystemGesture),
             _ => Err(DecodeError::UnknownMessageType),
         }
     }
@@ -949,6 +963,11 @@ fn body_len(message: &Message) -> Result<usize, EncodeError> {
             }
             16
         }
+        Message::Gesture(gesture) => {
+            gesture.validate().map_err(gesture_encode_error)?;
+            16
+        }
+        Message::SystemGesture(_) => 4,
         Message::Key(key) => {
             if !key.usage.is_valid() {
                 return Err(EncodeError::InvalidKeyUsage);
@@ -1032,6 +1051,16 @@ fn encode_body(message: &Message, output: &mut Vec<u8>) -> Result<(), EncodeErro
         Message::Scroll(scroll) => {
             write_f64(output, scroll.horizontal);
             write_f64(output, scroll.vertical);
+        }
+        Message::Gesture(gesture) => {
+            output.push(gesture.kind().to_wire());
+            output.push(gesture.phase().map_or(0, GesturePhase::to_wire));
+            output.extend_from_slice(&[0; 6]);
+            write_f64(output, gesture.value());
+        }
+        Message::SystemGesture(gesture) => {
+            output.push(gesture.to_wire());
+            output.extend_from_slice(&[0; 3]);
         }
         Message::Key(key) => {
             write_u16(output, key.usage.0);
@@ -1174,6 +1203,24 @@ fn decode_body(kind: MessageKind, body: &mut Cursor<'_>) -> Result<Message, Deco
             horizontal: body.read_f64()?,
             vertical: body.read_f64()?,
         })),
+        MessageKind::Gesture => {
+            let kind = GestureKind::from_wire(body.read_u8()?).ok_or(DecodeError::InvalidEnum)?;
+            let phase = match body.read_u8()? {
+                0 => None,
+                phase => Some(GesturePhase::from_wire(phase).ok_or(DecodeError::InvalidEnum)?),
+            };
+            body.require_zero(6)?;
+            let value = body.read_f64()?;
+            PointerGesture::from_parts(kind, phase, value)
+                .map(Message::Gesture)
+                .map_err(gesture_decode_error)
+        }
+        MessageKind::SystemGesture => {
+            let gesture =
+                SystemGesture::from_wire(body.read_u8()?).ok_or(DecodeError::InvalidEnum)?;
+            body.require_zero(3)?;
+            Ok(Message::SystemGesture(gesture))
+        }
         MessageKind::Key => {
             let usage = HidUsage(body.read_u16()?);
             if !usage.is_valid() {
@@ -1261,6 +1308,20 @@ impl InputPointError {
             Self::NonFinite => DecodeError::NonFiniteCoordinate,
             Self::OutOfRange => DecodeError::CoordinateOutOfRange,
         }
+    }
+}
+
+const fn gesture_encode_error(error: GestureError) -> EncodeError {
+    match error {
+        GestureError::NonFinite => EncodeError::NonFiniteCoordinate,
+        GestureError::Shape | GestureError::OutOfRange => EncodeError::InvalidGesture,
+    }
+}
+
+const fn gesture_decode_error(error: GestureError) -> DecodeError {
+    match error {
+        GestureError::NonFinite => DecodeError::NonFiniteCoordinate,
+        GestureError::Shape | GestureError::OutOfRange => DecodeError::InvalidGesture,
     }
 }
 

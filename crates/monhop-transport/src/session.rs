@@ -176,7 +176,12 @@ impl SessionProgress {
 fn is_input(frame: &Frame) -> bool {
     matches!(
         frame.message,
-        Message::Key(_) | Message::Button(_) | Message::Motion(_) | Message::Scroll(_)
+        Message::Key(_)
+            | Message::Button(_)
+            | Message::Motion(_)
+            | Message::Scroll(_)
+            | Message::Gesture(_)
+            | Message::SystemGesture(_)
     )
 }
 
@@ -187,8 +192,8 @@ pub enum SessionFailure {
     QueueFull,
     UnexpectedStream,
     Destination,
-    /// The receiving actor stopped; the code names the native step (1-14) or receiver rule
-    /// (20-33) that failed, never any input.
+    /// The receiving actor stopped; the code names the native step (1-17) or receiver rule
+    /// (20-34) that failed, never any input.
     DestinationActor(crate::session_actor::ActorFailure, u8),
     Source,
     /// The source controller refused to continue; the reason names the check, never any input.

@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use monhop_core::{MouseButton, Point};
 
+use crate::gesture_inject::SymbolicHotkeys;
 use crate::{MacDisplay, MacError, MacVirtualKey, PassiveDiagnosticCounts, PermissionState};
 
 #[derive(Clone, Copy, Debug)]
@@ -83,4 +84,8 @@ pub fn post_motion(
     _: Option<MouseButton>,
 ) -> Result<(), MacError> {
     Err(MacError::UnsupportedPlatform)
+}
+
+pub fn symbolic_hotkeys() -> SymbolicHotkeys {
+    SymbolicHotkeys::default()
 }

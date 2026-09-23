@@ -8,11 +8,11 @@ use std::ptr;
 use std::time::Duration;
 
 use crate::capture_decode::{
-    CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP, CG_EVENT_LEFT_MOUSE_DOWN,
-    CG_EVENT_LEFT_MOUSE_DRAGGED, CG_EVENT_LEFT_MOUSE_UP, CG_EVENT_MOUSE_MOVED,
-    CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_DRAGGED, CG_EVENT_OTHER_MOUSE_UP,
-    CG_EVENT_RIGHT_MOUSE_DOWN, CG_EVENT_RIGHT_MOUSE_DRAGGED, CG_EVENT_RIGHT_MOUSE_UP,
-    CG_EVENT_SCROLL_WHEEL,
+    CG_EVENT_DOCK_CONTROL, CG_EVENT_FLAGS_CHANGED, CG_EVENT_FLUID_TOUCH_GESTURE, CG_EVENT_GESTURE,
+    CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP, CG_EVENT_LEFT_MOUSE_DOWN, CG_EVENT_LEFT_MOUSE_DRAGGED,
+    CG_EVENT_LEFT_MOUSE_UP, CG_EVENT_MOUSE_MOVED, CG_EVENT_OTHER_MOUSE_DOWN,
+    CG_EVENT_OTHER_MOUSE_DRAGGED, CG_EVENT_OTHER_MOUSE_UP, CG_EVENT_RIGHT_MOUSE_DOWN,
+    CG_EVENT_RIGHT_MOUSE_DRAGGED, CG_EVENT_RIGHT_MOUSE_UP, CG_EVENT_SCROLL_WHEEL,
 };
 
 pub(crate) type CFTypeRef = *const c_void;
@@ -90,8 +90,7 @@ const fn event_mask_bit(event_type: CGEventType) -> CGEventMask {
     1_u64 << event_type
 }
 
-/// The fixed keyboard, pointer and scroll event set both the active capture tap and the passive
-/// diagnostic tap listen for.
+/// The fixed keyboard, pointer and scroll event set the passive diagnostic tap listens for.
 pub(crate) const fn full_input_event_mask() -> CGEventMask {
     event_mask_bit(CG_EVENT_LEFT_MOUSE_DOWN)
         | event_mask_bit(CG_EVENT_LEFT_MOUSE_UP)
@@ -107,6 +106,15 @@ pub(crate) const fn full_input_event_mask() -> CGEventMask {
         | event_mask_bit(CG_EVENT_OTHER_MOUSE_DOWN)
         | event_mask_bit(CG_EVENT_OTHER_MOUSE_UP)
         | event_mask_bit(CG_EVENT_OTHER_MOUSE_DRAGGED)
+}
+
+/// The active capture tap's set: the full input set plus the private trackpad gesture types, so a
+/// gesture made while the other computer has control can be withheld here.
+pub(crate) const fn capture_event_mask() -> CGEventMask {
+    full_input_event_mask()
+        | event_mask_bit(CG_EVENT_GESTURE)
+        | event_mask_bit(CG_EVENT_DOCK_CONTROL)
+        | event_mask_bit(CG_EVENT_FLUID_TOUCH_GESTURE)
 }
 
 /// True for the two tap callback event types that mean the tap itself was disabled.
@@ -220,5 +228,26 @@ impl EventTap {
             CFRelease(self.source);
             CFRelease(self.tap);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_active_capture_tap_listens_for_gestures() {
+        for gesture in [
+            CG_EVENT_GESTURE,
+            CG_EVENT_DOCK_CONTROL,
+            CG_EVENT_FLUID_TOUCH_GESTURE,
+        ] {
+            assert_eq!(full_input_event_mask() & event_mask_bit(gesture), 0);
+            assert_ne!(capture_event_mask() & event_mask_bit(gesture), 0);
+        }
+        assert_eq!(
+            capture_event_mask() & full_input_event_mask(),
+            full_input_event_mask()
+        );
     }
 }

@@ -15,8 +15,8 @@ use std::{fmt, time::Duration};
 
 use monhop_core::{
     DeviceId, DisplayId, Edge, EdgeTransition, FloorOwner, FloorSnapshot, FloorState, HidUsage,
-    LogicalRect, ModifierState, MouseButton, Platform, Point, PointerOwnership, PointerTarget,
-    SharedFloor, Topology, TransitionAcknowledgement,
+    LogicalRect, ModifierState, MouseButton, Platform, Point, PointerGesture, PointerOwnership,
+    PointerTarget, SharedFloor, SystemGesture, Topology, TransitionAcknowledgement,
     clicks::{ClickCounter, SINGLE_CLICK},
 };
 use monhop_protocol::{
@@ -63,7 +63,8 @@ pub const PUSH_THROUGH_LOGGED: Duration = Duration::from_millis(50);
 /// counts before constructing this type. Scroll is in signed wheel detents: positive horizontal is right
 /// and positive vertical is up. Windows adapters divide 120-unit detents, while macOS adapters
 /// divide 40-point detents after their horizontal inversion; both preserve fractional values.
-/// A `Button` keeps the capture clock reading it was stamped with when captured.
+/// A `Button` keeps the capture clock reading it was stamped with when captured. Gestures are
+/// forwarded only while remote and never count as pointer motion.
 #[derive(Clone, Copy, PartialEq)]
 pub enum NormalizedInput {
     Key {
@@ -83,6 +84,8 @@ pub enum NormalizedInput {
         horizontal: f64,
         vertical: f64,
     },
+    Gesture(PointerGesture),
+    SystemGesture(SystemGesture),
     /// Native-capture FIFO barrier for a new route.
     RouteChanged {
         remote: bool,
@@ -98,6 +101,8 @@ impl fmt::Debug for NormalizedInput {
             Self::AbsoluteMotion(_) => "AbsoluteMotion",
             Self::RelativeMotion(_) => "RelativeMotion",
             Self::Scroll { .. } => "Scroll",
+            Self::Gesture(_) => "Gesture",
+            Self::SystemGesture(_) => "SystemGesture",
             Self::RouteChanged { .. } => "RouteChanged",
         };
         write!(formatter, "NormalizedInput::{name}([redacted])")
@@ -119,6 +124,8 @@ impl NormalizedInput {
                     && horizontal.abs() <= 1_000_000.0
                     && vertical.abs() <= 1_000_000.0
             }
+            Self::Gesture(gesture) => gesture.validate().is_ok(),
+            Self::SystemGesture(_) => true,
             Self::RouteChanged { revision, .. } => revision != 0,
         }
     }
@@ -1596,7 +1603,9 @@ impl SourceController {
                     self.apply_local_relative(delta, now, effects)
                 }
             }
-            NormalizedInput::Scroll { .. } => {}
+            NormalizedInput::Scroll { .. }
+            | NormalizedInput::Gesture(_)
+            | NormalizedInput::SystemGesture(_) => {}
             NormalizedInput::RouteChanged { .. } => {
                 unreachable!("route records are dispatched first")
             }
@@ -1716,7 +1725,16 @@ impl SourceController {
                 }),
                 effects,
             ),
-            NormalizedInput::AbsoluteMotion(_) | NormalizedInput::Scroll { .. } => {}
+            NormalizedInput::Gesture(gesture) if forwarding => {
+                self.push_input(Message::Gesture(gesture), effects)
+            }
+            NormalizedInput::SystemGesture(gesture) if forwarding => {
+                self.push_input(Message::SystemGesture(gesture), effects)
+            }
+            NormalizedInput::AbsoluteMotion(_)
+            | NormalizedInput::Scroll { .. }
+            | NormalizedInput::Gesture(_)
+            | NormalizedInput::SystemGesture(_) => {}
             NormalizedInput::RouteChanged { .. } => {
                 unreachable!("route records are dispatched first")
             }
