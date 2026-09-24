@@ -42,6 +42,10 @@ mod keymap;
 pub use keymap::{KeyMapError, MacVirtualKey, hid_to_mac_virtual_key, mac_virtual_key_to_hid};
 
 #[cfg(target_os = "macos")]
+mod app_nap;
+#[cfg(target_os = "macos")]
+pub use app_nap::SessionActivity;
+#[cfg(target_os = "macos")]
 mod cf_owned;
 #[cfg(target_os = "macos")]
 mod event_tap;
@@ -53,6 +57,10 @@ mod native;
 pub mod network;
 #[cfg(target_os = "macos")]
 pub mod network_watch;
+#[cfg(target_os = "macos")]
+mod objc;
+#[cfg(target_os = "macos")]
+mod permission_watch;
 #[cfg(target_os = "macos")]
 pub mod threads;
 #[cfg(target_os = "macos")]

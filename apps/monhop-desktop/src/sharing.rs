@@ -1434,6 +1434,14 @@ impl SharingController {
                     // live ones from here; the record it runs with is exactly this geometry.
                     lock(&state).inspection = Some(paired.inspection.clone());
                     let session_started = Instant::now();
+                    // A napped app's timers stretch past the capture lease, so the Mac holds this
+                    // until the session's close has left.
+                    #[cfg(target_os = "macos")]
+                    let awake = monhop_platform_macos::SessionActivity::begin();
+                    #[cfg(target_os = "macos")]
+                    if awake.is_none() {
+                        log::warn!("sharing: macOS refused the no-nap activity for this session");
+                    }
                     let result = session::run_session(
                         paired.session,
                         topology,
@@ -1443,6 +1451,8 @@ impl SharingController {
                     )
                     .await;
                     flush_session_close(&paired.lease).await;
+                    #[cfg(target_os = "macos")]
+                    drop(awake);
                     let ended = {
                         let mut guard = lock(&state);
                         guard.native_cancel = None;

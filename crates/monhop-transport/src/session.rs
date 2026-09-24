@@ -472,7 +472,7 @@ pub(crate) const CONTROL_CHANGED_REASON: &[u8] = b"control changed";
 /// A user's stop closes as ended and the peer records no drop; a display change or a control-flip
 /// stop closes as such so the peer resyncs instead of reporting a failure. Any other end, native
 /// stops included, failed.
-fn close_reason(
+pub(crate) fn close_reason(
     result: &Result<(), SessionFailure>,
     deliberate: bool,
     control_change: bool,

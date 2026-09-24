@@ -2,13 +2,22 @@
 
 use std::{
     io,
-    net::{Ipv4Addr, UdpSocket},
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     os::windows::io::AsRawSocket,
     ptr,
 };
 use windows_sys::{
     Win32::{
-        NetworkManagement::{IpHelper::*, Ndis::IfOperStatusUp, WiFi::*},
+        Foundation::HANDLE,
+        NetworkManagement::{
+            IpHelper::*,
+            Ndis::IfOperStatusUp,
+            QoS::{
+                QOS_NON_ADAPTIVE_FLOW, QOS_VERSION, QOSAddSocketToFlow, QOSCloseHandle,
+                QOSCreateHandle, QOSTrafficTypeVoice,
+            },
+            WiFi::*,
+        },
         Networking::WinSock::*,
     },
     core::GUID,
@@ -182,6 +191,57 @@ pub fn restrict_udp_interface(socket: &UdpSocket, index: u32) -> io::Result<()> 
     Ok(())
 }
 
+/// Keeps a socket's datagrams to one peer in the voice class, which Windows tags so Wi-Fi queues
+/// them ahead of bulk traffic; dropping it ends the marking.
+pub struct InteractiveTraffic(HANDLE);
+
+// SAFETY: the qWAVE handle is used only when created and when closed on drop, never shared.
+unsafe impl Send for InteractiveTraffic {}
+// SAFETY: no method reads or writes the handle through a shared reference.
+unsafe impl Sync for InteractiveTraffic {}
+
+/// An unconnected socket names its one peer. A non-adaptive flow sends no probes, and a traffic
+/// type needs no administrator rights.
+pub fn mark_interactive_traffic(
+    socket: &UdpSocket,
+    peer: SocketAddrV4,
+) -> io::Result<InteractiveTraffic> {
+    let version = QOS_VERSION {
+        MajorVersion: 1,
+        MinorVersion: 0,
+    };
+    let mut handle = ptr::null_mut();
+    // SAFETY: the version and the handle output are valid for this synchronous call.
+    if unsafe { QOSCreateHandle(&version, &mut handle) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let traffic = InteractiveTraffic(handle);
+    let destination = sockaddr_in(peer);
+    let mut flow = 0;
+    // SAFETY: the handle and socket are live, and the destination is a complete SOCKADDR_IN.
+    let added = unsafe {
+        QOSAddSocketToFlow(
+            traffic.0,
+            socket.as_raw_socket() as SOCKET,
+            (&raw const destination).cast(),
+            QOSTrafficTypeVoice,
+            QOS_NON_ADAPTIVE_FLOW,
+            &mut flow,
+        )
+    };
+    if added == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(traffic)
+}
+
+impl Drop for InteractiveTraffic {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from QOSCreateHandle and is closed once, which removes its flow.
+        unsafe { QOSCloseHandle(self.0) };
+    }
+}
+
 fn set_ip_option(socket: &UdpSocket, option: i32, value: u32) -> io::Result<()> {
     // SAFETY: a live socket handle and a correctly sized DWORD are passed synchronously.
     let result = unsafe {
@@ -264,15 +324,20 @@ fn ssid_from_attachment(attachment: &[u8]) -> Option<&str> {
 
 fn sockaddr(address: Ipv4Addr) -> SOCKADDR_INET {
     SOCKADDR_INET {
-        Ipv4: SOCKADDR_IN {
-            sin_family: AF_INET,
-            sin_addr: IN_ADDR {
-                S_un: IN_ADDR_0 {
-                    S_addr: u32::from_ne_bytes(address.octets()),
-                },
+        Ipv4: sockaddr_in(SocketAddrV4::new(address, 0)),
+    }
+}
+
+fn sockaddr_in(address: SocketAddrV4) -> SOCKADDR_IN {
+    SOCKADDR_IN {
+        sin_family: AF_INET,
+        sin_port: address.port().to_be(),
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes(address.ip().octets()),
             },
-            ..Default::default()
         },
+        ..Default::default()
     }
 }
 pub(crate) fn ipv4_from_sockaddr(address: &SOCKADDR_INET) -> io::Result<Ipv4Addr> {
@@ -337,6 +402,8 @@ mod tests {
         ] {
             assert_eq!(ipv4_from_sockaddr(&sockaddr(address)).unwrap(), address);
         }
+        let peer = sockaddr_in(SocketAddrV4::new(Ipv4Addr::new(192, 168, 8, 7), 0x1f90));
+        assert_eq!(peer.sin_port.to_ne_bytes(), [0x1f, 0x90]);
     }
 
     #[test]

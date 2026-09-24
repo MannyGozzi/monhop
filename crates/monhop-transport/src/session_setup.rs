@@ -1324,3 +1324,182 @@ mod identity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod capture_stop_close_tests {
+    use super::*;
+    use crate::{
+        crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig, VerifiedPeer},
+        session::{NETWORK_REVOKED_REASON, SESSION_FAILED_REASON, close_reason, worker_end},
+    };
+    use monhop_core::capture::{CaptureStop, StopReason};
+    use quinn::udp::{RecvMeta, Transmit};
+    use std::{
+        fmt,
+        io::{self, IoSliceMut},
+        net::SocketAddr,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+
+    /// Far inside `session_health::HOLD_LIMIT`, how long a peer that never hears the close holds.
+    const HEARD_WITHIN: Duration = Duration::from_millis(200);
+
+    /// Loopback UDP gated like the guarded socket: once its session signal is revoked, nothing
+    /// leaves.
+    struct GatedSocket {
+        inner: Arc<dyn quinn::AsyncUdpSocket>,
+        signal: RevocationSignal,
+    }
+
+    impl fmt::Debug for GatedSocket {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("GatedSocket")
+        }
+    }
+
+    impl quinn::AsyncUdpSocket for GatedSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+            Arc::clone(&self.inner).create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+            if self.signal.is_revoked() {
+                return Ok(());
+            }
+            self.inner.try_send(transmit)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context<'_>,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            self.inner.poll_recv(cx, bufs, meta)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            self.inner.max_transmit_segments()
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            self.inner.max_receive_segments()
+        }
+
+        fn may_fragment(&self) -> bool {
+            self.inner.may_fragment()
+        }
+    }
+
+    /// Side A's capture stops with an expired lease and `settle` hands that to its session signal;
+    /// A's runtime then ends as it would and queues its close. Returns how side B's connection
+    /// closed, if it heard within `HEARD_WITHIN`.
+    async fn peer_hears_capture_end(
+        settle: impl FnOnce(&CaptureStop, &RevocationSignal),
+    ) -> Option<quinn::ConnectionError> {
+        let ours_id = DeviceIdentity::generate().unwrap();
+        let theirs_id = DeviceIdentity::generate().unwrap();
+        let pin = |identity: &DeviceIdentity| {
+            VerifiedPeer::from_certificate_der(
+                identity.certificate_der(),
+                &identity.fingerprint().full_hex(),
+            )
+            .unwrap()
+        };
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let theirs = quinn::Endpoint::server(
+            SecureQuicConfig::server(&theirs_id, &pin(&ours_id)).unwrap(),
+            loopback,
+        )
+        .unwrap();
+        let signal = RevocationSignal::default();
+        let socket = quinn::Runtime::wrap_udp_socket(
+            &quinn::TokioRuntime,
+            std::net::UdpSocket::bind(loopback).unwrap(),
+        )
+        .unwrap();
+        let mut ours = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            Arc::new(GatedSocket {
+                inner: socket,
+                signal: signal.clone(),
+            }),
+            Arc::new(quinn::TokioRuntime),
+        )
+        .unwrap();
+        ours.set_default_client_config(
+            SecureQuicConfig::client(&ours_id, &pin(&theirs_id)).unwrap(),
+        );
+        let connecting = ours
+            .connect(theirs.local_addr().unwrap(), LOCAL_TLS_SERVER_NAME)
+            .unwrap();
+        let (our_connection, their_connection) =
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(async { connecting.await.unwrap() }, async {
+                    theirs.accept().await.unwrap().await.unwrap()
+                })
+            })
+            .await
+            .unwrap();
+        // Wired as prepare_endpoint wires the endpoint's revoker.
+        let revoked_endpoint = ours.clone();
+        let revoked_signal = signal.clone();
+        let watch =
+            CancellationWatch::start(RevocationSignal::default(), signal.clone(), move || {
+                revoked_signal.revoke();
+                revoked_endpoint.close(0_u32.into(), NETWORK_REVOKED_REASON);
+            })
+            .unwrap();
+
+        let capture = CaptureStop::new();
+        capture.stop(StopReason::LeaseExpired);
+        settle(&capture, &signal);
+        let failure = worker_end(signal.is_stopping(), false, capture.reason(), false, None)
+            .expect("a capture's own end ends the session");
+        our_connection.close(
+            0_u32.into(),
+            close_reason(
+                &Err(failure),
+                false,
+                signal.is_stopping_for_control_change(),
+            ),
+        );
+        let heard = tokio::time::timeout(HEARD_WITHIN, their_connection.closed())
+            .await
+            .ok();
+        drop(watch);
+        ours.close(0_u32.into(), b"fixture complete");
+        theirs.close(0_u32.into(), b"fixture complete");
+        heard
+    }
+
+    #[tokio::test]
+    async fn a_lease_expiry_reaches_the_peer_as_a_failure_close_long_before_its_deadline() {
+        let heard = peer_hears_capture_end(|capture, session| {
+            capture.request_session_stop(session);
+        })
+        .await;
+        assert!(
+            matches!(
+                &heard,
+                Some(quinn::ConnectionError::ApplicationClosed(close))
+                    if close.reason.as_ref() == SESSION_FAILED_REASON
+            ),
+            "{heard:?}"
+        );
+    }
+
+    /// The end this replaces: a revoked session signal swallowed the close, so the peer waited.
+    #[tokio::test]
+    async fn a_revoked_session_signal_leaves_the_peer_waiting_for_its_deadline() {
+        let heard = peer_hears_capture_end(|_, session| session.mark_revoked_without_wake()).await;
+        assert!(heard.is_none(), "{heard:?}");
+    }
+}

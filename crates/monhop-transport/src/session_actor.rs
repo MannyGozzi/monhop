@@ -172,11 +172,36 @@ impl Status {
     }
 }
 
-pub trait WatchedDestination: InputDestination {
-    fn validate_environment(&mut self) -> Result<(), DestinationFailure>;
-    fn local_displays_changed(&self) -> bool {
-        false
+/// Why this computer no longer allows injection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvironmentFailure {
+    Native,
+    DisplaysChanged,
+}
+
+impl From<DestinationFailure> for EnvironmentFailure {
+    fn from(_: DestinationFailure) -> Self {
+        Self::Native
     }
+}
+
+impl From<EnvironmentFailure> for ActorFailure {
+    fn from(failure: EnvironmentFailure) -> Self {
+        match failure {
+            EnvironmentFailure::Native => Self::Native,
+            EnvironmentFailure::DisplaysChanged => Self::LocalDisplaysChanged,
+        }
+    }
+}
+
+pub trait WatchedDestination: InputDestination {
+    type Environment: WatchedEnvironment;
+    /// Taken once, before startup: the checks run on their own thread and never touch injection.
+    fn environment(&mut self) -> Self::Environment;
+}
+
+pub trait WatchedEnvironment: Send + 'static {
+    fn validate(&mut self) -> Result<(), EnvironmentFailure>;
 }
 
 struct StartupHandoff {
@@ -245,17 +270,14 @@ impl DestinationActor {
                     status: status.clone(),
                     armed: true,
                 };
+                let mut environment = destination.destination.environment();
                 if revocation.is_stopping() || status.failure().is_some() {
                     status.stop(ActorFailure::Revoked);
                     cleanup_without_receiver(&mut destination, &status);
                     return;
                 }
-                if destination.validate_environment().is_err() {
-                    status.stop(if destination.local_displays_changed() {
-                        ActorFailure::LocalDisplaysChanged
-                    } else {
-                        ActorFailure::Native
-                    });
+                if let Err(failure) = check_environment(&mut environment) {
+                    status.stop(failure);
                     cleanup_without_receiver(&mut destination, &status);
                     return;
                 }
@@ -281,12 +303,8 @@ impl DestinationActor {
                     cleanup_without_receiver(&mut destination, &status);
                     return;
                 }
-                if destination.validate_environment().is_err() {
-                    status.stop(if destination.local_displays_changed() {
-                        ActorFailure::LocalDisplaysChanged
-                    } else {
-                        ActorFailure::Native
-                    });
+                if let Err(failure) = check_environment(&mut environment) {
+                    status.stop(failure);
                     cleanup_without_receiver(&mut destination, &status);
                     return;
                 }
@@ -311,6 +329,13 @@ impl DestinationActor {
                     cleanup_receiver(&mut receiver, &mut destination, &status);
                     return;
                 }
+                let Ok(_watch) =
+                    EnvironmentWatch::start(environment, status.clone(), revocation.clone())
+                else {
+                    status.stop(ActorFailure::Startup);
+                    cleanup_receiver(&mut receiver, &mut destination, &status);
+                    return;
+                };
                 status.started.store(true, Ordering::Release);
                 run_receiver(
                     &mut receiver,
@@ -536,18 +561,70 @@ impl<D: WatchedDestination> InputDestination for DestinationGuard<D> {
     }
 }
 
-impl<D: WatchedDestination> WatchedDestination for DestinationGuard<D> {
-    fn local_displays_changed(&self) -> bool {
-        self.destination.local_displays_changed()
+/// A panicking check stops the session like a panicking injection.
+fn check_environment<E: WatchedEnvironment>(environment: &mut E) -> Result<(), ActorFailure> {
+    match catch_unwind(AssertUnwindSafe(|| environment.validate())) {
+        Ok(result) => result.map_err(ActorFailure::from),
+        Err(payload) => {
+            std::mem::forget(payload);
+            Err(ActorFailure::Panicked)
+        }
     }
-    fn validate_environment(&mut self) -> Result<(), DestinationFailure> {
-        match catch_unwind(AssertUnwindSafe(|| self.destination.validate_environment())) {
-            Ok(result) => result,
-            Err(payload) => {
-                std::mem::forget(payload);
-                self.status.stop(ActorFailure::Panicked);
-                Err(DestinationFailure)
-            }
+}
+
+/// Rechecks the environment every `DISPLAY_CHECK_INTERVAL` beside injection, so a slow native read
+/// never delays an event; a failure stops the session and wakes the injection thread to clean up.
+struct EnvironmentWatch {
+    done: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl EnvironmentWatch {
+    fn start<E: WatchedEnvironment>(
+        mut environment: E,
+        status: Arc<Status>,
+        revocation: RevocationSignal,
+    ) -> std::io::Result<Self> {
+        let done = Arc::new(AtomicBool::new(false));
+        let watching = done.clone();
+        let injection = thread::current();
+        let worker = thread::Builder::new()
+            .name("monhop-destination-check".into())
+            .spawn(move || {
+                loop {
+                    thread::park_timeout(crate::session::DISPLAY_CHECK_INTERVAL);
+                    if watching.load(Ordering::Acquire)
+                        || status.failure().is_some()
+                        || revocation.is_stopping()
+                    {
+                        return;
+                    }
+                    let started = std::time::Instant::now();
+                    let checked = check_environment(&mut environment);
+                    Stats::max(&status.stats.env_max_micros, micros_u64(started.elapsed()));
+                    if let Err(failure) = checked {
+                        // A revocation that raced the check is the injection loop's to report.
+                        if !revocation.is_stopping() {
+                            status.stop(failure);
+                        }
+                        injection.unpark();
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self {
+            done,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for EnvironmentWatch {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
         }
     }
 }
@@ -602,26 +679,12 @@ fn run_receiver<D: WatchedDestination>(
     origin: SessionClock,
 ) {
     let processing = catch_unwind(AssertUnwindSafe(|| {
-        let mut checked_environment = Duration::ZERO;
         let mut last_frame_at: Option<Duration> = None;
         while status.failure().is_none() {
             let now = origin.elapsed();
             if revocation.is_stopping() {
                 status.stop(ActorFailure::Revoked);
                 break;
-            }
-            if now.saturating_sub(checked_environment) >= crate::session::DISPLAY_CHECK_INTERVAL {
-                let validated = destination.validate_environment();
-                Stats::max(&status.stats.env_max_micros, micros_since(&origin, now));
-                if validated.is_err() {
-                    status.stop(if destination.local_displays_changed() {
-                        ActorFailure::LocalDisplaysChanged
-                    } else {
-                        ActorFailure::Native
-                    });
-                    break;
-                }
-                checked_environment = now;
             }
             match receiver.take_back(destination) {
                 Ok(Some(message)) => emit(message, receiver, &mut sequences, &outgoing, &status),
@@ -827,9 +890,38 @@ mod tests {
     use monhop_protocol::{DisplayDescription, Key, RateLimiter};
     use std::time::Instant;
 
+    /// Answers environment reads by number; reads 1 and 2 are the startup checks.
+    struct ProbeEnvironment {
+        reads: usize,
+        answer: Box<dyn FnMut(usize) -> Result<(), EnvironmentFailure> + Send>,
+    }
+
+    impl ProbeEnvironment {
+        fn steady() -> Self {
+            Self::answering(|_| Ok(()))
+        }
+
+        fn answering(
+            answer: impl FnMut(usize) -> Result<(), EnvironmentFailure> + Send + 'static,
+        ) -> Self {
+            Self {
+                reads: 0,
+                answer: Box::new(answer),
+            }
+        }
+    }
+
+    impl WatchedEnvironment for ProbeEnvironment {
+        fn validate(&mut self) -> Result<(), EnvironmentFailure> {
+            self.reads += 1;
+            (self.answer)(self.reads)
+        }
+    }
+
     struct Probe {
         _ownership: InjectionPermit,
         actions: SyncSender<DestinationAction>,
+        environment: ProbeEnvironment,
     }
 
     impl InputDestination for Probe {
@@ -840,8 +932,9 @@ mod tests {
     }
 
     impl WatchedDestination for Probe {
-        fn validate_environment(&mut self) -> Result<(), DestinationFailure> {
-            Ok(())
+        type Environment = ProbeEnvironment;
+        fn environment(&mut self) -> ProbeEnvironment {
+            std::mem::replace(&mut self.environment, ProbeEnvironment::steady())
         }
     }
 
@@ -915,7 +1008,10 @@ mod tests {
         }
     }
 
-    fn ready_probe(actions: SyncSender<DestinationAction>) -> DestinationActor {
+    fn ready_probe(
+        actions: SyncSender<DestinationAction>,
+        environment: ProbeEnvironment,
+    ) -> DestinationActor {
         let ownership = monhop_core::NativeSessionClaim::claim()
             .expect("test owns native input")
             .split()
@@ -931,6 +1027,7 @@ mod tests {
                 Ok(Probe {
                     _ownership: ownership,
                     actions,
+                    environment,
                 })
             },
         )
@@ -954,6 +1051,19 @@ mod tests {
                 display_id: DisplayId(1),
                 position: Point::new(20.0, 20.0),
             },
+        )
+    }
+
+    fn key_down(sequence: u64, usage: u16) -> Frame {
+        Frame::new(
+            SessionEpoch::new(2).unwrap(),
+            sequence,
+            Message::Key(Key {
+                usage: HidUsage(usage),
+                is_down: true,
+                repeat: false,
+                modifiers: ModifierState(0),
+            }),
         )
     }
 
@@ -981,6 +1091,7 @@ mod tests {
                 Ok(Probe {
                     _ownership: ownership,
                     actions,
+                    environment: ProbeEnvironment::steady(),
                 })
             },
         )
@@ -1045,6 +1156,7 @@ mod tests {
                 Ok(Probe {
                     _ownership: ownership,
                     actions,
+                    environment: ProbeEnvironment::steady(),
                 })
             },
         )
@@ -1061,20 +1173,9 @@ mod tests {
     fn blocked_network_consumer_cannot_prevent_native_release() {
         let _test = lock_test();
         let (tx, rx) = mpsc::sync_channel(10);
-        let mut actor = ready_probe(tx);
+        let mut actor = ready_probe(tx, ProbeEnvironment::steady());
         actor.try_submit(activation()).unwrap();
-        actor
-            .try_submit(Frame::new(
-                SessionEpoch::new(2).unwrap(),
-                1,
-                Message::Key(Key {
-                    usage: HidUsage(4),
-                    is_down: true,
-                    repeat: false,
-                    modifiers: ModifierState(0),
-                }),
-            ))
-            .unwrap();
+        actor.try_submit(key_down(1, 4)).unwrap();
         assert!(matches!(
             rx.recv_timeout(Duration::from_millis(100)).unwrap(),
             DestinationAction::MoveTo(_)
@@ -1104,27 +1205,106 @@ mod tests {
         assert!(!actor.cleanup_pending());
     }
 
-    enum PauseAt {
-        HandoffEnvironment,
-        HeldKey,
+    #[test]
+    fn a_slow_environment_check_never_delays_injection() {
+        let _test = lock_test();
+        let (checking, check_started) = mpsc::sync_channel(1);
+        let (finish_check, wait_to_finish) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::sync_channel(10);
+        let mut actor = ready_probe(
+            tx,
+            ProbeEnvironment::answering(move |read| {
+                if read == 3 {
+                    checking.send(()).unwrap();
+                    wait_to_finish.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                Ok(())
+            }),
+        );
+        check_started.recv_timeout(Duration::from_secs(1)).unwrap();
+        actor.try_submit(activation()).unwrap();
+        actor.try_submit(key_down(1, 4)).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+            DestinationAction::MoveTo(_)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+            DestinationAction::Key { pressed: true, .. }
+        ));
+        finish_check.send(()).unwrap();
+        wait_until(|| actor.stats().env_max_micros > 0);
+        assert!(actor.failure().is_none());
+        actor.request_stop();
+        wait_until(|| actor.finish());
+        assert!(!monhop_core::NativeSessionClaim::is_claimed());
+    }
+
+    #[test]
+    fn a_failed_background_check_stops_the_session_with_its_reason_and_releases_input() {
+        let _test = lock_test();
+        for (failure, reason) in [
+            (
+                EnvironmentFailure::DisplaysChanged,
+                ActorFailure::LocalDisplaysChanged,
+            ),
+            (EnvironmentFailure::Native, ActorFailure::Native),
+        ] {
+            let failing = Arc::new(AtomicBool::new(false));
+            let check_fails = failing.clone();
+            let (tx, rx) = mpsc::sync_channel(10);
+            let mut actor = ready_probe(
+                tx,
+                ProbeEnvironment::answering(move |read| {
+                    if read > 2 && check_fails.load(Ordering::Acquire) {
+                        Err(failure)
+                    } else {
+                        Ok(())
+                    }
+                }),
+            );
+            actor.try_submit(activation()).unwrap();
+            actor.try_submit(key_down(1, 4)).unwrap();
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+                DestinationAction::MoveTo(_)
+            ));
+            assert!(matches!(
+                rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+                DestinationAction::Key { pressed: true, .. }
+            ));
+            failing.store(true, Ordering::Release);
+            wait_until(|| actor.failure().is_some());
+            assert_eq!(actor.failure(), Some(reason));
+            wait_until(|| actor.finish());
+            let released = rx.try_iter().collect::<Vec<_>>();
+            assert!(released.contains(&DestinationAction::ReleaseAll));
+            assert!(released.iter().all(|action| action.is_release()));
+            assert!(!actor.cleanup_pending());
+            assert!(!monhop_core::NativeSessionClaim::is_claimed());
+        }
+    }
+
+    struct Pause {
+        paused: SyncSender<()>,
+        resume: Receiver<()>,
+    }
+
+    impl Pause {
+        fn wait(&self) {
+            self.paused.send(()).unwrap();
+            self.resume.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
     }
 
     struct PausedProbe {
         _ownership: InjectionPermit,
         actions: SyncSender<DestinationAction>,
-        pause_at: PauseAt,
-        environment_reads: usize,
-        paused: SyncSender<()>,
-        resume: Receiver<()>,
+        pause_on_key: Option<Pause>,
+        environment: ProbeEnvironment,
         allow_cleanup: Arc<AtomicBool>,
     }
 
-    impl PausedProbe {
-        fn pause(&self) {
-            self.paused.send(()).unwrap();
-            self.resume.recv_timeout(Duration::from_secs(2)).unwrap();
-        }
-    }
     impl InputDestination for PausedProbe {
         fn apply(&mut self, action: DestinationAction) -> Result<(), DestinationFailure> {
             let _ = self.actions.try_send(action);
@@ -1135,21 +1315,18 @@ mod tests {
                     .then_some(())
                     .ok_or(DestinationFailure);
             }
-            if matches!(self.pause_at, PauseAt::HeldKey)
+            if let Some(pause) = &self.pause_on_key
                 && matches!(action, DestinationAction::Key { pressed: true, .. })
             {
-                self.pause();
+                pause.wait();
             }
             Ok(())
         }
     }
     impl WatchedDestination for PausedProbe {
-        fn validate_environment(&mut self) -> Result<(), DestinationFailure> {
-            self.environment_reads += 1;
-            if matches!(self.pause_at, PauseAt::HandoffEnvironment) && self.environment_reads == 2 {
-                self.pause();
-            }
-            Ok(())
+        type Environment = ProbeEnvironment;
+        fn environment(&mut self) -> ProbeEnvironment {
+            std::mem::replace(&mut self.environment, ProbeEnvironment::steady())
         }
     }
 
@@ -1174,13 +1351,20 @@ mod tests {
             false,
             true,
             move |ownership| {
+                let pause = Pause {
+                    paused,
+                    resume: wait_for_resume,
+                };
                 Ok(PausedProbe {
                     _ownership: ownership,
                     actions,
-                    pause_at: PauseAt::HandoffEnvironment,
-                    environment_reads: 0,
-                    paused,
-                    resume: wait_for_resume,
+                    pause_on_key: None,
+                    environment: ProbeEnvironment::answering(move |read| {
+                        if read == 2 {
+                            pause.wait();
+                        }
+                        Ok(())
+                    }),
                     allow_cleanup: worker_cleanup,
                 })
             },
@@ -1241,10 +1425,11 @@ mod tests {
                 Ok(PausedProbe {
                     _ownership: ownership,
                     actions,
-                    pause_at: PauseAt::HeldKey,
-                    environment_reads: 0,
-                    paused,
-                    resume: wait_for_resume,
+                    pause_on_key: Some(Pause {
+                        paused,
+                        resume: wait_for_resume,
+                    }),
+                    environment: ProbeEnvironment::steady(),
                     allow_cleanup: Arc::new(AtomicBool::new(true)),
                 })
             },
@@ -1256,18 +1441,7 @@ mod tests {
             .unwrap();
         wait_until(|| actor.is_started());
         actor.try_submit(activation()).unwrap();
-        actor
-            .try_submit(Frame::new(
-                SessionEpoch::new(2).unwrap(),
-                1,
-                Message::Key(Key {
-                    usage: HidUsage(4),
-                    is_down: true,
-                    repeat: false,
-                    modifiers: ModifierState(0),
-                }),
-            ))
-            .unwrap();
+        actor.try_submit(key_down(1, 4)).unwrap();
         wait_for_pause.recv_timeout(Duration::from_secs(1)).unwrap();
         let ping = actor
             .outbound
@@ -1289,18 +1463,7 @@ mod tests {
                 Message::Pong(token),
             ))
             .unwrap();
-        actor
-            .try_submit(Frame::new(
-                SessionEpoch::new(2).unwrap(),
-                2,
-                Message::Key(Key {
-                    usage: HidUsage(5),
-                    is_down: true,
-                    repeat: false,
-                    modifiers: ModifierState(0),
-                }),
-            ))
-            .unwrap();
+        actor.try_submit(key_down(2, 5)).unwrap();
         // Resume the owner with an old loop sample, but a fresh receive-time clock past expiry.
         now.store(1 + liveness_millis(), Ordering::Release);
         resume_clock.send(()).unwrap();
@@ -1353,8 +1516,9 @@ mod tests {
     }
 
     impl WatchedDestination for PanickingDestination {
-        fn validate_environment(&mut self) -> Result<(), DestinationFailure> {
-            Ok(())
+        type Environment = ProbeEnvironment;
+        fn environment(&mut self) -> ProbeEnvironment {
+            ProbeEnvironment::steady()
         }
     }
 
@@ -1394,18 +1558,7 @@ mod tests {
             .unwrap();
         wait_until(|| actor.is_started());
         actor.try_submit(activation()).unwrap();
-        actor
-            .try_submit(Frame::new(
-                SessionEpoch::new(2).unwrap(),
-                1,
-                Message::Key(Key {
-                    usage: HidUsage(4),
-                    is_down: true,
-                    repeat: false,
-                    modifiers: ModifierState(0),
-                }),
-            ))
-            .unwrap();
+        actor.try_submit(key_down(1, 4)).unwrap();
         done.recv_timeout(Duration::from_millis(500)).unwrap();
         let deadline = Instant::now() + Duration::from_millis(500);
         while !actor.finish() {

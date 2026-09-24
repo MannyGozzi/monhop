@@ -214,23 +214,27 @@ impl<T: Copy> TtlCache<T> {
 
     /// Returns the cached value if it is still within its TTL; otherwise calls `probe` and caches
     /// its result. A probe error is never cached, so the next call probes again.
+    /// The probe runs outside the lock, so no caller ever waits behind another caller's probe.
     fn get(&self, probe: impl FnOnce() -> Result<T, MacError>) -> Result<T, MacError> {
-        let mut cached = self
-            .cached
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some((fetched_at, value)) = *cached
+        if let Some((fetched_at, value)) = *self.lock()
             && fetched_at.elapsed() < self.ttl
         {
             return Ok(value);
         }
         let value = probe()?;
-        *cached = Some((Instant::now(), value));
+        *self.lock() = Some((Instant::now(), value));
         Ok(value)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(Instant, T)>> {
+        self.cached
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
-const PERMISSION_CACHE_TTL: Duration = Duration::from_millis(250);
+/// Also the capture's permission watch interval, so both notice a revoked grant equally soon.
+pub(crate) const PERMISSION_CACHE_TTL: Duration = Duration::from_millis(250);
 static PERMISSION_CACHE: TtlCache<PermissionState> = TtlCache::new(PERMISSION_CACHE_TTL);
 
 pub fn preflight_permissions() -> Result<PermissionState, MacError> {

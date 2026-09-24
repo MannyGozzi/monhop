@@ -4,6 +4,7 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     sync::{Arc, Mutex},
+    task::{Context, Poll},
 };
 
 use monhop_core::RevocationSignal;
@@ -26,10 +27,45 @@ use monhop_platform_windows::{
     network_watch, udp_receive,
 };
 
-#[cfg(target_os = "macos")]
-pub(super) type NativeSocket = udp_receive::AsyncUdpReceiver;
-#[cfg(windows)]
-pub(super) type NativeSocket = udp_receive::AsyncUdpReceiver;
+/// The session socket, owning on Windows the flow that keeps its datagrams marked interactive.
+pub(super) struct NativeSocket {
+    // Declared first so the flow is removed while its socket is still open.
+    #[cfg(windows)]
+    _traffic: Option<network::InteractiveTraffic>,
+    receiver: udp_receive::AsyncUdpReceiver,
+}
+
+impl NativeSocket {
+    pub(super) fn poll_receive(
+        &self,
+        cx: &mut Context<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<io::Result<udp_receive::ReceivedDatagram>> {
+        self.receiver.poll_receive(cx, buffer)
+    }
+
+    pub(super) fn try_send_to(&self, buffer: &[u8], peer: SocketAddrV4) -> io::Result<usize> {
+        self.receiver.try_send_to(buffer, peer)
+    }
+
+    pub(super) async fn writable(&self) -> io::Result<()> {
+        self.receiver.writable().await
+    }
+
+    pub(super) fn local_addr(&self) -> io::Result<SocketAddrV4> {
+        self.receiver.local_addr()
+    }
+}
+
+impl From<udp_receive::AsyncUdpReceiver> for NativeSocket {
+    fn from(receiver: udp_receive::AsyncUdpReceiver) -> Self {
+        Self {
+            receiver,
+            #[cfg(windows)]
+            _traffic: None,
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub(super) type Watch = network_watch::NetworkChangeWatcher;
@@ -62,8 +98,19 @@ pub(super) fn prepare(selection: &NetworkSelection) -> io::Result<PreparedNetwor
     let socket = UdpSocket::bind(selection.local).map_err(native_category)?;
     verify_bound_address(&socket, selection.local)?;
     network::restrict_udp_interface(&socket, selection.interface_index).map_err(native_category)?;
+    // Wi-Fi queues marked datagrams ahead of bulk traffic; a refusal only costs that priority.
+    #[cfg(target_os = "macos")]
+    let _ = network::mark_interactive_traffic(&socket).inspect_err(warn_unmarked);
+    #[cfg(windows)]
+    let traffic = network::mark_interactive_traffic(&socket, selection.peer)
+        .inspect_err(warn_unmarked)
+        .ok();
     let socket = udp_receive::UdpReceiver::configure(socket).map_err(native_category)?;
-    let socket = socket.into_async().map_err(native_category)?;
+    let socket = NativeSocket {
+        receiver: socket.into_async().map_err(native_category)?,
+        #[cfg(windows)]
+        _traffic: traffic,
+    };
     if socket.local_addr().map_err(native_category)? != selection.local {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
@@ -76,6 +123,10 @@ pub(super) fn prepare(selection: &NetworkSelection) -> io::Result<PreparedNetwor
         signal,
         watch,
     })
+}
+
+fn warn_unmarked(error: &io::Error) {
+    log::warn!("session datagrams keep ordinary Wi-Fi priority: {error}");
 }
 
 #[cfg(target_os = "macos")]

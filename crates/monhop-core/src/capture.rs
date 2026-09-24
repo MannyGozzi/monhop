@@ -365,6 +365,31 @@ impl CaptureStop {
     }
 }
 
+/// Cuts the capture owner thread's wait short so a submitted command or stop applies at once
+/// instead of at its next poll. The native adapter registers how its own thread is woken.
+#[derive(Clone, Default)]
+pub struct OwnerWake(Arc<std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>>);
+
+impl fmt::Debug for OwnerWake {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnerWake")
+    }
+}
+
+impl OwnerWake {
+    /// Registers the one wake; a second registration is refused. It must only signal, never block.
+    pub fn register(&self, wake: Arc<dyn Fn() + Send + Sync>) -> bool {
+        self.0.set(wake).is_ok()
+    }
+
+    /// A no-op until a wake is registered: the owner's bounded poll still picks the change up.
+    pub fn wake(&self) {
+        if let Some(wake) = self.0.get() {
+            wake();
+        }
+    }
+}
+
 /// An event tagged with the hook thread's route that was active when it was admitted.
 #[derive(Clone, Copy, PartialEq)]
 pub struct CapturedEvent {
@@ -1090,6 +1115,42 @@ mod tests {
         );
         assert_eq!(session.origin().map(|at| at.line()), Some(asked_at));
         assert_eq!(second.request_session_stop(&session), None, "asks once");
+    }
+
+    #[test]
+    fn every_clone_of_an_owner_wake_runs_the_one_registered_wake() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let wake = OwnerWake::default();
+        wake.wake();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&wakes);
+        let control_side = wake.clone();
+        assert!(wake.register(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })));
+        assert!(
+            !control_side.register(Arc::new(|| {})),
+            "a second wake is refused"
+        );
+        control_side.wake();
+        wake.wake();
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_lease_expiry_asks_the_session_to_stop_and_leaves_its_socket_open() {
+        let session = RevocationSignal::default();
+        let stop = CaptureStop::new();
+        stop.stop(StopReason::LeaseExpired);
+        assert_eq!(
+            stop.request_session_stop(&session),
+            Some(StopReason::LeaseExpired)
+        );
+        assert!(session.is_stopping());
+        assert!(
+            !session.is_revoked(),
+            "the failure close still has a socket"
+        );
     }
 
     #[test]

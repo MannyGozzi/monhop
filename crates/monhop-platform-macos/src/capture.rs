@@ -28,7 +28,8 @@ use monhop_core::{
     MouseButton, Point, RevocationSignal, TakeBackGate,
     capture::{
         CaptureConsumer, CaptureEvent, CapturePermit, CaptureProducer, CaptureStop, CapturedEvent,
-        MAX_SUPPRESSION_TTL, NativeSessionClaim, StopReason, SuppressionLease, capture_channel,
+        MAX_SUPPRESSION_TTL, NativeSessionClaim, OwnerWake, StopReason, SuppressionLease,
+        capture_channel,
     },
     capture_control::{
         CaptureCommand, ControlCompletion, ControlError, ControlReader, ControlWriter,
@@ -39,7 +40,7 @@ use monhop_core::{
 };
 
 use crate::{
-    ContinuousInstant, MacError, PowerWatch, SYNTHETIC_EVENT_MARKER,
+    ContinuousInstant, MacError, PermissionState, PowerWatch, SYNTHETIC_EVENT_MARKER,
     capture_decode::{
         ActiveDisplayBounds, CG_EVENT_DOCK_CONTROL, CG_EVENT_FLAGS_CHANGED,
         CG_EVENT_FLUID_TOUCH_GESTURE, CG_EVENT_GESTURE, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
@@ -53,10 +54,13 @@ use crate::{
         CFRelease, CG_EVENT_SOURCE_USER_DATA, CG_EVENT_TAP_OPTION_DEFAULT,
         CG_EVENT_TAP_OPTION_LISTEN_ONLY, CG_HEAD_INSERT_EVENT_TAP, CG_HID_EVENT_TAP, CGEventField,
         CGEventGetIntegerValueField, CGEventPost, CGEventRef, CGEventSetIntegerValueField,
-        CGEventTapProxy, CGEventType, EventTap, EventTapInstallError, capture_event_mask,
-        finish_and_post_event, tap_disabled,
+        CGEventTapProxy, CGEventType, EventTap, EventTapInstallError, RunLoopWake,
+        capture_event_mask, finish_and_post_event, tap_disabled,
     },
-    hid_to_mac_virtual_key, mac_virtual_key_to_hid, preflight_permissions,
+    hid_to_mac_virtual_key, mac_virtual_key_to_hid,
+    native::PERMISSION_CACHE_TTL,
+    permission_watch::{PermissionCell, PermissionWatch},
+    preflight_permissions,
 };
 
 type CGDirectDisplayID = u32;
@@ -177,6 +181,9 @@ struct Shared {
     interception_failed: AtomicBool,
     progress_ms: AtomicU64,
     allows_suppression: bool,
+    owner_wake: OwnerWake,
+    /// Read by the owner thread in place of a TCC probe; see `PermissionWatch`.
+    permissions: PermissionCell,
 }
 
 /// The caller must establish the paired peer and topology before starting a session capture.
@@ -223,7 +230,7 @@ impl NativeCapture {
         permit: CapturePermit,
         mode: CaptureMode,
     ) -> Result<Self, NativeCaptureError> {
-        if generation == 0 || revocation.is_revoked() {
+        if generation == 0 || revocation.is_stopping() {
             return Err(NativeCaptureError::Stopped(StopReason::InvalidInput));
         }
         let origin = ContinuousInstant::try_now().map_err(NativeCaptureError::Clock)?;
@@ -231,7 +238,7 @@ impl NativeCapture {
         let power_watch =
             PowerWatch::start_after_local_enable(revocation.clone(), Some(stop.clone()))
                 .map_err(NativeCaptureError::Power)?;
-        if revocation.is_revoked() {
+        if revocation.is_stopping() {
             return Err(NativeCaptureError::Stopped(
                 stop.reason().unwrap_or(StopReason::Requested),
             ));
@@ -260,6 +267,8 @@ impl NativeCapture {
             interception_failed: AtomicBool::new(false),
             progress_ms: AtomicU64::new(0),
             allows_suppression: diagnostic_duration.is_none(),
+            owner_wake: OwnerWake::default(),
+            permissions: PermissionCell::default(),
         });
         let thread_shared = Arc::clone(&shared);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -292,7 +301,10 @@ impl NativeCapture {
             }) {
             Ok(worker) => worker,
             Err(_) => {
-                shared.revocation.revoke();
+                // The dropped closure's PowerWatch already recorded Requested, which leaves the
+                // session alone, so stop it directly.
+                shared.stop.stop(StopReason::NativeFailure);
+                shared.revocation.request_stop();
                 return Err(NativeCaptureError::StartFailed);
             }
         };
@@ -416,7 +428,7 @@ impl NativeCapture {
         if let Some(reason) = self.shared.stop.reason() {
             return Err(NativeCaptureError::Stopped(reason));
         }
-        self.control.submit(command).map_err(|error| match error {
+        let revision = self.control.submit(command).map_err(|error| match error {
             ControlError::Pending => NativeCaptureError::ControlPending,
             ControlError::Failed => NativeCaptureError::ControlFailed,
             ControlError::Exhausted
@@ -425,7 +437,9 @@ impl NativeCapture {
                 self.shared.stop.stop(StopReason::InvalidInput);
                 NativeCaptureError::Stopped(StopReason::InvalidInput)
             }
-        })
+        })?;
+        self.shared.owner_wake.wake();
+        Ok(revision)
     }
 
     pub fn completed_control_revision(&self) -> Result<u64, NativeCaptureError> {
@@ -440,6 +454,7 @@ impl NativeCapture {
 
     pub fn request_stop(&self) {
         self.shared.stop.stop(StopReason::Requested);
+        self.shared.owner_wake.wake();
     }
 
     pub fn is_finished(&self) -> bool {
@@ -576,6 +591,65 @@ impl fmt::Display for ShownPoint {
     }
 }
 
+/// Where the capture owner loop spent a pass; the slowest step of the longest pass names what held
+/// the thread when a lease lapses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopStep {
+    /// Progress, stop latches and the permission read.
+    Checks,
+    /// Applying a submitted route command, local posts included.
+    Control,
+    /// The held-input tick, finished gesture lines and a cursor return.
+    Tick,
+    /// Waiting on the run loop, tap callbacks included.
+    RunLoop,
+}
+
+impl fmt::Display for LoopStep {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Checks => "checks",
+            Self::Control => "control",
+            Self::Tick => "tick",
+            Self::RunLoop => "run loop",
+        })
+    }
+}
+
+/// One owner-loop pass, timed step by step on the capture clock.
+#[derive(Clone, Copy)]
+struct LoopPass {
+    started: Duration,
+    lap_started: Duration,
+    slowest: (Duration, LoopStep),
+}
+
+impl LoopPass {
+    fn start(now: Duration) -> Self {
+        Self {
+            started: now,
+            lap_started: now,
+            slowest: (Duration::ZERO, LoopStep::Checks),
+        }
+    }
+
+    fn lap(&mut self, step: LoopStep, now: Duration) {
+        let spent = now.saturating_sub(self.lap_started);
+        if spent > self.slowest.0 {
+            self.slowest = (spent, step);
+        }
+        self.lap_started = now;
+    }
+
+    /// The whole pass and its slowest step.
+    fn finish(&self) -> (Duration, LoopStep) {
+        (
+            self.lap_started.saturating_sub(self.started),
+            self.slowest.1,
+        )
+    }
+}
+
 /// One remote-route episode's diagnostics: plain fields updated per event, logged once at its end.
 #[derive(Clone, Copy)]
 struct RemoteEpisode {
@@ -602,6 +676,8 @@ struct RemoteEpisode {
     transfer_posts: u64,
     cursor_posts: u64,
     last_post: Option<Point>,
+    /// Kept past a lapse: the pass that let the lease lapse is the one worth naming.
+    longest_pass: (Duration, LoopStep),
 }
 
 impl RemoteEpisode {
@@ -634,6 +710,7 @@ impl RemoteEpisode {
             transfer_posts: 0,
             cursor_posts: 0,
             last_post: None,
+            longest_pass: (Duration::ZERO, LoopStep::Checks),
         }
     }
 
@@ -710,6 +787,12 @@ impl RemoteEpisode {
         self.last_post = Some(point);
     }
 
+    fn note_pass(&mut self, (total, step): (Duration, LoopStep)) {
+        if total > self.longest_pass.0 {
+            self.longest_pass = (total, step);
+        }
+    }
+
     fn summary(&self, now: Duration, ignored: IgnoredSources, end: EpisodeEnd) -> String {
         format!(
             "capture episode: {} ms remote, motion {} suppressed / {} passed ({} zero-delta), \
@@ -717,7 +800,8 @@ impl RemoteEpisode {
              touch latch opens {} closes {} idle expiries {}, \
              ignored-source own {} foreign {} (pointer {}, gesture {}), \
              location drift max {:.0} px last {}, passed-pointer drift max {:.0} px, \
-             pinned {}, handoff posts {}, transfer posts {} (+{} cursor) last {}, ended by {}",
+             pinned {}, handoff posts {}, transfer posts {} (+{} cursor) last {}, \
+             longest loop pass {:.1} ms in {}, ended by {}",
             self.lapsed
                 .unwrap_or(now)
                 .saturating_sub(self.started)
@@ -745,6 +829,8 @@ impl RemoteEpisode {
             self.transfer_posts,
             self.cursor_posts,
             ShownPoint(self.last_post),
+            self.longest_pass.0.as_secs_f64() * 1000.0,
+            self.longest_pass.1,
             end,
         )
     }
@@ -828,7 +914,7 @@ fn latch_callback_failure(reason: StopReason) {
         {
             shared.interception_failed.store(true, Ordering::Release);
             shared.stop.stop(reason);
-            shared.revocation.mark_revoked_without_wake();
+            shared.stop.request_session_stop(&shared.revocation);
         }
     });
 }
@@ -855,12 +941,23 @@ fn with_callback(action: impl FnOnce(&mut CallbackState) -> bool) -> bool {
 }
 
 impl CallbackState {
-    /// A requested stop is the session's own teardown; marking it would shut the socket before
-    /// its QUIC close leaves.
+    /// Any end but a requested one asks the session to stop, never revokes it: the socket must
+    /// stay open for the failure close to reach the peer. A requested stop is the session's own.
     fn mark_stopped(&self) {
-        if self.shared.stop.ends_session() {
-            self.shared.revocation.mark_revoked_without_wake();
+        self.shared
+            .stop
+            .request_session_stop(&self.shared.revocation);
+    }
+
+    fn note_pass(&mut self, pass: (Duration, LoopStep)) {
+        if let Some(episode) = self.episode.as_mut() {
+            episode.note_pass(pass);
         }
+    }
+
+    /// Owner thread only: the latest answer of the permission watch, never a TCC probe.
+    fn may_post(&self) -> bool {
+        self.shared.permissions.load().accessibility
     }
 
     fn remote(&mut self) -> bool {
@@ -917,10 +1014,11 @@ impl CallbackState {
     /// route that ends without a restore point re-anchors Quartz at the pin, at most once.
     fn return_cursor_to_pin(&mut self) {
         let flags = self.local_modifiers.flags();
+        let trusted = self.may_post();
         self.return_cursor_to_pin_with(|pin| {
             // Best effort: a pin a display change removed, or lost permission, skips the post.
             current_active_display_bounds().is_ok_and(|bounds| bounds.contains(pin))
-                && post_cursor(pin, flags)
+                && post_cursor(pin, flags, trusted)
         });
     }
 
@@ -981,7 +1079,7 @@ impl CallbackState {
             self.mark_stopped();
             return ControlCompletion::Failed;
         }
-        if !post_cursor(point, self.local_modifiers.flags()) {
+        if !post_cursor(point, self.local_modifiers.flags(), self.may_post()) {
             self.shared.stop.stop(StopReason::NativeFailure);
             self.mark_stopped();
             return ControlCompletion::Failed;
@@ -1046,7 +1144,7 @@ impl CallbackState {
     fn apply_transfer_plan(&mut self, plan: impl Iterator<Item = LocalTransfer>) -> bool {
         for transfer in plan {
             let flags = self.local_modifiers.flags_after_transfer(transfer);
-            if !post_local_transfer(transfer, self.pointer_position, flags) {
+            if !post_local_transfer(transfer, self.pointer_position, flags, self.may_post()) {
                 self.shared.stop.stop(StopReason::NativeFailure);
                 self.mark_stopped();
                 return false;
@@ -1374,7 +1472,7 @@ unsafe extern "C" fn display_reconfiguration_callback(
     // SAFETY: DisplayWatch retains one Arc for the entire registered callback lifetime.
     let shared = unsafe { &*user_info.cast::<Shared>() };
     shared.stop.stop(StopReason::DisplaysChanged);
-    shared.revocation.mark_revoked_without_wake();
+    shared.stop.request_session_stop(&shared.revocation);
 }
 
 fn run(
@@ -1421,11 +1519,7 @@ fn run(
         });
     });
 
-    let mut resources = match Resources::install(
-        diagnostic_duration.is_some(),
-        &shared.stop,
-        &shared.revocation,
-    ) {
+    let mut resources = match Resources::install(&shared) {
         Ok(resources) => resources,
         Err(error) => {
             shared.stop.stop(stop_reason(error));
@@ -1459,21 +1553,23 @@ fn run(
     let mut previous_tick = shared.origin.elapsed();
     loop {
         let now = shared.origin.elapsed();
+        let mut pass = LoopPass::start(now);
         if now.saturating_sub(previous_tick) >= MAX_OWNER_THREAD_GAP {
             shared.interception_failed.store(true, Ordering::Release);
             shared.stop.stop(StopReason::NativeFailure);
         }
         previous_tick = now;
         update_progress(&shared);
-        if shared.revocation.is_revoked()
+        if shared.revocation.is_stopping()
             || diagnostic_duration.is_some_and(|duration| now >= duration)
         {
             shared.stop.stop(StopReason::Requested);
         }
-        if !permissions_still_sufficient(diagnostic_duration.is_some()) {
+        if !permissions_still_sufficient(shared.permissions.load(), diagnostic_duration.is_some()) {
             shared.interception_failed.store(true, Ordering::Release);
             shared.stop.stop(StopReason::NativeFailure);
         }
+        pass.lap(LoopStep::Checks, shared.origin.elapsed());
         if let Some((revision, command)) = control.pending() {
             let completion = if with_callback(|state| {
                 matches!(
@@ -1489,6 +1585,7 @@ fn run(
             // a rejected barrier can never be reported as a completed route change.
             control.complete(revision, completion);
         }
+        pass.lap(LoopStep::Control, shared.origin.elapsed());
 
         let mut draining = false;
         with_callback(|state| {
@@ -1501,16 +1598,23 @@ fn run(
             state.mark_stopped();
             false
         });
-        if shared.stop.is_stopped()
+        pass.lap(LoopStep::Tick, shared.origin.elapsed());
+        let finished = shared.stop.is_stopped()
             && !should_keep_quarantine_tap(
                 draining,
                 shared.interception_failed.load(Ordering::Acquire),
-            )
-        {
+            );
+        if !finished {
+            resources.run_once();
+            pass.lap(LoopStep::RunLoop, shared.origin.elapsed());
+        }
+        with_callback(|state| {
+            state.note_pass(pass.finish());
+            false
+        });
+        if finished {
             break;
         }
-
-        resources.run_once();
     }
 
     // Remove the tap before cleanup so this loop can only submit fixed ledger-owned local
@@ -1529,27 +1633,28 @@ fn stop_reason(error: NativeCaptureError) -> StopReason {
     }
 }
 
-/// Runs once every native guard is gone, so waking an arbitrary observer is safe here. A requested
-/// stop keeps the session's socket open: revoking would cut its QUIC close short.
+/// Runs once every native guard is gone, so waking an arbitrary observer is safe here. No capture
+/// stop revokes the session: revoking would cut its QUIC close short.
 fn settle_session_after_stop(shared: &Shared) {
     let shown = |at: Option<&std::panic::Location<'_>>| {
         at.map_or_else(|| "?".to_owned(), ToString::to_string)
     };
     if shared.stop.ends_session() {
+        shared.stop.request_session_stop(&shared.revocation);
         log::warn!(
-            "native capture stopped on its own: {:?} at {}; revoking the session",
+            "native capture stopped on its own: {:?} at {}; stopping the session",
             shared.stop.reason(),
             shown(shared.stop.origin()),
         );
-        shared.revocation.revoke();
-    } else if shared.revocation.is_revoked() {
+    }
+    if shared.revocation.is_revoked() {
         // Callbacks and the power watch mark revocation without waking; this is their wake.
         log::info!(
             "native capture stopped with the session already revoked (first stop at {})",
             shown(shared.revocation.origin()),
         );
         shared.revocation.revoke();
-    } else if shared.stop.is_stopped() {
+    } else if !shared.stop.ends_session() && shared.stop.is_stopped() {
         log::info!("native capture stopped as requested; the session keeps its socket");
     }
 }
@@ -1582,10 +1687,8 @@ fn close_native_resources(
     resources_result.and(display_result)
 }
 
-fn permissions_still_sufficient(passive: bool) -> bool {
-    preflight_permissions().is_ok_and(|permissions| {
-        permissions.listen_events && (passive || permissions.accessibility)
-    })
+fn permissions_still_sufficient(permissions: PermissionState, passive: bool) -> bool {
+    permissions.listen_events && (passive || permissions.accessibility)
 }
 
 fn seed_initial_state() {
@@ -1632,7 +1735,12 @@ fn clear_callback() {
 /// Posts exactly one ledger-owned local transfer. This deliberately bypasses `MacInjector`: its
 /// held-state guard is appropriate for remote payload injection, while this path must release or
 /// restore each fixed physical-plan item on the capture owner thread before its route barrier.
-fn post_local_transfer(transfer: LocalTransfer, position: Option<Point>, flags: u64) -> bool {
+fn post_local_transfer(
+    transfer: LocalTransfer,
+    position: Option<Point>,
+    flags: u64,
+    trusted: bool,
+) -> bool {
     match transfer {
         LocalTransfer::Key { usage, pressed } => {
             let Ok(key) = hid_to_mac_virtual_key(usage) else {
@@ -1641,18 +1749,18 @@ fn post_local_transfer(transfer: LocalTransfer, position: Option<Point>, flags: 
             // SAFETY: the key came from the fixed HID mapping and a null source requests Quartz's
             // default source. The owned event is released by post_marked_event.
             let event = unsafe { CGEventCreateKeyboardEvent(ptr::null(), key.0, pressed) };
-            post_marked_event(event, flags)
+            post_marked_event(event, flags, trusted)
         }
         LocalTransfer::Button { button, pressed } => {
             let Some(point) = position else {
                 return false;
             };
-            post_button(button, pressed, point, flags)
+            post_button(button, pressed, point, flags, trusted)
         }
     }
 }
 
-fn post_cursor(point: Point, flags: u64) -> bool {
+fn post_cursor(point: Point, flags: u64, trusted: bool) -> bool {
     if !point.is_finite() {
         return false;
     }
@@ -1669,10 +1777,16 @@ fn post_cursor(point: Point, flags: u64) -> bool {
             0,
         )
     };
-    post_marked_event(event, flags)
+    post_marked_event(event, flags, trusted)
 }
 
-fn post_button(button: MouseButton, pressed: bool, point: Point, flags: u64) -> bool {
+fn post_button(
+    button: MouseButton,
+    pressed: bool,
+    point: Point,
+    flags: u64,
+    trusted: bool,
+) -> bool {
     if !point.is_finite() {
         return false;
     }
@@ -1712,16 +1826,17 @@ fn post_button(button: MouseButton, pressed: bool, point: Point, flags: u64) -> 
             i64::from(button_number),
         );
     }
-    post_marked_event(event, flags)
+    post_marked_event(event, flags, trusted)
 }
 
-fn post_marked_event(event: CGEventRef, flags: u64) -> bool {
+/// `trusted` is the permission watch's latest Accessibility answer.
+fn post_marked_event(event: CGEventRef, flags: u64, trusted: bool) -> bool {
     if event.is_null() {
         return false;
     }
     // This is called only by the owner thread. CGEventPost is void, so permission and event
     // creation prove submission eligibility, not downstream delivery.
-    if !preflight_permissions().is_ok_and(|permissions| permissions.accessibility) {
+    if !trusted {
         // SAFETY: event is owned by this function even when permission was revoked.
         unsafe { CFRelease(event) };
         return false;
@@ -1739,7 +1854,7 @@ fn require_capture_active(
     stop: &CaptureStop,
     revocation: &RevocationSignal,
 ) -> Result<(), NativeCaptureError> {
-    if revocation.is_revoked() {
+    if revocation.is_stopping() {
         stop.stop(StopReason::Requested);
     }
     match stop.reason() {
@@ -1806,17 +1921,17 @@ fn seconds_setting(value: &CFType) -> Option<Duration> {
 
 struct Resources {
     tap: EventTap,
+    wake: RunLoopWake,
+    _permissions: PermissionWatch,
 }
 
 impl Resources {
-    fn install(
-        passive: bool,
-        stop: &CaptureStop,
-        revocation: &RevocationSignal,
-    ) -> Result<Self, NativeCaptureError> {
-        let permissions = read_while_capture_active(stop, revocation, || {
+    fn install(shared: &Shared) -> Result<Self, NativeCaptureError> {
+        let passive = !shared.allows_suppression;
+        let permissions = read_while_capture_active(&shared.stop, &shared.revocation, || {
             preflight_permissions().map_err(NativeCaptureError::Mac)
         })?;
+        shared.permissions.store(permissions);
         if !permissions.listen_events {
             return Err(NativeCaptureError::Mac(
                 MacError::ListenEventPermissionRequired,
@@ -1826,6 +1941,17 @@ impl Resources {
             return Err(NativeCaptureError::Mac(
                 MacError::AccessibilityPermissionRequired,
             ));
+        }
+        // Both undo themselves on drop, so a later failure here never leaves them behind; the tap,
+        // which does not, comes last.
+        let wake = RunLoopWake::install().ok_or(NativeCaptureError::StartFailed)?;
+        let permission_watch =
+            PermissionWatch::start(shared.permissions.clone(), PERMISSION_CACHE_TTL, || {
+                preflight_permissions().unwrap_or_default()
+            })
+            .map_err(|_| NativeCaptureError::StartFailed)?;
+        if !shared.owner_wake.register(wake.waker()) {
+            return Err(NativeCaptureError::StartFailed);
         }
         let options = if passive {
             CG_EVENT_TAP_OPTION_LISTEN_ONLY
@@ -1847,11 +1973,16 @@ impl Resources {
                 EventTapInstallError::SourceUnavailable => MacError::EventTapSourceUnavailable,
             })
         })?;
-        Ok(Self { tap })
+        Ok(Self {
+            tap,
+            wake,
+            _permissions: permission_watch,
+        })
     }
 
     fn run_once(&self) {
-        // A bounded timeout services stop and control polling without a callback waker.
+        // The wake returns at once for a submitted command or stop; the slice still bounds polls
+        // of state nothing signals.
         self.tap.run_once(RUN_LOOP_SLICE);
     }
 
@@ -1860,6 +1991,7 @@ impl Resources {
         // state is cleared.
         self.tap.disable();
         self.tap.close();
+        self.wake.close();
         Ok(())
     }
 }
@@ -1951,6 +2083,8 @@ mod callback_tests {
             interception_failed: AtomicBool::new(false),
             progress_ms: AtomicU64::new(0),
             allows_suppression: true,
+            owner_wake: OwnerWake::default(),
+            permissions: PermissionCell::default(),
         });
         let physical = match &take_back {
             Some(gate) => PhysicalCapture::new(Duration::ZERO).with_take_back(gate.clone()),
@@ -2329,14 +2463,15 @@ mod callback_tests {
         // SAFETY: as above.
         unsafe { display_reconfiguration_callback(1, DISPLAY_REMOVED, user_info) };
         assert_eq!(shared.stop.reason(), Some(StopReason::DisplaysChanged));
+        assert!(shared.revocation.is_stopping(), "the session still ends");
         assert!(
-            shared.revocation.is_revoked(),
-            "the session still fails closed"
+            !shared.revocation.is_revoked(),
+            "its displays-changed close keeps a socket"
         );
     }
 
     #[test]
-    fn a_requested_stop_keeps_the_session_socket_and_every_other_stop_revokes_it() {
+    fn a_requested_stop_leaves_the_session_alone_and_every_other_stop_only_asks_it_to_stop() {
         let (state, _consumer) = callback_fixture();
         state.shared.stop.stop(StopReason::Requested);
         state.mark_stopped();
@@ -2355,16 +2490,29 @@ mod callback_tests {
             // The session's own teardown request follows every end and must not mask it.
             state.shared.stop.stop(StopReason::Requested);
             state.mark_stopped();
+            let revocation = &state.shared.revocation;
+            assert!(revocation.is_stopping(), "{reason:?} during capture");
             assert!(
-                state.shared.revocation.is_revoked(),
-                "{reason:?} during capture"
+                !revocation.is_revoked(),
+                "{reason:?} keeps the close's socket"
             );
             settle_session_after_stop(&state.shared);
-            assert!(
-                state.shared.revocation.is_revoked(),
-                "{reason:?} after teardown"
-            );
+            assert!(revocation.is_stopping(), "{reason:?} after teardown");
+            assert!(!revocation.is_revoked(), "{reason:?} after teardown");
         }
+    }
+
+    #[test]
+    fn a_callback_failure_asks_the_session_to_stop_without_revoking_it() {
+        let (state, _consumer) = callback_fixture();
+        let shared = Arc::clone(&state.shared);
+        CALLBACK_SHARED.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&shared)));
+        latch_callback_failure(StopReason::NativeFailure);
+        CALLBACK_SHARED.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(shared.stop.reason(), Some(StopReason::NativeFailure));
+        assert!(shared.interception_failed.load(Ordering::Acquire));
+        assert!(shared.revocation.is_stopping());
+        assert!(!shared.revocation.is_revoked());
     }
 
     #[test]
@@ -2566,6 +2714,11 @@ mod callback_tests {
             "suppression fails open once its lease is gone"
         );
         assert_eq!(state.shared.stop.reason(), Some(StopReason::LeaseExpired));
+        assert!(state.shared.revocation.is_stopping(), "the session ends");
+        assert!(
+            !state.shared.revocation.is_revoked(),
+            "and its failure close still reaches the peer"
+        );
         let episode = state.episode.expect("activation opens an episode");
         assert!(episode.lapsed.is_some(), "the lapse is stamped");
         assert_eq!(
@@ -2934,6 +3087,9 @@ mod episode_tests {
         episode.record(EpisodeEvent::Key, false);
         episode.record_transfer_post(Some(Point::new(10.0, 20.0)));
         episode.record_transfer_post(None);
+        episode.note_pass((Duration::from_micros(9_800), LoopStep::RunLoop));
+        episode.note_pass((Duration::from_micros(131_460), LoopStep::Control));
+        episode.note_pass((Duration::from_micros(40_000), LoopStep::Tick));
         let ignored = IgnoredSources {
             own: 5,
             foreign: 4,
@@ -2954,8 +3110,23 @@ mod episode_tests {
              ignored-source own 2 foreign 2 (pointer 1, gesture 1), \
              location drift max 434 px last 1700,467, passed-pointer drift max 434 px, \
              pinned 1728,467, handoff posts 1, transfer posts 2 (+0 cursor) last 10,20, \
-             ended by restore"
+             longest loop pass 131.5 ms in control, ended by restore"
         );
+    }
+
+    #[test]
+    fn a_pass_is_blamed_on_its_slowest_step() {
+        let ms = Duration::from_millis;
+        let mut pass = LoopPass::start(ms(1_000));
+        pass.lap(LoopStep::Checks, ms(1_001));
+        pass.lap(LoopStep::Control, ms(1_121));
+        pass.lap(LoopStep::Tick, ms(1_122));
+        pass.lap(LoopStep::RunLoop, ms(1_132));
+        assert_eq!(pass.finish(), (ms(132), LoopStep::Control));
+        let mut idle = LoopPass::start(ms(5));
+        idle.lap(LoopStep::Checks, ms(5));
+        idle.lap(LoopStep::RunLoop, ms(15));
+        assert_eq!(idle.finish(), (ms(10), LoopStep::RunLoop));
     }
 
     #[test]

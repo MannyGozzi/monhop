@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::capture_decode::{
@@ -84,6 +85,30 @@ unsafe extern "C" {
         seconds: f64,
         return_after_source_handled: bool,
     ) -> i32;
+    fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
+    fn CFRunLoopSourceCreate(
+        allocator: CFAllocatorRef,
+        order: isize,
+        context: *mut CFRunLoopSourceContext,
+    ) -> CFRunLoopSourceRef;
+    fn CFRunLoopSourceSignal(source: CFRunLoopSourceRef);
+    fn CFRunLoopSourceInvalidate(source: CFRunLoopSourceRef);
+    fn CFRunLoopWakeUp(run_loop: CFRunLoopRef);
+}
+
+/// `CFRunLoopSourceContext`, version 0, as declared in CFRunLoop.h.
+#[repr(C)]
+struct CFRunLoopSourceContext {
+    version: isize,
+    info: *mut c_void,
+    retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<unsafe extern "C" fn(*const c_void)>,
+    copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
+    equal: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> u8>,
+    hash: Option<unsafe extern "C" fn(*const c_void) -> usize>,
+    schedule: Option<unsafe extern "C" fn(*mut c_void, CFRunLoopRef, CFStringRef)>,
+    cancel: Option<unsafe extern "C" fn(*mut c_void, CFRunLoopRef, CFStringRef)>,
+    perform: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
 const fn event_mask_bit(event_type: CGEventType) -> CGEventMask {
@@ -206,11 +231,7 @@ impl EventTap {
 
     /// Services this tap's run loop for up to `slice`, delivering at most one queued source.
     pub(crate) fn run_once(&self, slice: Duration) {
-        // SAFETY: the source remains registered for the tap's lifetime; a bounded timeout lets
-        // the caller's own loop keep polling other state without a callback waker.
-        unsafe {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, slice.as_secs_f64(), true);
-        }
+        run_current_once(slice);
     }
 
     /// Stops new suppression from this tap. Callers that need this call it before `close`.
@@ -231,9 +252,145 @@ impl EventTap {
     }
 }
 
+/// Handling the signalled source is the whole point: it ends the owner's `run_once` early.
+unsafe extern "C" fn wake_performed(_: *mut c_void) {}
+
+/// A run-loop source other threads signal so the owner's `run_once` returns at once instead of
+/// waiting out its slice.
+pub(crate) struct RunLoopWake {
+    source: CFRunLoopSourceRef,
+    run_loop: CFRunLoopRef,
+    closed: bool,
+}
+
+impl RunLoopWake {
+    /// Registers on the calling thread's run loop, the one its tap runs on.
+    pub(crate) fn install() -> Option<Self> {
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: ptr::null_mut(),
+            retain: None,
+            release: None,
+            copy_description: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: Some(wake_performed),
+        };
+        // SAFETY: a null allocator selects the default; Core Foundation copies the context.
+        let source = unsafe { CFRunLoopSourceCreate(ptr::null(), 0, &mut context) };
+        if source.is_null() {
+            return None;
+        }
+        // SAFETY: no preconditions; the thread's own run loop lives as long as the thread.
+        let run_loop = unsafe { CFRunLoopGetCurrent() };
+        // SAFETY: both are live; the source stays registered until close invalidates it.
+        unsafe { CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode) };
+        Some(Self {
+            source,
+            run_loop,
+            closed: false,
+        })
+    }
+
+    /// Safe from any thread and after close: the waker retains what it signals, and a closed
+    /// source ignores the signal.
+    pub(crate) fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
+        // SAFETY: both objects are live; WakeTarget balances each retain on drop.
+        let target = unsafe {
+            WakeTarget {
+                source: CFRetain(self.source),
+                run_loop: CFRetain(self.run_loop),
+            }
+        };
+        Arc::new(move || target.wake())
+    }
+
+    pub(crate) fn close(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
+        // SAFETY: invalidation removes the source from every run loop before this reference goes.
+        unsafe {
+            CFRunLoopSourceInvalidate(self.source);
+            CFRelease(self.source);
+        }
+    }
+}
+
+impl Drop for RunLoopWake {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+struct WakeTarget {
+    source: CFRunLoopSourceRef,
+    run_loop: CFRunLoopRef,
+}
+
+// SAFETY: both are retained Core Foundation objects, and signalling a version-0 source then waking
+// its run loop is the documented way to reach a run loop from another thread.
+unsafe impl Send for WakeTarget {}
+// SAFETY: as above; neither call mutates Rust-visible state.
+unsafe impl Sync for WakeTarget {}
+
+impl WakeTarget {
+    fn wake(&self) {
+        // SAFETY: both objects stay retained for this target's lifetime.
+        unsafe {
+            CFRunLoopSourceSignal(self.source);
+            CFRunLoopWakeUp(self.run_loop);
+        }
+    }
+}
+
+impl Drop for WakeTarget {
+    fn drop(&mut self) {
+        // SAFETY: balances the two retains taken in RunLoopWake::waker.
+        unsafe {
+            CFRelease(self.source);
+            CFRelease(self.run_loop);
+        }
+    }
+}
+
+/// Services the calling thread's run loop for up to `slice`, returning after one handled source.
+fn run_current_once(slice: Duration) {
+    // SAFETY: the default mode is a process-lifetime constant; the bounded timeout lets the
+    // caller's own loop keep polling other state.
+    unsafe {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, slice.as_secs_f64(), true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::mpsc, time::Instant};
+
+    #[test]
+    fn a_wake_ends_the_owner_wait_long_before_its_slice() {
+        const SLICE: Duration = Duration::from_secs(5);
+        let (wakers, waker) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let mut wake = RunLoopWake::install().expect("run-loop source");
+            wakers.send(wake.waker()).unwrap();
+            let started = Instant::now();
+            run_current_once(SLICE);
+            let waited = started.elapsed();
+            wake.close();
+            waited
+        });
+        let wake = waker.recv().unwrap();
+        // The signal may land before the owner enters its wait: it stays pending until handled.
+        wake();
+        let waited = owner.join().unwrap();
+        assert!(waited < Duration::from_secs(1), "waited {waited:?}");
+        wake();
+        drop(wake);
+    }
 
     #[test]
     fn only_the_active_capture_tap_listens_for_gestures() {

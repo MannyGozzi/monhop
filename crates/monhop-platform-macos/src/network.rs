@@ -51,6 +51,9 @@ const RTF_IFSCOPE: i32 = 0x100_0000;
 pub(crate) const IPPROTO_IP: c_int = 0;
 const IP_RECVIF: c_int = 20;
 const IP_BOUND_IF: c_int = 25;
+const SOL_SOCKET: c_int = 0xffff;
+const SO_NET_SERVICE_TYPE: c_int = 0x1116;
+const NET_SERVICE_TYPE_VO: c_int = 4;
 const MAX_INTERFACES: usize = 4096;
 const MAX_IOKIT_INTERFACES: usize = 256;
 const MAX_IOKIT_PARENTS: usize = 32;
@@ -370,6 +373,17 @@ pub fn restrict_udp_interface(socket: &UdpSocket, index: u32) -> io::Result<()> 
     socket.set_broadcast(false)?;
     set_ip_option(socket.as_raw_fd(), IP_BOUND_IF, index)?;
     set_ip_option(socket.as_raw_fd(), IP_RECVIF, 1)
+}
+
+/// Marks the socket as interactive voice, so Wi-Fi queues its datagrams (WMM AC_VO) ahead of bulk
+/// traffic; the system decides whether a DSCP mark follows.
+pub fn mark_interactive_traffic(socket: &UdpSocket) -> io::Result<()> {
+    set_int_option(
+        socket.as_raw_fd(),
+        SOL_SOCKET,
+        SO_NET_SERVICE_TYPE,
+        NET_SERVICE_TYPE_VO,
+    )
 }
 
 fn system_configuration_metadata() -> io::Result<BTreeMap<String, InterfaceMetadata>> {
@@ -1223,11 +1237,15 @@ fn route_roundup(length: usize) -> usize {
 }
 
 pub(crate) fn set_ip_option(fd: RawFd, option: c_int, value: c_int) -> io::Result<()> {
+    set_int_option(fd, IPPROTO_IP, option, value)
+}
+
+fn set_int_option(fd: RawFd, level: c_int, option: c_int, value: c_int) -> io::Result<()> {
     // SAFETY: fd is a live UDP socket, and the value pointer and length match Darwin's int option ABI.
     let result = unsafe {
         setsockopt(
             fd,
-            IPPROTO_IP,
+            level,
             option,
             (&raw const value).cast(),
             u32::try_from(size_of::<c_int>()).expect("c_int size fits socklen_t"),
@@ -1242,6 +1260,37 @@ pub(crate) fn set_ip_option(fd: RawFd, option: c_int, value: c_int) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SAFETY: getsockopt writes at most `length` bytes into the caller's buffer.
+    unsafe extern "C" {
+        fn getsockopt(
+            fd: c_int,
+            level: c_int,
+            option: c_int,
+            value: *mut c_void,
+            length: *mut u32,
+        ) -> c_int;
+    }
+
+    #[test]
+    fn a_marked_socket_reads_back_as_interactive_voice() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        mark_interactive_traffic(&socket).unwrap();
+        let mut value: c_int = -1;
+        let mut length = u32::try_from(size_of::<c_int>()).unwrap();
+        // SAFETY: the socket is live and the buffer and its length describe one c_int.
+        let read = unsafe {
+            getsockopt(
+                socket.as_raw_fd(),
+                SOL_SOCKET,
+                SO_NET_SERVICE_TYPE,
+                (&raw mut value).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(read, 0);
+        assert_eq!(value, NET_SERVICE_TYPE_VO);
+    }
 
     fn metadata(kind: InterfaceType) -> InterfaceMetadata {
         InterfaceMetadata {

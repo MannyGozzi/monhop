@@ -694,7 +694,15 @@ fn main() {
                 log::info!("launched at login");
             }
             #[cfg(windows)]
-            app.manage(timer_resolution::TimerResolution::raise());
+            {
+                match monhop_platform_windows::threads::opt_out_of_power_throttling() {
+                    Ok(()) => log::info!("power throttling: off, even with the window hidden"),
+                    Err(code) => log::warn!(
+                        "power throttling: Windows kept it on (code {code}); a hidden window may slow the session loops"
+                    ),
+                }
+                app.manage(timer_resolution::TimerResolution::raise());
+            }
             app.state::<Arc<AppController>>()
                 .use_setup_path(sharing_setup_path(app.handle())?);
             autostart::init(app.handle());

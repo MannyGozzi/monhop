@@ -2,7 +2,7 @@
 
 use crate::{
     session::check_read_displays,
-    session_actor::WatchedDestination,
+    session_actor::{EnvironmentFailure, WatchedDestination, WatchedEnvironment},
     session_receiver::{DestinationAction, DestinationFailure, InputDestination},
 };
 use monhop_core::{
@@ -111,13 +111,20 @@ pub(crate) struct NativeDestination {
     device: DeviceId,
     displays: DisplayTopology,
     native: NativeInput,
-    /// The macOS permission query is a TCC round trip; the injection thread asks it at most every
-    /// PERMISSION_RECHECK while displays are still compared on every call.
-    #[cfg(target_os = "macos")]
-    permission_checked: Option<std::time::Instant>,
     _ownership: InjectionPermit,
     sequencer: Sequencer,
-    displays_changed: bool,
+}
+
+/// What must still hold for injection: no revocation, the ordinary desktop on Windows or the
+/// Accessibility permission on macOS, and the displays the session started with.
+pub(crate) struct NativeEnvironment {
+    device: DeviceId,
+    displays: DisplayTopology,
+    revocation: RevocationSignal,
+    /// The macOS permission query is a TCC round trip, asked at most every PERMISSION_RECHECK
+    /// while displays are still compared on every check.
+    #[cfg(target_os = "macos")]
+    permission_checked: Option<std::time::Instant>,
 }
 
 /// The platform injector and what its posts need.
@@ -164,7 +171,6 @@ impl NativeDestination {
         let result = Self {
             _ownership: ownership,
             sequencer: Sequencer::new(gate, revocation, &displays),
-            displays_changed: false,
             device,
             displays,
             native: NativeInput {
@@ -183,24 +189,32 @@ impl NativeDestination {
                 #[cfg(target_os = "macos")]
                 injector: monhop_platform_macos::MacInjector::new().map_err(|_| note_step(4))?,
             },
-            #[cfg(target_os = "macos")]
-            permission_checked: None,
         };
         Ok(result)
     }
 }
 
 impl WatchedDestination for NativeDestination {
-    fn local_displays_changed(&self) -> bool {
-        self.displays_changed
+    type Environment = NativeEnvironment;
+    fn environment(&mut self) -> NativeEnvironment {
+        NativeEnvironment {
+            device: self.device,
+            displays: self.displays.clone(),
+            revocation: self.sequencer.revocation.clone(),
+            #[cfg(target_os = "macos")]
+            permission_checked: None,
+        }
     }
-    fn validate_environment(&mut self) -> Result<(), DestinationFailure> {
-        if self.sequencer.revocation.is_stopping() {
-            return Err(note_step(5));
+}
+
+impl WatchedEnvironment for NativeEnvironment {
+    fn validate(&mut self) -> Result<(), EnvironmentFailure> {
+        if self.revocation.is_stopping() {
+            return Err(note_step(5).into());
         }
         #[cfg(windows)]
         if !monhop_platform_windows::desktop_state::ordinary_desktop_is_active() {
-            return Err(note_step(6));
+            return Err(note_step(6).into());
         }
         #[cfg(target_os = "macos")]
         if self
@@ -211,13 +225,13 @@ impl WatchedDestination for NativeDestination {
                 .map_err(|_| note_step(7))?
                 .accessibility
             {
-                return Err(note_step(6));
+                return Err(note_step(6).into());
             }
             self.permission_checked = Some(std::time::Instant::now());
         }
         if check_read_displays(&self.displays, current_displays(self.device)).is_err() {
-            self.displays_changed = true;
-            return Err(note_step(8));
+            note_step(8);
+            return Err(EnvironmentFailure::DisplaysChanged);
         }
         Ok(())
     }

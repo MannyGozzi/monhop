@@ -826,13 +826,14 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
         .find(|adapter| adapter.address == Ipv4Addr::LOCALHOST)
         .expect("literal localhost interface")
         .index;
-    let make_io = || {
+    let make_io = || -> NativeSocket {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         platform::network::restrict_udp_interface(&socket, index).unwrap();
         platform::udp_receive::UdpReceiver::configure(socket)
             .unwrap()
             .into_async()
             .unwrap()
+            .into()
     };
     let io_a = make_io();
     let io_b = make_io();
