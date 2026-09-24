@@ -23,7 +23,6 @@ use windows_sys::{
     core::GUID,
 };
 
-const WIFI_BSSID_LEN: usize = 6;
 const WIFI_NETWORK_GUID_LEN: usize = 16;
 const MAX_WIFI_SSID_LEN: usize = 32;
 
@@ -38,7 +37,7 @@ pub struct Adapter {
     pub up: bool,
     pub ethernet: bool,
     pub wifi: bool,
-    /// Attachment metadata only. Never display SSID/BSSID in automatic logs.
+    /// Attachment metadata only. Never display the SSID in automatic logs.
     pub attachment: Option<Vec<u8>>,
 }
 
@@ -289,13 +288,12 @@ fn wifi_attachment(guid: &GUID) -> io::Result<Vec<u8>> {
         let connection = unsafe { &*data.cast::<WLAN_CONNECTION_ATTRIBUTES>() };
         let association = &connection.wlanAssociationAttributes;
         let ssid_len = association.dot11Ssid.uSSIDLength as usize;
-        if connection.isState == wlan_interface_state_connected && ssid_len <= MAX_WIFI_SSID_LEN {
-            let mut signature = association.dot11Bssid.to_vec();
-            signature.push(ssid_len as u8);
-            signature.extend_from_slice(&association.dot11Ssid.ucSSID[..ssid_len]);
-            Ok(signature)
-        } else {
-            Err(io::Error::other("Wi-Fi attachment unavailable"))
+        let ssid = association.dot11Ssid.ucSSID.get(..ssid_len);
+        match ssid.and_then(wifi_signature) {
+            Some(signature) if connection.isState == wlan_interface_state_connected => {
+                Ok(signature)
+            }
+            _ => Err(io::Error::other("Wi-Fi attachment unavailable")),
         }
     } else {
         Err(io::Error::other("Missing Wi-Fi connection data"))
@@ -309,13 +307,24 @@ fn wifi_attachment(guid: &GUID) -> io::Result<Vec<u8>> {
     answer
 }
 
+/// The network, not the access point, so roaming within one network keeps it.
+fn wifi_signature(ssid: &[u8]) -> Option<Vec<u8>> {
+    if ssid.is_empty() || ssid.len() > MAX_WIFI_SSID_LEN {
+        return None;
+    }
+    let mut signature = Vec::with_capacity(1 + ssid.len());
+    signature.push(ssid.len() as u8);
+    signature.extend_from_slice(ssid);
+    Some(signature)
+}
+
 fn ssid_from_attachment(attachment: &[u8]) -> Option<&str> {
-    let ssid_len = *attachment.get(WIFI_BSSID_LEN)? as usize;
+    let ssid_len = *attachment.first()? as usize;
     if !(1..=MAX_WIFI_SSID_LEN).contains(&ssid_len) {
         return None;
     }
-    let ssid_start = WIFI_BSSID_LEN.checked_add(1)?;
-    let ssid_end = ssid_start.checked_add(ssid_len)?;
+    let ssid_start = 1;
+    let ssid_end = ssid_start + ssid_len;
     if attachment.len() != ssid_end.checked_add(WIFI_NETWORK_GUID_LEN)? {
         return None;
     }
@@ -372,8 +381,7 @@ mod tests {
     use super::*;
 
     fn wifi_attachment_record(ssid: &[u8]) -> Vec<u8> {
-        let mut attachment = vec![2, 1, 2, 3, 4, 5, ssid.len() as u8];
-        attachment.extend_from_slice(ssid);
+        let mut attachment = wifi_signature(ssid).unwrap();
         attachment.extend_from_slice(&[0; WIFI_NETWORK_GUID_LEN]);
         attachment
     }
@@ -422,17 +430,28 @@ mod tests {
         assert!(ssid_from_attachment(&truncated).is_none());
 
         let mut wrong_length = short;
-        wrong_length[WIFI_BSSID_LEN] = 5;
+        wrong_length[0] = 5;
         assert!(ssid_from_attachment(&wrong_length).is_none());
-        wrong_length[WIFI_BSSID_LEN] = 0;
+        wrong_length[0] = 0;
         assert!(ssid_from_attachment(&wrong_length).is_none());
 
         let mut overlong = wifi_attachment_record(&[b'x'; MAX_WIFI_SSID_LEN]);
-        overlong[WIFI_BSSID_LEN] = (MAX_WIFI_SSID_LEN + 1) as u8;
+        overlong[0] = (MAX_WIFI_SSID_LEN + 1) as u8;
         assert!(ssid_from_attachment(&overlong).is_none());
 
         let non_utf8 = wifi_attachment_record(&[0xff]);
         assert!(ssid_from_attachment(&non_utf8).is_none());
+    }
+
+    #[test]
+    fn the_signature_names_the_network_not_the_access_point() {
+        assert_eq!(wifi_signature(b"studio"), Some(b"\x06studio".to_vec()));
+        assert_eq!(
+            wifi_signature(&[b'x'; MAX_WIFI_SSID_LEN]).map(|signature| signature.len()),
+            Some(1 + MAX_WIFI_SSID_LEN)
+        );
+        assert_eq!(wifi_signature(b""), None);
+        assert_eq!(wifi_signature(&[b'x'; MAX_WIFI_SSID_LEN + 1]), None);
     }
 
     #[test]

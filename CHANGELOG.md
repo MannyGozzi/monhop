@@ -23,6 +23,7 @@ Both computers can control each other. **Breaking:** update both computers, pair
 ### Fixed
 
 - Sharing no longer drops for five seconds when the Mac's Wi-Fi moves to another access point or band of the same network. Joining a network with a different name still ends it.
+- Windows no longer ends sharing when its Wi-Fi starts roaming within the same network. It checks the network again when the roam finishes, and still ends sharing at once on a disconnect.
 - When the Mac's input capture stops on its own, the other computer is told at once and reconnects, instead of waiting five seconds. The Mac also picks up capture renewals immediately and checks its input permission off the capture thread, so a brief hiccup no longer ends sharing.
 - The Sharing pill's outline animation stays on the edge while the pill resizes.
 - A display change on the Mac ends sharing as a display change and resyncs, instead of as a failure with a ten-second wait.

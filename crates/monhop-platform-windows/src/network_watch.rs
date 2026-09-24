@@ -3,16 +3,25 @@
 //! Every IP Helper notice re-reads the selected adapter through the caller's check; only a changed,
 //! missing, or unreadable adapter revokes. Two notices revoke without the check: a deletion of the
 //! selected interface or its pinned address, which is final even if a later add restores the same
-//! values before the check runs, and an attachment-relevant Wi-Fi event on the selected adapter,
-//! because the check queries WLAN state and a WLAN callback must not.
+//! values before the check runs, and a Wi-Fi event on the selected adapter that leaves the network.
+//! A finished roam runs the check on a helper thread, because it queries WLAN state and a WLAN
+//! callback must not.
 
 #[cfg(any(windows, test))]
 use monhop_core::RevocationSignal;
 #[cfg(any(windows, test))]
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    io,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc,
+        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+    },
+    thread::JoinHandle,
+};
 
 #[cfg(windows)]
-use std::{ffi::c_void, io, net::Ipv4Addr, ptr};
+use std::{ffi::c_void, net::Ipv4Addr, ptr};
 
 #[cfg(windows)]
 use windows_sys::{
@@ -50,8 +59,9 @@ fn selected_row_deleted(notification_type: i32, row_is_selected: bool) -> bool {
     notification_type == MIB_DELETE_INSTANCE && row_is_selected
 }
 
-/// Re-reads the selected adapter after an IP Helper notice; `false` revokes. It runs on an IP Helper
-/// notification thread, never inside a WLAN callback, so it may query WLAN state.
+/// Re-reads the selected adapter after an IP Helper notice or a finished roam; `false` revokes. It runs
+/// on an IP Helper notification thread or the recheck thread, never inside a WLAN callback, so it may
+/// query WLAN state.
 #[cfg(any(windows, test))]
 pub type PinnedCheck = Box<dyn Fn() -> bool + Send + Sync>;
 
@@ -67,49 +77,126 @@ fn pinned_facts_hold(still_pinned: &PinnedCheck) -> bool {
     }
 }
 
+/// Revokes unless the pinned facts still hold. A revoked session is never rechecked.
+#[cfg(any(windows, test))]
+fn observe(latch: &RevocationSignal, still_pinned: &PinnedCheck, change: &str) {
+    if latch.is_revoked() {
+        return;
+    }
+    if pinned_facts_hold(still_pinned) {
+        log::debug!(
+            "network watch: {change}; the selected adapter is unchanged, session continues"
+        );
+    } else {
+        log::warn!("network watch: {change} and the selected adapter differs; revoked");
+        latch.revoke();
+    }
+}
+
 #[cfg(any(windows, test))]
 fn is_network_change(notification_type: i32) -> bool {
     notification_type != MIB_INITIAL_NOTIFICATION
 }
 
-/// Only attachment-relevant Wi-Fi events revoke. In particular, scan completion is not a change.
 #[cfg(any(windows, test))]
-fn wifi_event_revokes(source: u32, code: u32) -> bool {
-    match source {
-        WLAN_SOURCE_ACM => matches!(
-            code,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WifiEventAction {
+    Ignore,
+    Revoke,
+    Recheck,
+}
+
+/// Leaving the network revokes at once. A roam stays on it, so only its end rechecks: the steps in
+/// between read mid-roam state, and a roam that fails ends in a disconnect.
+#[cfg(any(windows, test))]
+fn wifi_event_action(source: u32, code: u32) -> WifiEventAction {
+    match (source, code) {
+        (
+            WLAN_SOURCE_ACM,
             9  // connection_start
-                | 10 // connection_complete
-                | 11 // connection_attempt_fail
-                | 13 // interface_arrival
-                | 14 // interface_removal
-                | 18 // network_not_available
-                | 19 // network_available
-                | 20 // disconnecting
-                | 21 // disconnected
-                | 27 // operational_state_change
-        ),
-        WLAN_SOURCE_MSM => matches!(
-            code,
-            1  // associating
-                | 2  // associated
-                | 3  // authenticating
-                | 4  // connected
-                | 5  // roaming_start
-                | 6  // roaming_end
-                | 7  // radio_state_change
-                | 9  // disassociating
-                | 10 // disconnected
-                | 13 // adapter_removal
-                | 14 // adapter_operation_mode_change
-        ),
-        _ => false,
+            | 10 // connection_complete
+            | 11 // connection_attempt_fail
+            | 13 // interface_arrival
+            | 14 // interface_removal
+            | 18 // network_not_available
+            | 19 // network_available
+            | 20 // disconnecting
+            | 21 // disconnected
+            | 27, // operational_state_change
+        )
+        | (
+            WLAN_SOURCE_MSM,
+            7  // radio_state_change
+            | 9  // disassociating
+            | 10 // disconnected
+            | 13 // adapter_removal
+            | 14, // adapter_operation_mode_change
+        ) => WifiEventAction::Revoke,
+        (WLAN_SOURCE_MSM, 6) => WifiEventAction::Recheck, // roaming_end
+        _ => WifiEventAction::Ignore,
     }
 }
 
 #[cfg(any(windows, test))]
-fn selected_wifi_event_revokes(interface_matches: bool, source: u32, code: u32) -> bool {
-    interface_matches && wifi_event_revokes(source, code)
+fn selected_wifi_event_action(interface_matches: bool, source: u32, code: u32) -> WifiEventAction {
+    if interface_matches {
+        wifi_event_action(source, code)
+    } else {
+        WifiEventAction::Ignore
+    }
+}
+
+#[cfg(any(windows, test))]
+enum Recheck {
+    Run,
+    Stop,
+}
+
+/// Runs the pinned check off the WLAN callback thread. Dropping it stops and joins the thread.
+#[cfg(any(windows, test))]
+struct RecheckWorker {
+    requests: SyncSender<Recheck>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(any(windows, test))]
+impl RecheckWorker {
+    fn start(latch: RevocationSignal, still_pinned: Arc<PinnedCheck>) -> io::Result<Self> {
+        // One slot: a queued run already covers every roam that ends before it starts.
+        let (requests, pending) = sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("monhop-wifi-recheck".to_owned())
+            .spawn(move || run_rechecks(&pending, &latch, &still_pinned))?;
+        Ok(Self {
+            requests,
+            thread: Some(thread),
+        })
+    }
+
+    /// Never blocks, so a WLAN callback may call it. False only when the worker is gone.
+    fn request(&self) -> bool {
+        !matches!(
+            self.requests.try_send(Recheck::Run),
+            Err(TrySendError::Disconnected(_))
+        )
+    }
+}
+
+#[cfg(any(windows, test))]
+fn run_rechecks(pending: &Receiver<Recheck>, latch: &RevocationSignal, still_pinned: &PinnedCheck) {
+    while let Ok(Recheck::Run) = pending.recv() {
+        observe(latch, still_pinned, "a Wi-Fi roam finished");
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for RecheckWorker {
+    fn drop(&mut self) {
+        let _ = self.requests.send(Recheck::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -136,7 +223,9 @@ struct CallbackContext {
     wifi: bool,
     index: u32,
     address: Ipv4Addr,
-    still_pinned: PinnedCheck,
+    still_pinned: Arc<PinnedCheck>,
+    /// Present exactly when the adapter is Wi-Fi. Dropping the context stops it.
+    recheck: Option<RecheckWorker>,
 }
 
 #[cfg(windows)]
@@ -148,17 +237,7 @@ impl CallbackContext {
 
     /// A notice revokes only when the pinned adapter no longer reads back as it was selected.
     fn observe(&self, change: &str) {
-        if self.latch.is_revoked() {
-            return;
-        }
-        if pinned_facts_hold(&self.still_pinned) {
-            log::debug!(
-                "network watch: {change}; the selected adapter is unchanged, session continues"
-            );
-        } else {
-            log::warn!("network watch: {change} and the selected adapter differs; revoked");
-            self.latch.revoke();
-        }
+        observe(&self.latch, &self.still_pinned, change);
     }
 }
 
@@ -188,6 +267,15 @@ impl NetworkChangeWatch {
 
         let signal = RevocationSignal::default();
         let power = crate::power_watch::PowerWatch::start(signal.clone())?;
+        let still_pinned = Arc::new(still_pinned);
+        let recheck = if initial.wifi {
+            Some(RecheckWorker::start(
+                signal.clone(),
+                Arc::clone(&still_pinned),
+            )?)
+        } else {
+            None
+        };
         let context = Box::new(CallbackContext {
             latch: signal.clone(),
             wifi_identity: initial.guid,
@@ -195,6 +283,7 @@ impl NetworkChangeWatch {
             index: selected.index,
             address: selected.address,
             still_pinned,
+            recheck,
         });
         let context_ptr = (&*context as *const CallbackContext).cast::<c_void>();
         let mut watch = Self {
@@ -473,11 +562,17 @@ unsafe extern "system" fn wifi_changed(
     }) else {
         return;
     };
-    if selected_wifi_event_revokes(
+    let action = selected_wifi_event_action(
         context.wifi && guid_bytes(&notification.InterfaceGuid) == context.wifi_identity,
         notification.NotificationSource,
         notification.NotificationCode,
-    ) {
+    );
+    let revoke = match action {
+        WifiEventAction::Ignore => false,
+        WifiEventAction::Recheck => !context.recheck.as_ref().is_some_and(RecheckWorker::request),
+        WifiEventAction::Revoke => true,
+    };
+    if revoke {
         log::warn!(
             "network watch: Wi-Fi event source {} code {} revoked the session",
             notification.NotificationSource,
@@ -559,6 +654,16 @@ fn win_result(code: u32) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
+
     use super::*;
 
     #[test]
@@ -579,16 +684,156 @@ mod tests {
         assert!(is_network_change(2));
     }
 
+    fn action(source: u32, code: u32) -> WifiEventAction {
+        selected_wifi_event_action(true, source, code)
+    }
+
     #[test]
-    fn wifi_attachment_events_revoke_but_scans_do_not() {
-        assert!(wifi_event_revokes(WLAN_SOURCE_ACM, 21));
-        assert!(wifi_event_revokes(WLAN_SOURCE_MSM, 5));
-        assert!(wifi_event_revokes(WLAN_SOURCE_MSM, 6));
-        assert!(!wifi_event_revokes(WLAN_SOURCE_ACM, 7));
-        assert!(!wifi_event_revokes(WLAN_SOURCE_ACM, 8));
-        assert!(!wifi_event_revokes(WLAN_SOURCE_ACM, 26));
-        assert!(!wifi_event_revokes(WLAN_SOURCE_MSM, 8));
-        assert!(!selected_wifi_event_revokes(false, WLAN_SOURCE_MSM, 5));
+    fn leaving_the_network_revokes_at_once() {
+        // ACM: connection start/complete/fail, interface arrival/removal, network (un)available,
+        // disconnecting, disconnected, operational state change.
+        for code in [9, 10, 11, 13, 14, 18, 19, 20, 21, 27] {
+            assert_eq!(
+                action(WLAN_SOURCE_ACM, code),
+                WifiEventAction::Revoke,
+                "ACM {code}"
+            );
+        }
+        // MSM: radio state change, disassociating, disconnected, adapter removal, mode change.
+        for code in [7, 9, 10, 13, 14] {
+            assert_eq!(
+                action(WLAN_SOURCE_MSM, code),
+                WifiEventAction::Revoke,
+                "MSM {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_finished_roam_rechecks_and_its_steps_wait_for_it() {
+        assert_eq!(action(WLAN_SOURCE_MSM, 6), WifiEventAction::Recheck);
+        // Associating, associated, authenticating, connected and roaming start read mid-roam state.
+        for code in [1, 2, 3, 4, 5] {
+            assert_eq!(
+                action(WLAN_SOURCE_MSM, code),
+                WifiEventAction::Ignore,
+                "MSM {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn scans_link_quality_and_other_adapters_are_ignored() {
+        for code in [7, 8, 15, 26] {
+            assert_eq!(
+                action(WLAN_SOURCE_ACM, code),
+                WifiEventAction::Ignore,
+                "ACM {code}"
+            );
+        }
+        for code in [8, 11, 15, 16] {
+            assert_eq!(
+                action(WLAN_SOURCE_MSM, code),
+                WifiEventAction::Ignore,
+                "MSM {code}"
+            );
+        }
+        assert_eq!(action(0, 21), WifiEventAction::Ignore);
+        assert_eq!(
+            selected_wifi_event_action(false, WLAN_SOURCE_MSM, 10),
+            WifiEventAction::Ignore
+        );
+        assert_eq!(
+            selected_wifi_event_action(false, WLAN_SOURCE_MSM, 6),
+            WifiEventAction::Ignore
+        );
+    }
+
+    const RECHECK_LIMIT: Duration = Duration::from_secs(5);
+
+    fn counted_check(result: bool) -> (Arc<PinnedCheck>, Arc<AtomicUsize>) {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        let check: PinnedCheck = Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            result
+        });
+        (Arc::new(check), runs)
+    }
+
+    #[test]
+    fn a_failed_recheck_revokes() {
+        let latch = RevocationSignal::default();
+        let (check, runs) = counted_check(false);
+        let worker = RecheckWorker::start(latch.clone(), check).unwrap();
+        worker.request();
+        drop(worker);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(latch.is_revoked());
+    }
+
+    #[test]
+    fn a_passing_recheck_keeps_the_session() {
+        let latch = RevocationSignal::default();
+        let (check, runs) = counted_check(true);
+        let worker = RecheckWorker::start(latch.clone(), check).unwrap();
+        worker.request();
+        drop(worker);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(!latch.is_revoked());
+    }
+
+    #[test]
+    fn a_revoked_session_is_not_rechecked() {
+        let latch = RevocationSignal::default();
+        latch.revoke();
+        let (check, runs) = counted_check(false);
+        let worker = RecheckWorker::start(latch.clone(), check).unwrap();
+        worker.request();
+        drop(worker);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_request_the_worker_can_no_longer_take_reports_it() {
+        let (check, runs) = counted_check(true);
+        let mut worker = RecheckWorker::start(RevocationSignal::default(), check).unwrap();
+        worker.requests.send(Recheck::Stop).unwrap();
+        worker.thread.take().unwrap().join().unwrap();
+        assert!(!worker.request());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn requests_return_at_once_and_coalesce_while_a_recheck_runs_elsewhere() {
+        let latch = RevocationSignal::default();
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let check: PinnedCheck = Box::new(move || {
+            entered.send(thread::current().id()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(RECHECK_LIMIT)
+                .is_ok()
+        });
+        let worker = RecheckWorker::start(latch.clone(), Arc::new(check)).unwrap();
+
+        worker.request();
+        let checker = entered_rx.recv_timeout(RECHECK_LIMIT).unwrap();
+        assert_ne!(checker, thread::current().id());
+        // The first check is blocked, so these must neither wait for it nor queue more than one run.
+        for _ in 0..5 {
+            assert!(worker.request());
+        }
+        release.send(()).unwrap();
+        assert_eq!(entered_rx.recv_timeout(RECHECK_LIMIT).unwrap(), checker);
+        release.send(()).unwrap();
+        drop(worker);
+
+        assert!(entered_rx.try_recv().is_err());
+        assert!(!latch.is_revoked());
     }
 
     #[test]
@@ -607,13 +852,6 @@ mod tests {
         assert!(pinned_facts_hold(&unchanged));
         assert!(!pinned_facts_hold(&changed));
         assert!(!pinned_facts_hold(&panicking));
-    }
-
-    #[test]
-    fn unrelated_wifi_events_do_not_revoke() {
-        assert!(!wifi_event_revokes(0, 21));
-        assert!(!wifi_event_revokes(WLAN_SOURCE_ACM, 15));
-        assert!(!wifi_event_revokes(WLAN_SOURCE_MSM, 11));
     }
 
     #[cfg(windows)]
