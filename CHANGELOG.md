@@ -19,12 +19,21 @@ Both computers can control each other. **Breaking:** update both computers, pair
 - Sections that appear or disappear on Home, such as the control switches when sharing starts or pauses, glide in and out instead of popping. The header logo is white like the product name.
 - Input stalls less on the computer being controlled. The periodic display check no longer runs on the thread that injects input, macOS no longer naps MonHop while sharing, Windows keeps its 1 ms timer while MonHop's window is hidden, and MonHop's packets ask Wi-Fi for voice priority.
 - After a display change, the computer with the lower device id chooses the layout, and only after both computers' displays have held still for a second. The window comes forward only when you need to arrange.
+- The pointer crosses to the other computer only when you push through the edge on purpose. Brushing the edge, reaching for a scrollbar or corner, or a quick flick stays on this computer.
+- A lost input packet is recovered in about half the time.
+- The display arrangement and display names update on both computers as soon as either changes.
+- The menu-bar and tray icon is white while sharing, dimmed when idle, and red when sharing needs attention.
 
 ### Fixed
 
 - Sharing no longer drops for five seconds when the Mac's Wi-Fi moves to another access point or band of the same network. Joining a network with a different name still ends it.
 - Windows no longer ends sharing when its Wi-Fi starts roaming within the same network. It checks the network again when the roam finishes, and still ends sharing at once on a disconnect.
 - When the Mac's input capture stops on its own, the other computer is told at once and reconnects, instead of waiting five seconds. The Mac also picks up capture renewals immediately and checks its input permission off the capture thread, so a brief hiccup no longer ends sharing.
+- Double- and triple-clicks arrive on the other computer as one multi-click, even when the mouse moves slightly between the clicks.
+- While the Mac controls the other computer, slow mouse movement and trackpad scroll no longer move the Mac's own cursor or scroll the app under it.
+- Holding the pointer against the far edge of the other computer's screen no longer ends the session.
+- Pausing sharing tells the other computer at once instead of leaving it waiting five seconds.
+- The pointer no longer sticks at the edge when it comes back beside a shared monitor.
 - The Sharing pill's outline animation stays on the edge while the pill resizes.
 - A display change on the Mac ends sharing as a display change and resyncs, instead of as a failure with a ten-second wait.
 - The computer whose displays did not change no longer reports that the other computer failed.
