@@ -77,7 +77,7 @@ pub struct Adapter {
     pub up: bool,
     pub ethernet: bool,
     pub wifi: bool,
-    /// Opaque attachment metadata. Never display SSID/BSSID in automatic logs.
+    /// Opaque attachment metadata. Never display the SSID in automatic logs.
     pub attachment: Option<Vec<u8>>,
 }
 
@@ -1610,11 +1610,7 @@ mod tests {
     }
 
     fn test_wifi_attachment(ssid: &[u8]) -> Vec<u8> {
-        let mut attachment = b"monhop/macos/wifi/1\0".to_vec();
-        attachment.extend_from_slice(&[2, 1, 2, 3, 4, 5]);
-        attachment.push(ssid.len() as u8);
-        attachment.extend_from_slice(ssid);
-        attachment
+        crate::wifi_attachment::build_signature(ssid).unwrap()
     }
 
     fn route_reply(

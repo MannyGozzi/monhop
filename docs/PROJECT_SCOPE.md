@@ -552,7 +552,7 @@ These graphical controls remain M5 work after the M4 physical-machine slice beha
 
 Provide one obvious native-backed sharing control with clear Off, Connecting, On and Needs attention states. Turning sharing off must immediately revoke forwarding and suppression, restore local ownership and release managed input without waiting for the peer. Keep confirmed pairings, selected physical-interface preferences and saved monitor layouts. Forget device and Reset layout are separate, explicit actions.
 
-Starting the app, waking the laptop, returning to a previous network or reconnecting a display must not silently enable sharing. Moving the laptop downstairs or losing the selected network ends the active session while preserving configuration. A later explicit enable rechecks permissions, network attachment and route, the stored peer identity and the current display topology. Saved preferences never constitute a live authorization lease.
+Starting the app, waking the laptop, returning to a previous network or reconnecting a display must not silently enable sharing. Losing the selected network ends the active session while preserving configuration. Roaming between access points or bands of the same network does not. A later explicit enable rechecks permissions, network attachment and route, the stored peer identity and the current display topology. Saved preferences never constitute a live authorization lease.
 
 Test disable during a held modifier or drag, peer loss, sleep/wake, changed Wi-Fi, undock/redock and app restart. Local control must return independently of network acknowledgement, previous settings must remain intact, and stale sessions or layouts must never reactivate themselves.
 
