@@ -36,6 +36,14 @@ struct NativeWorkers {
     starting: Option<tokio::task::JoinHandle<Result<NativeCapture, SessionFailure>>>,
     destination: Option<DestinationActor>,
 }
+/// What each native worker was doing when `CLEANUP_WAIT` ran out.
+struct CleanupPending {
+    startup_running: bool,
+    /// `CleanupPending` while the worker runs, otherwise how it ended.
+    capture: Option<NativeCaptureError>,
+    injection_running: bool,
+    injected_release_failed: bool,
+}
 impl NativeWorkers {
     fn stop(&self) {
         self.gate.open_injection(0);
@@ -46,7 +54,7 @@ impl NativeWorkers {
             destination.request_stop();
         }
     }
-    async fn finish(&mut self) -> bool {
+    async fn finish(&mut self) -> Result<(), CleanupPending> {
         self.stop();
         let deadline = tokio::time::Instant::now() + CLEANUP_WAIT;
         loop {
@@ -59,20 +67,37 @@ impl NativeWorkers {
                 capture.request_stop();
                 self.capture = Some(capture);
             }
-            let capture_done = self
-                .capture
-                .as_mut()
-                .is_none_or(|capture| capture.is_finished() && capture.finish().is_ok());
-            let destination_done = self
+            let capture = self.capture.as_mut().and_then(|capture| {
+                if capture.is_finished() {
+                    capture.finish().err()
+                } else {
+                    Some(NativeCaptureError::CleanupPending)
+                }
+            });
+            let injection_running = self
                 .destination
                 .as_mut()
-                .is_none_or(|actor| actor.finish() && !actor.cleanup_pending());
-            if self.starting.is_none() && capture_done && destination_done {
+                .is_some_and(|actor| !actor.finish());
+            let injected_release_failed = !injection_running
+                && self
+                    .destination
+                    .as_ref()
+                    .is_some_and(DestinationActor::cleanup_pending);
+            if self.starting.is_none()
+                && capture.is_none()
+                && !injection_running
+                && !injected_release_failed
+            {
                 self.gate.floor().reset();
-                return true;
+                return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                return false;
+                return Err(CleanupPending {
+                    startup_running: self.starting.is_some(),
+                    capture,
+                    injection_running,
+                    injected_release_failed,
+                });
             }
             tokio::time::sleep(SESSION_POLL_INTERVAL).await;
         }
@@ -570,7 +595,17 @@ pub async fn run_session(
         cancel.is_stopping_for_control_change(),
     );
     drop(io);
-    if !workers.finish().await {
+    if let Err(pending) = workers.finish().await {
+        // NativeCleanup replaces the session's own end, so that end is only visible here.
+        log::warn!(
+            "session: native cleanup outlasted {CLEANUP_WAIT:?} (startup running {}, capture {}, injection running {}, injected release failed {}) after the session ended with {result:?}",
+            pending.startup_running,
+            pending
+                .capture
+                .map_or_else(|| "done".to_owned(), |error| format!("{error:?}")),
+            pending.injection_running,
+            pending.injected_release_failed,
+        );
         return Err(SessionFailure::NativeCleanup);
     }
     result
