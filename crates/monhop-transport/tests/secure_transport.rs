@@ -73,7 +73,7 @@ async fn exact_mutual_pins_negotiate_tls13_alpn_and_transport_fixed_ping() {
     .expect("loopback test exceeded five seconds");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn a_stalled_datagram_queue_drops_its_oldest_datagrams_without_panicking() {
     timeout(NETWORK_TIMEOUT, async {
         let server_identity = DeviceIdentity::generate().expect("server identity");
