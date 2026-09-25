@@ -15,6 +15,8 @@ use zeroize::{Zeroize, Zeroizing};
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
 const PING: &[u8] = b"monhop transport ping";
 const PONG: &[u8] = b"monhop transport pong";
+/// Many times what the datagram send buffer holds, so the oldest queued datagrams are dropped.
+const STALLED_DATAGRAMS: usize = 1024;
 
 #[tokio::test]
 async fn exact_mutual_pins_negotiate_tls13_alpn_and_transport_fixed_ping() {
@@ -66,6 +68,54 @@ async fn exact_mutual_pins_negotiate_tls13_alpn_and_transport_fixed_ping() {
         connection.close(quinn::VarInt::from_u32(0), b"test complete");
         client.close(quinn::VarInt::from_u32(0), b"test complete");
         server.close(quinn::VarInt::from_u32(0), b"test complete");
+    })
+    .await
+    .expect("loopback test exceeded five seconds");
+}
+
+#[tokio::test]
+async fn a_stalled_datagram_queue_drops_its_oldest_datagrams_without_panicking() {
+    timeout(NETWORK_TIMEOUT, async {
+        let server_identity = DeviceIdentity::generate().expect("server identity");
+        let client_identity = DeviceIdentity::generate().expect("client identity");
+        let server_peer = paired_peer(&server_identity);
+        let client_peer = paired_peer(&client_identity);
+
+        let server = Endpoint::server(
+            SecureQuicConfig::server(&server_identity, &client_peer).expect("server config"),
+            loopback_unspecified_port(),
+        )
+        .expect("loopback server endpoint");
+        let server_address = server.local_addr().expect("server address");
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("incoming connection");
+            let connection = incoming.await.expect("authenticated connection");
+            connection.closed().await;
+            server.close(quinn::VarInt::from_u32(0), b"test complete");
+        });
+
+        let mut client =
+            Endpoint::client(loopback_unspecified_port()).expect("loopback client endpoint");
+        client.set_default_client_config(
+            SecureQuicConfig::client(&client_identity, &server_peer).expect("client config"),
+        );
+        let connection = client
+            .connect(server_address, LOCAL_TLS_SERVER_NAME)
+            .expect("valid TLS name")
+            .await
+            .expect("mutually pinned connection");
+
+        // Nothing yields, so the connection driver cannot drain the queue, as in a Wi-Fi stall.
+        let datagram = bytes::Bytes::from_static(&[0; 64]);
+        for _ in 0..STALLED_DATAGRAMS {
+            connection
+                .send_datagram(datagram.clone())
+                .expect("a full queue drops its oldest datagram");
+        }
+
+        connection.close(quinn::VarInt::from_u32(0), b"test complete");
+        server_task.await.expect("server task");
+        client.close(quinn::VarInt::from_u32(0), b"test complete");
     })
     .await
     .expect("loopback test exceeded five seconds");

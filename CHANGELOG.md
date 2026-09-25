@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- MonHop no longer quits during a long network stall. A bug in the network library's queue for unsent packets crashed the app after a few seconds without a connection.
+
 ## [0.2.1] - 2026-09-24
 
 ### Fixed

@@ -283,7 +283,7 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
 | quick-xml | 0.42.0 | MIT |
 | quinn | 0.11.11 | MIT OR Apache-2.0 |
-| quinn-proto | 0.11.17 | MIT OR Apache-2.0 |
+| quinn-proto | 0.11.18 | MIT OR Apache-2.0 |
 | quinn-udp | 0.5.15 | MIT OR Apache-2.0 |
 | quote | 1.0.47 | MIT OR Apache-2.0 |
 | r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |

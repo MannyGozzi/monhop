@@ -3390,9 +3390,9 @@
     {
       "type": "library",
       "name": "quinn-proto",
-      "version": "0.11.17",
-      "bom-ref": "quinn-proto@0.11.17",
-      "purl": "pkg:cargo/quinn-proto@0.11.17",
+      "version": "0.11.18",
+      "bom-ref": "quinn-proto@0.11.18",
+      "purl": "pkg:cargo/quinn-proto@0.11.18",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -8396,7 +8396,7 @@
       ]
     },
     {
-      "ref": "quinn-proto@0.11.17",
+      "ref": "quinn-proto@0.11.18",
       "dependsOn": [
         "bytes@1.12.1",
         "getrandom@0.4.3",
@@ -8431,7 +8431,7 @@
         "bytes@1.12.1",
         "cfg_aliases@0.2.2",
         "pin-project-lite@0.2.17",
-        "quinn-proto@0.11.17",
+        "quinn-proto@0.11.18",
         "quinn-udp@0.5.15",
         "rustc-hash@2.1.3",
         "rustls@0.23.45",
@@ -9367,7 +9367,7 @@
       "ref": "tempfile@3.27.0",
       "dependsOn": [
         "fastrand@2.5.0",
-        "getrandom@0.4.3",
+        "getrandom@0.3.4",
         "once_cell@1.21.4",
         "rustix@1.1.4",
         "windows-sys@0.61.2"

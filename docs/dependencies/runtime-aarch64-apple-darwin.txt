@@ -125,7 +125,7 @@ potential_utf v0.1.6 Unicode-3.0
 powerfmt v0.2.0 MIT OR Apache-2.0
 quick-xml v0.42.0 MIT
 quinn v0.11.11 MIT OR Apache-2.0
-quinn-proto v0.11.17 MIT OR Apache-2.0
+quinn-proto v0.11.18 MIT OR Apache-2.0
 quinn-udp v0.5.15 MIT OR Apache-2.0
 rand v0.10.2 MIT OR Apache-2.0
 rand_core v0.10.1 MIT OR Apache-2.0
