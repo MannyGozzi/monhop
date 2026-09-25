@@ -2178,6 +2178,7 @@ dependencies = [
  "monhop-platform-windows",
  "monhop-protocol",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "rustls",
  "sha2 0.11.0",

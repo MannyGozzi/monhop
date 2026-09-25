@@ -7919,6 +7919,7 @@
         "monhop-platform-macos@0.2.2",
         "monhop-platform-windows@0.2.2",
         "monhop-protocol@0.2.2",
+        "quinn-proto@0.11.18",
         "quinn@0.11.11",
         "rcgen@0.14.10",
         "rustls@0.23.45",
