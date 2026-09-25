@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-24
+
 ### Fixed
 
 - A short Wi-Fi stall no longer drops sharing for five seconds before it reconnects. When both computers paused at the same moment, one could wait for a signal it had already received.
@@ -135,7 +137,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.1
 [0.2.0]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.0
 [0.1.4]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.4
 [0.1.3]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.3
