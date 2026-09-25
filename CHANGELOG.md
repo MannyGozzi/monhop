@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-24
+
 ### Fixed
 
 - MonHop no longer quits during a long network stall. A bug in the network library's queue for unsent packets crashed the app after a few seconds without a connection.
@@ -141,7 +143,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.2
 [0.2.1]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.1
 [0.2.0]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.0
 [0.1.4]: https://github.com/MannyGozzi/monhop/releases/tag/v0.1.4

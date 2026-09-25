@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "monhop"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "monhop-core",
  "monhop-platform-macos",
@@ -2102,14 +2102,14 @@ dependencies = [
 
 [[package]]
 name = "monhop-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "futures-util",
 ]
 
 [[package]]
 name = "monhop-desktop"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arboard",
  "block2",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "monhop-platform-macos"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "core-foundation 0.10.1",
  "log",
@@ -2151,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "monhop-platform-windows"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "log",
  "monhop-core",
@@ -2162,14 +2162,14 @@ dependencies = [
 
 [[package]]
 name = "monhop-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "monhop-core",
 ]
 
 [[package]]
 name = "monhop-transport"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "log",
