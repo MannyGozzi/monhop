@@ -25,7 +25,9 @@ use monhop_protocol::{
 };
 
 use crate::session_clock::millis_u64;
-use crate::session_health::{HOLD_LIMIT, HealthError, PeerHealth, RETREAT_AFTER, hold_stats};
+use crate::session_health::{
+    BARRIER_RESEND_AFTER, HOLD_LIMIT, HealthError, PeerHealth, RETREAT_AFTER, hold_stats,
+};
 use crate::session_startup::ReadyControl;
 
 /// Maximum effects produced by one controller call.
@@ -361,6 +363,7 @@ pub struct SourceController {
     /// the last of them, so the hold ends only once the count reaches zero.
     release_acks_pending: u32,
     hold_pong_seen: bool,
+    barrier_sent_at: Duration,
     holds: u32,
     held_max: Duration,
 }
@@ -623,6 +626,7 @@ impl SourceController {
             held_since: None,
             release_acks_pending: 0,
             hold_pong_seen: false,
+            barrier_sent_at: Duration::ZERO,
             holds: 0,
             held_max: Duration::ZERO,
         })
@@ -1364,6 +1368,14 @@ impl SourceController {
                 self.fail(failure, &mut effects);
                 return self.outcome(effects);
             }
+            if self.release_acks_pending == 0
+                && now.saturating_sub(self.barrier_sent_at) >= BARRIER_RESEND_AFTER
+            {
+                self.send_hold_barrier(now, &mut effects);
+                if self.failure.is_some() {
+                    return self.outcome(effects);
+                }
+            }
             match self.health.poll_while_held(now) {
                 Ok(Some(token)) => self.push_control(Message::Ping(token), &mut effects),
                 Ok(None) => {}
@@ -1431,11 +1443,11 @@ impl SourceController {
             self.fail(SourceFailure::Ownership, effects);
             return;
         }
-        self.push_input(Message::ReleaseAll, effects);
+        self.release_acks_pending = self.release_acks_pending.saturating_add(owed);
+        self.send_hold_barrier(now, effects);
         if self.failure.is_some() {
             return;
         }
-        self.release_acks_pending = self.release_acks_pending.saturating_add(owed + 1);
         self.remote_target = None;
         self.clear_remote_delivery();
         if restore_pending {
@@ -1470,6 +1482,14 @@ impl SourceController {
         self.end_pushes(PushEnd::Cleared, |_| true);
         self.hold_pong_seen = false;
         self.holds = self.holds.saturating_add(1);
+    }
+
+    fn send_hold_barrier(&mut self, now: Duration, effects: &mut SourceEffects) {
+        self.push_input(Message::ReleaseAll, effects);
+        if self.failure.is_none() {
+            self.release_acks_pending = self.release_acks_pending.saturating_add(1);
+            self.barrier_sent_at = now;
+        }
     }
 
     /// Ownership records the retreat as a timeout and settles on the restore target at once, so

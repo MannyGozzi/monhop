@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- A short Wi-Fi stall no longer drops sharing for five seconds before it reconnects. When both computers paused at the same moment, one could wait for a signal it had already received.
+
 ## [0.2.0] - 2026-09-23
 
 Both computers can control each other. **Breaking:** update both computers, pair them again, then arrange once. Saved layouts and the network choice from earlier versions are discarded.

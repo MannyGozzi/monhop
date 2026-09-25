@@ -14,6 +14,9 @@ pub const RETREAT_AFTER: Duration = PEER_LIVENESS.saturating_sub(SUPPRESSION_LEA
 /// How long a held session waits for the link to come back before it ends as a health failure.
 /// Sized under the QUIC idle timeout so the transport never closes first.
 pub const HOLD_LIMIT: Duration = Duration::from_secs(5);
+/// A held source whose barrier was acknowledged but that hears no fresh reply sends another
+/// barrier after this long: the receiver consumed the last one just before holding itself.
+pub const BARRIER_RESEND_AFTER: Duration = PEER_LIVENESS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HealthError {

@@ -12,7 +12,8 @@ use monhop_protocol::{
     Motion, SessionEpoch,
 };
 use monhop_transport::session_health::{
-    HOLD_LIMIT, HealthError, PEER_LIVENESS, RETREAT_AFTER, SUPPRESSION_LEASE_CAP,
+    BARRIER_RESEND_AFTER, HOLD_LIMIT, HealthError, PEER_LIVENESS, RETREAT_AFTER,
+    SUPPRESSION_LEASE_CAP,
 };
 use monhop_transport::session_receiver::{
     DestinationAction, DestinationFailure, InputDestination, InputReceiver, ReceiverFailure,
@@ -2431,6 +2432,85 @@ fn a_hold_without_the_link_coming_back_ends_at_the_limit() {
         Some(SourceFailure::PeerHealth(HealthError::DeadlineExpired))
     );
     assert_eq!(source.mode(), SourceMode::Failed);
+}
+
+#[test]
+fn a_barrier_consumed_just_before_the_receiver_holds_is_sent_again() {
+    let mut source = source();
+    let mut bridge = ReceiverBridge::new(destination_topology(&[DisplayId(2), DisplayId(3)]));
+    // The receiver last heard from the source 100 ms after the source last heard from it.
+    let challenge = bridge
+        .receiver
+        .tick(ms(100), &mut bridge.destination)
+        .unwrap()
+        .unwrap();
+    let challenge = bridge.response_frame(challenge);
+    let reply = source.on_remote_frame(&challenge, ms(100));
+    bridge.pump(&mut source, reply, ms(100)).unwrap();
+    // The source holds first and its barrier reaches the receiver before the receiver's deadline.
+    let held = source.tick(PEER_LIVENESS);
+    bridge
+        .pump(&mut source, held, PEER_LIVENESS + ms(50))
+        .unwrap();
+    assert!(source.held_since().is_some());
+    assert_eq!(bridge.receiver.held_since(), None);
+    let receiver_held_at = ms(100) + PEER_LIVENESS;
+    assert_eq!(
+        bridge
+            .receiver
+            .tick(receiver_held_at, &mut bridge.destination),
+        Ok(None)
+    );
+    assert_eq!(bridge.receiver.held_since(), Some(receiver_held_at));
+    // The link is back: both sides resume once the source sends another barrier.
+    let mut now = receiver_held_at;
+    while source.held_since().is_some() || bridge.receiver.held_since().is_some() {
+        now += ms(10);
+        assert!(
+            now < PEER_LIVENESS + HOLD_LIMIT,
+            "both sides stayed held until the limit"
+        );
+        let tick = source.tick(now);
+        bridge.pump(&mut source, tick, now).unwrap();
+        if let Some(message) = bridge.receiver.tick(now, &mut bridge.destination).unwrap() {
+            let frame = bridge.response_frame(message);
+            let reply = source.on_remote_frame(&frame, now);
+            bridge.pump(&mut source, reply, now).unwrap();
+        }
+    }
+    assert!(
+        now <= PEER_LIVENESS + BARRIER_RESEND_AFTER + ms(40),
+        "{now:?}"
+    );
+    let barriers = bridge
+        .sent
+        .iter()
+        .filter(|frame| frame.message == Message::ReleaseAll)
+        .count();
+    assert_eq!(barriers, 2);
+    assert_eq!(source.hold_stats(now).0, 1);
+    assert_eq!(bridge.receiver.hold_stats(now).0, 1);
+}
+
+#[test]
+fn an_unacknowledged_hold_barrier_is_never_sent_again() {
+    let mut source = source();
+    source.tick(ms(0));
+    let mut barriers = 0;
+    let mut now = PEER_LIVENESS;
+    while now < PEER_LIVENESS + HOLD_LIMIT {
+        let outcome = source.tick(now);
+        assert_eq!(outcome.failure, None);
+        barriers += outcome
+            .effects
+            .iter()
+            .filter(|effect| {
+                matches!(effect, SourceEffect::RemoteFrame(frame) if frame.message == Message::ReleaseAll)
+            })
+            .count();
+        now += ms(10);
+    }
+    assert_eq!(barriers, 1);
 }
 
 #[test]
