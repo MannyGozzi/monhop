@@ -20,6 +20,7 @@ use monhop_transport::{
         encode_pair_frame, initiates_connection, validate_pair_frame,
     },
     policy::PolicyError,
+    session_setup::names_adapter,
 };
 use serde::Serialize;
 
@@ -1046,12 +1047,9 @@ fn selected_network(interface_id: &str) -> Result<NetworkSelection, String> {
         .map_err(display_error)?;
     #[cfg(windows)]
     let adapters = monhop_platform_windows::network::enumerate_adapters().map_err(display_error)?;
-    let mut matches = adapters.into_iter().filter(|adapter| {
-        format!(
-            "{}:{}:{}",
-            adapter.stable_id, adapter.index, adapter.address
-        ) == interface_id
-    });
+    let mut matches = adapters
+        .into_iter()
+        .filter(|adapter| names_adapter(interface_id, &adapter.stable_id, adapter.address));
     let adapter = matches
         .next()
         .ok_or("That physical network is no longer available. Check status and choose again.")?;

@@ -2,7 +2,7 @@
 
 use std::{
     future::Future,
-    net::SocketAddrV4,
+    net::{Ipv4Addr, SocketAddrV4},
     sync::{Mutex, PoisonError, mpsc},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -170,6 +170,23 @@ fn check_cancel(cancel: &RevocationSignal) -> Result<(), SetupFailure> {
     }
 }
 
+/// The id a chosen network is saved under.
+pub fn interface_id(stable_id: &str, index: u32, address: Ipv4Addr) -> String {
+    format!("{stable_id}:{index}:{address}")
+}
+
+/// Whether a saved network id names this adapter. The index is not compared: an adapter that
+/// resets can come back renumbered with the same stable id and address.
+pub fn names_adapter(interface_id: &str, stable_id: &str, address: Ipv4Addr) -> bool {
+    interface_id
+        .strip_prefix(stable_id)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(index, saved)| {
+            index.parse::<u32>().is_ok() && saved.parse::<Ipv4Addr>() == Ok(address)
+        })
+}
+
 pub fn selected_network(interface_id: &str) -> Result<NetworkSelection, SetupFailure> {
     #[cfg(windows)]
     let adapters = monhop_platform_windows::network::enumerate_adapters()
@@ -177,12 +194,9 @@ pub fn selected_network(interface_id: &str) -> Result<NetworkSelection, SetupFai
     #[cfg(target_os = "macos")]
     let adapters = monhop_platform_macos::network::enumerate_adapters_with_attachment()
         .map_err(|_| SetupFailure::NetworkSelection)?;
-    let mut matches = adapters.into_iter().filter(|adapter| {
-        format!(
-            "{}:{}:{}",
-            adapter.stable_id, adapter.index, adapter.address
-        ) == interface_id
-    });
+    let mut matches = adapters
+        .into_iter()
+        .filter(|adapter| names_adapter(interface_id, &adapter.stable_id, adapter.address));
     let adapter = matches.next().ok_or(SetupFailure::NetworkSelection)?;
     if matches.next().is_some()
         || !adapter.physical
@@ -861,6 +875,42 @@ impl InspectedPeer {
             links,
         )
         .map_err(|_| SetupFailure::Layout)
+    }
+}
+
+#[cfg(test)]
+mod network_id_tests {
+    use super::*;
+
+    const ADDRESS: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 4);
+
+    #[test]
+    fn a_renumbered_adapter_is_still_the_saved_network() {
+        let saved = interface_id("0123456789abcdef", 19, ADDRESS);
+        assert!(names_adapter(&saved, "0123456789abcdef", ADDRESS));
+    }
+
+    #[test]
+    fn another_adapter_or_address_is_not_the_saved_network() {
+        let saved = interface_id("mac:a0b1c2d3e4f5", 4, ADDRESS);
+        assert!(names_adapter(&saved, "mac:a0b1c2d3e4f5", ADDRESS));
+        assert!(!names_adapter(&saved, "mac:a0b1c2d3e4f6", ADDRESS));
+        assert!(!names_adapter(&saved, "mac:a0b1c2d3e4f", ADDRESS));
+        assert!(!names_adapter(
+            &saved,
+            "mac:a0b1c2d3e4f5",
+            Ipv4Addr::new(192, 168, 1, 5)
+        ));
+        assert!(!names_adapter(
+            "mac:a0b1c2d3e4f5:x:192.168.1.4",
+            "mac:a0b1c2d3e4f5",
+            ADDRESS
+        ));
+        assert!(!names_adapter(
+            "mac:a0b1c2d3e4f5:4:192.168.1.4:9",
+            "mac:a0b1c2d3e4f5",
+            ADDRESS
+        ));
     }
 }
 

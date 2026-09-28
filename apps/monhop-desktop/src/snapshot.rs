@@ -149,9 +149,10 @@ fn read_interfaces(result: &mut SetupSnapshot) {
                 .map(|adapter| {
                     let network_name = adapter.wifi_network_name().and_then(display_network_name);
                     Interface {
-                        id: format!(
-                            "{}:{}:{}",
-                            adapter.stable_id, adapter.index, adapter.address
+                        id: monhop_transport::session_setup::interface_id(
+                            &adapter.stable_id,
+                            adapter.index,
+                            adapter.address,
                         ),
                         index: adapter.index,
                         name: adapter.name,
