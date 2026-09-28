@@ -2,28 +2,36 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   arrangementGeometry,
+  chainPlacement,
+  computerGroups,
   constrainTransform,
   describeArrangement,
   displayGroups,
   drawnDisplays,
   fitTransform,
+  groupRects,
   groupedPlacement,
   hiddenDisplays,
+  hiddenDisplaysAcross,
   hiddenFromLayout,
   ownSeams,
   innerBox,
   isPlacement,
   labelPlacement,
   layoutArrangement,
+  matchesCrossings,
   movePlacement,
   placeGroup,
+  placeNewGroup,
   placementFromCrossings,
   placementFromLayout,
   placementOffset,
+  placementOffsets,
   resolvePlacement,
   sameTransform,
   seamCrossings,
   sharedMonitors,
+  sharedMonitorsAcross,
   sideRects,
   snapPlacement,
   tileRects,
@@ -500,4 +508,200 @@ test("own seams mirror the native edge inheritance", () => {
   );
   assert.deepEqual(ownSeams([a, b], ["2"]), []);
   assert.deepEqual(ownSeams([a, { ...b, origin: [0, 1] }]), []);
+});
+
+// --- N-computer groups -----------------------------------------------------
+
+function threeGroups() {
+  return computerGroups([
+    { key: "c1", displays: [monitor("1", 0, 0, 100, 100, true)] },
+    { key: "c2", displays: [monitor("2", 0, 0, 100, 100, true)] },
+    { key: "c3", displays: [monitor("3", 0, 0, 100, 100, true)] },
+  ]);
+}
+
+test("computer groups generalize to any number of members, keyed however the caller names them", () => {
+  const g = threeGroups();
+  assert.deepEqual(g.order, ["c1", "c2", "c3"]);
+  assert.equal(g.byKey.c2, g.c2);
+  assert.equal(g.c1.displays[0].id, "1");
+  // displayGroups is exactly the two-member case of the same engine.
+  const two = displayGroups([monitor("1", 0, 0, 100, 100)], [monitor("2", 0, 0, 100, 100)]);
+  assert.deepEqual(two.order, ["local", "peer"]);
+  assert.equal(two.local, two.byKey.local);
+  // No members, a duplicate key, or a reserved key never makes a valid group set.
+  assert.equal(computerGroups([]), null);
+  assert.equal(
+    computerGroups([
+      { key: "c1", displays: [monitor("1", 0, 0, 100, 100)] },
+      { key: "c1", displays: [monitor("2", 0, 0, 100, 100)] },
+    ]),
+    null,
+  );
+  assert.equal(computerGroups([{ key: "order", displays: [monitor("1", 0, 0, 100, 100)] }]), null);
+});
+
+test("three groups seam on every touching pair and never within one group", () => {
+  const g = threeGroups();
+  const placement = groupedPlacement(g, { c2: [100, 0], c3: [200, 0] });
+  const geometry = arrangementGeometry(g, placement);
+  assert.equal(geometry.valid, true);
+  assert.equal(geometry.connected, true);
+  assert.deepEqual(
+    geometry.seams.map((s) => [s.fromGroup, s.toGroup]),
+    [
+      ["c1", "c2"],
+      ["c2", "c3"],
+    ],
+  );
+  // c1 and c3 do not touch directly, and no seam is ever reported within a single group.
+  assert.ok(!geometry.seams.some((s) => s.fromGroup === "c1" && s.toGroup === "c3"));
+  assert.ok(!geometry.seams.some((s) => s.fromGroup === s.toGroup));
+});
+
+test("a drop is legal once the moved block touches any other block; full connectivity is only required to apply", () => {
+  const g = threeGroups();
+  // c2 and c3 touch; c1 sits far from both, so the whole picture is not yet connected.
+  const placement = groupedPlacement(g, { c2: [300, 0], c3: [400, 0] });
+  const geometry = arrangementGeometry(g, placement);
+  assert.equal(geometry.valid, true);
+  assert.deepEqual(
+    geometry.seams.map((s) => [s.fromGroup, s.toGroup]),
+    [["c2", "c3"]],
+  );
+  assert.equal(geometry.connected, false);
+  // The drop itself is still legal: c3 touches c2, which is all a drop ever requires.
+  assert.deepEqual(resolvePlacement(g, placement, { group: "c3" }), placement);
+});
+
+test("connectivity reaches every group through the whole contact graph, and the message names who is left out", () => {
+  const g = threeGroups();
+  const placement = groupedPlacement(g, { c2: [100, 0], c3: [10_000, 10_000] });
+  const geometry = arrangementGeometry(g, placement);
+  assert.equal(geometry.valid, true);
+  assert.equal(geometry.connected, false);
+  assert.match(geometry.message, /c3/);
+  assert.doesNotMatch(geometry.message, /c1|c2/);
+});
+
+test("placementOffsets reports every group's offset from the anchor, and rejects anything that is not one rigid move per group", () => {
+  const g = threeGroups();
+  const placement = groupedPlacement(g, { c2: [100, 0], c3: [200, 0] });
+  assert.deepEqual(placementOffsets(g, placement), { c1: [0, 0], c2: [100, 0], c3: [200, 0] });
+  // A group with more than one display can be checked for internal rigidity: moving one of its own
+  // displays independently of the other breaks the single translation every group must be.
+  const pair = computerGroups([
+    { key: "c1", displays: [monitor("1", 0, 0, 100, 100, true), monitor("1b", 100, 0, 100, 100)] },
+    { key: "c2", displays: [monitor("2", 0, 0, 100, 100, true)] },
+  ]);
+  const pairPlacement = groupedPlacement(pair, { c2: [200, 0] });
+  assert.deepEqual(placementOffsets(pair, pairPlacement), { c1: [0, 0], c2: [200, 0] });
+  const skewed = {
+    positions: { ...pairPlacement.positions, "1b": [pairPlacement.positions["1b"][0], 5] },
+  };
+  assert.equal(placementOffsets(pair, skewed), null);
+});
+
+test("a saved translation reconstructs by chaining crossings across different group pairs", () => {
+  const g = threeGroups();
+  const placement = groupedPlacement(g, { c2: [100, 0], c3: [200, 0] });
+  const geometry = arrangementGeometry(g, placement);
+  assert.equal(geometry.connected, true);
+  const crossings = seamCrossings(geometry.seams);
+  // The crossing only carries display-level fields; which groups it connects is derived, not stored.
+  assert.equal(Object.hasOwn(crossings[0], "fromGroup"), false);
+  assert.deepEqual(placementFromCrossings(g, crossings), placement);
+  assert.equal(matchesCrossings(g, placement, crossings), true);
+  // A crossing set that never reaches c3 cannot place it.
+  assert.equal(placementFromCrossings(g, [crossings[0]]), null);
+});
+
+test("chain placement seats every group touching what came before it, and a new member can join later", () => {
+  const g = threeGroups();
+  const chained = chainPlacement(g);
+  const geometry = arrangementGeometry(g, chained);
+  assert.equal(geometry.valid, true);
+  assert.equal(geometry.connected, true);
+
+  const four = computerGroups([
+    { key: "c1", displays: [monitor("1", 0, 0, 100, 100, true)] },
+    { key: "c2", displays: [monitor("2", 0, 0, 100, 100, true)] },
+    { key: "c3", displays: [monitor("3", 0, 0, 100, 100, true)] },
+    { key: "c4", displays: [monitor("4", 0, 0, 100, 100, true)] },
+  ]);
+  const joined = placeNewGroup(four, chained, "c4");
+  const finalGeometry = arrangementGeometry(four, joined);
+  assert.equal(finalGeometry.valid, true);
+  assert.equal(finalGeometry.connected, true);
+});
+
+test("a monitor cabled to three computers is drawn once, keeping the local copy by default", () => {
+  const key = "10ac-4123-0000abcd";
+  // Every member keeps a display of its own besides the shared one, so hiding the shared copy never
+  // runs into the "a computer always keeps at least one display" floor.
+  const members = [
+    {
+      key: "local",
+      displays: [
+        monitor("1", 0, 0, 100, 100, true),
+        { ...monitor("2", 100, 0, 100, 100), monitor: key },
+      ],
+    },
+    {
+      key: "c2",
+      displays: [
+        monitor("5", 0, 0, 100, 100, true),
+        { ...monitor("3", 100, 0, 100, 100), monitor: key },
+      ],
+    },
+    {
+      key: "c3",
+      displays: [
+        monitor("6", 0, 0, 100, 100, true),
+        { ...monitor("4", 100, 0, 100, 100), monitor: key },
+      ],
+    },
+  ];
+  const pairs = sharedMonitorsAcross(members);
+  assert.equal(pairs.length, 1);
+  assert.deepEqual(
+    pairs[0].copies.map((c) => [c.key, c.display.id]).toSorted(([a], [b]) => a.localeCompare(b)),
+    [
+      ["c2", "3"],
+      ["c3", "4"],
+      ["local", "2"],
+    ],
+  );
+  assert.deepEqual(hiddenDisplaysAcross(members).toSorted(), ["3", "4"]);
+  // Explicit choices are exact, same as the two-computer version.
+  assert.deepEqual(hiddenDisplaysAcross(members, ["2"]).toSorted(), ["2"]);
+  // Lacking a local copy, the first listed member with one wins.
+  assert.deepEqual(hiddenDisplaysAcross(members.slice(1)), ["4"]);
+});
+
+test("labels for three groups stay on the canvas and clear every other group and label", () => {
+  const stage = { width: 640, height: 200 };
+  const size = { width: 100, height: 16 };
+  const g = threeGroups();
+  const placement = groupedPlacement(g, { c2: [110, 0], c3: [220, 0] });
+  const placed = tiles(g, placement);
+  const rects = groupRects(placed, fitTransform(placed, stage));
+  const placedLabels = [];
+  for (const key of ["c1", "c2", "c3"]) {
+    const others = Object.entries(rects)
+      .filter(([k]) => k !== key)
+      .map(([, r]) => r);
+    const label = {
+      ...labelPlacement(rects[key], others[0], stage, size, undefined, [
+        ...others.slice(1),
+        ...placedLabels,
+      ]),
+      ...size,
+    };
+    for (const other of [...others, ...placedLabels])
+      assert.equal(boxesOverlap(label, other), false, key);
+    assert.ok(label.x >= 0 && label.x + size.width <= stage.width, key);
+    assert.ok(label.y >= 0 && label.y + size.height <= stage.height, key);
+    placedLabels.push(label);
+  }
 });

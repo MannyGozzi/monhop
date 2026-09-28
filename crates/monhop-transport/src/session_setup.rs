@@ -599,8 +599,11 @@ impl AttemptLog {
 pub(crate) const fn handshake_failure(error: HandshakeError) -> SetupFailure {
     match error {
         HandshakeError::PurposeMismatch => SetupFailure::PurposeMismatch,
-        // A changed saved control map must be agreed over the setup link.
-        HandshakeError::ControlMismatch => SetupFailure::ChangedSinceInspection,
+        // A changed saved control map, or a changed saved layout agreement, must be agreed over
+        // the setup link rather than retried as a share attempt.
+        HandshakeError::ControlMismatch | HandshakeError::AgreementMismatch => {
+            SetupFailure::ChangedSinceInspection
+        }
         HandshakeError::PeerHelloMismatch => SetupFailure::VersionMismatch,
         _ => SetupFailure::Handshake,
     }

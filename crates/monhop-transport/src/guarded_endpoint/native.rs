@@ -1,4 +1,4 @@
-//! Native socket preparation for one selected, directly connected private peer.
+//! Native socket preparation for a fixed set of selected, directly connected private peers.
 
 use std::{
     io,
@@ -14,7 +14,9 @@ use crate::policy::{
     validate_peer,
 };
 
-use super::{NetworkSelection, RouteCheckFailure};
+#[cfg(target_os = "macos")]
+use super::NetworkSelection;
+use super::{PinnedNetwork, RouteCheckFailure};
 
 #[cfg(target_os = "macos")]
 use monhop_platform_macos::{
@@ -86,23 +88,23 @@ struct PreparedSelection {
     watch: Watch,
 }
 
-pub(super) fn prepare(selection: &NetworkSelection) -> io::Result<PreparedNetwork> {
+pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
     let PreparedSelection {
         initial,
         mut lock,
         signal,
         watch,
-    } = prepare_selection(selection, None)?;
+    } = prepare_selection(pinned, None)?;
 
     require_active(&signal, None)?;
-    let socket = UdpSocket::bind(selection.local).map_err(native_category)?;
-    verify_bound_address(&socket, selection.local)?;
-    network::restrict_udp_interface(&socket, selection.interface_index).map_err(native_category)?;
+    let socket = UdpSocket::bind(pinned.local).map_err(native_category)?;
+    verify_bound_address(&socket, pinned.local)?;
+    network::restrict_udp_interface(&socket, pinned.interface_index).map_err(native_category)?;
     // Wi-Fi queues marked datagrams ahead of bulk traffic; a refusal only costs that priority.
     #[cfg(target_os = "macos")]
     let _ = network::mark_interactive_traffic(&socket).inspect_err(warn_unmarked);
     #[cfg(windows)]
-    let traffic = network::mark_interactive_traffic(&socket, selection.peer)
+    let traffic = network::mark_interactive_traffic(&socket, &pinned.peers)
         .inspect_err(warn_unmarked)
         .ok();
     let socket = udp_receive::UdpReceiver::configure(socket).map_err(native_category)?;
@@ -111,11 +113,11 @@ pub(super) fn prepare(selection: &NetworkSelection) -> io::Result<PreparedNetwor
         #[cfg(windows)]
         _traffic: traffic,
     };
-    if socket.local_addr().map_err(native_category)? != selection.local {
+    if socket.local_addr().map_err(native_category)? != pinned.local {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
 
-    revalidate_selection(&initial, selection, &mut lock, &signal, None)?;
+    revalidate_selection(&initial, pinned, &mut lock, &signal, None)?;
 
     Ok(PreparedNetwork {
         socket,
@@ -134,12 +136,18 @@ pub(super) fn request_local_network_access_after_local_action(
     selection: &NetworkSelection,
     cancel: &RevocationSignal,
 ) -> io::Result<()> {
+    let pinned = PinnedNetwork::new(
+        &selection.stable_id,
+        selection.interface_index,
+        selection.local,
+        &[selection.peer],
+    )?;
     let PreparedSelection {
         initial,
         mut lock,
         signal,
         watch: _watch,
-    } = prepare_selection(selection, Some(cancel))?;
+    } = prepare_selection(&pinned, Some(cancel))?;
 
     request_with_gates(
         || require_active(&signal, Some(cancel)),
@@ -149,30 +157,32 @@ pub(super) fn request_local_network_access_after_local_action(
             network::restrict_udp_interface(socket, selection.interface_index)
                 .map_err(native_category)
         },
-        || revalidate_selection(&initial, selection, &mut lock, &signal, Some(cancel)),
+        || revalidate_selection(&initial, &pinned, &mut lock, &signal, Some(cancel)),
         |socket| socket.connect(selection.peer).map_err(native_category),
     )
 }
 
+/// Each pinned peer with its current route, in the pinned order.
+type PeerRoutes = Vec<(Ipv4Addr, RouteSnapshot)>;
+
 fn prepare_selection(
-    selection: &NetworkSelection,
+    pinned: &PinnedNetwork,
     cancel: Option<&RevocationSignal>,
 ) -> io::Result<PreparedSelection> {
-    validate_exact_bind(selection.local)?;
+    validate_exact_bind(pinned.local)?;
     require_cancel_active(cancel)?;
-    let initial = find_exact_adapter(&enumerate_initial().map_err(native_category)?, selection)?;
+    let initial = find_exact_adapter(&enumerate_initial().map_err(native_category)?, pinned)?;
     require_cancel_active(cancel)?;
     validate_initial_adapter(&initial)?;
 
-    let pinned: PinnedLock = Arc::default();
-    let watch = start_watch(&initial, selection, &pinned)?;
+    let watched: PinnedLock = Arc::default();
+    let watch = start_watch(&initial, pinned, &watched)?;
     let signal = watch.revocation_signal();
     require_active(&signal, cancel)?;
 
-    let (selected, route) = current_selection(&initial, selection, &signal, cancel)?;
-    let lock =
-        NetworkLock::new(selected, *selection.peer.ip(), route, false).map_err(policy_category)?;
-    *pinned
+    let (selected, routes) = current_selection(&initial, pinned, &signal, cancel)?;
+    let lock = NetworkLock::new_group(selected, &routes, false).map_err(policy_category)?;
+    *watched
         .lock()
         .map_err(|_| io::Error::from(io::ErrorKind::Other))? = Some(lock.clone());
     require_active(&signal, cancel)?;
@@ -187,31 +197,41 @@ fn prepare_selection(
 
 fn revalidate_selection(
     initial: &Adapter,
-    selection: &NetworkSelection,
+    pinned: &PinnedNetwork,
     lock: &mut NetworkLock,
     signal: &RevocationSignal,
     cancel: Option<&RevocationSignal>,
 ) -> io::Result<()> {
-    let (current, route) = current_selection(initial, selection, signal, cancel)?;
-    lock.revalidate(Some(&current), route)
+    let (current, routes) = current_selection(initial, pinned, signal, cancel)?;
+    lock.revalidate(Some(&current), &routes)
         .map_err(policy_category)?;
     require_active(signal, cancel)
 }
 
 fn current_selection(
     initial: &Adapter,
-    selection: &NetworkSelection,
+    pinned: &PinnedNetwork,
     signal: &RevocationSignal,
     cancel: Option<&RevocationSignal>,
-) -> io::Result<(InterfaceSnapshot, RouteSnapshot)> {
-    let observed = observe_selected_adapter(initial, selection)?;
+) -> io::Result<(InterfaceSnapshot, PeerRoutes)> {
+    let observed = observe_selected_adapter(initial, pinned)?;
     require_active(signal, cancel)?;
     let selected = interface_snapshot(&observed)?;
-    let peer = *selection.peer.ip();
-    validate_peer(&selected, peer).map_err(policy_category)?;
-    let route = route_snapshot(&selected, peer)?;
-    require_active(signal, cancel)?;
-    Ok((selected, route))
+    let mut routes = Vec::with_capacity(pinned.peers.len());
+    for peer in &pinned.peers {
+        routes.push(peer_route(&selected, *peer.ip())?);
+        require_active(signal, cancel)?;
+    }
+    Ok((selected, routes))
+}
+
+/// Every peer must be on the selected subnet before its route is even read.
+fn peer_route(
+    selected: &InterfaceSnapshot,
+    peer: Ipv4Addr,
+) -> io::Result<(Ipv4Addr, RouteSnapshot)> {
+    validate_peer(selected, peer).map_err(policy_category)?;
+    Ok((peer, route_snapshot(selected, peer)?))
 }
 
 #[cfg(target_os = "macos")]
@@ -259,13 +279,13 @@ type PinnedLock = Arc<Mutex<Option<NetworkLock>>>;
 #[cfg(target_os = "macos")]
 fn start_watch(
     adapter: &Adapter,
-    selection: &NetworkSelection,
-    pinned: &PinnedLock,
+    pinned: &PinnedNetwork,
+    watched: &PinnedLock,
 ) -> io::Result<Watch> {
     Watch::start_after_local_enable(
         &adapter.name,
         adapter.index,
-        pinned_check(adapter, selection, pinned),
+        pinned_check(adapter, pinned, watched),
     )
     .map_err(io::Error::other)
 }
@@ -273,25 +293,25 @@ fn start_watch(
 #[cfg(windows)]
 fn start_watch(
     adapter: &Adapter,
-    selection: &NetworkSelection,
-    pinned: &PinnedLock,
+    pinned: &PinnedNetwork,
+    watched: &PinnedLock,
 ) -> io::Result<Watch> {
-    Watch::start(adapter, pinned_check(adapter, selection, pinned)).map_err(native_category)
+    Watch::start(adapter, pinned_check(adapter, pinned, watched)).map_err(native_category)
 }
 
 /// Runs on the native change-notice thread: the same adapter, attachment, peer, and on-link route
-/// revalidation the session performs. Anything unreadable, or a notice before the first snapshot,
-/// reads as a change.
+/// revalidation the session performs, for every pinned peer. Anything unreadable, or a notice
+/// before the first snapshot, reads as a change.
 fn pinned_check(
     initial: &Adapter,
-    selection: &NetworkSelection,
-    pinned: &PinnedLock,
+    pinned: &PinnedNetwork,
+    watched: &PinnedLock,
 ) -> network_watch::PinnedCheck {
     let initial = initial.clone();
-    let selection = selection.clone();
-    let pinned = Arc::clone(pinned);
+    let pinned = pinned.clone();
+    let watched = Arc::clone(watched);
     Box::new(move || {
-        let current = observe_selected_adapter(&initial, &selection)
+        let current = observe_selected_adapter(&initial, &pinned)
             .and_then(|observed| interface_snapshot(&observed))
             .inspect_err(|error| {
                 log::warn!(
@@ -299,30 +319,32 @@ fn pinned_check(
                     error.kind()
                 );
             });
-        let peer = *selection.peer.ip();
-        let route = current.as_ref().ok().map(|current| {
-            validate_peer(current, peer)
-                .map_err(policy_category)
-                .and_then(|()| route_snapshot(current, peer))
+        let routes = current.as_ref().ok().map(|current| {
+            pinned
+                .peers
+                .iter()
+                .map(|peer| peer_route(current, *peer.ip()))
+                .collect::<io::Result<PeerRoutes>>()
         });
-        let Ok(mut lock) = pinned.lock() else {
+        let Ok(mut lock) = watched.lock() else {
             return false;
         };
-        pinned_facts_hold(lock.as_mut(), current.ok().as_ref(), route)
+        pinned_facts_hold(lock.as_mut(), current.ok().as_ref(), routes)
     })
 }
 
 fn pinned_facts_hold(
     lock: Option<&mut NetworkLock>,
     current: Option<&InterfaceSnapshot>,
-    route: Option<io::Result<RouteSnapshot>>,
+    routes: Option<io::Result<PeerRoutes>>,
 ) -> bool {
-    let failure = match (lock, current, route) {
-        (Some(lock), Some(current), Some(Ok(route))) => match lock.revalidate(Some(current), route)
-        {
-            Ok(()) => return true,
-            Err(error) => format!("{error:?}"),
-        },
+    let failure = match (lock, current, routes) {
+        (Some(lock), Some(current), Some(Ok(routes))) => {
+            match lock.revalidate(Some(current), &routes) {
+                Ok(()) => return true,
+                Err(error) => format!("{error:?}"),
+            }
+        }
         (None, ..) => "no pinned snapshot yet".to_owned(),
         (_, _, Some(Err(error))) => error.to_string(),
         _ => return false,
@@ -331,12 +353,9 @@ fn pinned_facts_hold(
     false
 }
 
-fn observe_selected_adapter(
-    initial: &Adapter,
-    selection: &NetworkSelection,
-) -> io::Result<Adapter> {
+fn observe_selected_adapter(initial: &Adapter, pinned: &PinnedNetwork) -> io::Result<Adapter> {
     let adapters = enumerate_current().map_err(native_category)?;
-    let observed = find_exact_adapter(&adapters, selection)?;
+    let observed = find_exact_adapter(&adapters, pinned)?;
     if !same_adapter_identity(initial, &observed) {
         return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
     }
@@ -344,11 +363,11 @@ fn observe_selected_adapter(
     Ok(observed)
 }
 
-fn find_exact_adapter(adapters: &[Adapter], selection: &NetworkSelection) -> io::Result<Adapter> {
+fn find_exact_adapter(adapters: &[Adapter], pinned: &PinnedNetwork) -> io::Result<Adapter> {
     let mut matches = adapters.iter().filter(|adapter| {
-        adapter.stable_id == selection.stable_id
-            && adapter.index == selection.interface_index
-            && adapter.address == *selection.local.ip()
+        adapter.stable_id == pinned.stable_id
+            && adapter.index == pinned.interface_index
+            && adapter.address == *pinned.local.ip()
     });
     let adapter = matches
         .next()
@@ -501,13 +520,19 @@ mod tests {
         rc::Rc,
     };
 
-    fn selection() -> NetworkSelection {
-        NetworkSelection {
+    const PEER: Ipv4Addr = Ipv4Addr::new(192, 168, 50, 11);
+
+    fn pinned() -> PinnedNetwork {
+        PinnedNetwork {
             stable_id: "selected-adapter".to_owned(),
             interface_index: 7,
             local: SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 10), 49_152),
-            peer: SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 11), 49_153),
+            peers: [SocketAddrV4::new(PEER, 49_153)].into(),
         }
+    }
+
+    fn peer_routes(route: RouteSnapshot) -> PeerRoutes {
+        vec![(PEER, route)]
     }
 
     fn adapter() -> Adapter {
@@ -535,7 +560,7 @@ mod tests {
 
     #[test]
     fn exact_adapter_lookup_rejects_absence_and_ambiguity() {
-        let selection = selection();
+        let selection = pinned();
         assert_eq!(
             find_exact_adapter(&[], &selection)
                 .err()
@@ -563,12 +588,12 @@ mod tests {
         assert!(pinned_facts_hold(
             Some(&mut unchanged),
             Some(&selected),
-            Some(Ok(route()))
+            Some(Ok(peer_routes(route())))
         ));
         assert!(pinned_facts_hold(
             Some(&mut unchanged),
             Some(&selected),
-            Some(Ok(route()))
+            Some(Ok(peer_routes(route())))
         ));
         assert!(!unchanged.is_revoked());
 
@@ -578,7 +603,7 @@ mod tests {
         assert!(!pinned_facts_hold(
             Some(&mut other_network),
             Some(&moved),
-            Some(Ok(route()))
+            Some(Ok(peer_routes(route())))
         ));
         assert!(other_network.is_revoked());
 
@@ -586,10 +611,10 @@ mod tests {
         assert!(!pinned_facts_hold(
             Some(&mut gateway),
             Some(&selected),
-            Some(Ok(RouteSnapshot {
+            Some(Ok(peer_routes(RouteSnapshot {
                 next_hop: Ipv4Addr::new(192, 168, 50, 1),
                 ..route()
-            }))
+            })))
         ));
         assert!(gateway.is_revoked());
 
@@ -597,10 +622,10 @@ mod tests {
         assert!(!pinned_facts_hold(
             Some(&mut other_interface),
             Some(&selected),
-            Some(Ok(RouteSnapshot {
+            Some(Ok(peer_routes(RouteSnapshot {
                 interface_index: 9,
                 ..route()
-            }))
+            })))
         ));
 
         let mut unreadable = lock.clone();
@@ -610,15 +635,52 @@ mod tests {
             Some(Err(io::Error::from(io::ErrorKind::Other)))
         ));
         assert!(!pinned_facts_hold(Some(&mut lock.clone()), None, None));
-        assert!(!pinned_facts_hold(None, Some(&selected), Some(Ok(route()))));
+        assert!(!pinned_facts_hold(
+            None,
+            Some(&selected),
+            Some(Ok(peer_routes(route())))
+        ));
 
         let mut revoked = lock;
-        revoked.revalidate(None, route()).unwrap_err();
+        revoked.revalidate(None, &peer_routes(route())).unwrap_err();
         assert!(!pinned_facts_hold(
             Some(&mut revoked),
             Some(&selected),
-            Some(Ok(route()))
+            Some(Ok(peer_routes(route())))
         ));
+    }
+
+    #[test]
+    fn a_change_notice_revokes_the_whole_set_when_any_member_route_fails() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let members: PeerRoutes = [11, 12, 13]
+            .map(|host| (Ipv4Addr::new(192, 168, 50, host), route()))
+            .to_vec();
+        let lock = NetworkLock::new_group(selected.clone(), &members, false).unwrap();
+        let mut unchanged = lock.clone();
+        assert!(pinned_facts_hold(
+            Some(&mut unchanged),
+            Some(&selected),
+            Some(Ok(members.clone()))
+        ));
+        for member in 0..members.len() {
+            let mut routed = members.clone();
+            routed[member].1.next_hop = Ipv4Addr::new(192, 168, 50, 1);
+            let mut lock = lock.clone();
+            assert!(!pinned_facts_hold(
+                Some(&mut lock),
+                Some(&selected),
+                Some(Ok(routed))
+            ));
+            assert!(lock.is_revoked());
+        }
+        let mut missing = lock.clone();
+        assert!(!pinned_facts_hold(
+            Some(&mut missing),
+            Some(&selected),
+            Some(Ok(members[1..].to_vec()))
+        ));
+        assert!(missing.is_revoked());
     }
 
     #[test]
@@ -659,7 +721,7 @@ mod tests {
         assert!(!same_adapter_identity(&adapter, &changed_kind));
         let current = interface_snapshot(&changed).unwrap();
         assert_eq!(
-            lock.revalidate(Some(&current), route()),
+            lock.revalidate(Some(&current), &peer_routes(route())),
             Err(PolicyError::InterfaceChanged)
         );
         assert!(lock.is_revoked());

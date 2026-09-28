@@ -2,11 +2,11 @@ use std::{sync::Mutex, time::Duration};
 
 use monhop_core::{
     DestinationModifier, DestinationModifierKey, DeviceId, Display, DisplayId, Edge, EdgeLink,
-    EmergencyEscape, FailureReason, FloorOwner, FloorSnapshot, FloorState, HeldInput, HidUsage,
-    InputAction, LogicalSize, Machine, MouseButton, NativeSessionClaim, NativeSize, NormalizedSpan,
-    OwnershipCommand, OwnershipError, OwnershipState, Platform, Point, PointerOwnership,
-    PointerTarget, SharedFloor, Topology, TopologyError, TransitionAcknowledgement,
-    map_modifier_for_destination,
+    EmergencyEscape, FailureReason, FloorOwner, FloorPeer, FloorSnapshot, FloorState, HeldInput,
+    HidUsage, InputAction, LogicalSize, MAX_GROUP_PEERS, Machine, MouseButton, NativeSessionClaim,
+    NativeSize, NormalizedSpan, OwnershipCommand, OwnershipError, OwnershipState, Platform, Point,
+    PointerOwnership, PointerTarget, SharedFloor, Topology, TopologyError,
+    TransitionAcknowledgement, map_modifier_for_destination,
 };
 
 // The native claim is one process-wide flag; tests that touch it run one at a time.
@@ -925,6 +925,53 @@ fn floor_at(state: FloorState) -> (SharedFloor, FloorSnapshot) {
     (floor, snapshot)
 }
 
+const HELD_STATES: [FloorState; 5] = [
+    FloorState::Requesting,
+    FloorState::Sending,
+    FloorState::Returning,
+    FloorState::Receiving,
+    FloorState::Yielding,
+];
+
+/// The peer a floor driven only by `transition` names in `state`.
+fn pairwise_peer(state: FloorState) -> FloorPeer {
+    if state == FloorState::Free {
+        FloorPeer::NONE
+    } else {
+        FloorPeer::SOLE
+    }
+}
+
+fn group_peer(slot: u8) -> FloorPeer {
+    FloorPeer::slot(slot).expect("a group slot")
+}
+
+/// Drives a fresh floor to held `state` for `peer`: one claim out of Free, then legal edges only.
+fn floor_held_by(peer: FloorPeer, state: FloorState) -> (SharedFloor, FloorSnapshot) {
+    let (claimed, path): (FloorState, &[FloorState]) = match state {
+        FloorState::Free => panic!("a free floor names no peer"),
+        FloorState::Requesting => (FloorState::Requesting, &[]),
+        FloorState::Sending => (FloorState::Requesting, &[FloorState::Sending]),
+        FloorState::Returning => (
+            FloorState::Requesting,
+            &[FloorState::Sending, FloorState::Returning],
+        ),
+        FloorState::Receiving => (FloorState::Receiving, &[]),
+        FloorState::Yielding => (FloorState::Receiving, &[FloorState::Yielding]),
+    };
+    let floor = SharedFloor::new();
+    let mut snapshot = floor
+        .claim(floor.snapshot(), claimed, peer)
+        .expect("a free floor accepts a claim");
+    for next in path {
+        snapshot = floor
+            .transition(snapshot, *next)
+            .expect("path uses legal edges");
+        assert_eq!(snapshot.peer, peer, "transition keeps the claimed peer");
+    }
+    (floor, snapshot)
+}
+
 #[test]
 fn floor_rejects_illegal_edges() {
     use FloorState::*;
@@ -944,17 +991,20 @@ fn floor_rejects_illegal_edges() {
         SharedFloor::new().snapshot(),
         FloorSnapshot {
             state: Free,
-            generation: 1
+            generation: 1,
+            peer: FloorPeer::NONE,
         }
     );
     for from in FLOOR_STATES {
         for to in FLOOR_STATES {
             let (floor, before) = floor_at(from);
+            assert_eq!(before.peer, pairwise_peer(from));
             let result = floor.transition(before, to);
             if legal.contains(&(from, to)) {
                 let after = FloorSnapshot {
                     state: to,
                     generation: before.generation + 1,
+                    peer: pairwise_peer(to),
                 };
                 assert_eq!(result, Ok(after), "{from:?} -> {to:?} is legal");
                 assert_eq!(floor.snapshot(), after);
@@ -969,8 +1019,19 @@ fn floor_rejects_illegal_edges() {
     let stale = FloorSnapshot {
         state: Sending,
         generation: current.generation - 1,
+        peer: FloorPeer::SOLE,
     };
     assert_eq!(floor.transition(stale, Returning), Err(current));
+    let other_peer = FloorSnapshot {
+        peer: group_peer(2),
+        ..current
+    };
+    assert_eq!(floor.transition(other_peer, Returning), Err(current));
+    let unowned = FloorSnapshot {
+        peer: FloorPeer::NONE,
+        ..current
+    };
+    assert_eq!(floor.transition(unowned, Returning), Err(current));
     assert_eq!(floor.snapshot(), current);
 }
 
@@ -1013,7 +1074,8 @@ fn floor_release_requires_owner_and_generation() {
             floor.snapshot(),
             FloorSnapshot {
                 state: FloorState::Free,
-                generation: held.generation + 1
+                generation: held.generation + 1,
+                peer: FloorPeer::NONE,
             }
         );
         assert!(
@@ -1028,7 +1090,8 @@ fn floor_release_requires_owner_and_generation() {
         floor.snapshot(),
         FloorSnapshot {
             state: FloorState::Free,
-            generation: sending.generation + 1
+            generation: sending.generation + 1,
+            peer: FloorPeer::NONE,
         }
     );
     floor.reset();
@@ -1082,4 +1145,289 @@ fn tie_break_edge_requesting_to_receiving() {
         "the losing request can no longer complete"
     );
     assert!(floor.release(FloorOwner::Inbound, receiving.generation));
+}
+
+fn assert_same_word_but_peer(group: FloorSnapshot, pairwise: FloorSnapshot, peer: FloorPeer) {
+    assert_eq!(
+        (group.state, group.generation),
+        (pairwise.state, pairwise.generation)
+    );
+    let expected = if group.state == FloorState::Free {
+        FloorPeer::NONE
+    } else {
+        peer
+    };
+    assert_eq!(group.peer, expected);
+    assert_eq!(pairwise.peer, pairwise_peer(pairwise.state));
+}
+
+#[test]
+fn floor_word_names_the_owning_peer_and_keeps_generation_order() {
+    assert_eq!(MAX_GROUP_PEERS, 7);
+    assert_eq!(FloorPeer::slot(0), None);
+    assert_eq!(FloorPeer::slot(MAX_GROUP_PEERS as u8 + 1), None);
+    assert_eq!(FloorPeer::slot(1), Some(FloorPeer::SOLE));
+    assert_eq!(FloorPeer::NONE.get(), 0);
+
+    // Every slot takes both directions in turn; a pairwise floor walks the same states alongside.
+    let group = SharedFloor::new();
+    let pairwise = SharedFloor::new();
+    let mut issued = vec![group.snapshot().generation];
+    for slot in 1..=MAX_GROUP_PEERS as u8 {
+        let peer = group_peer(slot);
+        assert_eq!(peer.get(), slot);
+        let rounds: [(FloorState, &[FloorState]); 2] = [
+            (
+                FloorState::Requesting,
+                &[FloorState::Sending, FloorState::Returning, FloorState::Free],
+            ),
+            (
+                FloorState::Receiving,
+                &[FloorState::Yielding, FloorState::Free],
+            ),
+        ];
+        for (claimed, path) in rounds {
+            let mut held = group.claim(group.snapshot(), claimed, peer).unwrap();
+            let mut plain = pairwise.transition(pairwise.snapshot(), claimed).unwrap();
+            assert_same_word_but_peer(held, plain, peer);
+            issued.push(held.generation);
+            for &state in path {
+                held = group.transition(held, state).unwrap();
+                plain = pairwise.transition(plain, state).unwrap();
+                assert_same_word_but_peer(held, plain, peer);
+                assert_eq!(group.snapshot(), held);
+                issued.push(held.generation);
+            }
+        }
+    }
+    assert!(
+        issued.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "naming a peer never changes the generation sequence"
+    );
+}
+
+#[test]
+fn hand_over_moves_returning_to_sending_for_another_peer_only() {
+    use FloorState::*;
+    let (x, y) = (group_peer(2), group_peer(5));
+    let (floor, returning) = floor_held_by(x, Returning);
+    for refused in [x, FloorPeer::NONE] {
+        assert_eq!(floor.hand_over(returning, refused), Err(returning));
+    }
+    let stale = FloorSnapshot {
+        generation: returning.generation - 1,
+        ..returning
+    };
+    assert_eq!(floor.hand_over(stale, y), Err(returning));
+    assert_eq!(floor.snapshot(), returning);
+
+    let sending = floor
+        .hand_over(returning, y)
+        .expect("a return hands over to another peer");
+    assert_eq!(
+        sending,
+        FloorSnapshot {
+            state: Sending,
+            generation: returning.generation + 1,
+            peer: y,
+        }
+    );
+    assert_eq!(floor.snapshot(), sending);
+    assert_eq!(
+        floor.hand_over(returning, y),
+        Err(sending),
+        "a handover is one-shot"
+    );
+
+    // The new holder returns through the ordinary edge and may hand straight back.
+    let back = floor.transition(sending, Returning).unwrap();
+    assert_eq!(back.peer, y);
+    let again = floor.hand_over(back, x).unwrap();
+    assert_eq!((again.state, again.peer), (Sending, x));
+
+    // Only Returning hands over, pairwise or grouped.
+    for state in FLOOR_STATES {
+        if state == Returning {
+            continue;
+        }
+        let (floor, before) = floor_at(state);
+        for to in [FloorPeer::NONE, FloorPeer::SOLE, y] {
+            assert_eq!(
+                floor.hand_over(before, to),
+                Err(before),
+                "{state:?} never hands over"
+            );
+        }
+        assert_eq!(floor.snapshot(), before);
+        if state != Free {
+            let (floor, before) = floor_held_by(x, state);
+            assert_eq!(floor.hand_over(before, y), Err(before));
+            assert_eq!(floor.snapshot(), before);
+        }
+    }
+
+    // A pairwise return hands over to any slot but its own.
+    let (floor, returning) = floor_at(Returning);
+    assert_eq!(floor.hand_over(returning, FloorPeer::SOLE), Err(returning));
+    assert_eq!(floor.hand_over(returning, y).map(|now| now.peer), Ok(y));
+}
+
+#[test]
+fn claim_steals_requesting_only_for_the_same_peer() {
+    use FloorState::*;
+    let (asker, other) = (group_peer(3), group_peer(6));
+    let (floor, requesting) = floor_held_by(asker, Requesting);
+    assert_eq!(
+        floor.claim(requesting, Receiving, other),
+        Err(requesting),
+        "another peer's request is never stolen"
+    );
+    assert_eq!(
+        floor.claim(requesting, Receiving, FloorPeer::NONE),
+        Err(requesting)
+    );
+    assert_eq!(floor.snapshot(), requesting);
+    let receiving = floor
+        .claim(requesting, Receiving, asker)
+        .expect("the same peer's request is stolen");
+    assert_eq!(
+        receiving,
+        FloorSnapshot {
+            state: Receiving,
+            generation: requesting.generation + 1,
+            peer: asker,
+        }
+    );
+    assert_eq!(
+        floor.transition(requesting, Sending),
+        Err(receiving),
+        "the stolen request can no longer complete"
+    );
+
+    // Free is claimed only for a real peer, and only into Requesting or Receiving.
+    for to in FLOOR_STATES {
+        let (floor, free) = floor_at(Free);
+        assert_eq!(floor.claim(free, to, FloorPeer::NONE), Err(free));
+        let result = floor.claim(free, to, other);
+        if matches!(to, Requesting | Receiving) {
+            assert_eq!(
+                result,
+                Ok(FloorSnapshot {
+                    state: to,
+                    generation: free.generation + 1,
+                    peer: other,
+                })
+            );
+        } else {
+            assert_eq!(result, Err(free), "Free -> {to:?} is never claimed");
+            assert_eq!(floor.snapshot(), free);
+        }
+    }
+
+    // From a held floor the same-peer steal is the only claim.
+    for from in HELD_STATES {
+        for to in FLOOR_STATES {
+            for peer in [FloorPeer::NONE, asker, other] {
+                let (floor, before) = floor_held_by(asker, from);
+                let result = floor.claim(before, to, peer);
+                if (from, to, peer) == (Requesting, Receiving, asker) {
+                    assert!(result.is_ok());
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(before),
+                        "{from:?} -> {to:?} for {peer:?} is not a claim"
+                    );
+                    assert_eq!(floor.snapshot(), before);
+                }
+            }
+        }
+    }
+
+    // The pairwise tie-break edge keeps whichever peer requested.
+    let (floor, requesting) = floor_held_by(other, Requesting);
+    assert_eq!(
+        floor.transition(requesting, Receiving).map(|now| now.peer),
+        Ok(other)
+    );
+}
+
+#[test]
+fn release_peer_frees_only_the_named_peer_at_its_generation() {
+    let (holder, other) = (group_peer(4), group_peer(7));
+    for state in HELD_STATES {
+        let (floor, held) = floor_held_by(holder, state);
+        assert!(!floor.release_peer(other, held.generation));
+        assert!(!floor.release_peer(FloorPeer::NONE, held.generation));
+        assert!(!floor.release_peer(holder, held.generation - 1));
+        assert!(!floor.release_peer(holder, held.generation + 1));
+        assert_eq!(floor.snapshot(), held);
+        assert!(
+            floor.release_peer(holder, held.generation),
+            "{state:?} is freed for its peer"
+        );
+        assert_eq!(
+            floor.snapshot(),
+            FloorSnapshot {
+                state: FloorState::Free,
+                generation: held.generation + 1,
+                peer: FloorPeer::NONE,
+            }
+        );
+        assert!(
+            !floor.release_peer(holder, held.generation),
+            "release_peer is one-shot"
+        );
+    }
+
+    let floor = SharedFloor::new();
+    let free = floor.snapshot();
+    for peer in [FloorPeer::NONE, FloorPeer::SOLE, holder] {
+        assert!(
+            !floor.release_peer(peer, free.generation),
+            "a free floor has no peer to release"
+        );
+    }
+    assert_eq!(floor.snapshot(), free);
+
+    // A pairwise floor names SOLE, so its slot releases it too.
+    let (floor, sending) = floor_at(FloorState::Sending);
+    assert!(!floor.release_peer(holder, sending.generation));
+    assert!(floor.release_peer(FloorPeer::SOLE, sending.generation));
+}
+
+#[test]
+fn release_peer_never_frees_a_floor_that_moved_on() {
+    let (x, y) = (group_peer(3), group_peer(5));
+    let (floor, returning) = floor_held_by(x, FloorState::Returning);
+    let sending = floor.hand_over(returning, y).unwrap();
+    // x's orphan cleanup runs late, with the claim it held.
+    assert!(!floor.release_peer(x, returning.generation));
+    assert!(!floor.release_peer(x, sending.generation));
+    assert!(!floor.release_peer(y, returning.generation));
+    assert_eq!(floor.snapshot(), sending);
+
+    // Freed and claimed again by the same peer: the old generation frees nothing.
+    assert!(floor.release_peer(y, sending.generation));
+    let again = floor
+        .claim(floor.snapshot(), FloorState::Requesting, y)
+        .unwrap();
+    assert!(!floor.release_peer(y, sending.generation));
+    assert_eq!(floor.snapshot(), again);
+
+    // Owner release and reset still free a group floor and name no peer.
+    assert!(floor.release(FloorOwner::Outbound, again.generation));
+    assert_eq!(floor.snapshot().peer, FloorPeer::NONE);
+    let receiving = floor
+        .claim(floor.snapshot(), FloorState::Receiving, x)
+        .unwrap();
+    floor.reset();
+    assert_eq!(
+        floor.snapshot(),
+        FloorSnapshot {
+            state: FloorState::Free,
+            generation: receiving.generation + 1,
+            peer: FloorPeer::NONE,
+        }
+    );
 }

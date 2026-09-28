@@ -36,9 +36,11 @@ pub const LINK_ACK_DEADLINE: Duration = Duration::from_secs(10);
 pub const LINK_TOPOLOGY_POLL: Duration = Duration::from_secs(2);
 
 pub const MAX_LAYOUT_PAYLOAD_BYTES: usize = 32 * 1024;
+/// A record summary is a digest plus small membership bounds, never a full layout.
+pub const MAX_SUMMARY_PAYLOAD_BYTES: usize = 1024;
 
 const LINK_MAGIC: [u8; 4] = *b"LKLC";
-const LINK_FORMAT_VERSION: u8 = 1;
+const LINK_FORMAT_VERSION: u8 = 2;
 /// Matches the Setup purpose wire value.
 const LINK_PURPOSE: u8 = 5;
 const LINK_HEADER_LEN: usize = 64;
@@ -99,6 +101,10 @@ pub enum LinkEvent {
     PeerArranging {
         arranging: bool,
     },
+    /// The other computer's record summary, sent on connect and at once on every change.
+    PeerSummary {
+        bytes: Vec<u8>,
+    },
     Disconnected {
         reason: LinkDisconnect,
     },
@@ -112,6 +118,8 @@ pub enum LinkCommand {
     },
     /// This computer started or stopped arranging displays; the peer is told either way.
     Arranging(bool),
+    /// This computer's record summary; sent to the peer on connect and at once on change.
+    Summary(Vec<u8>),
     Close,
 }
 
@@ -232,6 +240,9 @@ async fn run_link<C: LinkConnector>(
     // Survives every reconnect: each fresh connection opens by telling the peer this state, so a
     // user who was already arranging is never reported as idle after a drop.
     let mut arranging = false;
+    // Same reconnect survival as `arranging`: a summary set before the link ever connects still
+    // reaches the peer on the first and every later connection.
+    let mut summary: Option<Vec<u8>> = None;
     loop {
         if cancel.is_revoked() {
             return Err(SetupFailure::Cancelled);
@@ -245,6 +256,7 @@ async fn run_link<C: LinkConnector>(
             events,
             commands,
             &mut arranging,
+            &mut summary,
         )
         .await;
         let established = match established {
@@ -268,7 +280,9 @@ async fn run_link<C: LinkConnector>(
                         reason: attempt_reason(error),
                     },
                 )?;
-                match wait_between_attempts(cancel, events, commands, &mut arranging).await? {
+                match wait_between_attempts(cancel, events, commands, &mut arranging, &mut summary)
+                    .await?
+                {
                     Waited::Continue => continue,
                     Waited::Closed => return closed(connector, events).await,
                 }
@@ -283,7 +297,9 @@ async fn run_link<C: LinkConnector>(
                     reason: LinkDisconnect::Handshake,
                 },
             )?;
-            match wait_between_attempts(cancel, events, commands, &mut arranging).await? {
+            match wait_between_attempts(cancel, events, commands, &mut arranging, &mut summary)
+                .await?
+            {
                 Waited::Continue => continue,
                 Waited::Closed => return closed(connector, events).await,
             }
@@ -300,7 +316,15 @@ async fn run_link<C: LinkConnector>(
                 inspection: inspection.clone(),
             },
         )?;
-        let mut link = Link::new(session, inspection, &mut arranging, persist, events, cancel);
+        let mut link = Link::new(
+            session,
+            inspection,
+            &mut arranging,
+            &mut summary,
+            persist,
+            events,
+            cancel,
+        );
         let exit = link.run(commands, connector).await;
         drop(link);
         match exit {
@@ -310,7 +334,8 @@ async fn run_link<C: LinkConnector>(
                 log::warn!("setup link: disconnected ({reason:?})");
                 emit(events, LinkEvent::Disconnected { reason })?;
                 if matches!(
-                    wait_between_attempts(cancel, events, commands, &mut arranging).await?,
+                    wait_between_attempts(cancel, events, commands, &mut arranging, &mut summary)
+                        .await?,
                     Waited::Closed
                 ) {
                     return closed(connector, events).await;
@@ -358,6 +383,7 @@ async fn wait_between_attempts(
     events: &UnboundedSender<LinkEvent>,
     commands: &mut UnboundedReceiver<LinkCommand>,
     arranging: &mut bool,
+    summary: &mut Option<Vec<u8>>,
 ) -> Result<Waited, SetupFailure> {
     match while_idle(
         tokio::time::sleep(LINK_DIAL_INTERVAL),
@@ -365,6 +391,7 @@ async fn wait_between_attempts(
         events,
         commands,
         arranging,
+        summary,
     )
     .await
     {
@@ -375,13 +402,14 @@ async fn wait_between_attempts(
 }
 
 /// Runs `work` while the link is down, answering Close immediately and refusing proposals.
-/// Arranging is only recorded here; the next connection opens by sending it.
+/// Arranging and the summary are only recorded here; the next connection opens by sending them.
 async fn while_idle<T>(
     work: impl Future<Output = T>,
     cancel: &RevocationSignal,
     events: &UnboundedSender<LinkEvent>,
     commands: &mut UnboundedReceiver<LinkCommand>,
     arranging: &mut bool,
+    summary: &mut Option<Vec<u8>>,
 ) -> Result<T, IdleExit> {
     tokio::pin!(work);
     let mut guard = ticker(LINK_GUARD_INTERVAL);
@@ -393,6 +421,11 @@ async fn while_idle<T>(
                 // A dropped command channel means the controller is gone: close the link cleanly.
                 Some(LinkCommand::Close) | None => return Err(IdleExit::Closed),
                 Some(LinkCommand::Arranging(value)) => *arranging = value,
+                Some(LinkCommand::Summary(bytes)) => {
+                    if is_valid_summary(&bytes) {
+                        *summary = Some(bytes);
+                    }
+                }
                 // No link carries this proposal; the controller must apply again once connected.
                 Some(LinkCommand::Propose { .. }) => {
                     if events
@@ -456,6 +489,8 @@ enum LinkKind {
     Committed,
     /// One byte, 0 or 1: whether the sender's user is arranging displays right now.
     Arranging,
+    /// The sender's opaque record summary; the peer reports it as `LinkEvent::PeerSummary`.
+    Summary,
 }
 
 impl LinkKind {
@@ -470,6 +505,7 @@ impl LinkKind {
             Self::Bye => 7,
             Self::Committed => 8,
             Self::Arranging => 9,
+            Self::Summary => 10,
         }
     }
 
@@ -484,6 +520,7 @@ impl LinkKind {
             7 => Ok(Self::Bye),
             8 => Ok(Self::Committed),
             9 => Ok(Self::Arranging),
+            10 => Ok(Self::Summary),
             _ => Err(LinkDisconnect::Transport),
         }
     }
@@ -661,6 +698,12 @@ fn validate_link_frame(frame: &LinkFrame) -> Result<(), LinkDisconnect> {
                 && matches!(frame.payload.as_slice(), [0 | 1])
                 && frame.digest == digest(&frame.payload)
         }
+        LinkKind::Summary => {
+            frame.reason.is_none()
+                && !frame.payload.is_empty()
+                && frame.payload.len() <= MAX_SUMMARY_PAYLOAD_BYTES
+                && frame.digest == digest(&frame.payload)
+        }
     };
     if valid {
         Ok(())
@@ -701,6 +744,16 @@ fn decode_topology(payload: &[u8], epoch: SessionEpoch) -> Result<DisplayTopolog
 
 fn digest(payload: &[u8]) -> [u8; 32] {
     Sha256::digest(payload).into()
+}
+
+/// The digest a `Summary` frame carrying this payload must bind, for callers that verify one
+/// before proposing it.
+pub fn payload_digest(payload: &[u8]) -> [u8; 32] {
+    digest(payload)
+}
+
+fn is_valid_summary(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.len() <= MAX_SUMMARY_PAYLOAD_BYTES
 }
 
 /// An incremental reader for one ordered link stream.
@@ -859,6 +912,8 @@ struct Link<'a> {
     inspection: InspectedPeer,
     /// Owned by `run_link` so the state outlives this connection and opens the next one.
     arranging: &'a mut bool,
+    /// Same lifetime as `arranging`: republished at the start of every connection.
+    summary: &'a mut Option<Vec<u8>>,
     persist: &'a LinkPersist,
     events: &'a UnboundedSender<LinkEvent>,
     cancel: &'a RevocationSignal,
@@ -869,6 +924,7 @@ impl<'a> Link<'a> {
         session: NegotiatedSession,
         inspection: InspectedPeer,
         arranging: &'a mut bool,
+        summary: &'a mut Option<Vec<u8>>,
         persist: &'a LinkPersist,
         events: &'a UnboundedSender<LinkEvent>,
         cancel: &'a RevocationSignal,
@@ -891,6 +947,7 @@ impl<'a> Link<'a> {
             committed: None,
             inspection,
             arranging,
+            summary,
             persist,
             events,
             cancel,
@@ -917,6 +974,7 @@ impl<'a> Link<'a> {
         let mut guard = ticker(LINK_GUARD_INTERVAL);
         // The peer decides nothing from silence, so every connection opens by naming this state.
         self.publish_arranging().await?;
+        self.publish_summary().await?;
         loop {
             while let Some(frame) = self.pending.pop_front() {
                 if let Some(exit) = self.handle_frame(frame).await? {
@@ -950,6 +1008,13 @@ impl<'a> Link<'a> {
                     if *self.arranging != value {
                         *self.arranging = value;
                         self.publish_arranging().await?;
+                    }
+                }
+                Wake::Command(Some(LinkCommand::Summary(bytes))) => {
+                    if is_valid_summary(&bytes) && self.summary.as_deref() != Some(bytes.as_slice())
+                    {
+                        *self.summary = Some(bytes);
+                        self.publish_summary().await?;
                     }
                 }
                 // A dropped command channel means the controller is gone: close the link cleanly.
@@ -1037,6 +1102,9 @@ impl<'a> Link<'a> {
             // Validation bounds the payload to one 0-or-1 byte.
             LinkKind::Arranging => self.emit(LinkEvent::PeerArranging {
                 arranging: frame.payload[0] == 1,
+            })?,
+            LinkKind::Summary => self.emit(LinkEvent::PeerSummary {
+                bytes: frame.payload,
             })?,
             LinkKind::Bye => {
                 self.close_transaction(LinkRejectReason::Cancelled)?;
@@ -1318,6 +1386,19 @@ impl<'a> Link<'a> {
             LinkKind::Arranging,
             self.epoch,
             payload,
+        ))
+        .await
+    }
+
+    /// No-op until a summary has been set; a later `Summary` command publishes it immediately.
+    async fn publish_summary(&mut self) -> Result<(), LinkExit> {
+        let Some(bytes) = self.summary.clone() else {
+            return Ok(());
+        };
+        self.write(LinkFrame::with_payload(
+            LinkKind::Summary,
+            self.epoch,
+            bytes,
         ))
         .await
     }
@@ -1741,6 +1822,12 @@ mod tests {
 
         fn arranging(&self, value: bool) {
             self.commands.send(LinkCommand::Arranging(value)).unwrap();
+        }
+
+        fn summary(&self, bytes: &[u8]) {
+            self.commands
+                .send(LinkCommand::Summary(bytes.to_vec()))
+                .unwrap();
         }
     }
 
@@ -2292,6 +2379,125 @@ mod tests {
                 assert!(next_arranging(&mut driver.listener.inbox).await);
                 driver.dialer.arranging(false);
                 assert!(!next_arranging(&mut driver.listener.inbox).await);
+                driver.dialer.close();
+                driver.listener.close();
+                driver
+            })
+            .await;
+        assert_eq!(dialer, Ok(()));
+        assert_eq!(listener, Ok(()));
+    }
+
+    /// Waits for the next reported peer summary, so the state the peer holds is never inferred.
+    async fn next_summary(inbox: &mut UnboundedReceiver<LinkEvent>) -> Vec<u8> {
+        let event = wait_for(inbox, |event| {
+            matches!(event, LinkEvent::PeerSummary { .. })
+        })
+        .await;
+        let LinkEvent::PeerSummary { bytes } = event else {
+            unreachable!("filtered above");
+        };
+        bytes
+    }
+
+    #[test]
+    fn summary_frames_bind_digest_and_bound() {
+        let epoch = SessionEpoch::new(4).unwrap();
+        let payload = vec![9; MAX_SUMMARY_PAYLOAD_BYTES];
+        let frame = LinkFrame::with_payload(LinkKind::Summary, epoch, payload.clone());
+        assert_eq!(frame.digest, payload_digest(&payload));
+        let encoded = encode_link_frame(&frame).unwrap();
+        let (header, body) = encoded.split_at(LINK_HEADER_LEN);
+        let header: [u8; LINK_HEADER_LEN] = header.try_into().unwrap();
+        let decoded = decode_link_frame(&header, body.to_vec()).unwrap();
+        assert_eq!(decoded.kind, LinkKind::Summary);
+        assert_eq!(decoded.payload, payload);
+
+        // Empty and past-bound payloads are both refused at encode time.
+        let empty = LinkFrame::with_payload(LinkKind::Summary, epoch, Vec::new());
+        assert_eq!(
+            encode_link_frame(&empty).err(),
+            Some(LinkDisconnect::Transport)
+        );
+        let oversized = LinkFrame::with_payload(
+            LinkKind::Summary,
+            epoch,
+            vec![1; MAX_SUMMARY_PAYLOAD_BYTES + 1],
+        );
+        assert_eq!(
+            encode_link_frame(&oversized).err(),
+            Some(LinkDisconnect::Transport)
+        );
+
+        // A tampered digest is rejected on decode, same as every other framed kind.
+        let mut tampered = header;
+        tampered[32] ^= 1;
+        assert_eq!(
+            decode_link_frame(&tampered, body.to_vec()).err(),
+            Some(LinkDisconnect::Transport)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_summary_set_before_connecting_opens_every_connection() {
+        let (dialer, listener) =
+            with_link((Duration::ZERO, Duration::ZERO), |mut driver| async move {
+                // Set while the link has not connected yet: it must still reach the peer.
+                driver.dialer.summary(b"member record v1");
+                wait_connected(&mut driver.dialer.inbox).await;
+                wait_connected(&mut driver.listener.inbox).await;
+                assert_eq!(
+                    next_summary(&mut driver.listener.inbox).await,
+                    b"member record v1".to_vec()
+                );
+                driver
+                    .dialer
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("established connection")
+                    .close(9_u32.into(), b"fixture drop");
+                wait_for(&mut driver.dialer.inbox, |event| {
+                    matches!(event, LinkEvent::Disconnected { .. })
+                })
+                .await;
+                wait_for(&mut driver.listener.inbox, |event| {
+                    matches!(event, LinkEvent::Disconnected { .. })
+                })
+                .await;
+                wait_connected(&mut driver.dialer.inbox).await;
+                wait_connected(&mut driver.listener.inbox).await;
+                // The same value is republished on the reconnect too.
+                assert_eq!(
+                    next_summary(&mut driver.listener.inbox).await,
+                    b"member record v1".to_vec()
+                );
+                driver.dialer.close();
+                driver.listener.close();
+                driver
+            })
+            .await;
+        assert_eq!(dialer, Ok(()));
+        assert_eq!(listener, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn the_peer_summary_is_reported_and_a_change_is_sent_at_once() {
+        let (dialer, listener) =
+            with_link((Duration::ZERO, Duration::ZERO), |mut driver| async move {
+                wait_connected(&mut driver.dialer.inbox).await;
+                wait_connected(&mut driver.listener.inbox).await;
+                driver.dialer.summary(b"revision one");
+                assert_eq!(
+                    next_summary(&mut driver.listener.inbox).await,
+                    b"revision one".to_vec()
+                );
+                driver.dialer.summary(b"revision two");
+                assert_eq!(
+                    next_summary(&mut driver.listener.inbox).await,
+                    b"revision two".to_vec()
+                );
                 driver.dialer.close();
                 driver.listener.close();
                 driver

@@ -11,6 +11,7 @@ use crate::{
 use monhop_core::{DeviceId, DisplayId, RevocationSignal, capture::StopReason};
 use monhop_protocol::{Frame, FrameScope, Message};
 use std::{
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -323,12 +324,84 @@ impl SessionScopes {
     }
 }
 
-/// The writer may await socket capacity while the session continues reading and polling recovery.
+/// One peer link driven by one loop: the reader and writer halves of the same connection.
 pub(crate) struct SessionIo {
-    pub(crate) scopes: SessionScopes,
-    pub(crate) connection: quinn::Connection,
-    pub(crate) reader: FrameReader,
-    pub(crate) recv: quinn::RecvStream,
+    // Declared first so it drops first: the connection closes before the control stream drops.
+    link: LinkIo,
+    reader: LinkReader,
+}
+
+impl SessionIo {
+    pub(crate) fn new(session: NegotiatedSession, progress: SessionProgress) -> Self {
+        let (reader, link) = LinkIo::split(session, progress);
+        Self { link, reader }
+    }
+    pub(crate) fn send_outbound(&self, frame: Frame) -> Result<(), SessionFailure> {
+        self.link.send_outbound(frame)
+    }
+    pub(crate) fn send_inbound(&self, frame: Frame) -> Result<(), SessionFailure> {
+        self.link.send_inbound(frame)
+    }
+    pub(crate) async fn next_frame(&mut self) -> Result<Frame, SessionFailure> {
+        self.reader.next_frame().await
+    }
+    pub(crate) fn link_stats(
+        &self,
+        session_millis: u64,
+        max_tick_gap_micros: u64,
+        holds: (u64, u64),
+        revocation: &RevocationSignal,
+    ) -> LinkStats {
+        self.link
+            .link_stats(session_millis, max_tick_gap_micros, holds, revocation)
+    }
+    pub(crate) fn close_after(
+        &self,
+        result: &Result<(), SessionFailure>,
+        deliberate: bool,
+        control_change: bool,
+    ) {
+        self.link.close_after(result, deliberate, control_change);
+    }
+    pub(crate) fn check(&self) -> Result<(), SessionFailure> {
+        self.link.check()
+    }
+}
+
+/// The receiving half of one peer link: its ordered control stream and heartbeat datagrams.
+pub(crate) struct LinkReader {
+    scopes: SessionScopes,
+    connection: quinn::Connection,
+    reader: FrameReader,
+    recv: quinn::RecvStream,
+}
+
+impl LinkReader {
+    /// The next frame from the ordered stream or a heartbeat datagram. A peer that opens a
+    /// bidirectional stream ends the link; unidirectional streams belong to their own acceptor.
+    /// A closed or lost connection surfaces as Wire on every arm.
+    pub(crate) async fn next_frame(&mut self) -> Result<Frame, SessionFailure> {
+        let frame = tokio::select! {
+            biased;
+            frame = self.reader.read_frame(&mut self.recv) => frame.map_err(|_| SessionFailure::Wire),
+            datagram = self.connection.read_datagram() => match datagram {
+                Ok(bytes) => decode_datagram(&bytes).map_err(|_| SessionFailure::UnexpectedStream),
+                Err(_) => Err(SessionFailure::Wire),
+            },
+            event = self.connection.accept_bi() => Err(peer_event(event)),
+        }?;
+        self.scopes.validate(&frame)?;
+        Ok(frame)
+    }
+}
+
+/// The sending half of one peer link, which owns the connection: dropping it closes the link.
+/// The writer may await socket capacity while the reader keeps reading and polling recovery.
+pub(crate) struct LinkIo {
+    scopes: SessionScopes,
+    connection: quinn::Connection,
+    /// The peer address this link is bound to; any other path ends the link.
+    remote: SocketAddr,
     outbound: tokio::sync::mpsc::Sender<Frame>,
     writer: tokio::task::JoinHandle<Result<(), SessionFailure>>,
     progress: SessionProgress,
@@ -336,13 +409,19 @@ pub(crate) struct SessionIo {
     written: Arc<AtomicU64>,
 }
 
-impl SessionIo {
-    pub(crate) fn new(session: NegotiatedSession, progress: SessionProgress) -> Self {
+impl LinkIo {
+    /// Binds the link to the connection's current peer address and starts its writer task on the
+    /// current runtime.
+    pub(crate) fn split(
+        session: NegotiatedSession,
+        progress: SessionProgress,
+    ) -> (LinkReader, Self) {
         let scopes = SessionScopes {
             outbound: session.outbound_scope(),
             inbound: session.inbound_scope(),
         };
         let connection = session.connection;
+        let remote = connection.remote_address();
         let writer_connection = connection.clone();
         let mut send = session.control_streams.send;
         let (outbound, mut pending) = tokio::sync::mpsc::channel::<Frame>(SESSION_QUEUE_CAPACITY);
@@ -369,17 +448,23 @@ impl SessionIo {
             }
             Ok(())
         });
-        Self {
+        let reader = LinkReader {
             scopes,
-            connection,
+            connection: connection.clone(),
             reader: session.control_streams.reader,
             recv: session.control_streams.recv,
+        };
+        let link = Self {
+            scopes,
+            connection,
+            remote,
             outbound,
             writer,
             progress,
             queued: AtomicU64::new(0),
             written,
-        }
+        };
+        (reader, link)
     }
     fn send(&self, frame: Frame) -> Result<(), SessionFailure> {
         self.outbound.try_send(frame).map_err(|error| match error {
@@ -394,22 +479,6 @@ impl SessionIo {
     }
     pub(crate) fn send_inbound(&self, frame: Frame) -> Result<(), SessionFailure> {
         self.send(frame.with_scope(self.scopes.inbound))
-    }
-    /// The next frame from the ordered stream or a heartbeat datagram. A peer that opens a
-    /// stream ends the session; a closed connection surfaces as Wire.
-    pub(crate) async fn next_frame(&mut self) -> Result<Frame, SessionFailure> {
-        let frame = tokio::select! {
-            biased;
-            frame = self.reader.read_frame(&mut self.recv) => frame.map_err(|_| SessionFailure::Wire),
-            datagram = self.connection.read_datagram() => match datagram {
-                Ok(bytes) => decode_datagram(&bytes).map_err(|_| SessionFailure::UnexpectedStream),
-                Err(_) => Err(SessionFailure::Wire),
-            },
-            event = self.connection.accept_bi() => Err(peer_event(event)),
-            event = self.connection.accept_uni() => Err(peer_event(event)),
-        }?;
-        self.scopes.validate(&frame)?;
-        Ok(frame)
     }
     pub(crate) fn link_stats(
         &self,
@@ -457,6 +526,9 @@ impl SessionIo {
                 self.writer.is_finished(),
                 self.connection.close_reason()
             );
+            Err(SessionFailure::Wire)
+        } else if self.connection.remote_address() != self.remote {
+            log::warn!("session wire ended: the peer's address changed");
             Err(SessionFailure::Wire)
         } else {
             Ok(())
@@ -533,7 +605,7 @@ impl TickGap {
     }
 }
 
-impl Drop for SessionIo {
+impl Drop for LinkIo {
     fn drop(&mut self) {
         log::debug!(
             "closing session connection (peer close reason before ours: {:?})",
@@ -772,5 +844,259 @@ mod close_tests {
         progress.end_deliberately();
         assert!(progress.ended_deliberately());
         assert!(progress.clone().ended_deliberately());
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use crate::{
+        crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig, VerifiedPeer},
+        session_handshake::{HandshakeConfig, negotiate},
+    };
+    use monhop_core::{Platform, Point};
+    use monhop_protocol::{
+        Capabilities, ControlPermissions, DisplayDescription, DisplayTopology, SessionPurpose,
+    };
+    use std::net::Ipv4Addr;
+    use tokio::time::timeout;
+
+    const NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Far longer than a loopback delivery: a frame that has not arrived by then never will.
+    const QUIET: Duration = Duration::from_millis(200);
+
+    // A hub runs each link's reader in its own task.
+    const _: () = {
+        const fn movable<T: Send + 'static>() {}
+        movable::<LinkReader>();
+        movable::<LinkIo>();
+    };
+
+    struct Pair {
+        client: NegotiatedSession,
+        server: NegotiatedSession,
+        _endpoints: [quinn::Endpoint; 2],
+    }
+
+    fn pin(identity: &DeviceIdentity) -> VerifiedPeer {
+        VerifiedPeer::from_certificate_der(
+            identity.certificate_der(),
+            &identity.fingerprint().full_hex(),
+        )
+        .expect("generated identity has a full matching pin")
+    }
+
+    fn displays(id: u64) -> DisplayTopology {
+        DisplayTopology::new(vec![DisplayDescription {
+            id: DisplayId(id),
+            name: "fixture".into(),
+            native_width: 100,
+            native_height: 100,
+            logical_origin: Point::default(),
+            logical_size: Point::new(100.0, 100.0),
+            scale_factor: 1.0,
+            is_primary: true,
+            monitor: None,
+        }])
+        .expect("fixture topology is valid")
+    }
+
+    fn share_config<'a>(
+        identity: &'a DeviceIdentity,
+        peer: &'a VerifiedPeer,
+        (local, remote): (Platform, Platform),
+        topology: &'a DisplayTopology,
+    ) -> HandshakeConfig<'a> {
+        let features =
+            Capabilities::new(Capabilities::RELATIVE_MOTION | Capabilities::DISPLAY_TOPOLOGY)
+                .expect("fixture capabilities are known");
+        HandshakeConfig::new(
+            identity,
+            peer,
+            local,
+            remote,
+            features,
+            features,
+            topology,
+            ControlPermissions::BOTH,
+            SessionPurpose::Share,
+        )
+        .expect("share handshake configuration")
+    }
+
+    async fn negotiated_pair() -> Pair {
+        let client_identity = DeviceIdentity::generate().expect("client identity");
+        let server_identity = DeviceIdentity::generate().expect("server identity");
+        let (client_pin, server_pin) = (pin(&client_identity), pin(&server_identity));
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let listener = quinn::Endpoint::server(
+            SecureQuicConfig::server(&server_identity, &client_pin)
+                .expect("server TLS configuration"),
+            loopback,
+        )
+        .expect("loopback server endpoint");
+        let mut dialer = quinn::Endpoint::client(loopback).expect("loopback client endpoint");
+        dialer.set_default_client_config(
+            SecureQuicConfig::client(&client_identity, &server_pin)
+                .expect("client TLS configuration"),
+        );
+        let connecting = dialer
+            .connect(
+                listener.local_addr().expect("server address"),
+                LOCAL_TLS_SERVER_NAME,
+            )
+            .expect("loopback connection");
+        let (client_connection, server_connection) = tokio::join!(
+            async { connecting.await.expect("client TLS connection") },
+            async {
+                listener
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("server TLS connection")
+            },
+        );
+        let (client_displays, server_displays) = (displays(1), displays(2));
+        let (client, server) = tokio::join!(
+            negotiate(
+                client_connection,
+                share_config(
+                    &client_identity,
+                    &server_pin,
+                    (Platform::Windows, Platform::MacOs),
+                    &client_displays,
+                ),
+            ),
+            negotiate(
+                server_connection,
+                share_config(
+                    &server_identity,
+                    &client_pin,
+                    (Platform::MacOs, Platform::Windows),
+                    &server_displays,
+                ),
+            ),
+        );
+        Pair {
+            client: client.expect("client share session"),
+            server: server.expect("server share session"),
+            _endpoints: [dialer, listener],
+        }
+    }
+
+    #[tokio::test]
+    async fn control_frames_flow_both_ways_and_a_closed_peer_still_ends_the_link() {
+        timeout(NETWORK_TIMEOUT, async {
+            let pair = negotiated_pair().await;
+            let epoch = pair.client.initial_epoch;
+            let client_outbound = pair.client.outbound_scope();
+            let mut client = SessionIo::new(pair.client, SessionProgress::default());
+            let mut server = SessionIo::new(pair.server, SessionProgress::default());
+
+            client
+                .send_outbound(Frame::new(epoch, 3, Message::SessionReady))
+                .expect("queue a control frame");
+            client
+                .send_outbound(Frame::new(epoch, 4, Message::Ping(7)))
+                .expect("queue a heartbeat");
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let frame = server.next_frame().await.expect("frame reaches the peer");
+                assert_eq!(frame.scope, client_outbound);
+                received.push(frame.message);
+            }
+            assert!(received.contains(&Message::SessionReady));
+            assert!(received.contains(&Message::Ping(7)));
+
+            server
+                .send_inbound(Frame::new(epoch, 3, Message::ReleaseAck))
+                .expect("queue a reply");
+            assert_eq!(
+                client
+                    .next_frame()
+                    .await
+                    .expect("reply reaches the peer")
+                    .message,
+                Message::ReleaseAck
+            );
+
+            drop(client);
+            assert_eq!(server.next_frame().await, Err(SessionFailure::Wire));
+            assert_eq!(server.check(), Err(SessionFailure::Wire));
+            let stats = server.link_stats(0, 0, (0, 0), &RevocationSignal::default());
+            assert_eq!(stats.close, LinkClose::PeerEnded);
+        })
+        .await
+        .expect("loopback test exceeded five seconds");
+    }
+
+    #[tokio::test]
+    async fn a_unidirectional_stream_is_left_to_its_own_acceptor() {
+        timeout(NETWORK_TIMEOUT, async {
+            let pair = negotiated_pair().await;
+            let epoch = pair.client.initial_epoch;
+            let client_connection = pair.client.connection.clone();
+            let server_connection = pair.server.connection.clone();
+            server_connection.set_max_concurrent_uni_streams(1_u32.into());
+            let client = SessionIo::new(pair.client, SessionProgress::default());
+            let mut server = SessionIo::new(pair.server, SessionProgress::default());
+
+            let mut uni = client_connection
+                .open_uni()
+                .await
+                .expect("granted credit opens a stream");
+            uni.write_all(b"clipboard").await.expect("write the stream");
+            uni.finish().expect("finish the stream");
+            uni.stopped()
+                .await
+                .expect("the peer received the whole stream");
+            assert!(
+                timeout(QUIET, server.next_frame()).await.is_err(),
+                "the input loop neither ends nor yields on a unidirectional stream"
+            );
+
+            client
+                .send_outbound(Frame::new(epoch, 3, Message::SessionReady))
+                .expect("queue a control frame");
+            assert_eq!(
+                server
+                    .next_frame()
+                    .await
+                    .expect("control still flows")
+                    .message,
+                Message::SessionReady
+            );
+            let mut accepted = server_connection
+                .accept_uni()
+                .await
+                .expect("the stream still waits for its own acceptor");
+            assert_eq!(
+                accepted.read_to_end(64).await.expect("read the stream"),
+                b"clipboard"
+            );
+            assert_eq!(server.check(), Ok(()));
+        })
+        .await
+        .expect("loopback test exceeded five seconds");
+    }
+
+    #[tokio::test]
+    async fn a_link_whose_remote_address_changes_fails_its_check() {
+        timeout(NETWORK_TIMEOUT, async {
+            let pair = negotiated_pair().await;
+            let (_reader, mut link) = LinkIo::split(pair.server, SessionProgress::default());
+            assert_eq!(link.check(), Ok(()));
+
+            let bound = link.remote;
+            link.remote = SocketAddr::new(bound.ip(), bound.port().wrapping_add(1));
+            assert_eq!(link.check(), Err(SessionFailure::Wire));
+            assert!(
+                link.connection.close_reason().is_none(),
+                "only the address binding failed"
+            );
+        })
+        .await
+        .expect("loopback test exceeded five seconds");
     }
 }

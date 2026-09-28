@@ -85,12 +85,10 @@ impl TakeBackGate {
     /// Checked before every native post. False once take-back closed the current generation.
     pub fn admits_injection(&self) -> bool {
         let admitted = self.0.admission.load(Ordering::SeqCst);
-        admitted != CLOSED
-            && self.0.floor.snapshot()
-                == (FloorSnapshot {
-                    state: FloorState::Receiving,
-                    generation: admitted,
-                })
+        admitted != CLOSED && {
+            let floor = self.0.floor.snapshot();
+            floor.state == FloorState::Receiving && floor.generation == admitted
+        }
     }
 
     /// Call before the [`Self::admits_injection`] check that precedes any key or button down, and
@@ -193,7 +191,7 @@ impl TakeBackGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::floor::FloorOwner;
+    use crate::floor::{FloorOwner, FloorPeer};
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -309,5 +307,32 @@ mod tests {
             Some(yielded.1.generation),
             "the stale trigger names only the generation it yielded"
         );
+    }
+
+    #[test]
+    fn a_group_peer_receiving_is_admitted_and_taken_back_like_the_pairwise_floor() {
+        let gate = TakeBackGate::new(SharedFloor::new());
+        let floor = gate.floor();
+        let peer = FloorPeer::slot(4).unwrap();
+        let receiving = floor
+            .claim(floor.snapshot(), FloorState::Receiving, peer)
+            .unwrap();
+        gate.open_injection(receiving.generation);
+        assert!(
+            gate.admits_injection(),
+            "admission reads state and generation only"
+        );
+
+        assert!(matches!(
+            gate.trigger(),
+            TakeBackOutcome::Triggered { withhold: false }
+        ));
+        let yielding = floor.snapshot();
+        assert_eq!(
+            (yielding.state, yielding.peer),
+            (FloorState::Yielding, peer)
+        );
+        assert!(!gate.admits_injection());
+        assert_eq!(gate.take_triggered(), Some(yielding.generation));
     }
 }

@@ -27,28 +27,40 @@ function labelSize(label, placement = "above") {
   return { width: Math.ceil(width), height: LABEL_HEIGHT };
 }
 
-// Place both labels together so the second one never lands on top of the first.
+// Places every group's label in sequence, each one avoiding every other group's rect plus every
+// label already placed, so N labels never land on top of a group or of each other. `rects` and
+// `labels` are keyed by group; the order labels are placed in follows the key order `rects` was
+// built in, which for a two-computer arrangement is "local" then "peer" (unchanged from before).
 export function labelBoxes(rects, labels, stage, insets) {
-  const local = box(rects.local, rects.peer, labels.local, stage, insets, []);
-  return {
-    local,
-    peer: box(rects.peer, rects.local, labels.peer, stage, insets, [local]),
-  };
+  const keys = Object.keys(rects);
+  const boxes = {};
+  const placed = [];
+  for (const key of keys) {
+    const otherRects = keys.filter((k) => k !== key).map((k) => rects[k]);
+    const next = box(rects[key], labels[key], stage, insets, [...otherRects, ...placed]);
+    boxes[key] = next;
+    placed.push(next);
+  }
+  return boxes;
 }
 
-function box(self, other, label, stage, insets, avoid) {
-  const placed = labelPlacement(self, other, stage, labelSize(label), insets, avoid);
+function box(self, label, stage, insets, avoid) {
+  const placed = labelPlacement(self, null, stage, labelSize(label), insets, avoid);
   return { ...placed, ...labelSize(label, placed.placement) };
 }
 
 // One computer's displays inside a group node placed at the computer's bounding box; each display sits at
 // its own tile rect, so the same node draws a grouped block and a free spread.
+// `tone` names the color slot the group draws in ("local", "peer", "peer-2" ... "peer-6" for a third
+// computer and beyond); it defaults to `side` so the two-computer callers that do not pass it yet
+// still get the right tone for free.
 export function createGroupNode({
   tiles,
   tileRects,
   groupKey,
   platform,
   side,
+  tone,
   label,
   rect,
   labelBox,
@@ -61,6 +73,7 @@ export function createGroupNode({
   node.classList.add("arrangement-group", `is-${platform}`);
   if (side) node.classList.add(`is-${side}`);
   node.dataset.group = groupKey;
+  node.dataset.tone = tone ?? side ?? groupKey;
   node.setAttribute("role", focusable ? "button" : "group");
   node.setAttribute("aria-label", ariaLabel ?? label);
   if (focusable) {
@@ -150,6 +163,7 @@ export function createLegend(items) {
     entry.dataset.kind = item.kind;
     if (item.platform) entry.dataset.platform = item.platform;
     if (item.side) entry.dataset.side = item.side;
+    if (item.tone) entry.dataset.tone = item.tone;
     const swatch = item.kind === "shared" ? icon("link", 10) : document.createElement("span");
     swatch.classList.add("arrangement-legend-swatch");
     swatch.setAttribute("aria-hidden", "true");

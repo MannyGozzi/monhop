@@ -190,7 +190,7 @@ pub fn restrict_udp_interface(socket: &UdpSocket, index: u32) -> io::Result<()> 
     Ok(())
 }
 
-/// Keeps a socket's datagrams to one peer in the voice class, which Windows tags so Wi-Fi queues
+/// Keeps a socket's datagrams to its peers in the voice class, which Windows tags so Wi-Fi queues
 /// them ahead of bulk traffic; dropping it ends the marking.
 pub struct InteractiveTraffic(HANDLE);
 
@@ -199,12 +199,15 @@ unsafe impl Send for InteractiveTraffic {}
 // SAFETY: no method reads or writes the handle through a shared reference.
 unsafe impl Sync for InteractiveTraffic {}
 
-/// An unconnected socket names its one peer. A non-adaptive flow sends no probes, and a traffic
-/// type needs no administrator rights.
+/// An unconnected socket names each peer, one flow apiece on one handle; any refused flow drops
+/// them all. A non-adaptive flow sends no probes, and a traffic type needs no administrator rights.
 pub fn mark_interactive_traffic(
     socket: &UdpSocket,
-    peer: SocketAddrV4,
+    peers: &[SocketAddrV4],
 ) -> io::Result<InteractiveTraffic> {
+    if peers.is_empty() {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
     let version = QOS_VERSION {
         MajorVersion: 1,
         MinorVersion: 0,
@@ -215,21 +218,23 @@ pub fn mark_interactive_traffic(
         return Err(io::Error::last_os_error());
     }
     let traffic = InteractiveTraffic(handle);
-    let destination = sockaddr_in(peer);
-    let mut flow = 0;
-    // SAFETY: the handle and socket are live, and the destination is a complete SOCKADDR_IN.
-    let added = unsafe {
-        QOSAddSocketToFlow(
-            traffic.0,
-            socket.as_raw_socket() as SOCKET,
-            (&raw const destination).cast(),
-            QOSTrafficTypeVoice,
-            QOS_NON_ADAPTIVE_FLOW,
-            &mut flow,
-        )
-    };
-    if added == 0 {
-        return Err(io::Error::last_os_error());
+    for peer in peers {
+        let destination = sockaddr_in(*peer);
+        let mut flow = 0;
+        // SAFETY: the handle and socket are live, and the destination is a complete SOCKADDR_IN.
+        let added = unsafe {
+            QOSAddSocketToFlow(
+                traffic.0,
+                socket.as_raw_socket() as SOCKET,
+                (&raw const destination).cast(),
+                QOSTrafficTypeVoice,
+                QOS_NON_ADAPTIVE_FLOW,
+                &mut flow,
+            )
+        };
+        if added == 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(traffic)
 }
@@ -399,6 +404,38 @@ mod tests {
             wifi: true,
             attachment,
         }
+    }
+
+    #[test]
+    #[ignore = "explicit qWAVE probe on a live adapter; binds one local socket and sends nothing"]
+    fn one_handle_marks_a_flow_for_each_peer_on_one_socket() {
+        let adapter = enumerate_adapters()
+            .unwrap()
+            .into_iter()
+            .find(|adapter| {
+                adapter.physical
+                    && adapter.up
+                    && adapter.address.is_private()
+                    && (8..=29).contains(&adapter.prefix_len)
+            })
+            .expect("an up physical adapter with a private address");
+        let socket = UdpSocket::bind((adapter.address, 0)).unwrap();
+        let network = u32::from(adapter.address) & (u32::MAX << (32 - adapter.prefix_len));
+        let peers: Vec<_> = (1..)
+            .map(|host| Ipv4Addr::from(network + host))
+            .filter(|address| *address != adapter.address)
+            .take(3)
+            .map(|address| SocketAddrV4::new(address, 24872))
+            .collect();
+        assert_eq!(
+            mark_interactive_traffic(&socket, &[])
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        let traffic = mark_interactive_traffic(&socket, &peers).unwrap();
+        drop(traffic);
+        drop(mark_interactive_traffic(&socket, &peers[..1]).unwrap());
     }
 
     #[test]

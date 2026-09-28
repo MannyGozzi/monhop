@@ -14,9 +14,11 @@ use monhop_core::{
     SystemGesture,
 };
 
+pub mod clipboard;
+
 pub const MAGIC: [u8; 4] = *b"LKM!";
 /// Bumped whenever the wire changes shape; both computers must run the same build.
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_LEN: usize = 8_192;
 pub use monhop_core::MAX_DISPLAYS;
@@ -106,6 +108,9 @@ pub struct Hello {
     pub platform: Platform,
     pub protocol_version: u16,
     pub capabilities: Capabilities,
+    /// Digest of the sender's saved share-session agreement (group layout); all zeros on a
+    /// Setup-purpose link, which never checks it. See `session_handshake::HandshakeConfig`.
+    pub agreement: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -927,7 +932,7 @@ fn body_len(message: &Message) -> Result<usize, EncodeError> {
             if Capabilities::new(hello.capabilities.bits()).is_err() {
                 return Err(EncodeError::InvalidCapabilities);
             }
-            24
+            56
         }
         Message::SessionSetup(_) => 8,
         Message::DisplayTopology(topology) => {
@@ -1000,6 +1005,7 @@ fn encode_body(message: &Message, output: &mut Vec<u8>) -> Result<(), EncodeErro
             output.push(0);
             write_u16(output, hello.protocol_version);
             write_u32(output, hello.capabilities.bits());
+            output.extend_from_slice(&hello.agreement);
         }
         Message::SessionSetup(setup) => {
             output.push(session_purpose_to_wire(setup.purpose));
@@ -1115,11 +1121,14 @@ fn decode_body(kind: MessageKind, body: &mut Cursor<'_>) -> Result<Message, Deco
             }
             let capabilities = Capabilities::new(body.read_u32()?)
                 .map_err(|_| DecodeError::InvalidCapabilities)?;
+            let mut agreement = [0; 32];
+            agreement.copy_from_slice(body.take(32)?);
             Ok(Message::Hello(Hello {
                 device_id: DeviceId(device_id),
                 platform,
                 protocol_version: hello_version,
                 capabilities,
+                agreement,
             }))
         }
         MessageKind::SessionSetup => {

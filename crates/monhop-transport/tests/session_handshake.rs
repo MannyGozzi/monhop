@@ -50,6 +50,29 @@ fn peer_frames(
     capabilities: Capabilities,
     purpose: SessionPurpose,
 ) -> [Frame; 3] {
+    peer_frames_with_agreement(
+        peer,
+        epoch,
+        topology,
+        control,
+        platform,
+        capabilities,
+        purpose,
+        [0; 32],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn peer_frames_with_agreement(
+    peer: &DeviceIdentity,
+    epoch: SessionEpoch,
+    topology: &DisplayTopology,
+    control: ControlPermissions,
+    platform: Platform,
+    capabilities: Capabilities,
+    purpose: SessionPurpose,
+    agreement: [u8; 32],
+) -> [Frame; 3] {
     [
         Frame::new(
             epoch,
@@ -59,6 +82,7 @@ fn peer_frames(
                 platform,
                 protocol_version: PROTOCOL_VERSION,
                 capabilities,
+                agreement,
             }),
         ),
         Frame::new(epoch, 1, Message::DisplayTopology(topology.clone())),
@@ -285,4 +309,103 @@ fn configuration_rejects_both_directions_disabled() {
         ),
         Err(HandshakeError::InvalidConfiguration)
     ));
+}
+
+#[test]
+fn share_link_rejects_a_differing_agreement_digest() {
+    let local = DeviceIdentity::generate().expect("local identity");
+    let peer = DeviceIdentity::generate().expect("peer identity");
+    let peer_pin = peer_pin(&peer);
+    let topology = topology();
+    let config = HandshakeConfig::new(
+        &local,
+        &peer_pin,
+        Platform::Windows,
+        Platform::MacOs,
+        capabilities(),
+        capabilities(),
+        &topology,
+        ControlPermissions::BOTH,
+        SessionPurpose::Share,
+    )
+    .expect("valid handshake configuration")
+    .with_agreement([9; 32]);
+    let frames = peer_frames_with_agreement(
+        &peer,
+        epoch(),
+        &topology,
+        ControlPermissions::BOTH,
+        Platform::MacOs,
+        capabilities(),
+        SessionPurpose::Share,
+        [1; 32],
+    );
+    assert_eq!(
+        validate_peer_handshake(&config, peer.fingerprint(), epoch(), &frames),
+        Err(HandshakeError::AgreementMismatch)
+    );
+}
+
+#[test]
+fn share_link_accepts_a_matching_agreement_digest() {
+    let local = DeviceIdentity::generate().expect("local identity");
+    let peer = DeviceIdentity::generate().expect("peer identity");
+    let peer_pin = peer_pin(&peer);
+    let topology = topology();
+    let config = HandshakeConfig::new(
+        &local,
+        &peer_pin,
+        Platform::Windows,
+        Platform::MacOs,
+        capabilities(),
+        capabilities(),
+        &topology,
+        ControlPermissions::BOTH,
+        SessionPurpose::Share,
+    )
+    .expect("valid handshake configuration")
+    .with_agreement([9; 32]);
+    let frames = peer_frames_with_agreement(
+        &peer,
+        epoch(),
+        &topology,
+        ControlPermissions::BOTH,
+        Platform::MacOs,
+        capabilities(),
+        SessionPurpose::Share,
+        [9; 32],
+    );
+    assert!(validate_peer_handshake(&config, peer.fingerprint(), epoch(), &frames).is_ok());
+}
+
+#[test]
+fn setup_link_ignores_a_differing_agreement_digest() {
+    let local = DeviceIdentity::generate().expect("local identity");
+    let peer = DeviceIdentity::generate().expect("peer identity");
+    let peer_pin = peer_pin(&peer);
+    let topology = topology();
+    let config = HandshakeConfig::new(
+        &local,
+        &peer_pin,
+        Platform::Windows,
+        Platform::MacOs,
+        capabilities(),
+        capabilities(),
+        &topology,
+        ControlPermissions::BOTH,
+        SessionPurpose::Setup,
+    )
+    .expect("valid handshake configuration")
+    .with_agreement([9; 32]);
+    let frames = peer_frames_with_agreement(
+        &peer,
+        epoch(),
+        &topology,
+        ControlPermissions::BOTH,
+        Platform::MacOs,
+        capabilities(),
+        SessionPurpose::Setup,
+        [1; 32],
+    );
+    assert!(validate_peer_handshake(&config, peer.fingerprint(), epoch(), &frames).is_ok());
 }

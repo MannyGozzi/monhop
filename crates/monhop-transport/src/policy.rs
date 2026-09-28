@@ -1,6 +1,9 @@
 //! Validation is required before socket creation and again whenever the interface changes.
 use std::net::Ipv4Addr;
 
+/// The most paired computers one pinned socket admits.
+pub const MAX_PINNED_PEERS: usize = 7;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterfaceKind {
     Ethernet,
@@ -62,6 +65,7 @@ pub enum PolicyError {
     InterfaceChanged,
     SessionClosed,
     DiscoveryDisabled,
+    InvalidPeerSet,
 }
 
 impl std::fmt::Display for PolicyError {
@@ -87,16 +91,21 @@ impl std::fmt::Display for PolicyError {
             }
             Self::SessionClosed => "this network lock has been revoked",
             Self::DiscoveryDisabled => "discovery is not supported in this version",
+            Self::InvalidPeerSet => {
+                "the paired peers must be 1 to 7 distinct addresses, each with its own route"
+            }
         })
     }
 }
 
 impl std::error::Error for PolicyError {}
 
+/// One selected interface and the fixed set of on-link peers it admits. Any peer's route failing
+/// revokes the whole lock.
 #[derive(Clone, Debug)]
 pub struct NetworkLock {
     selected: InterfaceSnapshot,
-    peer: Ipv4Addr,
+    peers: Vec<Ipv4Addr>,
     revoked: bool,
 }
 
@@ -107,15 +116,32 @@ impl NetworkLock {
         route: RouteSnapshot,
         allow_discovery: bool,
     ) -> Result<Self, PolicyError> {
+        Self::new_group(selected, &[(peer, route)], allow_discovery)
+    }
+
+    /// `routes` names each peer with its current route; the peers keep this order.
+    pub fn new_group(
+        selected: InterfaceSnapshot,
+        routes: &[(Ipv4Addr, RouteSnapshot)],
+        allow_discovery: bool,
+    ) -> Result<Self, PolicyError> {
         if allow_discovery {
             return Err(PolicyError::DiscoveryDisabled);
         }
         validate_interface(&selected)?;
-        validate_peer(&selected, peer)?;
-        validate_route(&selected, route)?;
+        if routes.is_empty() || routes.len() > MAX_PINNED_PEERS {
+            return Err(PolicyError::InvalidPeerSet);
+        }
+        for (index, (peer, route)) in routes.iter().enumerate() {
+            if routes[..index].iter().any(|(earlier, _)| earlier == peer) {
+                return Err(PolicyError::InvalidPeerSet);
+            }
+            validate_peer(&selected, *peer)?;
+            validate_route(&selected, *route)?;
+        }
         Ok(Self {
             selected,
-            peer,
+            peers: routes.iter().map(|(peer, _)| *peer).collect(),
             revoked: false,
         })
     }
@@ -124,8 +150,8 @@ impl NetworkLock {
         &self.selected
     }
 
-    pub fn peer(&self) -> Ipv4Addr {
-        self.peer
+    pub fn peers(&self) -> &[Ipv4Addr] {
+        &self.peers
     }
 
     pub fn is_revoked(&self) -> bool {
@@ -133,22 +159,41 @@ impl NetworkLock {
     }
 
     /// Revocation is sticky: restoring the old address must not silently resume input forwarding.
+    /// `routes` must name every peer, in order, with its current route.
     pub fn revalidate(
         &mut self,
         current: Option<&InterfaceSnapshot>,
-        route: RouteSnapshot,
+        routes: &[(Ipv4Addr, RouteSnapshot)],
     ) -> Result<(), PolicyError> {
         if self.revoked {
             return Err(PolicyError::SessionClosed);
         }
         let result = match current {
-            Some(current) if current == &self.selected => validate_route(current, route),
+            Some(current) if current == &self.selected => self.validate_routes(current, routes),
             _ => Err(PolicyError::InterfaceChanged),
         };
         if result.is_err() {
             self.revoked = true;
         }
         result
+    }
+
+    fn validate_routes(
+        &self,
+        current: &InterfaceSnapshot,
+        routes: &[(Ipv4Addr, RouteSnapshot)],
+    ) -> Result<(), PolicyError> {
+        if routes.len() != self.peers.len()
+            || routes
+                .iter()
+                .zip(&self.peers)
+                .any(|((peer, _), pinned)| peer != pinned)
+        {
+            return Err(PolicyError::InvalidPeerSet);
+        }
+        routes
+            .iter()
+            .try_for_each(|(_, route)| validate_route(current, *route))
     }
 
     pub fn authorize_packet(
@@ -163,7 +208,7 @@ impl NetworkLock {
         if local != self.selected.address || arrival_interface != self.selected.index {
             return Err(PolicyError::WrongInterface);
         }
-        if source != self.peer {
+        if !self.peers.contains(&source) {
             return Err(PolicyError::OffLinkPeer);
         }
         Ok(())
@@ -262,8 +307,10 @@ mod tests {
         }
     }
 
+    const PEER: Ipv4Addr = Ipv4Addr::new(192, 168, 50, 12);
+
     fn lock() -> NetworkLock {
-        NetworkLock::new(selected(), Ipv4Addr::new(192, 168, 50, 12), route(), false).unwrap()
+        NetworkLock::new(selected(), PEER, route(), false).unwrap()
     }
 
     #[test]
@@ -280,12 +327,9 @@ mod tests {
     #[test]
     fn only_exact_private_peer_on_selected_interface_is_authorized() {
         let lock = lock();
-        assert!(
-            lock.authorize_packet(selected().address, lock.peer(), 7)
-                .is_ok()
-        );
+        assert!(lock.authorize_packet(selected().address, PEER, 7).is_ok());
         assert_eq!(
-            lock.authorize_packet(selected().address, lock.peer(), 8),
+            lock.authorize_packet(selected().address, PEER, 8),
             Err(PolicyError::WrongInterface)
         );
         assert_eq!(
@@ -344,7 +388,7 @@ mod tests {
             ..route()
         };
         assert_eq!(
-            NetworkLock::new(selected(), lock().peer(), route, false).unwrap_err(),
+            NetworkLock::new(selected(), PEER, route, false).unwrap_err(),
             PolicyError::RoutedPeer
         );
     }
@@ -371,15 +415,15 @@ mod tests {
         changed.index = 8;
         let mut lock = lock();
         assert_eq!(
-            lock.revalidate(Some(&changed), route()),
+            lock.revalidate(Some(&changed), &[(PEER, route())]),
             Err(PolicyError::InterfaceChanged)
         );
         assert_eq!(
-            lock.revalidate(Some(&selected()), route()),
+            lock.revalidate(Some(&selected()), &[(PEER, route())]),
             Err(PolicyError::SessionClosed)
         );
         assert_eq!(
-            lock.authorize_packet(selected().address, lock.peer(), 7),
+            lock.authorize_packet(selected().address, PEER, 7),
             Err(PolicyError::SessionClosed)
         );
     }
@@ -389,11 +433,11 @@ mod tests {
         let mut changed = selected();
         changed.network_signature[0] = 2;
         assert_eq!(
-            lock().revalidate(Some(&changed), route()),
+            lock().revalidate(Some(&changed), &[(PEER, route())]),
             Err(PolicyError::InterfaceChanged)
         );
         assert_eq!(
-            lock().revalidate(None, route()),
+            lock().revalidate(None, &[(PEER, route())]),
             Err(PolicyError::InterfaceChanged)
         );
     }
@@ -404,14 +448,165 @@ mod tests {
         assert_eq!(
             lock.revalidate(
                 Some(&selected()),
-                RouteSnapshot {
-                    interface_index: 88,
-                    ..route()
-                }
+                &[(
+                    PEER,
+                    RouteSnapshot {
+                        interface_index: 88,
+                        ..route()
+                    }
+                )]
             ),
             Err(PolicyError::WrongInterface)
         );
         assert!(lock.is_revoked());
+    }
+
+    const MEMBERS: [Ipv4Addr; 3] = [
+        Ipv4Addr::new(192, 168, 50, 11),
+        Ipv4Addr::new(192, 168, 50, 12),
+        Ipv4Addr::new(192, 168, 50, 13),
+    ];
+
+    fn member_routes() -> Vec<(Ipv4Addr, RouteSnapshot)> {
+        MEMBERS.iter().map(|member| (*member, route())).collect()
+    }
+
+    #[test]
+    fn every_member_route_is_validated_and_any_change_revokes() {
+        let group = NetworkLock::new_group(selected(), &member_routes(), false).unwrap();
+        assert_eq!(group.peers(), MEMBERS);
+        for member in MEMBERS {
+            assert!(
+                group
+                    .authorize_packet(selected().address, member, 7)
+                    .is_ok()
+            );
+            assert_eq!(
+                group.authorize_packet(selected().address, member, 8),
+                Err(PolicyError::WrongInterface)
+            );
+        }
+        for stranger in ["192.168.50.14", "192.168.50.10", "10.0.0.2"] {
+            assert_eq!(
+                group.authorize_packet(selected().address, stranger.parse().unwrap(), 7),
+                Err(PolicyError::OffLinkPeer)
+            );
+        }
+        let mut unchanged = group.clone();
+        assert!(
+            unchanged
+                .revalidate(Some(&selected()), &member_routes())
+                .is_ok()
+        );
+        assert!(!unchanged.is_revoked());
+
+        let gateway = RouteSnapshot {
+            next_hop: Ipv4Addr::new(192, 168, 50, 1),
+            ..route()
+        };
+        let other_interface = RouteSnapshot {
+            interface_index: 9,
+            ..route()
+        };
+        for (member, bad, error) in [
+            (0, gateway, PolicyError::RoutedPeer),
+            (2, gateway, PolicyError::RoutedPeer),
+            (1, other_interface, PolicyError::WrongInterface),
+        ] {
+            let mut lock = group.clone();
+            let mut routes = member_routes();
+            routes[member].1 = bad;
+            assert_eq!(lock.revalidate(Some(&selected()), &routes), Err(error));
+            assert!(lock.is_revoked());
+            assert_eq!(
+                lock.authorize_packet(selected().address, MEMBERS[0], 7),
+                Err(PolicyError::SessionClosed)
+            );
+            assert_eq!(
+                lock.revalidate(Some(&selected()), &member_routes()),
+                Err(PolicyError::SessionClosed)
+            );
+        }
+
+        let mut reordered = member_routes();
+        reordered.swap(0, 2);
+        let mut substituted = member_routes();
+        substituted[1].0 = Ipv4Addr::new(192, 168, 50, 14);
+        for routes in [
+            member_routes()[..2].to_vec(),
+            [
+                member_routes(),
+                vec![(Ipv4Addr::new(192, 168, 50, 14), route())],
+            ]
+            .concat(),
+            reordered,
+            substituted,
+            Vec::new(),
+        ] {
+            let mut lock = group.clone();
+            assert_eq!(
+                lock.revalidate(Some(&selected()), &routes),
+                Err(PolicyError::InvalidPeerSet)
+            );
+            assert!(lock.is_revoked());
+        }
+
+        let mut moved = group.clone();
+        let mut other_network = selected();
+        other_network.network_signature = vec![2; 32];
+        assert_eq!(
+            moved.revalidate(Some(&other_network), &member_routes()),
+            Err(PolicyError::InterfaceChanged)
+        );
+        assert!(moved.is_revoked());
+    }
+
+    #[test]
+    fn a_member_set_is_one_to_seven_distinct_on_link_private_peers_with_direct_routes() {
+        assert_eq!(
+            NetworkLock::new_group(selected(), &[], false).unwrap_err(),
+            PolicyError::InvalidPeerSet
+        );
+        let seven: Vec<_> = (11..18)
+            .map(|host| (Ipv4Addr::new(192, 168, 50, host), route()))
+            .collect();
+        assert!(NetworkLock::new_group(selected(), &seven, false).is_ok());
+        let eight: Vec<_> = (11..19)
+            .map(|host| (Ipv4Addr::new(192, 168, 50, host), route()))
+            .collect();
+        assert_eq!(
+            NetworkLock::new_group(selected(), &eight, false).unwrap_err(),
+            PolicyError::InvalidPeerSet
+        );
+        let mut duplicate = member_routes();
+        duplicate[2].0 = MEMBERS[0];
+        assert_eq!(
+            NetworkLock::new_group(selected(), &duplicate, false).unwrap_err(),
+            PolicyError::InvalidPeerSet
+        );
+        for (stranger, error) in [
+            ("192.168.51.12", PolicyError::OffLinkPeer),
+            ("8.8.8.8", PolicyError::NonPrivateAddress),
+            ("192.168.50.10", PolicyError::PeerIsLocal),
+            ("192.168.50.255", PolicyError::NetworkOrBroadcastAddress),
+        ] {
+            let mut routes = member_routes();
+            routes[1].0 = stranger.parse().unwrap();
+            assert_eq!(
+                NetworkLock::new_group(selected(), &routes, false).unwrap_err(),
+                error
+            );
+        }
+        let mut routed = member_routes();
+        routed[2].1.next_hop = Ipv4Addr::new(192, 168, 50, 1);
+        assert_eq!(
+            NetworkLock::new_group(selected(), &routed, false).unwrap_err(),
+            PolicyError::RoutedPeer
+        );
+        assert_eq!(
+            NetworkLock::new_group(selected(), &member_routes(), true).unwrap_err(),
+            PolicyError::DiscoveryDisabled
+        );
     }
 
     #[test]
@@ -442,7 +637,7 @@ mod tests {
             );
         }
         assert_eq!(
-            NetworkLock::new(selected(), lock().peer(), route(), true).unwrap_err(),
+            NetworkLock::new(selected(), PEER, route(), true).unwrap_err(),
             PolicyError::DiscoveryDisabled
         );
     }

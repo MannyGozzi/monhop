@@ -52,6 +52,9 @@ pub struct HandshakeConfig<'a> {
     local_topology: &'a DisplayTopology,
     control: ControlPermissions,
     purpose: SessionPurpose,
+    /// Digest of the saved share-session agreement (group layout); all zeros unless
+    /// [`HandshakeConfig::with_agreement`] opts in. Checked only for [`SessionPurpose::Share`].
+    agreement: [u8; 32],
 }
 
 impl<'a> HandshakeConfig<'a> {
@@ -77,9 +80,17 @@ impl<'a> HandshakeConfig<'a> {
             local_topology,
             control,
             purpose,
+            agreement: [0; 32],
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Sets the local share-session agreement digest sent in Hello and checked against the
+    /// peer's; unset, both sides default to all zeros and a [`SessionPurpose::Share`] link
+    /// connects as it did before this existed.
+    pub fn with_agreement(self, agreement: [u8; 32]) -> Self {
+        Self { agreement, ..self }
     }
 
     pub fn local_device_id(&self) -> DeviceId {
@@ -258,6 +269,8 @@ pub enum HandshakeError {
     PeerHelloMismatch,
     ControlMismatch,
     PurposeMismatch,
+    /// A Share link's saved-layout agreement digest disagrees; Setup links never check this.
+    AgreementMismatch,
 }
 
 impl fmt::Display for HandshakeError {
@@ -274,6 +287,7 @@ impl fmt::Display for HandshakeError {
             Self::PeerHelloMismatch => "session peer hello does not match the negotiated policy",
             Self::ControlMismatch => "session peer chose different control permissions",
             Self::PurposeMismatch => "session peer chose a different session purpose",
+            Self::AgreementMismatch => "session peer's saved layout agreement does not match",
         })
     }
 }
@@ -367,6 +381,7 @@ async fn negotiate_inner(
                 platform: config.local_platform,
                 protocol_version: PROTOCOL_VERSION,
                 capabilities: config.local_capabilities,
+                agreement: config.agreement,
             }),
         ),
     )
@@ -416,11 +431,13 @@ async fn negotiate_inner(
         // too, whether two builds announced different platforms or features or a frame arrived on
         // another protocol version: a computer that closed first would leave the other a reset
         // stream, which reads as transient, so it keeps dialing instead of being told which build
-        // to install.
+        // to install. A differing agreement digest is symmetric the same way: both sides read the
+        // other's Hello and reach the same verdict.
         Err(
             error @ (HandshakeError::PurposeMismatch
             | HandshakeError::ControlMismatch
-            | HandshakeError::PeerHelloMismatch),
+            | HandshakeError::PeerHelloMismatch
+            | HandshakeError::AgreementMismatch),
         ) => {
             acknowledge_disagreement(&mut send, deadline).await;
             return Err(error);
@@ -537,6 +554,11 @@ pub fn validate_peer_handshake(
     // A setup link meeting sharing is a step collision, not a saved-control disagreement.
     if setup.purpose != config.purpose {
         return Err(HandshakeError::PurposeMismatch);
+    }
+    // Weighed after purpose so both sides of a Share/Setup collision reach PurposeMismatch. A Setup
+    // link arranges the layout this digest names, so only a Share link requires agreement on it.
+    if config.purpose == SessionPurpose::Share && hello.agreement != config.agreement {
+        return Err(HandshakeError::AgreementMismatch);
     }
     if setup.control != config.control {
         return Err(HandshakeError::ControlMismatch);
@@ -799,6 +821,133 @@ mod tests {
     async fn agreeing_computers_still_negotiate() {
         let (client, server) =
             negotiate_both((true, SessionPurpose::Share), (true, SessionPurpose::Share)).await;
+        assert!(client.is_ok());
+        assert!(server.is_ok());
+    }
+
+    /// As `negotiate_both`, but each side declares its own share-session agreement digest.
+    async fn negotiate_both_agreements(
+        (client_purpose, server_purpose): (SessionPurpose, SessionPurpose),
+        client_agreement: [u8; 32],
+        server_agreement: [u8; 32],
+    ) -> (
+        Result<NegotiatedSession, HandshakeError>,
+        Result<NegotiatedSession, HandshakeError>,
+    ) {
+        let client_identity = DeviceIdentity::generate().expect("client identity");
+        let server_identity = DeviceIdentity::generate().expect("server identity");
+        let server_pin = pin(&server_identity);
+        let client_pin = pin(&client_identity);
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let listener = quinn::Endpoint::server(
+            SecureQuicConfig::server(&server_identity, &client_pin)
+                .expect("server TLS configuration"),
+            loopback,
+        )
+        .expect("loopback server endpoint");
+        let mut dialer = quinn::Endpoint::client(loopback).expect("loopback client endpoint");
+        dialer.set_default_client_config(
+            SecureQuicConfig::client(&client_identity, &server_pin)
+                .expect("client TLS configuration"),
+        );
+        let connecting = dialer
+            .connect(
+                listener.local_addr().expect("server address"),
+                LOCAL_TLS_SERVER_NAME,
+            )
+            .expect("loopback connection");
+        let (client_connection, server_connection) = tokio::join!(
+            async { connecting.await.expect("client TLS connection") },
+            async {
+                listener
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("server TLS connection")
+            },
+        );
+        let client_topology = topology(1);
+        let server_topology = topology(2);
+        let client_config = HandshakeConfig::new(
+            &client_identity,
+            &server_pin,
+            Platform::Windows,
+            Platform::MacOs,
+            capabilities(),
+            capabilities(),
+            &client_topology,
+            ControlPermissions::BOTH,
+            client_purpose,
+        )
+        .expect("client handshake configuration")
+        .with_agreement(client_agreement);
+        let server_config = HandshakeConfig::new(
+            &server_identity,
+            &client_pin,
+            Platform::MacOs,
+            Platform::Windows,
+            capabilities(),
+            capabilities(),
+            &server_topology,
+            ControlPermissions::BOTH,
+            server_purpose,
+        )
+        .expect("server handshake configuration")
+        .with_agreement(server_agreement);
+        let verdicts = tokio::join!(
+            negotiate(client_connection, client_config),
+            negotiate(server_connection, server_config),
+        );
+        dialer.close(0_u32.into(), b"fixture complete");
+        listener.close(0_u32.into(), b"fixture complete");
+        verdicts
+    }
+
+    #[tokio::test]
+    async fn equal_agreements_connect() {
+        let (client, server) = negotiate_both_agreements(
+            (SessionPurpose::Share, SessionPurpose::Share),
+            [7; 32],
+            [7; 32],
+        )
+        .await;
+        assert!(client.is_ok());
+        assert!(server.is_ok());
+    }
+
+    #[tokio::test]
+    async fn different_agreements_on_share_fail_both_sides_with_agreement_mismatch() {
+        let (client, server) = negotiate_both_agreements(
+            (SessionPurpose::Share, SessionPurpose::Share),
+            [1; 32],
+            [2; 32],
+        )
+        .await;
+        assert_eq!(client.err(), Some(HandshakeError::AgreementMismatch));
+        assert_eq!(server.err(), Some(HandshakeError::AgreementMismatch));
+    }
+
+    #[tokio::test]
+    async fn a_share_link_meeting_a_setup_link_is_a_purpose_mismatch_whatever_the_agreement() {
+        let (client, server) = negotiate_both_agreements(
+            (SessionPurpose::Share, SessionPurpose::Setup),
+            [1; 32],
+            [2; 32],
+        )
+        .await;
+        assert_eq!(client.err(), Some(HandshakeError::PurposeMismatch));
+        assert_eq!(server.err(), Some(HandshakeError::PurposeMismatch));
+    }
+
+    #[tokio::test]
+    async fn setup_links_ignore_differing_agreements() {
+        let (client, server) = negotiate_both_agreements(
+            (SessionPurpose::Setup, SessionPurpose::Setup),
+            [1; 32],
+            [2; 32],
+        )
+        .await;
         assert!(client.is_ok());
         assert!(server.is_ok());
     }

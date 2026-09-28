@@ -975,6 +975,7 @@ fn control_mismatch_is_symmetric() {
                     platform: Platform::MacOs,
                     protocol_version: PROTOCOL_VERSION,
                     capabilities,
+                    agreement: [0; 32],
                 }),
             ),
             Frame::new(epoch, 1, Message::DisplayTopology(displays.clone())),

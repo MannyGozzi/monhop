@@ -50,9 +50,19 @@ const DATAGRAM_BUFFER_SIZE: usize = 8 * 1024;
 const CRYPTO_BUFFER_SIZE: usize = 8 * 1024;
 const MAX_IDLE_TIMEOUT_MILLIS: u32 = 10_000;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(3);
-const MAX_PENDING_INCOMING: usize = 4;
+const MAX_PENDING_INCOMING: usize = 8;
 const INCOMING_BUFFER_SIZE: u64 = 32 * 1024;
-const TOTAL_INCOMING_BUFFER_SIZE: u64 = 128 * 1024;
+const TOTAL_INCOMING_BUFFER_SIZE: u64 = 256 * 1024;
+/// The most unidirectional streams a connection may grant for clipboard transfers.
+pub(crate) const CLIPBOARD_UNI_STREAMS: u32 = 2;
+// The control stream plus every clipboard stream fit the connection window at once.
+const _: () = assert!(
+    STREAM_RECEIVE_WINDOW as u64 * (1 + CLIPBOARD_UNI_STREAMS as u64)
+        <= CONNECTION_RECEIVE_WINDOW as u64
+);
+// Clipboard data in flight can never use up the send window control frames need.
+const _: () =
+    assert!((STREAM_RECEIVE_WINDOW as u64) * (CLIPBOARD_UNI_STREAMS as u64) < SEND_WINDOW);
 // Handshake PTO is 3x this until the first sample: a lost first flight costs 300 ms, not 1 s.
 const INITIAL_RTT: Duration = Duration::from_millis(100);
 // Replaces the peer's 25 ms in our PTO once it acknowledges ACK_FREQUENCY; quinn's floor is 1 ms.
@@ -345,25 +355,109 @@ impl SecureQuicConfig {
     ) -> Result<quinn::ServerConfig, CryptoError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = Arc::new(PinnedClientVerifier::new(verified_client, &provider)?);
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        let tls = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| CryptoError::TlsConfiguration)?
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(Arc::new(SingleCertAndKey::from(identity.certified_key()?)));
-        tls.alpn_protocols = vec![LOCAL_ALPN.to_vec()];
-        tls.max_early_data_size = 0;
-        tls.send_tls13_tickets = 0;
-        tls.max_tls13_tickets = 0;
+        quic_server(tls)
+    }
 
-        let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
-            .map_err(|_| CryptoError::QuicConfiguration)?;
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
-        config.transport_config(transport_config());
-        config.migration(false);
-        config.max_incoming(MAX_PENDING_INCOMING);
-        config.incoming_buffer_size(INCOMING_BUFFER_SIZE);
-        config.incoming_buffer_size_total(TOTAL_INCOMING_BUFFER_SIZE);
-        Ok(config)
+    /// Build a server config that presents no certificate and refuses every client. It is only
+    /// Quinn's default: every guarded accept picks one paired peer's config by its address.
+    pub fn server_refusing_all() -> Result<quinn::ServerConfig, CryptoError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(RefuseEveryClient {
+            schemes: provider
+                .signature_verification_algorithms
+                .supported_schemes(),
+        });
+        let tls = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| CryptoError::TlsConfiguration)?
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(Arc::new(NoServerCertificate));
+        quic_server(tls)
+    }
+}
+
+fn quic_server(mut tls: rustls::ServerConfig) -> Result<quinn::ServerConfig, CryptoError> {
+    tls.alpn_protocols = vec![LOCAL_ALPN.to_vec()];
+    tls.max_early_data_size = 0;
+    tls.send_tls13_tickets = 0;
+    tls.max_tls13_tickets = 0;
+
+    let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
+        .map_err(|_| CryptoError::QuicConfiguration)?;
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
+    config.transport_config(transport_config());
+    config.migration(false);
+    config.max_incoming(MAX_PENDING_INCOMING);
+    config.incoming_buffer_size(INCOMING_BUFFER_SIZE);
+    config.incoming_buffer_size_total(TOTAL_INCOMING_BUFFER_SIZE);
+    Ok(config)
+}
+
+#[derive(Debug)]
+struct NoServerCertificate;
+
+impl rustls::server::ResolvesServerCert for NoServerCertificate {
+    fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct RefuseEveryClient {
+    schemes: Vec<SignatureScheme>,
+}
+
+fn refused() -> RustlsError {
+    RustlsError::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
+}
+
+impl ClientCertVerifier for RefuseEveryClient {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, RustlsError> {
+        Err(refused())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(refused())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(refused())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes.clone()
     }
 }
 

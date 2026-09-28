@@ -57,8 +57,8 @@ There must be:
 
 Updates: MonHop may ask one pinned HTTPS release host for a newer signed build, only when the user has automatic updates on or presses Check now, never while a sharing session is active. The request carries the platform and current version and nothing else. A downloaded build is installed only after its signature verifies against the public key built into the app, and only on a restart the user sees.
 Start at login: onboarding opts the user in, and a Settings switch turns it off or on. The registration is written only when the user applies a layout or flips that switch, never merely from starting the app, and it is removed when the last paired computer is forgotten. A login launch starts MonHop hidden in the menu bar or tray and reconnects to the last used computer.
+Clipboard (requested 2026-09-28): optional clipboard sharing between every connected computer, off by default and turned on by the user in Settings. It carries text and images only, never files, and only inside an authenticated sharing connection to a paired computer. The clipboard is not read or watched while the switch is off or no sharing connection is live. Items that password managers mark concealed or transient are never sent, received content never leaves the computer it arrives on (not forwarded, not synced to a cloud clipboard), every received item is validated and bounded before it touches the system clipboard, and contents are never logged.
 
-* No clipboard synchronization in the initial version
 * No file transfer
 * No shell commands received over the network
 * No arbitrary RPC mechanism
@@ -595,6 +595,8 @@ One node is temporarily the physical input controller because the keyboard/mouse
 The protocol should support reversing this role in the future.
 
 For version 1, make Windows-as-controller and Mac-as-receiver the first vertical slice, but do not paint the architecture into a corner.
+
+Several computers (requested 2026-09-28): at least three paired computers can share at once, any mix of Windows and macOS. Every enabled computer stays connected to every other, all their displays form one arrangement, and any computer's keyboard and mouse can control any other, including moving the pointer from one controlled computer straight onto another. A third computer is optional: two computers must keep working exactly as before, with their saved layouts. One socket on the selected interface admits only paired computers, and every connection is bound to one paired computer's certificate and address. A computer receives input from at most one other computer at a time, and losing any one connection restores local input without disturbing the others.
 
 ## Protocol
 

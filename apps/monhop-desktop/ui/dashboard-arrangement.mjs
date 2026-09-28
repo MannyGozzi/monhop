@@ -1,15 +1,16 @@
 import {
   VIEW_INSETS,
   arrangementGeometry,
-  displayGroups,
-  drawnDisplays,
+  chainPlacement,
+  computerGroups,
+  drawnDisplaysAcross,
   fitTransform,
+  groupRects,
+  hiddenDisplaysAcross,
   hiddenFromLayout,
   monitorKey,
-  placeGroup,
   placementFromLayout,
-  sharedMonitors,
-  sideRects,
+  sharedMonitorsAcross,
   tileRects,
 } from "./arrangement-model.mjs";
 import {
@@ -48,33 +49,68 @@ export function forgetArrangementMotion(motionKeyPrefix) {
   return dropped;
 }
 
+// The computers a saved setup names: a group record's own `members` array when it has one, or
+// today's local/peer saved-setup shape as a two-member fallback. Either way the result is the same
+// `{key, displays}` list `computerGroups` and the N-computer helpers take.
+function membersOf(setup) {
+  if (Array.isArray(setup?.members) && setup.members.length) {
+    const normalized = setup.members.map((entry) => ({
+      key: typeof entry?.key === "string" && entry.key ? entry.key : null,
+      displays: displays(entry?.displays),
+    }));
+    return normalized.every((member) => member.key && member.displays) ? normalized : null;
+  }
+  const local = displays(setup?.localDisplays);
+  const peer = displays(setup?.peerDisplays);
+  return local && peer
+    ? [
+        { key: "local", displays: local },
+        { key: "peer", displays: peer },
+      ]
+    : null;
+}
+
+// The exact two-computer rule (`hiddenFromLayout`) when `members` really is today's local/peer
+// shape, so every existing caller keeps its byte-identical behavior, including inferring which copy
+// of a shared monitor a legacy save's crossing already uses. A genuine N-member group record has no
+// such crossing-side inference (that history does not exist for more than two computers yet): it
+// only honors an explicit `hidden` list, else falls back to the same "keep local, else the first
+// listed member" default `hiddenDisplaysAcross` uses everywhere else.
+function hiddenFromLayoutAcross(layout, members) {
+  if (members.length === 2 && members[0].key === "local" && members[1].key === "peer")
+    return hiddenFromLayout(layout, members[0].displays, members[1].displays);
+  const chosen = layout?.arrangement?.hidden;
+  return hiddenDisplaysAcross(members, Array.isArray(chosen) ? chosen : null);
+}
+
 export function savedDashboardArrangement(setup) {
   if (!setup?.saved) return unavailable("No saved arrangement is available.");
-  const local = displays(setup.localDisplays);
-  const peer = displays(setup.peerDisplays);
+  const members = membersOf(setup);
   const layout = normalizeStoredLayout(setup.previewLayout);
-  if (!local || !peer || !layout) return unavailable(STALE);
-  const all = [...local, ...peer];
+  if (!members || !layout) return unavailable(STALE);
+  const all = members.flatMap((member) => member.displays);
   if (new Set(all.map((display) => display.id)).size !== all.length)
     return unavailable("Saved display identifiers are not valid.");
 
-  // A monitor cabled to both computers is drawn once, on the side the saved layout uses.
-  const shared = sharedMonitors(local, peer);
-  const hidden = hiddenFromLayout(layout, local, peer);
-  const drawnLocal = drawnDisplays(local, hidden, shared);
-  const drawnPeer = drawnDisplays(peer, hidden, shared);
+  // A monitor cabled to more than one of these computers is drawn once, on the side the saved
+  // layout uses.
+  const shared = sharedMonitorsAcross(members);
+  const hidden = hiddenFromLayoutAcross(layout, members);
+  const drawnMembers = members.map((member) => ({
+    key: member.key,
+    displays: drawnDisplaysAcross(member.displays, hidden, shared),
+  }));
   const crossings = crossingsFromLinks(
     layout.links,
-    new Set(drawnLocal.map((display) => display.id)),
-    new Set(drawnPeer.map((display) => display.id)),
+    new Map(drawnMembers.map((member) => [member.key, new Set(member.displays.map((d) => d.id))])),
   );
-  const groups = displayGroups(drawnLocal, drawnPeer);
+  const groups = computerGroups(drawnMembers);
   if (!crossings || !groups) return unavailable(STALE);
-  // No link was ever recorded: place the two groups the same way a fresh arrangement would, and
-  // draw them unconnected rather than inventing a crossing that was never saved.
+  // No link was ever recorded: place the groups the same way a fresh arrangement would, and draw
+  // them unconnected rather than inventing a crossing that was never saved.
   const noCrossingYet = crossings.length === 0;
   const placement = noCrossingYet
-    ? placeGroup(groups, "right")
+    ? chainPlacement(groups, "right")
     : placementFromLayout(groups, layout.arrangement ?? null, crossings);
   const geometry = placement ? arrangementGeometry(groups, placement) : null;
   if (!geometry || (!noCrossingYet && !geometry.connected))
@@ -173,14 +209,8 @@ export function createDashboardArrangement(setup, names = {}) {
     return root;
   }
 
-  const labels = {
-    local: label(names.local, "This computer"),
-    peer: label(names.peer, "Saved computer"),
-  };
-  const platforms = {
-    local: platform(names.localPlatform, "macos"),
-    peer: platform(names.peerPlatform, "windows"),
-  };
+  const members = memberPresentation(names, arrangement.groups.order);
+  const labels = Object.fromEntries(members.map((member) => [member.key, member.label]));
   const seamCount = arrangement.seams.length;
 
   const svg = svgNode("svg");
@@ -190,33 +220,35 @@ export function createDashboardArrangement(setup, names = {}) {
   svg.setAttribute("role", "img");
   svg.setAttribute(
     "aria-label",
-    `${labels.local} and ${labels.peer}. ${arrangement.noCrossingYet ? "No crossing yet." : `${seamCount} saved display seam${seamCount === 1 ? "" : "s"}.`}`,
+    `${joinLabels(members.map((member) => member.label))}. ${arrangement.noCrossingYet ? "No crossing yet." : `${seamCount} saved display seam${seamCount === 1 ? "" : "s"}.`}`,
   );
 
   const transform = fitTransform(arrangement.tiles, VIEW, PREVIEW_INSETS);
   const rects = {
     tiles: tileRects(arrangement.tiles, transform),
-    sides: sideRects(arrangement.tiles, transform),
+    groups: groupRects(arrangement.tiles, transform),
   };
-  const boxes = labelBoxes(rects.sides, labels, VIEW, PREVIEW_INSETS);
-  const groups = svgNode("g");
-  groups.classList.add("arrangement-groups");
-  for (const key of ["local", "peer"]) {
-    groups.append(
+  const boxes = labelBoxes(rects.groups, labels, VIEW, PREVIEW_INSETS);
+  const groupsLayer = svgNode("g");
+  groupsLayer.classList.add("arrangement-groups");
+  for (const member of members) {
+    if (!rects.groups[member.key]) continue;
+    groupsLayer.append(
       createGroupNode({
-        tiles: arrangement.tiles.filter((tile) => tile.side === key),
+        tiles: arrangement.tiles.filter((tile) => tile.group === member.key),
         tileRects: rects.tiles,
-        groupKey: key,
-        platform: platforms[key],
-        side: key,
-        label: labels[key],
-        rect: rects.sides[key],
-        labelBox: boxes[key],
+        groupKey: member.key,
+        platform: member.platform,
+        side: member.key,
+        tone: member.tone,
+        label: member.label,
+        rect: rects.groups[member.key],
+        labelBox: boxes[member.key],
       }),
     );
   }
   const seams = createSeamLayer(arrangement.seams, transform);
-  svg.append(groups, seams);
+  svg.append(groupsLayer, seams);
 
   const seamSignature = JSON.stringify(arrangement.seams.map((seam) => [seam.start, seam.end]));
   if (names.motionKey) {
@@ -232,8 +264,12 @@ export function createDashboardArrangement(setup, names = {}) {
   // The compact viewport rides inside a computer card, where the legend would cost more room
   // than it explains; the picture and one caption are what that card needs.
   const legendItems = [
-    { kind: "group", label: labels.local, side: "local" },
-    { kind: "group", label: labels.peer, side: "peer" },
+    ...members.map((member) => ({
+      kind: "group",
+      label: member.label,
+      side: member.key,
+      tone: member.tone,
+    })),
     ...(names.compactLegend ? [] : [{ kind: "primary", label: "Primary display" }]),
     ...(arrangement.tiles.some((tile) => tile.shared)
       ? [{ kind: "shared", label: "Cabled to both computers" }]
@@ -255,8 +291,59 @@ export function createDashboardArrangement(setup, names = {}) {
   return root;
 }
 
-function crossingsFromLinks(links, localIds, peerIds) {
+// The label, platform and color tone for each group in `order`, from a group record's own
+// `names.members` list when the caller has one, or from today's `names.local` / `names.peer` /
+// `names.localPlatform` / `names.peerPlatform` shape as the two-computer fallback every existing
+// caller still passes.
+function memberPresentation(names, order) {
+  if (Array.isArray(names.members) && names.members.length) {
+    const byKey = new Map(names.members.map((entry) => [entry.key, entry]));
+    return order.map((key, index) => {
+      const entry = byKey.get(key) ?? {};
+      return {
+        key,
+        label: label(entry.label, `Computer ${index + 1}`),
+        platform: platform(entry.platform, index === 0 ? "macos" : "windows"),
+        tone: typeof entry.tone === "string" && entry.tone ? entry.tone : defaultTone(index),
+      };
+    });
+  }
+  return order.map((key, index) => ({
+    key,
+    label: label(
+      key === "local" ? names.local : names.peer,
+      key === "local" ? "This computer" : "Saved computer",
+    ),
+    platform: platform(
+      key === "local" ? names.localPlatform : names.peerPlatform,
+      index === 0 ? "macos" : "windows",
+    ),
+    tone: defaultTone(index),
+  }));
+}
+
+// The color slot a group draws in: the first computer is "local", the second is "peer" (today's two
+// tones), and a third through eighth are "peer-2".."peer-6" (the group record caps a group at 8
+// members; a ninth would reuse "peer-6" rather than draw in no color at all).
+function defaultTone(index) {
+  if (index === 0) return "local";
+  if (index === 1) return "peer";
+  return `peer-${Math.min(index, 6)}`;
+}
+
+function joinLabels(labelList) {
+  if (labelList.length <= 2) return labelList.join(" and ");
+  return `${labelList.slice(0, -1).join(", ")} and ${labelList.at(-1)}`;
+}
+
+// Recovers this computer's saved crossings from the raw link pairs the native side stores: every
+// crossing is two reciprocal links, and the "forward" half is the one that goes from an earlier
+// member (by `idsByMember`'s own key order) to a later one, matching how `arrangementGeometry` only
+// ever seams a pair in that direction.
+function crossingsFromLinks(links, idsByMember) {
   if (links.length % 2 !== 0) return null;
+  const order = [...idsByMember.keys()];
+  const memberOf = (id) => order.find((key) => idsByMember.get(key).has(id));
   const unused = [...links];
   const crossings = [];
   while (unused.length) {
@@ -264,9 +351,11 @@ function crossingsFromLinks(links, localIds, peerIds) {
     const reciprocalIndex = unused.findIndex((candidate) => reciprocal(candidate, first));
     if (reciprocalIndex < 0) return null;
     const second = unused.splice(reciprocalIndex, 1)[0];
-    const forward = [first, second].find(
-      (link) => localIds.has(link.fromDisplay) && peerIds.has(link.toDisplay),
-    );
+    const forward = [first, second].find((link) => {
+      const fromMember = memberOf(link.fromDisplay);
+      const toMember = memberOf(link.toDisplay);
+      return fromMember && toMember && order.indexOf(fromMember) < order.indexOf(toMember);
+    });
     if (!forward) return null;
     crossings.push({
       fromDisplay: forward.fromDisplay,

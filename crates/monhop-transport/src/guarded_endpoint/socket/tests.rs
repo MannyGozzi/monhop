@@ -42,6 +42,8 @@ struct TestIo {
     local: SocketAddrV4,
     inbox: Arc<Mutex<Inbox>>,
     target: Arc<Mutex<Inbox>>,
+    /// On a shared link, sends reach the inbox of the address they name, or no one.
+    routes: Vec<(SocketAddrV4, Arc<Mutex<Inbox>>)>,
     receives: AtomicUsize,
     sends: AtomicUsize,
     blocked: AtomicBool,
@@ -61,6 +63,7 @@ impl TestIo {
             local,
             inbox,
             target,
+            routes: Vec::new(),
             receives: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
             blocked: AtomicBool::new(false),
@@ -119,8 +122,16 @@ impl DatagramIo for TestIo {
         if self.discard_sends.load(Ordering::SeqCst) {
             return Ok(buffer.len());
         }
+        let target = if self.routes.is_empty() {
+            &self.target
+        } else {
+            match self.routes.iter().find(|(address, _)| *address == peer) {
+                Some((_, inbox)) => inbox,
+                None => return Ok(buffer.len()),
+            }
+        };
         let reader = {
-            let mut inbox = self.target.lock().unwrap();
+            let mut inbox = target.lock().unwrap();
             inbox.arrivals += 1;
             inbox.queue.push_back(Ok(Packet {
                 bytes: buffer.to_vec(),
@@ -160,7 +171,7 @@ fn fixture() -> Arc<GuardedSocket<TestIo>> {
     Arc::new(GuardedSocket {
         io: Arc::new(TestIo::new(LOCAL, Arc::default(), Arc::default())),
         local: LOCAL,
-        peer: PEER,
+        members: [PEER].into(),
         interface_index: INDEX,
         lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
@@ -480,7 +491,7 @@ fn memory_sockets() -> (Arc<GuardedSocket<TestIo>>, Arc<GuardedSocket<TestIo>>) 
             second_inbox.clone(),
         )),
         local: LOCAL,
-        peer: PEER,
+        members: [PEER].into(),
         interface_index: INDEX,
         lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
@@ -488,7 +499,7 @@ fn memory_sockets() -> (Arc<GuardedSocket<TestIo>>, Arc<GuardedSocket<TestIo>>) 
     let second = Arc::new(GuardedSocket {
         io: Arc::new(TestIo::new(PEER, second_inbox, first_inbox)),
         local: PEER,
-        peer: LOCAL,
+        members: [LOCAL].into(),
         interface_index: INDEX,
         lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
@@ -517,7 +528,8 @@ async fn late_incoming_registration_after_driver_loss_is_rejected_without_waitin
             .unwrap()
             .is_none()
     );
-    let result = super::super::register_incoming(&endpoint_b, &second.signal, incoming);
+    let server = Arc::new(SecureQuicConfig::server(&identity_b, &paired(&identity_a)).unwrap());
+    let result = super::super::register_incoming(&endpoint_b, &second.signal, incoming, server);
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
     first.signal.revoke();
     assert!(
@@ -768,7 +780,7 @@ async fn a_standing_endpoint_serves_the_next_session_while_the_paused_close_drai
                 paused_socket.io.target.clone(),
             )),
             local: PEER,
-            peer: LOCAL,
+            members: [LOCAL].into(),
             interface_index: INDEX,
             lifetime: watch::Sender::new(()),
             signal: RevocationSignal::default(),
@@ -813,6 +825,543 @@ async fn the_socket_outlives_its_last_handle_until_the_drivers_run() {
     drop((accepted, theirs));
 }
 
+use super::super::{
+    EndpointHandle, GroupMember, GroupSelection, GuardedEndpoint, MemberHandshakeFailure,
+};
+use crate::{
+    crypto::CertificateFingerprint,
+    policy::{InterfaceKind, InterfaceSnapshot, RouteSnapshot},
+};
+
+const MEMBERS: [SocketAddrV4; 3] = [
+    SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 11), 24800),
+    SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 12), 24800),
+    SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 13), 24800),
+];
+
+/// The lock a bind on the memory link would hold: every member on-link with a direct route.
+fn memory_lock(local: SocketAddrV4, members: &[SocketAddrV4]) -> NetworkLock {
+    let selected = InterfaceSnapshot {
+        stable_id: "memory-link".into(),
+        name: "memory".into(),
+        index: INDEX,
+        address: *local.ip(),
+        prefix_len: 24,
+        kind: InterfaceKind::Ethernet,
+        is_hardware: true,
+        is_up: true,
+        network_signature: vec![1; 32],
+    };
+    let route = RouteSnapshot {
+        interface_index: INDEX,
+        source: *local.ip(),
+        next_hop: Ipv4Addr::UNSPECIFIED,
+    };
+    let routes: Vec<_> = members.iter().map(|member| (*member.ip(), route)).collect();
+    NetworkLock::new_group(selected, &routes, false).unwrap()
+}
+
+/// One in-memory link shared by every node: a send reaches the inbox of the address it names, or
+/// no one. Each socket is built as a bind builds it, admitting only its own members.
+fn memory_network<const N: usize>(
+    nodes: [(SocketAddrV4, &[SocketAddrV4]); N],
+) -> [GuardedSocket<TestIo>; N] {
+    let inboxes: Vec<(SocketAddrV4, Arc<Mutex<Inbox>>)> = nodes
+        .iter()
+        .map(|(address, _)| (*address, Arc::default()))
+        .collect();
+    nodes.map(|(local, members)| {
+        let own = &inboxes
+            .iter()
+            .find(|(address, _)| *address == local)
+            .unwrap()
+            .1;
+        let mut io = TestIo::new(local, own.clone(), Arc::default());
+        io.routes = inboxes
+            .iter()
+            .filter(|(address, _)| *address != local)
+            .cloned()
+            .collect();
+        GuardedSocket::new(
+            io,
+            &memory_lock(local, members),
+            local,
+            members,
+            RevocationSignal::default(),
+        )
+        .unwrap()
+    })
+}
+
+fn group(local: SocketAddrV4, members: &[(SocketAddrV4, &DeviceIdentity)]) -> GroupSelection {
+    GroupSelection {
+        stable_id: "memory-link".into(),
+        interface_index: INDEX,
+        local,
+        members: members
+            .iter()
+            .map(|(address, identity)| GroupMember {
+                address: *address,
+                pin: paired(identity),
+            })
+            .collect(),
+    }
+}
+
+fn guarded(
+    socket: GuardedSocket<TestIo>,
+    identity: &DeviceIdentity,
+    members: &[(SocketAddrV4, &DeviceIdentity)],
+) -> GuardedEndpoint {
+    let local = socket.local;
+    GuardedEndpoint::over_socket(socket, &group(local, members), identity).unwrap()
+}
+
+fn handshake_failure(error: &io::Error) -> &MemberHandshakeFailure {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<MemberHandshakeFailure>())
+        .expect("a member's handshake failure")
+}
+
+#[test]
+fn a_member_set_admits_exactly_its_members_on_the_pinned_interface() {
+    let lock = memory_lock(LOCAL, &MEMBERS);
+    let io = || TestIo::new(LOCAL, Arc::default(), Arc::default());
+    let signal = RevocationSignal::default;
+    let stranger = SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 14), 24800);
+    let mut reordered = MEMBERS;
+    reordered.swap(0, 2);
+    let mut portless = MEMBERS;
+    portless[1] = SocketAddrV4::new(*MEMBERS[1].ip(), 0);
+    let mut substituted = MEMBERS;
+    substituted[2] = stranger;
+    for members in [
+        &MEMBERS[..2],
+        &[MEMBERS[0], MEMBERS[1], MEMBERS[2], stranger][..],
+        &[MEMBERS[0], MEMBERS[0], MEMBERS[2]][..],
+        &reordered[..],
+        &portless[..],
+        &substituted[..],
+        &[][..],
+    ] {
+        assert_eq!(
+            GuardedSocket::new(io(), &lock, LOCAL, members, signal())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let wrong_local = SocketAddrV4::new(*MEMBERS[0].ip(), 24800);
+    assert!(GuardedSocket::new(io(), &lock, wrong_local, &MEMBERS, signal()).is_err());
+    let mut revoked = lock.clone();
+    let _ = revoked.revalidate(None, &[]);
+    assert_eq!(
+        GuardedSocket::new(io(), &revoked, LOCAL, &MEMBERS, signal())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+
+    let socket = GuardedSocket::new(io(), &lock, LOCAL, &MEMBERS, signal()).unwrap();
+    let member = |source| Arrival {
+        source,
+        ..arrival()
+    };
+    let refused = [
+        member(SocketAddrV4::new(*MEMBERS[1].ip(), 24801)),
+        member(stranger),
+        member(LOCAL),
+        Arrival {
+            destination: *MEMBERS[1].ip(),
+            ..member(MEMBERS[0])
+        },
+        Arrival {
+            interface_index: INDEX + 1,
+            ..member(MEMBERS[2])
+        },
+        Arrival {
+            length: 0,
+            ..member(MEMBERS[1])
+        },
+    ];
+    for packet in refused {
+        socket.io.enqueue(packet);
+    }
+    for source in MEMBERS {
+        socket.io.enqueue(member(source));
+    }
+    let mut cx = Context::from_waker(Waker::noop());
+    for source in MEMBERS {
+        let (result, meta) = receive(&socket, &mut cx);
+        assert!(matches!(result, Poll::Ready(Ok(1))));
+        assert_eq!(meta.addr, source.into());
+        assert_eq!(meta.dst_ip, Some((*LOCAL.ip()).into()));
+    }
+    assert_eq!(
+        socket.io.receives.load(Ordering::SeqCst),
+        refused.len() + MEMBERS.len()
+    );
+    assert!(receive(&socket, &mut cx).0.is_pending());
+    assert!(!socket.signal.is_revoked());
+}
+
+#[test]
+fn sends_reach_only_members_and_anything_else_revokes() {
+    let [hub, first, second, third] = memory_network([
+        (LOCAL, &MEMBERS[..]),
+        (MEMBERS[0], &[LOCAL][..]),
+        (MEMBERS[1], &[LOCAL][..]),
+        (MEMBERS[2], &[LOCAL][..]),
+    ]);
+    for (index, member) in MEMBERS.into_iter().enumerate() {
+        for _ in 0..=index {
+            hub.try_send(&Transmit {
+                destination: member.into(),
+                ..transmit()
+            })
+            .unwrap();
+        }
+    }
+    let arrivals = [&first, &second, &third].map(|node| node.io.inbox.lock().unwrap().arrivals);
+    assert_eq!(arrivals, [1, 2, 3]);
+    assert_eq!(hub.io.sends.load(Ordering::SeqCst), 6);
+    assert!(!hub.signal.is_revoked());
+
+    let lock = memory_lock(LOCAL, &MEMBERS);
+    let fresh = || {
+        GuardedSocket::new(
+            TestIo::new(LOCAL, Arc::default(), Arc::default()),
+            &lock,
+            LOCAL,
+            &MEMBERS,
+            RevocationSignal::default(),
+        )
+        .unwrap()
+    };
+    let bad = [
+        "192.168.50.14:24800",
+        "192.168.50.12:24801",
+        "192.168.50.10:24800",
+        "[::1]:24800",
+        "[::ffff:192.168.50.12]:24800",
+    ]
+    .map(|destination| Transmit {
+        destination: destination.parse().unwrap(),
+        ..transmit()
+    });
+    let wrong_source = Transmit {
+        destination: MEMBERS[0].into(),
+        src_ip: Some("192.168.50.99".parse().unwrap()),
+        ..transmit()
+    };
+    for tx in bad.iter().chain([&wrong_source]) {
+        let socket = fresh();
+        assert_eq!(
+            socket.try_send(tx).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(socket.signal.is_revoked());
+        assert_eq!(
+            socket
+                .try_send(&Transmit {
+                    destination: MEMBERS[0].into(),
+                    ..transmit()
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(socket.io.sends.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn the_default_server_config_refuses_every_client() {
+    let (server_socket, client_socket) = memory_sockets();
+    let server_id = DeviceIdentity::generate().unwrap();
+    let client_id = DeviceIdentity::generate().unwrap();
+    let server = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(SecureQuicConfig::server_refusing_all().unwrap()),
+        server_socket.clone(),
+        Arc::new(quinn::TokioRuntime),
+    )
+    .unwrap();
+    let client = endpoint(client_socket.clone(), &client_id, &server_id);
+
+    let (dialed, accepted) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(
+            async {
+                client
+                    .connect(LOCAL.into(), LOCAL_TLS_SERVER_NAME)
+                    .unwrap()
+                    .await
+            },
+            async {
+                // With no certificate to present, the default config fails on the first flight.
+                match server.accept().await.unwrap().accept() {
+                    Ok(connecting) => connecting.await.map(drop),
+                    Err(refused) => Err(refused),
+                }
+            }
+        )
+    })
+    .await
+    .expect("the refusal is prompt");
+    assert!(dialed.is_err());
+    assert!(accepted.is_err());
+
+    // The same two identities connect once the member's pinned configuration is chosen.
+    let pinned = Arc::new(SecureQuicConfig::server(&server_id, &paired(&client_id)).unwrap());
+    let (dialed, accepted) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(
+            async {
+                client
+                    .connect(LOCAL.into(), LOCAL_TLS_SERVER_NAME)
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },
+            async {
+                server
+                    .accept()
+                    .await
+                    .unwrap()
+                    .accept_with(pinned)
+                    .unwrap()
+                    .await
+                    .unwrap()
+            }
+        )
+    })
+    .await
+    .expect("the pinned handshake finishes");
+    delivers(&dialed, &accepted).await;
+    server_socket.signal.revoke();
+    client_socket.signal.revoke();
+}
+
+#[tokio::test]
+async fn three_members_share_one_endpoint_each_bound_to_its_own_pin() {
+    let [hub_socket, first_socket, second_socket, third_socket] = memory_network([
+        (LOCAL, &MEMBERS[..]),
+        (MEMBERS[0], &[LOCAL][..]),
+        (MEMBERS[1], &[LOCAL][..]),
+        (MEMBERS[2], &[LOCAL][..]),
+    ]);
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 3].map(|()| DeviceIdentity::generate().unwrap());
+    let prints: [CertificateFingerprint; 3] = [0, 1, 2].map(|index| ids[index].fingerprint());
+    let hub = guarded(
+        hub_socket,
+        &hub_id,
+        &[
+            (MEMBERS[0], &ids[0]),
+            (MEMBERS[1], &ids[1]),
+            (MEMBERS[2], &ids[2]),
+        ],
+    );
+    let first = guarded(first_socket, &ids[0], &[(LOCAL, &hub_id)]);
+    let second = guarded(second_socket, &ids[1], &[(LOCAL, &hub_id)]);
+    let third = guarded(third_socket, &ids[2], &[(LOCAL, &hub_id)]);
+    assert_eq!(
+        hub.connect().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        hub.accept().await.unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+
+    let (from_first, from_third, accepted, (to_second, at_second)) =
+        tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                async { first.connect().unwrap().await.unwrap() },
+                async { third.connect().unwrap().await.unwrap() },
+                async {
+                    let one = hub.accept_any().await.unwrap();
+                    let other = hub.accept_any().await.unwrap();
+                    [one, other]
+                },
+                async {
+                    tokio::join!(
+                        async { hub.connect_member(prints[1]).unwrap().await.unwrap() },
+                        async { second.accept().await.unwrap() }
+                    )
+                }
+            )
+        })
+        .await
+        .expect("every member connected within a second");
+    hub.confirm_member(prints[1], &to_second).unwrap();
+    assert_eq!(to_second.remote_address(), MEMBERS[1].into());
+
+    let accepted_from = |print: CertificateFingerprint| {
+        accepted
+            .iter()
+            .find(|(member, _)| *member == print)
+            .map(|(_, connection)| connection)
+            .expect("each dialing member was accepted as itself")
+    };
+    let at_hub_first = accepted_from(prints[0]);
+    let at_hub_third = accepted_from(prints[2]);
+    assert_eq!(at_hub_first.remote_address(), MEMBERS[0].into());
+    assert_eq!(at_hub_third.remote_address(), MEMBERS[2].into());
+    for (ours, theirs) in [
+        (at_hub_first, &from_first),
+        (at_hub_third, &from_third),
+        (&to_second, &at_second),
+    ] {
+        delivers(ours, theirs).await;
+        delivers(theirs, ours).await;
+    }
+
+    // A connection names exactly one member; confirming it as another closes it.
+    assert_eq!(
+        hub.confirm_member(prints[0], &to_second)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    tokio::time::timeout(DEADLINE, at_second.closed())
+        .await
+        .expect("the misbound connection closed");
+    delivers(at_hub_first, &from_first).await;
+    assert!(
+        hub.confirm_member(hub_id.fingerprint(), at_hub_third)
+            .is_err()
+    );
+    for endpoint in [&hub, &first, &second, &third] {
+        endpoint.revoke();
+    }
+}
+
+#[tokio::test]
+async fn a_member_presenting_another_members_certificate_is_refused() {
+    let [hub_socket, impostor_socket, second_socket] = memory_network([
+        (LOCAL, &MEMBERS[..2]),
+        (MEMBERS[0], &[LOCAL][..]),
+        (MEMBERS[1], &[LOCAL][..]),
+    ]);
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let first_id = DeviceIdentity::generate().unwrap();
+    let second_id = DeviceIdentity::generate().unwrap();
+    let hub = guarded(
+        hub_socket,
+        &hub_id,
+        &[(MEMBERS[0], &first_id), (MEMBERS[1], &second_id)],
+    );
+    // The second member's key, used from the first member's recorded address.
+    let impostor = guarded(impostor_socket, &second_id, &[(LOCAL, &hub_id)]);
+    let second = guarded(second_socket, &second_id, &[(LOCAL, &hub_id)]);
+
+    let (dialed, refused) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(
+            async { impostor.connect().unwrap().await },
+            hub.accept_any()
+        )
+    })
+    .await
+    .expect("the refusal is prompt");
+    let Err(refused) = refused else {
+        panic!("the impostor was accepted");
+    };
+    let failure = handshake_failure(&refused);
+    assert!(failure.member == first_id.fingerprint());
+    assert!(failure.cause.is_some());
+    if let Ok(dialed) = dialed {
+        tokio::time::timeout(DEADLINE, dialed.closed())
+            .await
+            .expect("the impostor's connection closed");
+    }
+
+    let (dialed, answered) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(
+            async { hub.connect_member(first_id.fingerprint()).unwrap().await },
+            impostor.accept()
+        )
+    })
+    .await
+    .expect("the refusal is prompt");
+    assert!(dialed.is_err());
+    assert!(answered.is_err());
+
+    let (dialed, (member, accepted)) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(async { second.connect().unwrap().await.unwrap() }, async {
+            hub.accept_any().await.unwrap()
+        })
+    })
+    .await
+    .expect("the real member still connects");
+    assert!(member == second_id.fingerprint());
+    assert_eq!(accepted.remote_address(), MEMBERS[1].into());
+    delivers(&dialed, &accepted).await;
+    assert_eq!(
+        hub.confirm_member(first_id.fingerprint(), &accepted)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    for endpoint in [&hub, &impostor, &second] {
+        endpoint.revoke();
+    }
+}
+
+fn handles_cross_threads<T: Clone + Send + Sync + 'static>() {}
+
+#[test]
+fn connection_drivers_run_on_the_network_runtime_when_another_thread_dials() {
+    handles_cross_threads::<EndpointHandle>();
+    let (handle_sender, handle_receiver) = std::sync::mpsc::channel();
+    let (dialed_sender, dialed_receiver) = tokio::sync::oneshot::channel::<quinn::Connection>();
+    let network = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let [dialer_socket, listener_socket] =
+                memory_network([(LOCAL, &[PEER][..]), (PEER, &[LOCAL][..])]);
+            let dialer_id = DeviceIdentity::generate().unwrap();
+            let listener_id = DeviceIdentity::generate().unwrap();
+            let dialer = guarded(dialer_socket, &dialer_id, &[(PEER, &listener_id)]);
+            let listener = guarded(listener_socket, &listener_id, &[(LOCAL, &dialer_id)]);
+            handle_sender
+                .send((dialer.handle(), listener_id.fingerprint()))
+                .unwrap();
+            let (accepted, dialed) = tokio::time::timeout(DEADLINE, async {
+                tokio::join!(listener.accept(), dialed_receiver)
+            })
+            .await
+            .expect("the dial from another thread finished");
+            let (accepted, dialed) = (accepted.unwrap(), dialed.unwrap());
+            // The dialing thread's runtime is gone; only the network runtime drives this now.
+            delivers(&dialed, &accepted).await;
+            delivers(&accepted, &dialed).await;
+            dialer.revoke();
+            listener.revoke();
+        });
+    });
+
+    let (handle, listener) = handle_receiver.recv_timeout(DEADLINE).unwrap();
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    let connecting = handle.connect_member(listener).unwrap();
+    let dialing = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let connection = dialing
+        .block_on(async { tokio::time::timeout(DEADLINE, connecting).await })
+        .expect("the dial finished within a second")
+        .unwrap();
+    handle.confirm_member(listener, &connection).unwrap();
+    drop(dialing);
+    dialed_sender.send(connection).unwrap();
+    network.join().unwrap();
+    assert!(handle.is_revoked());
+}
+
 #[tokio::test]
 #[ignore = "explicit localhost-only guarded QUIC probe; does not authorize a physical network"]
 async fn native_loopback_guarded_quic_delivers_and_revokes() {
@@ -843,7 +1392,7 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
     let first = Arc::new(GuardedSocket {
         io: Arc::new(io_a),
         local: local_a,
-        peer: local_b,
+        members: [local_b].into(),
         interface_index: index,
         lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
@@ -851,7 +1400,7 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
     let second = Arc::new(GuardedSocket {
         io: Arc::new(io_b),
         local: local_b,
-        peer: local_a,
+        members: [local_a].into(),
         interface_index: index,
         lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),
@@ -868,7 +1417,7 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
             pending: Notify::new(),
         }),
         local: idle_address,
-        peer: local_b,
+        members: [local_b].into(),
         interface_index: index,
         lifetime: watch::Sender::new(()),
         signal: RevocationSignal::default(),

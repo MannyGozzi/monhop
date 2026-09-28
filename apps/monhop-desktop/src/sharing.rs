@@ -2423,6 +2423,8 @@ fn apply_link_event(shared: &Arc<Mutex<State>>, generation: u64, event: LinkEven
             state.view.sync = SyncView::default();
             state.view.message = "Lost the connection to the other computer. Reconnecting.".into();
         }
+        // Group record summaries are read once the app layer keeps group records.
+        LinkEvent::PeerSummary { .. } => {}
         LinkEvent::Closed => {
             let message = state
                 .close_message
@@ -3356,6 +3358,7 @@ pub(crate) mod tests {
                         Some(LinkCommand::Arranging(value)) => {
                             let _ = arranged.send(value);
                         }
+                        Some(LinkCommand::Summary(_)) => {}
                         Some(LinkCommand::Close) | None => {
                             let _ = events.send(LinkEvent::Closed);
                             return Ok(());

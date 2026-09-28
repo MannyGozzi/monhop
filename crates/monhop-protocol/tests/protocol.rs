@@ -45,6 +45,7 @@ fn all_messages() -> Vec<Message> {
                 Capabilities::RELATIVE_MOTION | Capabilities::DISPLAY_TOPOLOGY,
             )
             .expect("known capability bits"),
+            agreement: [3; 32],
         }),
         Message::SessionSetup(SessionSetup {
             purpose: SessionPurpose::Share,
@@ -685,10 +686,10 @@ fn readiness_requires_the_current_protocol_and_an_empty_reliable_body() {
     let ready = frame(3, Message::SessionReady);
     let mut bytes = Vec::new();
     ready.encode_into(&mut bytes).unwrap();
-    assert_eq!(PROTOCOL_VERSION, 11);
+    assert_eq!(PROTOCOL_VERSION, 12);
     assert_eq!(ready.delivery(), DeliveryClass::Reliable);
     assert_eq!(decode(&bytes), Ok(ready));
-    for version in 1_u16..=10 {
+    for version in 1_u16..=11 {
         let mut old = bytes.clone();
         old[4..6].copy_from_slice(&version.to_be_bytes());
         assert_eq!(decode(&old), Err(DecodeError::UnsupportedVersion));

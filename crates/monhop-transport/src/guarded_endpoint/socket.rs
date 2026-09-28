@@ -16,7 +16,7 @@ use quinn::{
 use tokio::sync::watch;
 
 use super::native::NativeSocket;
-use crate::policy::NetworkLock;
+use crate::policy::{MAX_PINNED_PEERS, NetworkLock};
 
 const MAX_DATAGRAM_BYTES: usize = 65_507;
 const RECEIVE_BUDGET: usize = 32;
@@ -65,7 +65,8 @@ impl DatagramIo for NativeSocket {
 pub(super) struct GuardedSocket<I> {
     io: Arc<I>,
     local: SocketAddrV4,
-    peer: SocketAddrV4,
+    /// Fixed for the socket's life: exactly the lock's peers, each with its pinned port.
+    members: Box<[SocketAddrV4]>,
     interface_index: u32,
     signal: RevocationSignal,
     /// Dropped with the socket, ending every `lifetime()` wait. Declared after `io`, so the OS
@@ -81,20 +82,19 @@ impl<I> fmt::Debug for GuardedSocket<I> {
     }
 }
 
-impl GuardedSocket<NativeSocket> {
+impl<I: DatagramIo> GuardedSocket<I> {
     pub(super) fn new(
-        io: NativeSocket,
+        io: I,
         lock: &NetworkLock,
         local: SocketAddrV4,
-        peer: SocketAddrV4,
+        members: &[SocketAddrV4],
         signal: RevocationSignal,
     ) -> io::Result<Self> {
         if lock.is_revoked() || signal.is_revoked() {
             return Err(revoked_error());
         }
         if local.port() == 0
-            || peer.port() == 0
-            || *peer.ip() != lock.peer()
+            || !members_match_lock(members, lock)
             || *local.ip() != lock.selected().address
             || io.local_addr()? != local
         {
@@ -106,7 +106,7 @@ impl GuardedSocket<NativeSocket> {
         Ok(Self {
             io: Arc::new(io),
             local,
-            peer,
+            members: members.into(),
             interface_index: lock.selected().index,
             signal,
             lifetime: watch::Sender::new(()),
@@ -114,10 +114,28 @@ impl GuardedSocket<NativeSocket> {
     }
 }
 
+/// The same distinct peers as the lock, in its order, each with a nonzero port.
+fn members_match_lock(members: &[SocketAddrV4], lock: &NetworkLock) -> bool {
+    (1..=MAX_PINNED_PEERS).contains(&members.len())
+        && members.len() == lock.peers().len()
+        && members
+            .iter()
+            .zip(lock.peers())
+            .all(|(member, peer)| member.port() != 0 && member.ip() == peer)
+        && members
+            .iter()
+            .enumerate()
+            .all(|(index, member)| !members[..index].contains(member))
+}
+
 impl<I> GuardedSocket<I> {
     /// Never changes; `changed()` errs once the socket is dropped and its OS socket closed.
     pub(super) fn lifetime(&self) -> watch::Receiver<()> {
         self.lifetime.subscribe()
+    }
+
+    pub(super) fn revocation(&self) -> RevocationSignal {
+        self.signal.clone()
     }
 }
 
@@ -149,9 +167,27 @@ impl<I: DatagramIo> GuardedSocket<I> {
     }
 
     fn permits(&self, packet: Arrival) -> bool {
-        packet.source == self.peer
+        self.members.contains(&packet.source)
             && packet.destination == *self.local.ip()
             && packet.interface_index == self.interface_index
+    }
+
+    /// The member a transmit is for, if it also keeps the pinned source address and size bounds.
+    fn permitted_destination(&self, transmit: &Transmit<'_>) -> Option<SocketAddrV4> {
+        let SocketAddr::V4(destination) = transmit.destination else {
+            return None;
+        };
+        if !self.members.contains(&destination)
+            || transmit
+                .src_ip
+                .is_some_and(|ip| ip != IpAddr::V4(*self.local.ip()))
+            || transmit.segment_size.is_some()
+            || transmit.contents.is_empty()
+            || transmit.contents.len() > MAX_DATAGRAM_BYTES
+        {
+            return None;
+        }
+        Some(destination)
     }
 }
 
@@ -168,19 +204,12 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
         if self.signal.is_revoked() {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        if transmit.destination != SocketAddr::V4(self.peer)
-            || transmit
-                .src_ip
-                .is_some_and(|ip| ip != IpAddr::V4(*self.local.ip()))
-            || transmit.segment_size.is_some()
-            || transmit.contents.is_empty()
-            || transmit.contents.len() > MAX_DATAGRAM_BYTES
-        {
-            self.revoke_because(&"a transmit left the pinned peer, address, or size bounds");
+        let Some(destination) = self.permitted_destination(transmit) else {
+            self.revoke_because(&"a transmit left the pinned peers, address, or size bounds");
             return Err(io::ErrorKind::WouldBlock.into());
-        }
+        };
         // No outgoing source/ECN ancillary data: IP_PKTINFO could override macOS interface pinning.
-        let result = self.io.try_send_to(transmit.contents, self.peer);
+        let result = self.io.try_send_to(transmit.contents, destination);
         if self.signal.is_revoked() {
             return Err(io::ErrorKind::WouldBlock.into());
         }
