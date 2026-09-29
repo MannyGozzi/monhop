@@ -954,6 +954,17 @@ pub struct GroupMemberRecord {
 pub struct PairedMember {
     pub session: NegotiatedSession,
     pub inspection: InspectedPeer,
+    /// This link's own cancel, to pass to the session run on it: stopping it ends only that
+    /// session, never the endpoint. The endpoint revokes it once the member is forgotten and
+    /// requests a stop once the link is released or replaced; revoking the endpoint closes the
+    /// connection instead.
+    pub cancel: RevocationSignal,
+}
+
+/// The connection a group endpoint last handed out for one member, with that link's cancel.
+struct LiveLink {
+    connection: quinn::Connection,
+    cancel: RevocationSignal,
 }
 
 /// Close reasons for member connections the group endpoint ends itself.
@@ -1194,7 +1205,7 @@ pub struct GroupEndpoint {
     routes: Arc<Mutex<Routes>>,
     /// Each member's latest connection handed out, kept so forget and a newer connection can
     /// close it. Dropping a session's handle therefore does not close its connection.
-    live: RefCell<Box<[Option<quinn::Connection>]>>,
+    live: RefCell<Box<[Option<LiveLink>]>>,
     controls: RefCell<Vec<GroupMemberRecord>>,
     peers: Box<[GroupPeer]>,
     local: LocalFacts,
@@ -1313,14 +1324,18 @@ impl GroupEndpoint {
         *self.controls.borrow_mut() = members.to_vec();
     }
 
+    /// The whole endpoint's revocation: stopping or revoking it ends every member's connection
+    /// and the endpoint itself. Never use it to cancel one link; each `PairedMember` carries its
+    /// own `cancel`.
     pub fn revocation(&self) -> RevocationSignal {
         self.revocation.clone()
     }
 
     /// Dials `member` or waits for it, as the pair's dial rule says, then negotiates `purpose`.
     /// A share session carries the member's control and `agreement`, and a different agreement on
-    /// the other computer is `ChangedSinceInspection`. Handing the session out closes the
-    /// member's previous connection.
+    /// the other computer is `ChangedSinceInspection`. A member forgotten, or `cancel` revoked,
+    /// before or during negotiation gets no session, and no Hello when that came first. Handing
+    /// the session out closes the member's previous connection.
     pub async fn connect(
         &self,
         member: CertificateFingerprint,
@@ -1355,7 +1370,7 @@ impl GroupEndpoint {
             } else {
                 self.wait_for(index, cancel).await?
             };
-            self.negotiate(index, connection, control, purpose, agreement)
+            self.negotiate_while_admitted(index, connection, control, purpose, agreement, cancel)
                 .await
         })
         .await;
@@ -1365,32 +1380,38 @@ impl GroupEndpoint {
         };
         let (session, inspection) = established?;
         // Forget runs on this thread, so nothing is handed out for a member it already removed.
-        if let Err(error) = self.check(index, None) {
-            let reason = if error == SetupFailure::PairingRequired {
-                MEMBER_FORGOTTEN_REASON
-            } else {
-                NETWORK_REVOKED_REASON
-            };
-            session.connection.close(0_u32.into(), reason);
+        if let Err(error) = self.check(index, Some(cancel)) {
+            session
+                .connection
+                .close(0_u32.into(), self.refusal_reason(error));
             return Err(error);
         }
-        let previous = self.live.borrow_mut()[index].replace(session.connection.clone());
+        let link_cancel = RevocationSignal::default();
+        let previous = self.live.borrow_mut()[index].replace(LiveLink {
+            connection: session.connection.clone(),
+            cancel: link_cancel.clone(),
+        });
         if let Some(previous) = previous {
-            previous.close(0_u32.into(), MEMBER_SUPERSEDED_REASON);
+            previous.cancel.request_stop();
+            previous
+                .connection
+                .close(0_u32.into(), MEMBER_SUPERSEDED_REASON);
         }
         Ok(PairedMember {
             session,
             inspection,
+            cancel: link_cancel,
         })
     }
 
     /// Closes `member`'s connection, leaving every other member's untouched.
     pub fn close_member(&self, member: CertificateFingerprint) {
-        let connection = self
+        let link = self
             .index(member)
             .and_then(|index| self.live.borrow_mut()[index].take());
-        if let Some(connection) = connection {
-            connection.close(0_u32.into(), MEMBER_RELEASED_REASON);
+        if let Some(link) = link {
+            link.cancel.request_stop();
+            link.connection.close(0_u32.into(), MEMBER_RELEASED_REASON);
         }
     }
 
@@ -1402,9 +1423,10 @@ impl GroupEndpoint {
         };
         self.endpoint.forget_member(member);
         routes(&self.routes).waiters[index] = None;
-        let connection = self.live.borrow_mut()[index].take();
-        if let Some(connection) = connection {
-            connection.close(0_u32.into(), MEMBER_FORGOTTEN_REASON);
+        let link = self.live.borrow_mut()[index].take();
+        if let Some(link) = link {
+            link.cancel.revoke();
+            link.connection.close(0_u32.into(), MEMBER_FORGOTTEN_REASON);
         }
         log::info!(
             "group endpoint: forgot paired computer {}",
@@ -1528,6 +1550,41 @@ impl GroupEndpoint {
         .await
     }
 
+    /// Why this endpoint closes a member's connection instead of handing it out.
+    fn refusal_reason(&self, error: SetupFailure) -> &'static [u8] {
+        if error == SetupFailure::PairingRequired {
+            MEMBER_FORGOTTEN_REASON
+        } else if self.endpoint.is_revoked() {
+            NETWORK_REVOKED_REASON
+        } else {
+            MEMBER_RELEASED_REASON
+        }
+    }
+
+    /// Negotiates only while the member stays admitted and nothing cancels. The check runs
+    /// before the Hello goes out, and a stop found midway closes the connection with its reason
+    /// before the unfinished handshake is dropped.
+    async fn negotiate_while_admitted(
+        &self,
+        index: usize,
+        connection: quinn::Connection,
+        control: ControlPermissions,
+        purpose: SessionPurpose,
+        agreement: [u8; 32],
+        cancel: &RevocationSignal,
+    ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
+        let closing = connection.clone();
+        let negotiation = self.negotiate(index, connection, control, purpose, agreement);
+        tokio::pin!(negotiation);
+        let result = self
+            .while_member_active(index, cancel, &mut negotiation)
+            .await;
+        if let Err(error @ (SetupFailure::PairingRequired | SetupFailure::Cancelled)) = result {
+            closing.close(0_u32.into(), self.refusal_reason(error));
+        }
+        result
+    }
+
     async fn negotiate(
         &self,
         index: usize,
@@ -1566,8 +1623,10 @@ impl GroupEndpoint {
         loop {
             let attempt = tokio::time::timeout(DIAL_ATTEMPT_DEADLINE, async {
                 let connection = self.dial(index, cancel).await?;
-                self.negotiate(index, connection, control, purpose, agreement)
-                    .await
+                self.negotiate_while_admitted(
+                    index, connection, control, purpose, agreement, cancel,
+                )
+                .await
             })
             .await;
             match attempt {
@@ -2842,6 +2901,196 @@ mod group_tests {
         .await
         .expect("both sides settle the refusal");
         assert_eq!(ours.err(), Some(SetupFailure::PeerIdentityChanged));
+    }
+
+    /// Connects `remote` once the hub waits for it, reads the start of the hub's Hello, then
+    /// runs `interrupt` without ever answering, and reports how the hub closed the connection.
+    async fn interrupted_negotiation(
+        remote: &Remote,
+        hub: &Hub,
+        interrupt: impl FnOnce(),
+    ) -> (quinn::ConnectionError, Duration) {
+        until(|| hub.group.waiting(remote.fingerprint())).await;
+        let connection = remote
+            .endpoint
+            .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+            .unwrap()
+            .await
+            .unwrap();
+        let (_, mut hello) = connection.accept_bi().await.unwrap();
+        let mut first_byte = [0_u8; 1];
+        hello.read_exact(&mut first_byte).await.unwrap();
+        let interrupted = Instant::now();
+        interrupt();
+        let closed = connection.closed().await;
+        (closed, interrupted.elapsed())
+    }
+
+    fn closed_with(error: &quinn::ConnectionError, reason: &[u8]) -> bool {
+        matches!(
+            error,
+            quinn::ConnectionError::ApplicationClosed(close) if close.reason.as_ref() == reason
+        )
+    }
+
+    #[tokio::test]
+    async fn a_member_forgotten_mid_negotiation_gets_no_session() {
+        use crate::session_handshake::HANDSHAKE_DEADLINE;
+        let computers = [(); 2].map(|()| Computer::new());
+        let hub = hub(&computers.each_ref(), false, &[]);
+        let [forgotten, kept] = computers.map(|computer| computer.dialing(&hub));
+        let setup = SessionPurpose::Setup;
+
+        let fingerprint = forgotten.fingerprint();
+        let (ours, (closed, took)) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub.group
+                    .connect(fingerprint, setup, NO_AGREEMENT, &hub.cancel),
+                interrupted_negotiation(&forgotten, &hub, || hub.group.forget(fingerprint))
+            )
+        })
+        .await
+        .expect("both sides settle the forget");
+        assert_eq!(ours.err(), Some(SetupFailure::PairingRequired));
+        assert!(closed_with(&closed, MEMBER_FORGOTTEN_REASON), "{closed}");
+        assert!(took < HANDSHAKE_DEADLINE, "ended after {took:?}");
+
+        // A connect cancelled midway gets no session either; the endpoint and the other member
+        // carry on.
+        let cancel = RevocationSignal::default();
+        let fingerprint = kept.fingerprint();
+        let (ours, (closed, took)) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub.group.connect(fingerprint, setup, NO_AGREEMENT, &cancel),
+                interrupted_negotiation(&kept, &hub, || cancel.revoke())
+            )
+        })
+        .await
+        .expect("both sides settle the cancel");
+        assert_eq!(ours.err(), Some(SetupFailure::Cancelled));
+        assert!(closed_with(&closed, MEMBER_RELEASED_REASON), "{closed}");
+        assert!(took < HANDSHAKE_DEADLINE, "ended after {took:?}");
+        assert!(!hub.group.revocation().is_stopping());
+        let (paired, _dialed) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub.group
+                    .connect(fingerprint, setup, NO_AGREEMENT, &hub.cancel),
+                async {
+                    until(|| hub.group.waiting(fingerprint)).await;
+                    remote_dials(&kept, &hub).await
+                }
+            )
+        })
+        .await
+        .expect("the kept computer still connects");
+        assert!(paired.unwrap().inspection.peer_fingerprint == fingerprint);
+    }
+
+    /// The hub dials `remote` for a setup link while it answers.
+    async fn dial_setup(
+        hub: &Hub,
+        remote: &Remote,
+    ) -> (
+        Result<PairedMember, SetupFailure>,
+        Result<NegotiatedSession, HandshakeError>,
+    ) {
+        tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub.group.connect(
+                    remote.fingerprint(),
+                    SessionPurpose::Setup,
+                    NO_AGREEMENT,
+                    &hub.cancel
+                ),
+                async {
+                    let connection = remote.endpoint.accept().await.unwrap().await.unwrap();
+                    remote_negotiates(remote, hub, connection, SessionPurpose::Setup, NO_AGREEMENT)
+                        .await
+                }
+            )
+        })
+        .await
+        .expect("the member answers")
+    }
+
+    #[tokio::test]
+    async fn a_dial_to_an_unreachable_member_is_a_transient_connection_failure() {
+        let computers = [(); 2].map(|()| Computer::new());
+        let hub = hub(&computers.each_ref(), true, &[]);
+        let [down, up] = computers.map(|computer| computer.listening(&hub));
+
+        hub.group.endpoint.set_reachable(&[false, true]);
+        let failure = tokio::time::timeout(
+            DEADLINE,
+            hub.group.connect(
+                down.fingerprint(),
+                SessionPurpose::Setup,
+                NO_AGREEMENT,
+                &hub.cancel,
+            ),
+        )
+        .await
+        .expect("the dial fails at once")
+        .err()
+        .expect("no session without a route");
+        assert_eq!(failure, SetupFailure::Connection);
+        assert!(is_transient(failure));
+        let (paired, answered) = dial_setup(&hub, &up).await;
+        assert!(paired.unwrap().inspection.peer_fingerprint == up.fingerprint());
+        answered.unwrap();
+
+        // The route check that finds it again admits the next dial.
+        hub.group.endpoint.set_reachable(&[true, true]);
+        let (paired, answered) = dial_setup(&hub, &down).await;
+        assert!(paired.unwrap().inspection.peer_fingerprint == down.fingerprint());
+        answered.unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_link_has_its_own_cancel_apart_from_the_endpoints() {
+        let computer = Computer::new();
+        let hub = hub(&[&computer], false, &[]);
+        let remote = computer.dialing(&hub);
+        let fingerprint = remote.fingerprint();
+        let link = || async {
+            let (paired, dialed) = tokio::time::timeout(DEADLINE, async {
+                tokio::join!(
+                    hub.group.connect(
+                        fingerprint,
+                        SessionPurpose::Setup,
+                        NO_AGREEMENT,
+                        &hub.cancel
+                    ),
+                    async {
+                        until(|| hub.group.waiting(fingerprint)).await;
+                        remote_dials(&remote, &hub).await
+                    }
+                )
+            })
+            .await
+            .expect("the computer connects");
+            (paired.unwrap(), dialed)
+        };
+
+        // A newer link stops the one it replaces, and only that one.
+        let (first, _first_dialed) = link().await;
+        let (second, _second_dialed) = link().await;
+        assert!(first.cancel.is_stopping() && !first.cancel.is_revoked());
+        assert!(!second.cancel.is_stopping());
+
+        // A session stopping its own link leaves the endpoint and the connection to the caller.
+        second.cancel.request_stop();
+        assert!(!hub.group.revocation().is_stopping());
+        assert!(second.session.connection.close_reason().is_none());
+
+        let (third, _third_dialed) = link().await;
+        hub.group.close_member(fingerprint);
+        assert!(third.cancel.is_stopping() && !third.cancel.is_revoked());
+
+        let (fourth, _fourth_dialed) = link().await;
+        hub.group.forget(fingerprint);
+        assert!(fourth.cancel.is_revoked());
+        assert!(!hub.group.revocation().is_stopping());
     }
 
     #[test]

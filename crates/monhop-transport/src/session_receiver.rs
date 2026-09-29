@@ -4,8 +4,8 @@ use crate::session_clock::millis_u64;
 use crate::session_health::{HOLD_LIMIT, HealthError, PEER_LIVENESS, PeerHealth, hold_stats};
 use crate::session_startup::ReadyControl;
 use monhop_core::{
-    DisplayId, FloorPeer, FloorSnapshot, FloorState, GesturePhase, HidUsage, ModifierState,
-    MouseButton, Point, PointerGesture, SharedFloor, SystemGesture, TakeBackGate,
+    DisplayId, FloorOwner, FloorPeer, FloorSnapshot, FloorState, GesturePhase, HidUsage,
+    ModifierState, MouseButton, Point, PointerGesture, SharedFloor, SystemGesture, TakeBackGate,
     gesture_latch::TOUCH_STREAM_IDLE,
 };
 use monhop_protocol::{
@@ -226,6 +226,14 @@ impl InputReceiver {
         !self.shared || self.holds(self.gate.floor().snapshot())
     }
 
+    /// Whether native releases are this receiver's to make: when it owns native input, and while
+    /// no receiver holds the floor inbound, since no owner's injection can be disturbed then and
+    /// input a freed claim left down must still come up.
+    fn may_release(&self) -> bool {
+        let floor = self.gate.floor().snapshot();
+        !self.shared || self.holds(floor) || floor.state.owner() != Some(FloorOwner::Inbound)
+    }
+
     fn release_floor(&mut self) {
         if let Some(generation) = self.floor_generation.take() {
             let floor = self.gate.floor();
@@ -391,7 +399,7 @@ impl InputReceiver {
             && now.saturating_sub(self.gesture_seen) >= TOUCH_STREAM_IDLE
         {
             self.open_gestures = [false; 2];
-            if self.owns_native()
+            if self.may_release()
                 && let Err(failure) = deliver(destination, DestinationAction::EndGestures)
             {
                 return Err(self.stop(failure, destination));
@@ -551,11 +559,12 @@ impl InputReceiver {
         match &frame.message {
             Message::ReleaseAll => {
                 // Closing admission precedes native cleanup and the floor becoming available.
-                // Without the floor it is still acknowledged, but never releases the owner's input.
-                if self.owns_native() {
-                    if self.floor_generation.is_some() {
-                        self.gate.open_injection(0);
-                    }
+                // Without the floor it is still acknowledged, but never releases another owner's
+                // input.
+                if self.owns_native() && self.floor_generation.is_some() {
+                    self.gate.open_injection(0);
+                }
+                if self.may_release() {
                     self.release_injected(destination)
                         .map_err(|_| ReceiverFailure::NativeDelivery)?;
                     self.gate.note_injected_released();
@@ -700,12 +709,14 @@ impl InputReceiver {
         failure
     }
 
-    /// A shared receiver without the floor injected nothing, so its cleanup is bookkeeping only.
+    /// While another receiver holds the floor inbound, a shared receiver's cleanup is bookkeeping
+    /// only: a native release would lift that owner's input, and the owner's own release lifts
+    /// everything injected.
     pub fn retry_cleanup(&mut self, destination: &mut impl InputDestination) {
         if !self.cleanup_pending {
             return;
         }
-        let native = self.owns_native();
+        let native = self.may_release();
         if native && self.release_injected(destination).is_err() {
             return;
         }

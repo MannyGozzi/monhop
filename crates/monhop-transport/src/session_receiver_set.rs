@@ -227,9 +227,10 @@ impl Slot {
     }
 }
 
-/// The destination as one slot's receiver reaches it: unless the floor names that slot inbound,
+/// The destination as one slot's receiver reaches it: while the floor names another slot inbound,
 /// nothing reaches native input, releases included, so another peer's barrier or failure never
-/// lifts the owner's held keys or drag. Dropped posts succeed, as refused native admission does.
+/// lifts the owner's held keys or drag. With no inbound owner releases pass, so input a freed
+/// claim left down still comes up. Dropped posts succeed, as refused native admission does.
 struct OwnerGuard<'a, D> {
     destination: &'a mut D,
     floor: &'a SharedFloor,
@@ -239,7 +240,13 @@ struct OwnerGuard<'a, D> {
 impl<D: InputDestination> InputDestination for OwnerGuard<'_, D> {
     fn apply(&mut self, action: DestinationAction) -> Result<(), DestinationFailure> {
         let floor = self.floor.snapshot();
-        if floor.peer != self.slot || floor.state.owner() != Some(FloorOwner::Inbound) {
+        let inbound = floor.state.owner() == Some(FloorOwner::Inbound);
+        let admitted = if inbound {
+            floor.peer == self.slot
+        } else {
+            action.is_release()
+        };
+        if !admitted {
             return Ok(());
         }
         self.destination.apply(action)
@@ -514,8 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_guard_passes_only_the_floors_inbound_owner() {
-        fn through(target: &mut Destination, floor: &SharedFloor, slot: FloorPeer) {
+    fn the_owner_guard_passes_the_inbound_owner_and_releases_while_none_receives() {
+        fn through(target: &mut Destination, floor: &SharedFloor, slot: FloorPeer) -> usize {
+            let before = target.calls.len();
             let mut guarded = OwnerGuard {
                 destination: target,
                 floor,
@@ -524,21 +532,137 @@ mod tests {
             for action in [ReleaseAll, EndGestures, pressed(true)] {
                 assert_eq!(guarded.apply(action), Ok(()));
             }
+            target.calls.len() - before
         }
         let floor = SharedFloor::new();
         let mut target = Destination::default();
-        through(&mut target, &floor, slot(1));
+        // Free, then held by the outbound half: releases only.
+        assert_eq!(through(&mut target, &floor, slot(1)), 2);
         floor
             .claim(floor.snapshot(), FloorState::Requesting, slot(1))
             .unwrap();
-        through(&mut target, &floor, slot(1));
+        assert_eq!(through(&mut target, &floor, slot(2)), 2);
+        assert_eq!(
+            target.calls,
+            [ReleaseAll, EndGestures, ReleaseAll, EndGestures]
+        );
+        // Held inbound: everything for the owner, nothing for any other slot.
         floor
             .claim(floor.snapshot(), FloorState::Receiving, slot(1))
             .unwrap();
-        through(&mut target, &floor, slot(2));
-        assert!(target.calls.is_empty());
-        through(&mut target, &floor, slot(1));
-        assert_eq!(target.calls, [ReleaseAll, EndGestures, pressed(true)]);
+        assert_eq!(through(&mut target, &floor, slot(2)), 0);
+        assert_eq!(through(&mut target, &floor, slot(1)), 3);
+        assert_eq!(target.calls[4..], [ReleaseAll, EndGestures, pressed(true)]);
+        floor
+            .transition(floor.snapshot(), FloorState::Yielding)
+            .unwrap();
+        assert_eq!(through(&mut target, &floor, slot(2)), 0);
+    }
+
+    #[test]
+    fn a_release_is_let_through_when_the_floor_has_no_inbound_owner() {
+        let (mut set, gate) = set_with(&[1, 2, 3]);
+        let floor = gate.floor().clone();
+        let mut target = Destination::default();
+        let at = Duration::ZERO;
+
+        // The claim is freed before its source's barrier lands; the barrier still lifts the key.
+        set.receive(slot(1), &activation(2), at, &mut target)
+            .unwrap();
+        set.receive(slot(1), &key(2, 1, true), at, &mut target)
+            .unwrap();
+        gate.note_injected_press();
+        assert!(floor.release_peer(slot(1), floor.snapshot().generation));
+        assert_eq!(
+            sent(set.receive(slot(1), &frame(2, 2, Message::ReleaseAll), at, &mut target)),
+            (2, 1, Message::ReleaseAck)
+        );
+        assert!(!gate.injected_held());
+        assert_eq!(
+            target.calls,
+            [
+                MoveTo(Point::new(10.0, 10.0)),
+                pressed(true),
+                EndGestures,
+                ReleaseAll
+            ]
+        );
+
+        // Freed before its slot is removed, the stop still releases.
+        set.receive(slot(2), &activation(2), at, &mut target)
+            .unwrap();
+        set.receive(slot(2), &key(2, 1, true), at, &mut target)
+            .unwrap();
+        gate.note_injected_press();
+        floor.reset();
+        assert!(set.remove(slot(2), &mut target));
+        assert!(!gate.injected_held());
+        assert_eq!(
+            target.calls[4..],
+            [
+                MoveTo(Point::new(10.0, 10.0)),
+                pressed(true),
+                EndGestures,
+                ReleaseAll
+            ]
+        );
+
+        // Held by this computer's outbound half, the floor has no inbound owner either.
+        floor
+            .claim(floor.snapshot(), FloorState::Requesting, slot(2))
+            .unwrap();
+        assert!(set.remove(slot(1), &mut target));
+        assert_eq!(target.calls[8..], [EndGestures, ReleaseAll]);
+
+        // While another slot receives, a release is withheld.
+        let requested = floor.snapshot();
+        assert!(floor.release_peer(slot(2), requested.generation));
+        assert_eq!(
+            sent(set.receive(slot(3), &activation(2), at, &mut target)),
+            (2, 0, Message::ActivationAck(DisplayId(1)))
+        );
+        set.add(slot(1), receiver(), false, true, 3).unwrap();
+        assert!(set.remove(slot(1), &mut target));
+        assert_eq!(target.calls[10..], [MoveTo(Point::new(10.0, 10.0))]);
+        assert!(gate.admits_injection());
+    }
+
+    #[test]
+    fn take_back_after_the_floor_owner_changed_reaches_the_new_owner() {
+        let (mut set, gate) = set_with(&[1, 2]);
+        let mut target = Destination::default();
+        let at = Duration::ZERO;
+        set.receive(slot(1), &activation(2), at, &mut target)
+            .unwrap();
+        // Local input yields slot 1's claim, whose barrier lands before the set takes the
+        // trigger; slot 2 then takes the floor.
+        take_back_locally(&gate);
+        assert_eq!(
+            sent(set.receive(slot(1), &frame(2, 1, Message::ReleaseAll), at, &mut target)),
+            (2, 1, Message::ReleaseAck)
+        );
+        assert_eq!(gate.floor().snapshot().state, FloorState::Free);
+        set.receive(slot(2), &activation(2), at, &mut target)
+            .unwrap();
+        set.receive(slot(2), &key(2, 1, true), at, &mut target)
+            .unwrap();
+        let owned = gate.floor().snapshot();
+        assert_eq!((owned.state, owned.peer), (FloorState::Receiving, slot(2)));
+        let calls = target.calls.len();
+
+        // The stale trigger reaches the new owner, which neither answers nor releases.
+        assert_eq!(set.take_back(&mut target), Some((slot(2), Ok(None))));
+        assert_eq!(target.calls.len(), calls);
+        assert_eq!(gate.floor().snapshot(), owned);
+        assert!(gate.admits_injection());
+
+        // A take-back of the new owner's own claim yields it.
+        take_back_locally(&gate);
+        let (owner, taken) = set.take_back(&mut target).expect("the owner takes it");
+        assert_eq!(owner, slot(2));
+        assert_eq!(sent(taken), (2, 1, Message::TakeBack));
+        assert_eq!(target.calls[calls..], [EndGestures, ReleaseAll]);
+        assert!(set.take_back(&mut target).is_none());
     }
 
     #[test]

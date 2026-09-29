@@ -96,12 +96,26 @@ export function keepForgetListed(armed, fingerprint, entries) {
 
 export const CONTROL_PAUSE_HINT = "Use Pause to stop sharing";
 
+// A specific member's own "may control the others" toggle, read from the group's per-member list
+// (`control.members`, one entry per computer other than this one). Legacy `control.peerToLocal` is
+// the fallback: no member list, or no fingerprint to look one up by, so every existing single-peer
+// caller reads exactly as it always has.
+function memberPeerToLocal(control, fingerprint) {
+  if (fingerprint && Array.isArray(control?.members)) {
+    const entry = control.members.find((member) => member.fingerprint === fingerprint);
+    if (entry) return entry.allowed;
+  }
+  return control?.peerToLocal ?? true;
+}
+
 // Two switches, one per direction. With no active record yet, both read on, matching what a fresh
 // setup turns on by default. The last enabled direction cannot be turned off here — pausing is how
-// sharing stops entirely — and both disable while a change to either is still syncing.
-export function controlSwitchRows(control, localName, peerName, syncing) {
+// sharing stops entirely — and both disable while a change to either is still syncing. `fingerprint`
+// picks one member's own direction out of a group's `control.members`; omitted, this is today's
+// single-peer pair.
+export function controlSwitchRows(control, localName, peerName, syncing, fingerprint) {
   const localToPeer = control?.localToPeer ?? true;
-  const peerToLocal = control?.peerToLocal ?? true;
+  const peerToLocal = memberPeerToLocal(control, fingerprint);
   const isSyncing = syncing === true || control?.syncing === true;
   const row = (direction, label, checked, isLast) => ({
     direction,
@@ -137,4 +151,40 @@ export function layoutRows({ fingerprint, entries, armed, isActive, connected, b
     disabled: locked,
     load: loadGate({ isActive, connected, entry }),
   }));
+}
+
+// --- switching computers in and out -----------------------------------------
+
+// Which computers are switched in, in the group's own order: the live view's own list wins once the
+// backend sends one, then the polled computers reply's own list, and a bare `active` fingerprint
+// (today's only source) is always the fallback, so a reply from before the multi-computer backend
+// lands reads exactly as it always has.
+export function resolveEnabledList(sharingView, computers, active) {
+  if (Array.isArray(sharingView?.enabled) && sharingView.enabled.length) return sharingView.enabled;
+  if (Array.isArray(computers?.enabled) && computers.enabled.length) return computers.enabled;
+  return active ? [active] : [];
+}
+
+export function isComputerEnabled(fingerprint, enabledList) {
+  return Array.isArray(enabledList) && enabledList.includes(fingerprint);
+}
+
+// The color slot a card's icon and pill draw in, matching the group arrangement picture's own tones
+// (arrangement-view-model.mjs's `defaultTone`, applied to the peers only: the local computer never
+// gets its own Home card, so "local" never appears here): the first enabled computer is "peer", the
+// rest are "peer-2".."peer-6" (a group tops out at 8 members, so an 8th enabled computer reuses
+// "peer-6" rather than drawing in no color at all).
+export function computerTone(fingerprint, enabledList) {
+  const index = Array.isArray(enabledList) ? enabledList.indexOf(fingerprint) : -1;
+  const position = index < 0 ? 0 : index;
+  return position === 0 ? "peer" : `peer-${Math.min(position + 1, 6)}`;
+}
+
+// Switches one computer in or out: the new per-computer action once the app provides it, falling
+// back to today's single-active-computer action so an app.js that has not wired the new one up yet
+// keeps working exactly as before.
+export function toggleComputerEnabled(actions, fingerprint, enabled) {
+  if (typeof actions?.setComputerEnabled === "function")
+    return actions.setComputerEnabled(fingerprint, !enabled);
+  return actions.useComputer(enabled ? null : fingerprint);
 }

@@ -41,6 +41,8 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIET: Duration = Duration::from_millis(200);
 /// The concurrent unidirectional streams `attach` grants.
 const GRANTED_STREAMS: usize = 2;
+/// The receiver admits 16 streams per this window.
+const RATE_WINDOW: Duration = Duration::from_secs(10);
 /// More than the 16 KiB stream window, so writing it proves the link admitted the header.
 const PAST_THE_WINDOW: usize = 20 * 1024;
 const MIB: usize = 1024 * 1024;
@@ -937,6 +939,63 @@ async fn more_than_sixteen_streams_in_ten_seconds_are_refused() {
             .wait_note(0, violation(None, Violation::RateLimited))
             .await;
         assert_eq!(server.recorder.violations(), 1);
+    })
+    .await
+    .expect("test exceeded its deadline");
+}
+
+/// A burst the path bunched up past the rate counts as one violation however many streams it
+/// holds, and content flows again once the window has passed.
+#[tokio::test]
+async fn jitter_beyond_the_rate_window_does_not_disable_the_link() {
+    let runtime = ClipboardRuntime::start();
+    timeout(TEST_TIMEOUT, async {
+        let pair = negotiated_pair().await;
+        let epoch = pair.server.initial_epoch.get();
+        let server = Side::attach(&pair.server, pair.client_id, true, &runtime);
+        let client = pair.client.connection.clone();
+        let started = Instant::now();
+
+        for sequence in 1..=16 {
+            let mark = server.recorder.mark();
+            raw_transfer(&client, &state_stream(epoch, sequence, sequence % 2 == 1)).await;
+            server
+                .recorder
+                .wait_peer_state(mark, sequence % 2 == 1)
+                .await;
+        }
+        // Twice as many streams over the rate as it takes violations to disable the link.
+        for sequence in 17..=24 {
+            let mark = server.recorder.mark();
+            let stream = raw_stream(&client, &state_stream(epoch, sequence, true)).await;
+            assert_stopped(&stream).await;
+            let expected = if sequence == 17 {
+                violation(None, Violation::RateLimited)
+            } else {
+                refused(None, Refusal::RateLimited)
+            };
+            server.recorder.wait_note(mark, expected).await;
+        }
+        assert_eq!(
+            (server.recorder.violations(), server.recorder.disabled()),
+            (1, 0)
+        );
+
+        tokio::time::sleep_until(started + RATE_WINDOW + Duration::from_secs(1)).await;
+        raw_transfer(
+            &client,
+            &[header(ClipboardKind::Text, epoch, 25, 5), b"later".to_vec()].concat(),
+        )
+        .await;
+        let (kind, bytes, sequence, _) = server.recorder.wait_received(0).await;
+        assert_eq!(
+            (kind, bytes.as_slice(), sequence),
+            (ClipboardKind::Text, &b"later"[..], 25)
+        );
+        assert_eq!(
+            (server.recorder.violations(), server.recorder.disabled()),
+            (1, 0)
+        );
     })
     .await
     .expect("test exceeded its deadline");

@@ -28,7 +28,7 @@ use crate::{
     policy::{MAX_PINNED_PEERS, is_private_or_link_local},
 };
 use runtime::HandleRuntime;
-use socket::{DatagramIo, GuardedSocket};
+use socket::{DatagramIo, GuardedSocket, Reachability};
 
 /// Incoming handshakes one member may have running at once; more are refused until one ends.
 const MAX_MEMBER_HANDSHAKES: usize = 2;
@@ -300,6 +300,8 @@ fn member_configs(identity: &DeviceIdentity, members: &[GroupMember]) -> io::Res
 /// stray handle never keeps the pinned socket open.
 struct Shared {
     members: Box<[Member]>,
+    /// The socket's route verdict for each member, in member order.
+    reachability: Arc<Reachability>,
     signal: RevocationSignal,
     endpoint: Mutex<Option<quinn::Endpoint>>,
 }
@@ -307,10 +309,15 @@ struct Shared {
 impl Shared {
     /// Only a member still admitted: a forgotten one is no longer paired on this endpoint.
     fn member(&self, fingerprint: CertificateFingerprint) -> io::Result<&Member> {
-        let member = self
+        self.admitted_member(fingerprint).map(|(_, member)| member)
+    }
+
+    fn admitted_member(&self, fingerprint: CertificateFingerprint) -> io::Result<(usize, &Member)> {
+        let (index, member) = self
             .members
             .iter()
-            .find(|member| member.fingerprint == fingerprint)
+            .enumerate()
+            .find(|(_, member)| member.fingerprint == fingerprint)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -323,7 +330,7 @@ impl Shared {
                 "that computer is no longer paired on this endpoint",
             ));
         }
-        Ok(member)
+        Ok((index, member))
     }
 
     /// The admitted member recorded at exactly `remote`, IP and port.
@@ -394,7 +401,14 @@ impl Shared {
 
     fn connect_member(&self, fingerprint: CertificateFingerprint) -> io::Result<quinn::Connecting> {
         self.check_active()?;
-        let member = self.member(fingerprint)?;
+        let (index, member) = self.admitted_member(fingerprint)?;
+        // Its datagrams would only be dropped; the caller retries once a route check finds it.
+        if !self.reachability.reaches(index) {
+            return Err(io::Error::new(
+                io::ErrorKind::HostUnreachable,
+                "that computer has no usable route on the selected network",
+            ));
+        }
         let Some(endpoint) = self.endpoint() else {
             return Err(socket::revoked_error());
         };
@@ -487,7 +501,7 @@ pub(crate) struct Acceptor {
     network: tokio::runtime::Handle,
     running: JoinSet<Handshake>,
     pending: Arc<[AtomicUsize]>,
-    budgets: Box<[HandshakeBudget]>,
+    budgets: Box<[TokenBucket]>,
 }
 
 /// What one accept produced.
@@ -516,36 +530,37 @@ impl Drop for PendingSlot {
     }
 }
 
-/// A token bucket over one member's incoming handshakes, so a flood from one recorded address
-/// never takes another member's turn or the network thread.
-struct HandshakeBudget {
+/// A token bucket over one member's attempts, so a flood from one recorded address never takes
+/// another member's turn or the network thread: `burst` back to back, then one per `refill`.
+struct TokenBucket {
+    burst: u32,
+    refill: Duration,
     tokens: u32,
     refilled: Instant,
 }
 
-impl HandshakeBudget {
-    fn new(now: Instant) -> Self {
+impl TokenBucket {
+    fn new(burst: u32, refill: Duration, now: Instant) -> Self {
         Self {
-            tokens: MEMBER_HANDSHAKE_BURST,
+            burst,
+            refill,
+            tokens: burst,
             refilled: now,
         }
     }
 
     fn take(&mut self, now: Instant) -> bool {
-        if self.tokens < MEMBER_HANDSHAKE_BURST {
-            let earned = now.saturating_duration_since(self.refilled).as_nanos()
-                / MEMBER_HANDSHAKE_REFILL.as_nanos();
+        if self.tokens < self.burst {
+            let earned =
+                now.saturating_duration_since(self.refilled).as_nanos() / self.refill.as_nanos();
             let earned = u32::try_from(earned).unwrap_or(u32::MAX);
             if earned > 0 {
-                self.tokens = self
-                    .tokens
-                    .saturating_add(earned)
-                    .min(MEMBER_HANDSHAKE_BURST);
-                // Below the cap, earned < BURST, so the product cannot overflow.
-                self.refilled = if self.tokens == MEMBER_HANDSHAKE_BURST {
+                self.tokens = self.tokens.saturating_add(earned).min(self.burst);
+                // Below the cap, earned < burst, so the product cannot overflow.
+                self.refilled = if self.tokens == self.burst {
                     now
                 } else {
-                    self.refilled + MEMBER_HANDSHAKE_REFILL * earned
+                    self.refilled + self.refill * earned
                 };
             }
         }
@@ -553,12 +568,17 @@ impl HandshakeBudget {
             return false;
         }
         // A full bucket earns nothing, so its refill clock starts at the first take.
-        if self.tokens == MEMBER_HANDSHAKE_BURST {
+        if self.tokens == self.burst {
             self.refilled = now;
         }
         self.tokens -= 1;
         true
     }
+}
+
+/// Incoming handshakes one member may start.
+fn handshake_budget(now: Instant) -> TokenBucket {
+    TokenBucket::new(MEMBER_HANDSHAKE_BURST, MEMBER_HANDSHAKE_REFILL, now)
 }
 
 impl Acceptor {
@@ -567,7 +587,7 @@ impl Acceptor {
         let members = shared.members.len();
         Self {
             pending: (0..members).map(|_| AtomicUsize::new(0)).collect(),
-            budgets: (0..members).map(|_| HandshakeBudget::new(now)).collect(),
+            budgets: (0..members).map(|_| handshake_budget(now)).collect(),
             running: JoinSet::new(),
             shared,
             network,
@@ -771,11 +791,13 @@ impl EndpointHandle {
     }
 }
 
-/// What carries QUIC for one endpoint: the socket, its revocation and its lifetime.
+/// What carries QUIC for one endpoint: the socket, its revocation, its lifetime and its members'
+/// reachability.
 struct Carrier {
     socket: Arc<dyn AsyncUdpSocket>,
     signal: RevocationSignal,
     lifetime: watch::Receiver<()>,
+    reachability: Arc<Reachability>,
 }
 
 impl Carrier {
@@ -783,6 +805,7 @@ impl Carrier {
         Self {
             signal: socket.revocation(),
             lifetime: socket.lifetime(),
+            reachability: socket.reachability(),
             socket: Arc::new(socket),
         }
     }
@@ -838,6 +861,7 @@ impl GuardedEndpoint {
             &prepared.lock,
             pinned.local,
             &pinned.peers,
+            prepared.reachability,
             prepared.signal,
         )?;
         Self::assemble(
@@ -861,7 +885,14 @@ impl GuardedEndpoint {
             socket,
             signal,
             lifetime,
+            reachability,
         } = carrier;
+        if reachability.len() != members.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the socket's members differ from the endpoint's",
+            ));
+        }
         let network = runtime.handle().clone();
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
@@ -875,6 +906,7 @@ impl GuardedEndpoint {
         }
         let shared = Arc::new(Shared {
             members,
+            reachability,
             signal,
             endpoint: Mutex::new(Some(endpoint.clone())),
         });
@@ -1035,6 +1067,11 @@ impl GuardedEndpoint {
             None,
         )
     }
+
+    /// Sets each member's reachability, in member order, as a route check would.
+    pub(crate) fn set_reachable(&self, reachable: &[bool]) {
+        self.shared.reachability.set(reachable);
+    }
 }
 
 async fn wait_idle_or_revoked(
@@ -1193,6 +1230,7 @@ pub(crate) mod loopback {
                     _lifetime: lifetime,
                 }),
                 signal,
+                reachability: Reachability::new(members.len()),
             };
             Self::assemble(
                 carrier,
@@ -1491,7 +1529,7 @@ mod tests {
     #[test]
     fn a_member_handshake_budget_refills_one_per_interval_up_to_its_burst() {
         let start = Instant::now();
-        let mut budget = HandshakeBudget::new(start);
+        let mut budget = handshake_budget(start);
         for _ in 0..MEMBER_HANDSHAKE_BURST {
             assert!(budget.take(start));
         }

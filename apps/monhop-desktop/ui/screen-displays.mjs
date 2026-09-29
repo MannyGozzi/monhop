@@ -1,4 +1,5 @@
 import { isSessionStatus } from "./computer-status.mjs";
+import { displayName, findComputer } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
 import {
   MAX_ARRANGEMENT_NAME,
@@ -9,6 +10,7 @@ import {
   canResetArrangement,
   canSaveArrangement,
   displayUseChoices,
+  groupFromView,
   hasAppliedCurrentLayout,
   hasAppliedLayout,
   isConnected,
@@ -201,16 +203,49 @@ function arrangementCard(ctx, reset) {
 // The app rebuilds this screen on every status poll; keeping the editor alive keeps a drag alive with it.
 let live = null;
 
+// Today's exactly-two-computer options (`localPlatform`/`peerPlatform`/`localLabel`/`peerLabel`) for
+// up to two members, unchanged; past that the picture needs a member per computer, so this instead
+// hands the view a `members` list (arrangement-view-model.mjs assigns each one the same "local",
+// "peer", "peer-2".."peer-6" tones it always has) built from the connected group's own order.
+function liveOptions(ctx) {
+  const { sharing, computers } = ctx;
+  const view = sharing.view;
+  const group = groupFromView(view);
+  if (!group || group.order.length <= 2)
+    return {
+      localPlatform: view.localPlatform,
+      peerPlatform: view.peerPlatform,
+      localLabel: `${platformLabel(view.localPlatform)} · This computer`,
+      peerLabel: ctx.peerName,
+    };
+  return { members: memberOptions(group, computers, ctx) };
+}
+
+// The label, platform and key for each member of the connected group, in the group's own order
+// (local first): a paired computer's own name when one is found, `ctx.peerName`'s fallback chain
+// otherwise, so a member MonHop has not read a name for yet still gets something to show.
+function memberOptions(group, computers, ctx) {
+  return group.order.map((memberKey) => {
+    const member = group.byKey[memberKey];
+    return {
+      key: memberKey,
+      platform: member.platform,
+      label: member.local
+        ? `${platformLabel(member.platform)} · This computer`
+        : memberLabel(member, computers, ctx),
+    };
+  });
+}
+
+function memberLabel(member, computers, ctx) {
+  const computer = member.fingerprint ? findComputer(computers, member.fingerprint) : null;
+  return computer ? displayName(computer) : ctx.peerName;
+}
+
 function liveEditor(ctx, reset, arrangement) {
   const { sharing, actions, busy } = ctx;
-  const view = sharing.view;
-  const setup = {
-    localPlatform: view.localPlatform,
-    peerPlatform: view.peerPlatform,
-    localLabel: `${platformLabel(view.localPlatform)} · This computer`,
-    peerLabel: ctx.peerName,
-  };
-  const key = Object.values(setup).join("|");
+  const setup = liveOptions(ctx);
+  const key = JSON.stringify(setup);
   const handlers = {
     onCommit: (placement, moving) => actions.commitArrangement(placement, moving),
     onReset: reset.apply,
@@ -257,6 +292,7 @@ function liveEditor(ctx, reset, arrangement) {
         canReset: reset.enabled,
         resetHint: reset.hint,
         handlers,
+        members: setup.members,
       }),
   };
 }

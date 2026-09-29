@@ -15,9 +15,42 @@ const BYTES_PER_PIXEL: usize = 4;
 pub const MAX_DIB_BYTES: usize = MAX_CLIPBOARD_PIXELS as usize * BYTES_PER_PIXEL + (1 << 20);
 /// Fast compression can land above the peer's encoder, so a re-encode gets twice the wire cap.
 pub const MAX_REENCODED_PNG: usize = 2 * MAX_CLIPBOARD_PNG as usize;
-/// Covers the decoder's own row and chunk buffers. The RGBA output is allocated here instead and
-/// is at most four bytes per capped pixel (about 256 MiB), because 16-bit channels are stripped.
+/// Covers the decoder's own row and chunk buffers. Decoded rows go to buffers `grow` sizes here
+/// instead, at most four bytes per capped pixel (about 256 MiB) because 16-bit channels are
+/// stripped.
 const DECODER_BUDGET: usize = 16 << 20;
+/// Deflate's ceiling: one 258-byte match per two bits of input.
+const MAX_DEFLATE_EXPANSION: u64 = 1032;
+/// The first step a decode buffer grows by; later steps double.
+const FIRST_GROWTH: usize = 64 << 10;
+
+const PNG_SIGNATURE_LEN: usize = 8;
+/// Chunk length and type; the chunk data and a 4-byte CRC follow.
+const PNG_CHUNK_HEADER_LEN: usize = 8;
+const PNG_CRC_LEN: usize = 4;
+// IHDR fields by offset in the file; `png_dimensions` validates them first.
+const IHDR_BIT_DEPTH: usize = 24;
+const IHDR_COLOR_TYPE: usize = 25;
+const IHDR_INTERLACE: usize = 28;
+/// Adam7 passes as (x offset, y offset, x step, y step).
+const ADAM7_PASSES: [(u32, u32, u32, u32); 7] = [
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+];
+
+type PngReader<'a> = png::Reader<Cursor<&'a [u8]>>;
+
+#[cfg(test)]
+thread_local! {
+    /// The largest capacity `grow` has reserved on this thread, so tests can see what a decode
+    /// committed.
+    static PEAK_DECODE_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 const BITMAPINFOHEADER_LEN: usize = 40;
 const BITMAPV4HEADER_LEN: usize = 108;
@@ -90,11 +123,14 @@ impl Rgba {
         BITMAPV5HEADER_LEN + self.pixels.len()
     }
 
-    /// Fills `out`, exactly `dibv5_len` bytes (e.g. locked clipboard memory), with a CF_DIBV5:
-    /// BITMAPV5HEADER (BI_BITFIELDS, LCS_sRGB) and BGRA rows with straight alpha. Rows go bottom-up
-    /// because some programs cannot paste a negative-height DIB.
-    pub fn write_dibv5(&self, out: &mut [u8]) {
-        assert_eq!(out.len(), self.dibv5_len(), "CF_DIBV5 buffer size");
+    /// Fills `out` with a CF_DIBV5: BITMAPV5HEADER (BI_BITFIELDS, LCS_sRGB) and BGRA rows with
+    /// straight alpha. Rows go bottom-up because some programs cannot paste a negative-height DIB.
+    /// `out` must be exactly `dibv5_len` bytes (the start of a rounded-up clipboard allocation);
+    /// any other size is refused untouched.
+    pub fn write_dibv5(&self, out: &mut [u8]) -> Result<(), ImageError> {
+        if out.len() != self.dibv5_len() {
+            return Err(ImageError::Malformed);
+        }
         let (header, bits) = out.split_at_mut(BITMAPV5HEADER_LEN);
         header.fill(0);
         put_u32(header, 0, BITMAPV5HEADER_LEN as u32);
@@ -122,6 +158,7 @@ impl Rgba {
                 *bgra = [rgba[2], rgba[1], rgba[0], rgba[3]];
             }
         }
+        Ok(())
     }
 }
 
@@ -321,14 +358,19 @@ pub fn encode_png(image: &Rgba, limit: usize) -> Result<Vec<u8>, ImageError> {
     Ok(output.bytes)
 }
 
-/// Decodes a peer PNG with checksums verified. The IHDR is checked against the caps before the
-/// decoder runs; text and ICC chunks are skipped, never parsed.
+/// Decodes a peer PNG with checksums verified. The IHDR is checked against the caps, and the image
+/// data's length against deflate's ceiling, before anything inflates; text and ICC chunks are
+/// skipped, never parsed. Memory follows the rows that really decode, never the size the header
+/// claims.
 pub fn decode_png(png: &[u8]) -> Result<Rgba, ImageError> {
     if png.len() > MAX_CLIPBOARD_PNG as usize {
         return Err(ImageError::TooLarge);
     }
     let (width, height) = png_dimensions(png).map_err(prefix_error)?;
     let len = rgba_len(width, height)?;
+    if inflated_len(png, width, height) > MAX_DEFLATE_EXPANSION * idat_len(png) {
+        return Err(ImageError::Malformed);
+    }
     let mut decoder = png::Decoder::new_with_limits(
         Cursor::new(png),
         png::Limits {
@@ -347,18 +389,197 @@ pub fn decode_png(png: &[u8]) -> Result<Rgba, ImageError> {
         (png::ColorType::Rgba, png::BitDepth::Eight) => 4,
         _ => return Err(ImageError::Malformed),
     };
-    let mut pixels = zeroed(len)?;
-    let frame = reader.next_frame(&mut pixels).map_err(decode_error)?;
-    if (frame.width, frame.height) != (width, height) {
+    let info = reader.info();
+    let interlaced = info.interlaced;
+    if info
+        .frame_control()
+        .is_some_and(|frame| (frame.width, frame.height) != (width, height))
+    {
         return Err(ImageError::Malformed);
     }
-    reader.finish().map_err(decode_error)?;
-    expand_to_rgba(&mut pixels, channels);
+    let packed_len = len / BYTES_PER_PIXEL * channels;
+    let pixels = if interlaced {
+        let passes = read_passes(&mut reader, packed_len)?;
+        reader.finish().map_err(decode_error)?;
+        deinterlace(passes, width, channels, len)?
+    } else {
+        let pixels = read_rows(&mut reader, width as usize * channels, channels, len)?;
+        reader.finish().map_err(decode_error)?;
+        pixels
+    };
     Ok(Rgba {
         width,
         height,
         pixels,
     })
+}
+
+/// Appends each row as RGBA as soon as it decodes, so a stream that breaks early has committed
+/// only the rows before the break.
+fn read_rows(
+    reader: &mut PngReader<'_>,
+    row_len: usize,
+    channels: usize,
+    len: usize,
+) -> Result<Vec<u8>, ImageError> {
+    let mut pixels = Vec::new();
+    while let Some(row) = reader.next_row().map_err(decode_error)? {
+        let row = row.data();
+        if row.len() != row_len {
+            return Err(ImageError::Malformed);
+        }
+        grow(&mut pixels, row_len / channels * BYTES_PER_PIXEL, len)?;
+        push_rgba(&mut pixels, row, channels);
+    }
+    if pixels.len() != len {
+        return Err(ImageError::Malformed);
+    }
+    Ok(pixels)
+}
+
+/// Adam7 rows as they decoded, packed back to back, with where each belongs.
+struct Passes {
+    bytes: Vec<u8>,
+    rows: Vec<(png::Adam7Info, usize)>,
+}
+
+/// Every Adam7 pass spans the whole image, so rows are kept packed as they decode and only
+/// placed once all of them have.
+fn read_passes(reader: &mut PngReader<'_>, packed_len: usize) -> Result<Passes, ImageError> {
+    let mut passes = Passes {
+        bytes: Vec::new(),
+        rows: Vec::new(),
+    };
+    while let Some(row) = reader.next_interlaced_row().map_err(decode_error)? {
+        let png::InterlaceInfo::Adam7(info) = *row.interlace() else {
+            return Err(ImageError::Malformed);
+        };
+        let data = row.data();
+        grow(&mut passes.bytes, data.len(), packed_len)?;
+        passes.bytes.extend_from_slice(data);
+        passes.rows.push((info, data.len()));
+    }
+    if passes.bytes.len() != packed_len {
+        return Err(ImageError::Malformed);
+    }
+    Ok(passes)
+}
+
+/// Allocates the whole image, so it runs only once every pass has decoded and passed its checks.
+fn deinterlace(
+    passes: Passes,
+    width: u32,
+    channels: usize,
+    len: usize,
+) -> Result<Vec<u8>, ImageError> {
+    let mut pixels = Vec::new();
+    grow(&mut pixels, len, len)?;
+    pixels.resize(len, 0);
+    let (packed, _) = pixels.split_at_mut(passes.bytes.len());
+    let stride = width as usize * channels;
+    let bits_per_pixel = (channels * 8) as u8;
+    let mut bytes = passes.bytes.as_slice();
+    for (info, row_len) in &passes.rows {
+        let (row, rest) = bytes.split_at(*row_len);
+        png::expand_interlaced_row(packed, stride, row, info, bits_per_pixel);
+        bytes = rest;
+    }
+    drop(passes);
+    expand_to_rgba(&mut pixels, channels);
+    Ok(pixels)
+}
+
+/// Makes room for `additional` more bytes, never past `limit`. Capacity doubles from
+/// `FIRST_GROWTH` like a `Vec`'s, so it stays within twice what has really been decoded.
+fn grow(buffer: &mut Vec<u8>, additional: usize, limit: usize) -> Result<(), ImageError> {
+    let needed = buffer
+        .len()
+        .checked_add(additional)
+        .filter(|needed| *needed <= limit)
+        .ok_or(ImageError::Malformed)?;
+    if needed > buffer.capacity() {
+        let target = needed
+            .max(buffer.capacity().saturating_mul(2))
+            .max(FIRST_GROWTH)
+            .min(limit);
+        buffer
+            .try_reserve_exact(target - buffer.len())
+            .map_err(|_| ImageError::TooLarge)?;
+        #[cfg(test)]
+        PEAK_DECODE_CAPACITY.with(|peak| peak.set(peak.get().max(buffer.capacity())));
+    }
+    Ok(())
+}
+
+fn push_rgba(pixels: &mut Vec<u8>, row: &[u8], channels: usize) {
+    match channels {
+        1 => pixels.extend(row.iter().flat_map(|&gray| [gray, gray, gray, u8::MAX])),
+        2 => pixels.extend(
+            row.as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&[gray, alpha]| [gray, gray, gray, alpha]),
+        ),
+        3 => pixels.extend(
+            row.as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|&[red, green, blue]| [red, green, blue, u8::MAX]),
+        ),
+        _ => pixels.extend_from_slice(row),
+    }
+}
+
+/// Bytes the IHDR says the image data inflates to: every scanline of the image, or of each Adam7
+/// pass, plus its filter byte.
+fn inflated_len(png: &[u8], width: u32, height: u32) -> u64 {
+    let samples = match png[IHDR_COLOR_TYPE] {
+        2 => 3,
+        4 => 2,
+        6 => 4,
+        _ => 1,
+    };
+    let bits = u64::from(png[IHDR_BIT_DEPTH]) * samples;
+    let scanline = |pixels: u32| match pixels {
+        0 => 0,
+        pixels => 1 + (u64::from(pixels) * bits).div_ceil(8),
+    };
+    if png[IHDR_INTERLACE] == 0 {
+        return u64::from(height) * scanline(width);
+    }
+    ADAM7_PASSES
+        .iter()
+        .map(|&(x, y, x_step, y_step)| {
+            let lines = height.saturating_sub(y).div_ceil(y_step);
+            u64::from(lines) * scanline(width.saturating_sub(x).div_ceil(x_step))
+        })
+        .sum()
+}
+
+/// Data bytes in the first run of IDAT chunks, the only image data the decoder reads. Uses chunk
+/// lengths alone and never counts past the end of `png`.
+fn idat_len(png: &[u8]) -> u64 {
+    let mut at = PNG_SIGNATURE_LEN;
+    let mut total = 0;
+    let mut in_run = false;
+    while let Some(header) = png
+        .get(at..)
+        .and_then(|rest| rest.get(..PNG_CHUNK_HEADER_LEN))
+    {
+        let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let data_at = at + PNG_CHUNK_HEADER_LEN;
+        match &header[4..] {
+            b"IDAT" => {
+                in_run = true;
+                total += (png.len() - data_at).min(len) as u64;
+            }
+            b"IEND" => break,
+            _ if in_run => break,
+            _ => {}
+        }
+        at = data_at.saturating_add(len).saturating_add(PNG_CRC_LEN);
+    }
+    total
 }
 
 /// What a peer PNG becomes before it reaches the local clipboard: decoded under the caps, then
@@ -530,6 +751,101 @@ mod tests {
         png.windows(4).position(|window| window == kind).unwrap() - 4
     }
 
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        !crc
+    }
+
+    fn adler32(bytes: &[u8]) -> u32 {
+        let (mut low, mut high) = (1_u32, 0_u32);
+        for &byte in bytes {
+            low = (low + u32::from(byte)) % 65_521;
+            high = (high + low) % 65_521;
+        }
+        (high << 16) | low
+    }
+
+    /// Deflate stored blocks: valid data that inflates to exactly `raw`.
+    fn stored_blocks(raw: &[u8], last: bool) -> Vec<u8> {
+        let blocks = raw.chunks(usize::from(u16::MAX));
+        let count = blocks.len();
+        let mut out = Vec::new();
+        for (index, block) in blocks.enumerate() {
+            out.push(u8::from(last && index + 1 == count));
+            let len = block.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(block);
+        }
+        out
+    }
+
+    const ZLIB_HEADER: [u8; 2] = [0x78, 0x01];
+
+    fn stored_zlib(raw: &[u8]) -> Vec<u8> {
+        [
+            ZLIB_HEADER.to_vec(),
+            stored_blocks(raw, true),
+            adler32(raw).to_be_bytes().to_vec(),
+        ]
+        .concat()
+    }
+
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(kind);
+        chunk.extend_from_slice(data);
+        let crc = crc32(&chunk[4..]);
+        chunk.extend_from_slice(&crc.to_be_bytes());
+        chunk
+    }
+
+    /// An 8-bit PNG around `idat`, split into IDAT chunks of up to `idat_chunk` bytes.
+    fn assemble_png(
+        (width, height): (u32, u32),
+        color_type: u8,
+        interlace: u8,
+        idat: &[u8],
+        idat_chunk: usize,
+    ) -> Vec<u8> {
+        let mut ihdr = width.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, color_type, 0, 0, interlace]);
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend(png_chunk(b"IHDR", &ihdr));
+        for part in idat.chunks(idat_chunk) {
+            png.extend(png_chunk(b"IDAT", part));
+        }
+        png.extend(png_chunk(b"IEND", &[]));
+        png
+    }
+
+    fn idat_data(png: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut at = PNG_SIGNATURE_LEN;
+        while at < png.len() {
+            let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+            if &png[at + 4..at + 8] == b"IDAT" {
+                data.extend_from_slice(&png[at + 8..at + 8 + len]);
+            }
+            at += PNG_CHUNK_HEADER_LEN + len + PNG_CRC_LEN;
+        }
+        data
+    }
+
+    /// The decode's result and the largest buffer capacity it reserved for decoded rows.
+    fn decode_measured(png: &[u8]) -> (Result<Rgba, ImageError>, usize) {
+        PEAK_DECODE_CAPACITY.with(|peak| peak.set(0));
+        let decoded = decode_png(png);
+        (decoded, PEAK_DECODE_CAPACITY.with(std::cell::Cell::get))
+    }
+
     const RED: [u8; 4] = [255, 0, 0, 255];
     const GREEN: [u8; 4] = [0, 255, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
@@ -663,7 +979,7 @@ mod tests {
     fn rgba_becomes_a_bottom_up_bitfields_dibv5_with_an_srgb_header() {
         let image = rgba(1, 2, &[[1, 2, 3, 4], [5, 6, 7, 8]]);
         let mut out = vec![0xAA; image.dibv5_len()];
-        image.write_dibv5(&mut out);
+        image.write_dibv5(&mut out).unwrap();
         let field = |at| read_u32(&out, at).unwrap();
         assert_eq!(out.len(), 124 + 8);
         assert_eq!(field(0), 124);
@@ -688,8 +1004,22 @@ mod tests {
     fn a_dibv5_round_trips_through_the_dib_reader() {
         let image = rgba(2, 2, &[[1, 2, 3, 0], [4, 5, 6, 7], [8, 9, 10, 128], WHITE]);
         let mut out = vec![0; image.dibv5_len()];
-        image.write_dibv5(&mut out);
+        image.write_dibv5(&mut out).unwrap();
         assert_eq!(dib_to_rgba(&out).unwrap(), image);
+    }
+
+    #[test]
+    fn write_dibv5_rejects_a_wrong_sized_buffer_without_panicking() {
+        let image = rgba(2, 1, &[RED, BLUE]);
+        let exact = image.dibv5_len();
+        for len in [0, 1, exact - 1, exact + 1, exact + 4096] {
+            let mut out = vec![0xAA; len];
+            assert_eq!(image.write_dibv5(&mut out), Err(ImageError::Malformed));
+            assert!(
+                out.iter().all(|byte| *byte == 0xAA),
+                "{len} bytes untouched"
+            );
+        }
     }
 
     #[test]
@@ -832,6 +1162,158 @@ mod tests {
         assert_eq!(
             check_outgoing_png(b"not a png at all, just some text"),
             Err(ImageError::Malformed)
+        );
+    }
+
+    #[test]
+    fn a_forged_huge_header_with_garbage_data_commits_no_large_buffer() {
+        let size = (8_000, 8_000);
+        let row: usize = 1 + 8_000 * 4;
+        let rows: Vec<u8> = (0..8 * row)
+            .map(|at| if at % row == 0 { 0 } else { (at % 251) as u8 })
+            .collect();
+        // Eight real rows, then 0xFF: a final block of a type deflate does not have.
+        let idat = [
+            ZLIB_HEADER.to_vec(),
+            stored_blocks(&rows, false),
+            vec![0xFF; 4096],
+        ]
+        .concat();
+        let png = assemble_png(size, 6, 0, &idat, 1 << 20);
+        let frame = 8_000 * 8_000 * 4;
+        assert_eq!(inflated_len(&png, size.0, size.1), 8_000 * row as u64);
+        assert!(
+            inflated_len(&png, size.0, size.1) <= MAX_DEFLATE_EXPANSION * idat_len(&png),
+            "enough image data to pass the ratio check, so the rows really decode"
+        );
+
+        let (decoded, peak) = decode_measured(&png);
+        assert_eq!(decoded, Err(ImageError::Malformed));
+        assert!(
+            (2 * 8_000 * 4..=1 << 20).contains(&peak),
+            "reserved {peak} bytes for a {frame}-byte frame"
+        );
+    }
+
+    #[test]
+    fn a_compression_bomb_beyond_the_deflate_ratio_is_refused_before_inflating() {
+        let zeros = Rgba::new(1_000, 1_000, vec![0; 1_000 * 1_000 * 4]).unwrap();
+        let dense = png_with(
+            1_000,
+            1_000,
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            zeros.pixels(),
+            |encoder| {
+                encoder.set_compression(png::Compression::High);
+                encoder.set_filter(png::Filter::NoFilter);
+            },
+        );
+        let (decoded, _) = decode_measured(&dense);
+        assert_eq!(
+            decoded.unwrap(),
+            zeros,
+            "the densest real stream is let through"
+        );
+
+        // The same stream inflates to valid, all-zero 8000-pixel rows, but far fewer than a
+        // header claiming 8000 of them needs.
+        let bomb = assemble_png((8_000, 8_000), 6, 0, &idat_data(&dense), 1 << 20);
+        assert!(inflated_len(&bomb, 8_000, 8_000) > MAX_DEFLATE_EXPANSION * idat_len(&bomb));
+        let (decoded, peak) = decode_measured(&bomb);
+        assert_eq!(decoded, Err(ImageError::Malformed));
+        assert_eq!(peak, 0, "not a single row was inflated");
+    }
+
+    #[test]
+    fn a_valid_large_image_still_round_trips() {
+        let (width, height) = (1_500_u32, 1_000_u32);
+        let pixels = (0..width * height)
+            .flat_map(|at| {
+                let (x, y) = (at % width, at / width);
+                [x as u8, y as u8, (x ^ y) as u8, (x + y) as u8]
+            })
+            .collect();
+        let image = Rgba::new(width, height, pixels).unwrap();
+        let png = encode_png(&image, MAX_CLIPBOARD_PNG as usize).unwrap();
+        assert!(idat_len(&png) > 0);
+
+        let (decoded, peak) = decode_measured(&png);
+        assert_eq!(decoded.unwrap(), image);
+        assert_eq!(
+            peak,
+            image.pixels().len(),
+            "the buffer grew to the image, never past it"
+        );
+        let (reencoded_image, reencoded) = reencode_png(&png).unwrap();
+        assert_eq!(reencoded_image, image);
+        assert_eq!(decode_png(&reencoded).unwrap(), image);
+    }
+
+    #[test]
+    fn interlaced_pngs_place_every_pass() {
+        let sample = |x: u32, y: u32, channel: u32| (x * 16 + y * 3 + channel * 40) as u8;
+        for (color_type, channels) in [(0, 1), (4, 2), (2, 3), (6, 4)] {
+            for (width, height) in [(1_u32, 1_u32), (3, 2), (13, 11)] {
+                let mut raw = Vec::new();
+                for (x0, y0, x_step, y_step) in ADAM7_PASSES {
+                    let columns = width.saturating_sub(x0).div_ceil(x_step);
+                    if columns == 0 {
+                        continue;
+                    }
+                    for y in (y0..height).step_by(y_step as usize) {
+                        raw.push(0);
+                        for x in (x0..width).step_by(x_step as usize) {
+                            raw.extend((0..channels).map(|channel| sample(x, y, channel)));
+                        }
+                    }
+                }
+                let idat = stored_zlib(&raw);
+                let png = assemble_png((width, height), color_type, 1, &idat, 7);
+                assert_eq!(inflated_len(&png, width, height), raw.len() as u64);
+                assert_eq!(idat_len(&png), idat.len() as u64);
+
+                let expected: Vec<u8> = (0..height)
+                    .flat_map(|y| (0..width).map(move |x| (x, y)))
+                    .flat_map(|(x, y)| {
+                        let value = |channel| sample(x, y, channel);
+                        match channels {
+                            1 => [value(0), value(0), value(0), u8::MAX],
+                            2 => [value(0), value(0), value(0), value(1)],
+                            3 => [value(0), value(1), value(2), u8::MAX],
+                            _ => [value(0), value(1), value(2), value(3)],
+                        }
+                    })
+                    .collect();
+                let decoded = decode_png(&png).unwrap();
+                assert_eq!(
+                    decoded.pixels(),
+                    expected,
+                    "color type {color_type}, {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_first_run_of_idat_chunks_counts_toward_the_ratio() {
+        let idat = stored_zlib(&[0, 1, 2, 3, 4]);
+        let mut split = assemble_png((1, 1), 6, 0, &idat, 3);
+        assert_eq!(idat_len(&split), idat.len() as u64);
+        let iend = chunk_at(&split, b"IEND");
+        split.splice(
+            iend..iend,
+            [png_chunk(b"tEXt", b"a\0b"), png_chunk(b"IDAT", &[0; 100])].concat(),
+        );
+        assert_eq!(idat_len(&split), idat.len() as u64);
+
+        let mut truncated = assemble_png((1, 1), 6, 0, &idat, 1024);
+        let ihdr_len = PNG_CHUNK_HEADER_LEN + 13 + PNG_CRC_LEN;
+        truncated.truncate(PNG_SIGNATURE_LEN + ihdr_len + PNG_CHUNK_HEADER_LEN + 4);
+        assert_eq!(
+            idat_len(&truncated),
+            4,
+            "counted only as far as the bytes go"
         );
     }
 

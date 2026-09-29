@@ -9,10 +9,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use monhop_core::{MonitorIdentity, Point};
+use monhop_core::{MonitorIdentity, Platform, Point};
 use monhop_protocol::ControlPermissions;
 use monhop_transport::{
     crypto::CertificateFingerprint,
+    pairing::opposite_platform,
     session_handshake::device_id_from_fingerprint,
     session_setup::{
         DisplayDescription, DisplayTopology, InspectedPeer, MAX_DISPLAY_NAME_BYTES,
@@ -22,20 +23,27 @@ use monhop_transport::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::group_record::{GroupRecord, MAX_GROUP_MEMBERS};
 use crate::sharing::{
     ArrangementRequest, LayoutRequest, parse_display, parse_link, validated_layout,
 };
 
 /// One computer's saved setup record; also the wire format shared at Apply.
 pub const SHARING_PREFERENCES_VERSION: u8 = 2;
-/// The file holding every computer's record and which one is active.
-pub const SETUP_FILE_VERSION: u8 = 3;
+/// The file holding every group's record, the active group, and the network.
+pub const SETUP_FILE_VERSION: u8 = 4;
+/// The file before groups: one record per paired computer, read only to migrate it.
+const SETUP_FILE_V3_VERSION: u8 = 3;
 /// The layout both computers exchange at Apply.
 const SHARED_SETUP_VERSION: u8 = 2;
 pub const MAX_SHARING_PREFERENCES_BYTES: u64 = 32 * 1024;
-pub const MAX_SETUP_FILE_BYTES: u64 = 256 * 1024;
+pub const MAX_SETUP_FILE_BYTES: u64 = 512 * 1024;
 /// Paired computers this app keeps setups and names for.
 pub const MAX_COMPUTERS: usize = 16;
+/// Past this many records the oldest inactive one is dropped.
+const MAX_GROUPS: usize = 16;
+/// Migrated records are revision 1 or 2, so the first change after migration is newer than both.
+const MIGRATED_CLOCK: u64 = 2;
 
 const MAX_INTERFACE_ID_BYTES: usize = 512;
 pub(crate) const MAX_LINKS: usize = 64;
@@ -98,21 +106,37 @@ pub struct SharingPreferences {
     pub(crate) layout: LayoutRequest,
 }
 
-/// Every paired computer's saved setup and which one MonHop shares input with. Loading never
-/// authorizes or starts anything; a computer paired without a layout has no record here.
+/// Every group's saved layout, the group MonHop shares input with, and the one network all
+/// sharing uses. Loading never authorizes or starts anything; a computer paired without a layout
+/// is in no record here.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SetupFile {
     version: u8,
-    /// The physical network the last pairing or layout used; standing links reopen on it.
+    /// The physical network all sharing uses. Records carry none, and nothing but an explicit
+    /// choice replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     interface_id: Option<String>,
-    /// Lowercase fingerprint of the active computer; may name a computer without a record.
+    /// This computer's fingerprint as its records name it, full uppercase hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    active: Option<String>,
-    /// Keyed by the lowercase peer fingerprint of each record.
-    #[serde(default)]
-    computers: BTreeMap<String, SharingPreferences>,
+    local: Option<String>,
+    /// Strictly sorted lowercase fingerprints of the other members of the active group; may name
+    /// computers without a record.
+    enabled: Vec<String>,
+    /// Pause keeps the group; any choice clears it.
+    paused: bool,
+    /// The highest revision this computer made or saw.
+    clock: u64,
+    /// Strictly sorted by member set, each set naming this computer.
+    groups: Vec<GroupRecord>,
+    /// The two-member groups as pairwise records on the file's network, keyed by lowercase peer
+    /// fingerprint, so `computer` can lend them out.
+    #[serde(skip)]
+    pairwise: BTreeMap<String, SharingPreferences>,
+    /// `insert` was handed a record no group can hold, so saving fails as it did when the file
+    /// kept such a record.
+    #[serde(skip)]
+    refused: bool,
 }
 
 impl Default for SetupFile {
@@ -120,10 +144,30 @@ impl Default for SetupFile {
         Self {
             version: SETUP_FILE_VERSION,
             interface_id: None,
-            active: None,
-            computers: BTreeMap::new(),
+            local: None,
+            enabled: Vec::new(),
+            paused: false,
+            clock: 0,
+            groups: Vec::new(),
+            pairwise: BTreeMap::new(),
+            refused: false,
         }
     }
+}
+
+/// The file as version 3 wrote it: one record per paired computer and the active one.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetupFileV3 {
+    version: u8,
+    #[serde(default)]
+    interface_id: Option<String>,
+    /// Lowercase fingerprint of the active computer; may name a computer without a record.
+    #[serde(default)]
+    active: Option<String>,
+    /// Keyed by the lowercase peer fingerprint of each record.
+    #[serde(default)]
+    computers: BTreeMap<String, SharingPreferences>,
 }
 
 /// Only the version is read first: a file from another version holds nothing this build reads.
@@ -134,13 +178,33 @@ struct VersionedFile {
 
 impl SetupFile {
     /// An absent file, or one another version wrote, is empty: the displays are arranged again.
+    /// A version 3 file is migrated in memory and rewritten only by the next save.
     pub fn load(path: &Path) -> io::Result<Self> {
-        load_versioned(
-            path,
-            MAX_SETUP_FILE_BYTES,
-            SETUP_FILE_VERSION,
-            |file: &Self| file.validate().map_err(|_| invalid_data()),
-        )
+        Self::load_as(path, crate::sharing::local_platform())
+    }
+
+    /// `platform` is this computer's, which a migrated record names it with.
+    fn load_as(path: &Path, platform: Platform) -> io::Result<Self> {
+        let Some(bytes) = read_bounded(path, MAX_SETUP_FILE_BYTES)? else {
+            return Ok(Self::default());
+        };
+        let versioned: VersionedFile =
+            serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
+        let mut file = match versioned.version {
+            SETUP_FILE_VERSION => {
+                serde_json::from_slice::<Self>(&bytes).map_err(|_| invalid_data())?
+            }
+            SETUP_FILE_V3_VERSION => {
+                let old: SetupFileV3 =
+                    serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
+                old.validate().map_err(|_| invalid_data())?;
+                old.migrate(platform)
+            }
+            _ => return Ok(Self::default()),
+        };
+        file.validate().map_err(|_| invalid_data())?;
+        file.refresh_pairwise();
+        Ok(file)
     }
 
     /// Writes the whole file atomically, creating the setup folder on first use.
@@ -151,12 +215,94 @@ impl SetupFile {
         save_bounded(path, &bytes, MAX_SETUP_FILE_BYTES)
     }
 
-    pub fn active(&self) -> Option<&str> {
-        self.active.as_deref()
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn local(&self) -> Option<&str> {
+        self.local.as_deref()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn enabled(&self) -> &[String] {
+        &self.enabled
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn paused(&self) -> bool {
+        self.paused
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn clock(&self) -> u64 {
+        self.clock
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn groups(&self) -> &[GroupRecord] {
+        &self.groups
+    }
+
+    /// The record for this computer and the enabled computers; None means they need arranging.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn active_group(&self) -> Option<&GroupRecord> {
+        let members = self.active_members()?;
+        self.groups
+            .iter()
+            .find(|group| group.member_keys() == members)
+    }
+
+    /// Keeps whichever of `record` and the record held for its members has the greater stamp
+    /// (`record` on a tie, for its labels) and enables exactly its other members. Pause and the
+    /// network stay as the user chose them. Ok(true) when `record` is now its members' record.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn adopt(
+        &mut self,
+        local: &str,
+        record: GroupRecord,
+    ) -> Result<bool, PreferenceError> {
+        record.validate()?;
+        let local = CertificateFingerprint::parse_full(local)
+            .map_err(|_| PreferenceError::Invalid)?
+            .full_hex();
+        if !record.has_member(&local) {
+            return Err(PreferenceError::Invalid);
+        }
+        self.set_local(&local);
+        let members = record.member_keys();
+        let local = fingerprint_key(&local);
+        self.enabled = members
+            .iter()
+            .filter(|member| **member != local)
+            .cloned()
+            .collect();
+        self.clock = self.clock.max(record.revision());
+        let newer = self
+            .groups
+            .iter()
+            .find(|group| group.member_keys() == members)
+            .is_none_or(|held| record.stamp() >= held.stamp());
+        if newer {
+            self.store(record);
+        }
+        self.refresh_pairwise();
+        Ok(newer)
+    }
+
+    /// The one enabled computer while sharing is not paused.
+    pub fn active(&self) -> Option<&str> {
+        match self.enabled.as_slice() {
+            [peer] if !self.paused => Some(peer),
+            _ => None,
+        }
+    }
+
+    /// Enables exactly that computer and resumes; None pauses and keeps the group.
     pub fn set_active(&mut self, fingerprint: Option<&CertificateFingerprint>) {
-        self.active = fingerprint.map(|fingerprint| fingerprint_key(&fingerprint.full_hex()));
+        match fingerprint {
+            Some(fingerprint) => {
+                self.enabled = vec![fingerprint_key(&fingerprint.full_hex())];
+                self.paused = false;
+            }
+            None => self.paused = true,
+        }
     }
 
     pub fn interface_id(&self) -> Option<&str> {
@@ -165,28 +311,42 @@ impl SetupFile {
 
     pub fn set_interface_id(&mut self, interface_id: &str) {
         self.interface_id = Some(interface_id.to_owned());
+        self.refresh_pairwise();
     }
 
+    /// This computer's two-member record with that computer, on the file's network.
     pub fn computer(&self, fingerprint: &str) -> Option<&SharingPreferences> {
-        self.computers.get(&fingerprint_key(fingerprint))
+        self.pairwise.get(&fingerprint_key(fingerprint))
     }
 
     pub fn active_computer(&self) -> Option<&SharingPreferences> {
-        self.active
-            .as_deref()
-            .and_then(|active| self.computer(active))
+        self.active().and_then(|active| self.computer(active))
     }
 
-    /// Lowercase fingerprints of every computer with a saved record.
+    /// Lowercase fingerprints of every computer with a two-member record.
     pub fn fingerprints(&self) -> impl Iterator<Item = &str> {
-        self.computers.keys().map(String::as_str)
+        self.pairwise.keys().map(String::as_str)
     }
 
-    /// Replaces that computer's record; the record's network becomes the file's network.
+    /// Replaces this computer's two-member group with that computer, stamped as a new local
+    /// change. The file's network stays; only a file without one takes the record's.
     pub fn insert(&mut self, setup: SharingPreferences) {
-        self.interface_id = Some(setup.interface_id.clone());
-        self.computers
-            .insert(fingerprint_key(&setup.peer_fingerprint), setup);
+        let platform = crate::sharing::local_platform();
+        let record = GroupRecord::from_pairwise(&setup, platform, opposite_platform(platform))
+            .and_then(|record| {
+                record.restamped(self.clock.saturating_add(1), &setup.local_fingerprint)
+            });
+        let Ok(record) = record else {
+            self.refused = true;
+            return;
+        };
+        self.set_local(&setup.local_fingerprint);
+        if self.interface_id.is_none() {
+            self.interface_id = Some(setup.interface_id);
+        }
+        self.clock = record.revision();
+        self.store(record);
+        self.refresh_pairwise();
     }
 
     /// A copy to draw from and never save: each record replaced by `preview`'s answer for it,
@@ -196,23 +356,128 @@ impl SetupFile {
         mut preview: impl FnMut(&SharingPreferences) -> SharingPreferences,
     ) -> Self {
         let mut previewed = self.clone();
-        for record in previewed.computers.values_mut() {
+        for record in previewed.pairwise.values_mut() {
             *record = preview(record);
         }
         previewed
     }
 
-    /// Drops the record and, when it was the active computer, the active choice with it.
+    /// Drops every record naming that computer, and that computer from the enabled group.
     pub fn remove(&mut self, fingerprint: &str) {
         let key = fingerprint_key(fingerprint);
-        self.computers.remove(&key);
-        if self.active.as_deref() == Some(key.as_str()) {
-            self.active = None;
+        self.groups.retain(|group| !group.has_member(&key));
+        self.enabled.retain(|peer| *peer != key);
+        self.refresh_pairwise();
+    }
+
+    /// Records name this computer by one identity; those of an earlier one can never be used.
+    fn set_local(&mut self, local: &str) {
+        let key = fingerprint_key(local);
+        if self.local.as_deref().map(fingerprint_key) == Some(key.clone()) {
+            return;
         }
+        let held = self.groups.len();
+        self.groups.retain(|group| group.has_member(&key));
+        if self.groups.len() < held {
+            log::warn!(
+                "setup: dropped {} saved layouts of an earlier identity of this computer",
+                held - self.groups.len()
+            );
+        }
+        self.enabled.retain(|peer| *peer != key);
+        self.local = Some(key.to_ascii_uppercase());
+    }
+
+    /// Sorted lowercase fingerprints of this computer and the enabled computers.
+    fn active_members(&self) -> Option<Vec<String>> {
+        if self.enabled.is_empty() {
+            return None;
+        }
+        let mut members = self.enabled.clone();
+        members.push(fingerprint_key(self.local.as_deref()?));
+        members.sort();
+        Some(members)
+    }
+
+    /// Replaces the record held for `record`'s members, then drops the oldest inactive records
+    /// past the bound.
+    fn store(&mut self, record: GroupRecord) {
+        let members = record.member_keys();
+        self.groups.retain(|group| group.member_keys() != members);
+        self.groups.push(record);
+        self.groups.sort_by_cached_key(GroupRecord::member_keys);
+        let active = self.active_members();
+        while self.groups.len() > MAX_GROUPS {
+            let Some(oldest) = self
+                .groups
+                .iter()
+                .enumerate()
+                .filter(|(_, group)| active.as_ref() != Some(&group.member_keys()))
+                .min_by_key(|(_, group)| group.stamp())
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            self.groups.remove(oldest);
+        }
+    }
+
+    fn refresh_pairwise(&mut self) {
+        self.pairwise = match (&self.local, &self.interface_id) {
+            (Some(local), Some(interface_id)) => self
+                .groups
+                .iter()
+                .filter_map(|group| group.to_pairwise(local, interface_id).ok())
+                .map(|record| (fingerprint_key(&record.peer_fingerprint), record))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
     }
 
     fn validate(&self) -> Result<(), PreferenceError> {
         if self.version != SETUP_FILE_VERSION
+            || self.refused
+            || self.groups.len() > MAX_GROUPS
+            || self.enabled.len() >= MAX_GROUP_MEMBERS
+            || self.enabled.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .interface_id
+                .as_ref()
+                .is_some_and(|id| id.is_empty() || id.len() > MAX_INTERFACE_ID_BYTES)
+        {
+            return Err(PreferenceError::Invalid);
+        }
+        if let Some(local) = &self.local {
+            validate_fingerprint(local)?;
+        }
+        let local = self.local.as_deref().map(fingerprint_key);
+        for peer in &self.enabled {
+            validate_fingerprint(&peer.to_ascii_uppercase())?;
+            if fingerprint_key(peer) != *peer || local.as_ref() == Some(peer) {
+                return Err(PreferenceError::Invalid);
+            }
+        }
+        let mut previous: Option<Vec<String>> = None;
+        for group in &self.groups {
+            group.validate()?;
+            let members = group.member_keys();
+            if !local.as_ref().is_some_and(|local| group.has_member(local))
+                || group.revision() > self.clock
+                || previous
+                    .as_ref()
+                    .is_some_and(|previous| *previous >= members)
+            {
+                return Err(PreferenceError::Invalid);
+            }
+            previous = Some(members);
+        }
+        Ok(())
+    }
+}
+
+impl SetupFileV3 {
+    fn validate(&self) -> Result<(), PreferenceError> {
+        if self.version != SETUP_FILE_V3_VERSION
             || self.computers.len() > MAX_COMPUTERS
             || self
                 .interface_id
@@ -234,6 +499,72 @@ impl SetupFile {
             }
         }
         Ok(())
+    }
+
+    /// This computer is the identity most records name, the active record's on a tie. Every
+    /// record of it becomes a two-member group with its layout verbatim, stamped so that both
+    /// computers' copies of one pair agree (`GroupRecord::from_pairwise`).
+    fn migrate(self, platform: Platform) -> SetupFile {
+        let active = self
+            .active
+            .as_ref()
+            .and_then(|active| self.computers.get(active));
+        let mut votes: BTreeMap<&str, usize> = BTreeMap::new();
+        for record in self.computers.values() {
+            *votes.entry(record.local_fingerprint.as_str()).or_default() += 1;
+        }
+        let most = votes.values().copied().max().unwrap_or_default();
+        let local = active
+            .map(|record| record.local_fingerprint.as_str())
+            .filter(|local| votes.get(local) == Some(&most))
+            .or_else(|| {
+                votes
+                    .iter()
+                    .find(|(_, count)| **count == most)
+                    .map(|(local, _)| *local)
+            })
+            .map(str::to_owned);
+        let interface_id = self
+            .interface_id
+            .clone()
+            .or_else(|| active.map(|record| record.interface_id.clone()));
+        let (mut earlier_identity, mut unusable) = (0_usize, 0_usize);
+        let mut groups = Vec::new();
+        for record in self.computers.values() {
+            if Some(&record.local_fingerprint) != local.as_ref() {
+                earlier_identity += 1;
+                continue;
+            }
+            match GroupRecord::from_pairwise(record, platform, opposite_platform(platform)) {
+                Ok(group) => groups.push(group),
+                Err(_) => unusable += 1,
+            }
+        }
+        if earlier_identity > 0 {
+            log::warn!(
+                "setup: dropped {earlier_identity} saved layouts of an earlier identity of this computer"
+            );
+        }
+        if unusable > 0 {
+            log::warn!("setup: dropped {unusable} saved layouts that could not be carried over");
+        }
+        groups.sort_by_cached_key(GroupRecord::member_keys);
+        let local_key = local.as_deref().map(fingerprint_key);
+        SetupFile {
+            version: SETUP_FILE_VERSION,
+            interface_id,
+            enabled: self
+                .active
+                .into_iter()
+                .filter(|peer| Some(peer) != local_key.as_ref())
+                .collect(),
+            local,
+            paused: false,
+            clock: MIGRATED_CLOCK,
+            groups,
+            pairwise: BTreeMap::new(),
+            refused: false,
+        }
     }
 }
 
@@ -1279,7 +1610,7 @@ fn invalid_data() -> io::Error {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use monhop_core::Platform;
+    use crate::group_record::{GroupMember, KnownDisplays};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -1887,10 +2218,15 @@ pub(crate) mod tests {
         );
         assert_eq!(loaded.active_computer(), Some(&preferences()));
         let text = String::from_utf8(fs::read(&path).unwrap()).unwrap();
-        assert!(text.contains("\"version\":3"));
+        assert!(text.contains("\"version\":4"));
         assert!(!text.contains("sharingEnabled"));
-        assert!(text.contains(&format!("\"active\":\"{}\"", "b".repeat(64))));
-        assert!(text.contains(&format!("\"{}\":{{", "b".repeat(64))));
+        assert!(text.contains(&format!("\"local\":\"{}\"", "A".repeat(64))));
+        assert!(text.contains(&format!("\"enabled\":[\"{}\"]", "b".repeat(64))));
+        assert!(text.contains("\"paused\":false"));
+        assert!(!text.contains("\"computers\""));
+        assert!(!text.contains("\"active\""));
+        // Records carry no network: the file names the one all sharing uses, once.
+        assert_eq!(text.matches("interfaceId").count(), 1);
 
         let mut file = loaded;
         file.remove(&"B".repeat(64));
@@ -2160,18 +2496,543 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn inserting_the_same_computer_replaces_its_complete_record() {
+    fn inserting_never_touches_the_network_choice() {
         let directory = TestDirectory::new();
         let path = directory.path("sharing.json");
+        // A record made on another network replaces the pair's whole layout, not the network.
         let mut replacement = preferences();
         replacement.interface_id = "en1:7:192.168.1.5".into();
+        replacement.layout.control.insert("b".repeat(64), false);
         let mut file = file_with(preferences());
         file.insert(replacement.clone());
         file.save(&path).unwrap();
         let loaded = SetupFile::load(&path).unwrap();
         assert_eq!(loaded.fingerprints().count(), 1);
-        assert_eq!(loaded.computer(&"b".repeat(64)), Some(&replacement));
-        assert_eq!(loaded.interface_id(), Some("en1:7:192.168.1.5"));
+        assert_eq!(loaded.interface_id(), Some("en0:4:192.168.1.4"));
+        let on_the_chosen_network = SharingPreferences {
+            interface_id: "en0:4:192.168.1.4".into(),
+            ..replacement.clone()
+        };
+        assert_eq!(
+            loaded.computer(&"b".repeat(64)),
+            Some(&on_the_chosen_network)
+        );
+
+        // Only an explicit choice moves it, and every record follows it.
+        let mut file = loaded;
+        file.set_interface_id("en1:7:192.168.1.5");
+        assert_eq!(file.computer(&"b".repeat(64)), Some(&replacement));
+        // A record a link agreed on leaves it alone as well.
+        file.adopt(&"A".repeat(64), trio(9, true)).unwrap();
+        assert_eq!(file.interface_id(), Some("en1:7:192.168.1.5"));
+
+        // A file with no network yet takes the first record's, so that record can be used.
+        let mut fresh = SetupFile::default();
+        fresh.insert(replacement.clone());
+        assert_eq!(fresh.interface_id(), Some("en1:7:192.168.1.5"));
+        fresh.insert(preferences());
+        assert_eq!(fresh.interface_id(), Some("en1:7:192.168.1.5"));
+    }
+
+    /// This computer (A, a Mac) with two PCs, B and C, each crossing to A's one display.
+    fn trio(revision: u64, c_controls: bool) -> GroupRecord {
+        let member = |owner: char, platform: Platform, id: &str| {
+            let display = DisplaySnapshot {
+                id: id.into(),
+                name: format!("Display {id}"),
+                origin: [0.0, 0.0],
+                size: [1920.0, 1080.0],
+                native_size: [1920, 1080],
+                scale: 1.0,
+                primary: true,
+                monitor: None,
+            };
+            GroupMember::new(
+                &owner.to_string().repeat(64),
+                platform,
+                &topology_of(&[display]).unwrap(),
+            )
+            .unwrap()
+        };
+        let mut control = both_directions(&"A".repeat(64), &"B".repeat(64));
+        control.insert("c".repeat(64), c_controls);
+        GroupRecord::new(
+            revision,
+            &"A".repeat(64),
+            vec![
+                member('A', Platform::MacOs, "1"),
+                member('B', Platform::Windows, "2"),
+                member('C', Platform::Windows, "3"),
+            ],
+            LayoutRequest {
+                links: vec![
+                    link("1", "right", "2", "left"),
+                    link("2", "left", "1", "right"),
+                    link("1", "left", "3", "right"),
+                    link("3", "right", "1", "left"),
+                ],
+                arrangement: None,
+                control,
+            },
+        )
+        .expect("the fixture is a valid record")
+    }
+
+    #[test]
+    fn adopting_sets_enabled_to_the_members_and_never_goes_back() {
+        let directory = TestDirectory::new();
+        let path = directory.path("sharing.json");
+        let local = "A".repeat(64);
+        let (b, c) = ("b".repeat(64), "c".repeat(64));
+        let mut file = file_with(preferences());
+        let pair_before = file.computer(&b).cloned();
+        assert!(pair_before.is_some());
+
+        // A group of three: its other members become the enabled group.
+        assert_eq!(file.adopt(&local, trio(5, true)), Ok(true));
+        assert_eq!(file.enabled(), [b.clone(), c.clone()]);
+        assert_eq!(file.active_group(), Some(&trio(5, true)));
+        assert_eq!(file.clock(), 5);
+        // No single computer is active, and the pair keeps its own record.
+        assert_eq!(file.active(), None);
+        assert_eq!(file.computer(&b).cloned(), pair_before);
+
+        // An older copy of the group changes nothing held.
+        assert_eq!(file.adopt(&local, trio(4, false)), Ok(false));
+        assert_eq!(file.active_group(), Some(&trio(5, true)));
+        assert_eq!(file.clock(), 5);
+        // The same stamp is taken, for its labels.
+        let mut known = KnownDisplays::default();
+        let mut renamed = trio(5, true).members()[0].displays().to_vec();
+        renamed[0].name = "Studio Display".into();
+        known.insert(&local, Platform::MacOs, &topology_of(&renamed).unwrap());
+        let relabeled = trio(5, true).relabeled(&known);
+        assert_ne!(relabeled, trio(5, true));
+        assert_eq!(relabeled.stamp(), trio(5, true).stamp());
+        assert_eq!(file.adopt(&local, relabeled.clone()), Ok(true));
+        assert_eq!(file.active_group(), Some(&relabeled));
+
+        // Back to the pair: its newer record is taken and only B stays enabled, while the
+        // group of three keeps its record for when C is switched on again.
+        let pair = GroupRecord::from_pairwise(&preferences(), Platform::MacOs, Platform::Windows)
+            .unwrap()
+            .restamped(6, &local)
+            .unwrap();
+        assert_eq!(file.adopt(&local, pair.clone()), Ok(true));
+        assert_eq!(file.enabled(), std::slice::from_ref(&b));
+        assert_eq!(file.active(), Some(b.as_str()));
+        assert_eq!(file.active_group(), Some(&pair));
+        assert_eq!(file.groups().len(), 2);
+        assert_eq!(file.clock(), 6);
+        // An older pair record never replaces the held one, though its members are enabled.
+        let older = pair.restamped(2, &"B".repeat(64)).unwrap();
+        assert_eq!(file.adopt(&local, older), Ok(false));
+        assert_eq!(file.active_group(), Some(&pair));
+
+        // A pause is the user's and stays.
+        file.set_active(None);
+        assert_eq!(file.adopt(&local, trio(7, true)), Ok(true));
+        assert!(file.paused());
+        assert_eq!(file.enabled(), [b.clone(), c.clone()]);
+        // A record that does not name this computer is refused and changes nothing.
+        let before = file.clone();
+        assert_eq!(
+            file.adopt(&"D".repeat(64), trio(8, true)),
+            Err(PreferenceError::Invalid)
+        );
+        assert_eq!(file, before);
+
+        file.save(&path).unwrap();
+        assert_eq!(SetupFile::load(&path).unwrap(), file);
+    }
+
+    /// `preferences()` made with the computer `peer` names instead.
+    fn record_for(peer: &str) -> SharingPreferences {
+        let mut record = preferences();
+        record.peer_fingerprint = peer.to_owned();
+        record.layout.control = both_directions(&record.local_fingerprint, peer);
+        record
+    }
+
+    #[test]
+    fn groups_are_bounded_and_the_oldest_inactive_is_evicted() {
+        let directory = TestDirectory::new();
+        let path = directory.path("sharing.json");
+        // The active pair is the oldest record of all and still stays.
+        let mut file = file_with(preferences());
+        let peers: Vec<String> = (0..MAX_GROUPS)
+            .map(|index| format!("{index:064X}"))
+            .collect();
+        for peer in &peers {
+            file.insert(record_for(peer));
+        }
+        assert_eq!(file.groups().len(), MAX_GROUPS);
+        assert_eq!(file.active_computer(), Some(&preferences()));
+        assert_eq!(file.computer(&peers[0]), None);
+        for peer in &peers[1..] {
+            assert_eq!(file.computer(peer), Some(&record_for(peer)));
+        }
+        file.save(&path).unwrap();
+        assert_eq!(SetupFile::load(&path).unwrap(), file);
+
+        // Saving a record again makes it the newest, so the next one to go is the oldest left.
+        file.insert(record_for(&peers[1]));
+        file.insert(record_for(&peers[0]));
+        assert_eq!(file.groups().len(), MAX_GROUPS);
+        assert_eq!(file.computer(&peers[2]), None);
+        assert!(file.computer(&peers[1]).is_some());
+        assert!(file.computer(&peers[0]).is_some());
+
+        // A file past the bound was not written by this version and is an error.
+        let mut groups = file.groups().to_vec();
+        groups.push(
+            GroupRecord::from_pairwise(&record_for(&peers[2]), Platform::MacOs, Platform::Windows)
+                .unwrap(),
+        );
+        groups.sort_by_cached_key(GroupRecord::member_keys);
+        let mut past = serde_json::to_value(&file).unwrap();
+        past["groups"] = serde_json::to_value(groups).unwrap();
+        write_raw(&path, &serde_json::to_vec(&past).unwrap());
+        assert!(SetupFile::load(&path).is_err());
+    }
+
+    #[test]
+    fn the_compatibility_layer_returns_a_pairwise_record_as_inserted() {
+        let directory = TestDirectory::new();
+        let path = directory.path("sharing.json");
+        for record in [
+            preferences(),
+            mirrored(&preferences()),
+            two_display_record(),
+            placed_record((1920.0, 0.0)),
+            preferences_for_peer('0'),
+        ] {
+            let key = fingerprint_key(&record.peer_fingerprint);
+            let peer = CertificateFingerprint::parse_full(&record.peer_fingerprint).unwrap();
+            let mut file = SetupFile::default();
+            file.set_interface_id("en7:12:10.1.1.7");
+            file.set_active(Some(&peer));
+            file.insert(record.clone());
+            // Exactly the record inserted, on the file's network.
+            let expected = SharingPreferences {
+                interface_id: "en7:12:10.1.1.7".into(),
+                ..record.clone()
+            };
+            assert_eq!(file.computer(&key), Some(&expected));
+            assert_eq!(file.active_computer(), Some(&expected));
+            file.save(&path).unwrap();
+            let loaded = SetupFile::load(&path).unwrap();
+            assert_eq!(loaded.active_computer(), Some(&expected));
+            assert_eq!(loaded.fingerprints().collect::<Vec<_>>(), [key.as_str()]);
+
+            // Pause keeps the computer and its record; choosing it again resumes.
+            let mut paused = loaded;
+            paused.set_active(None);
+            assert!(paused.paused());
+            assert_eq!(paused.active(), None);
+            assert_eq!(paused.enabled(), std::slice::from_ref(&key));
+            assert_eq!(paused.computer(&key), Some(&expected));
+            paused.set_active(Some(&peer));
+            assert!(!paused.paused());
+            assert_eq!(paused.active_computer(), Some(&expected));
+        }
+    }
+
+    const LOCAL: &str = "7C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F8";
+    const WINDOWS_PC: &str = "2B8F0C6D4E1A93572B8F0C6D4E1A93572B8F0C6D4E1A93572B8F0C6D4E1A9357";
+    const SECOND_PC: &str = "E04A7B3C9D2F1856E04A7B3C9D2F1856E04A7B3C9D2F1856E04A7B3C9D2F1856";
+
+    /// A Mac's setup file exactly as version 3 wrote it: a PC with two displays, arranged and
+    /// active, and a second PC saved on another network whose input may not control the Mac.
+    const V3_FILE: &str = r#"{
+  "version": 3,
+  "interfaceId": "en0:4:192.168.1.4",
+  "active": "2b8f0c6d4e1a93572b8f0c6d4e1a93572b8f0c6d4e1a93572b8f0c6d4e1a9357",
+  "computers": {
+    "2b8f0c6d4e1a93572b8f0c6d4e1a93572b8f0c6d4e1a93572b8f0c6d4e1a9357": {
+      "version": 2,
+      "interfaceId": "en0:4:192.168.1.4",
+      "localFingerprint": "7C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F8",
+      "peerFingerprint": "2B8F0C6D4E1A93572B8F0C6D4E1A93572B8F0C6D4E1A93572B8F0C6D4E1A9357",
+      "localDisplays": [
+        {"id": "5764607523034234881", "name": "Built-in Retina Display", "origin": [0.0, 0.0],
+         "size": [1512.0, 982.0], "nativeSize": [3024, 1964], "scale": 2.0, "primary": true,
+         "monitor": "0610-a050-00000000"}
+      ],
+      "peerDisplays": [
+        {"id": "17293822569102704641", "name": "DELL U2723QE", "origin": [0.0, 0.0],
+         "size": [2560.0, 1440.0], "nativeSize": [2560, 1440], "scale": 1.0, "primary": true,
+         "monitor": "10ac-4173-00000001"},
+        {"id": "12297829382473034410", "name": "Generic PnP Monitor", "origin": [2560.0, 0.0],
+         "size": [1920.0, 1080.0], "nativeSize": [1920, 1080], "scale": 1.0, "primary": false}
+      ],
+      "layout": {
+        "links": [
+          {"fromDisplay": "5764607523034234881", "fromEdge": "right", "fromSpan": [0.0, 1.0],
+           "toDisplay": "17293822569102704641", "toEdge": "left", "toSpan": [0.25, 0.75],
+           "hysteresis": 1.0},
+          {"fromDisplay": "17293822569102704641", "fromEdge": "left", "fromSpan": [0.25, 0.75],
+           "toDisplay": "5764607523034234881", "toEdge": "right", "toSpan": [0.0, 1.0],
+           "hysteresis": 1.0}
+        ],
+        "arrangement": {
+          "positions": [
+            {"display": "5764607523034234881", "x": -1512.0, "y": 144.0},
+            {"display": "17293822569102704641", "x": 0.0, "y": 0.0},
+            {"display": "12297829382473034410", "x": 2560.0, "y": 0.0}
+          ],
+          "hidden": []
+        },
+        "control": {
+          "2b8f0c6d4e1a93572b8f0c6d4e1a93572b8f0c6d4e1a93572b8f0c6d4e1a9357": true,
+          "7c1e5a9034b6d2f87c1e5a9034b6d2f87c1e5a9034b6d2f87c1e5a9034b6d2f8": true
+        }
+      }
+    },
+    "e04a7b3c9d2f1856e04a7b3c9d2f1856e04a7b3c9d2f1856e04a7b3c9d2f1856": {
+      "version": 2,
+      "interfaceId": "en1:9:10.0.0.2",
+      "localFingerprint": "7C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F8",
+      "peerFingerprint": "E04A7B3C9D2F1856E04A7B3C9D2F1856E04A7B3C9D2F1856E04A7B3C9D2F1856",
+      "localDisplays": [
+        {"id": "5764607523034234881", "name": "Built-in Retina Display", "origin": [0.0, 0.0],
+         "size": [1512.0, 982.0], "nativeSize": [3024, 1964], "scale": 2.0, "primary": true,
+         "monitor": "0610-a050-00000000"}
+      ],
+      "peerDisplays": [
+        {"id": "9223372036854775817", "name": "LG HDR 4K", "origin": [0.0, 0.0],
+         "size": [2560.0, 1440.0], "nativeSize": [3840, 2160], "scale": 1.5, "primary": true,
+         "monitor": "1e6d-7750-0001e240"}
+      ],
+      "layout": {
+        "links": [
+          {"fromDisplay": "5764607523034234881", "fromEdge": "left", "fromSpan": [0.0, 1.0],
+           "toDisplay": "9223372036854775817", "toEdge": "right", "toSpan": [0.25, 0.75],
+           "hysteresis": 1.0},
+          {"fromDisplay": "9223372036854775817", "fromEdge": "right", "fromSpan": [0.25, 0.75],
+           "toDisplay": "5764607523034234881", "toEdge": "left", "toSpan": [0.0, 1.0],
+           "hysteresis": 1.0}
+        ],
+        "control": {
+          "7c1e5a9034b6d2f87c1e5a9034b6d2f87c1e5a9034b6d2f87c1e5a9034b6d2f8": true,
+          "e04a7b3c9d2f1856e04a7b3c9d2f1856e04a7b3c9d2f1856e04a7b3c9d2f1856": false
+        }
+      }
+    }
+  }
+}"#;
+
+    /// The first PC's own version 3 file: the same pair from its side, on its own network.
+    fn mirrored_v3_file() -> String {
+        let v3: serde_json::Value = serde_json::from_str(V3_FILE).unwrap();
+        let mut record = v3["computers"][fingerprint_key(WINDOWS_PC)].clone();
+        let fields = record.as_object_mut().unwrap();
+        for (here, there) in [
+            ("localFingerprint", "peerFingerprint"),
+            ("localDisplays", "peerDisplays"),
+        ] {
+            let (mine, theirs) = (fields.remove(here).unwrap(), fields.remove(there).unwrap());
+            fields.insert(here.into(), theirs);
+            fields.insert(there.into(), mine);
+        }
+        fields.insert("interfaceId".into(), "windows-physical-interface".into());
+        serde_json::json!({
+            "version": 3,
+            "interfaceId": "windows-physical-interface",
+            "active": fingerprint_key(LOCAL),
+            "computers": { fingerprint_key(LOCAL): record },
+        })
+        .to_string()
+    }
+
+    fn load_as(text: &str, platform: Platform) -> SetupFile {
+        let directory = TestDirectory::new();
+        let path = directory.path("sharing.json");
+        write_raw(&path, text.as_bytes());
+        SetupFile::load_as(&path, platform).unwrap()
+    }
+
+    fn group_of<'a>(file: &'a SetupFile, peer: &str) -> &'a GroupRecord {
+        file.groups()
+            .iter()
+            .find(|group| group.has_member(peer))
+            .expect("the pair has a record")
+    }
+
+    #[test]
+    fn a_v3_file_migrates_every_pairwise_layout() {
+        let v3: serde_json::Value = serde_json::from_str(V3_FILE).unwrap();
+        let file = load_as(V3_FILE, Platform::MacOs);
+        assert_eq!(file.local(), Some(LOCAL));
+        assert_eq!(file.enabled(), [fingerprint_key(WINDOWS_PC)]);
+        assert!(!file.paused());
+        assert_eq!(file.clock(), MIGRATED_CLOCK);
+        assert_eq!(file.interface_id(), Some("en0:4:192.168.1.4"));
+        assert_eq!(file.groups().len(), 2);
+        // The PC with the lower DeviceId decided for the first pair, this Mac for the second.
+        for (peer, revision, author) in [(WINDOWS_PC, 1, WINDOWS_PC), (SECOND_PC, 2, LOCAL)] {
+            let saved: SharingPreferences =
+                serde_json::from_value(v3["computers"][fingerprint_key(peer)].clone()).unwrap();
+            assert_eq!(saved.local_decides(), revision == 2);
+            // Displays, ids, monitors, arrangement and control verbatim; the network is the file's.
+            let expected = SharingPreferences {
+                interface_id: "en0:4:192.168.1.4".into(),
+                ..saved
+            };
+            assert_eq!(file.computer(peer), Some(&expected));
+            let group = group_of(&file, peer);
+            assert_eq!((group.revision(), group.author()), (revision, author));
+            assert!(group.members().iter().all(|member| {
+                member.platform()
+                    == if member.fingerprint() == LOCAL {
+                        ComputerPlatform::Macos
+                    } else {
+                        ComputerPlatform::Windows
+                    }
+            }));
+            assert!(group.topology_for(LOCAL).is_some());
+            assert_eq!(
+                crate::group_record::wire_control(&group.layout().control, LOCAL, peer),
+                expected.wire_control().ok()
+            );
+        }
+        assert_eq!(file.active_computer(), file.computer(WINDOWS_PC));
+        assert_eq!(file.active_group(), Some(group_of(&file, WINDOWS_PC)));
+    }
+
+    #[test]
+    fn the_other_computers_v3_file_migrates_to_the_same_content() {
+        let mac = load_as(V3_FILE, Platform::MacOs);
+        let pc = load_as(&mirrored_v3_file(), Platform::Windows);
+        assert_eq!(pc.local(), Some(WINDOWS_PC));
+        assert_eq!(pc.active(), Some(fingerprint_key(LOCAL).as_str()));
+        assert_eq!(pc.interface_id(), Some("windows-physical-interface"));
+        let (here, there) = (group_of(&mac, WINDOWS_PC), group_of(&pc, LOCAL));
+        assert_eq!(here.content_digest(), there.content_digest());
+        assert_eq!(here.members(), there.members());
+        // Both name the old decider; its own copy is newer, so copies that drifted converge to it.
+        assert_eq!((here.author(), there.author()), (WINDOWS_PC, WINDOWS_PC));
+        assert_eq!((here.revision(), there.revision()), (1, 2));
+        assert_eq!(here.clone().merge(there.clone()), *there);
+        // Each computer still reads the pair from its own side.
+        let (mine, theirs) = (
+            mac.computer(WINDOWS_PC).unwrap(),
+            pc.computer(LOCAL).unwrap(),
+        );
+        assert_eq!(theirs.local_fingerprint(), WINDOWS_PC);
+        assert_eq!(theirs.local_displays(), mine.peer_displays());
+        assert_eq!(theirs.layout(), mine.layout());
+        assert_eq!(theirs.wire_control(), mine.wire_control());
+    }
+
+    /// A version 3 file holding `records`, with the computer `active` names chosen.
+    fn v3_file(active: Option<char>, records: &[SharingPreferences]) -> Vec<u8> {
+        let computers: serde_json::Map<String, serde_json::Value> = records
+            .iter()
+            .map(|record| {
+                (
+                    fingerprint_key(&record.peer_fingerprint),
+                    serde_json::to_value(record).unwrap(),
+                )
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "version": 3,
+            "interfaceId": "en0:4:192.168.1.4",
+            "active": active.map(|owner| owner.to_string().repeat(64).to_ascii_lowercase()),
+            "computers": computers,
+        }))
+        .unwrap()
+    }
+
+    /// `local`'s record with `peer`, as that identity of this computer saved it.
+    fn record_of(local: char, peer: char) -> SharingPreferences {
+        let mut record = preferences_for_peer(peer);
+        record.local_fingerprint = local.to_string().repeat(64);
+        record.layout.control =
+            both_directions(&record.local_fingerprint, &record.peer_fingerprint);
+        record
+    }
+
+    #[test]
+    fn a_record_of_an_older_identity_is_dropped() {
+        let directory = TestDirectory::new();
+        let path = directory.path("sharing.json");
+        let load = |active, records: &[SharingPreferences]| {
+            write_raw(&path, &v3_file(active, records));
+            SetupFile::load(&path).unwrap()
+        };
+        let keys = |file: &SetupFile| file.fingerprints().map(str::to_owned).collect::<Vec<_>>();
+
+        // Two records name this computer A; the one it saved under its earlier identity D goes.
+        let file = load(
+            Some('B'),
+            &[
+                record_of('A', 'B'),
+                record_of('A', 'C'),
+                record_of('D', 'E'),
+            ],
+        );
+        assert_eq!(file.local(), Some("A".repeat(64).as_str()));
+        assert_eq!(keys(&file), ["b".repeat(64), "c".repeat(64)]);
+        assert_eq!(file.groups().len(), 2);
+        assert_eq!(file.computer(&"e".repeat(64)), None);
+        assert_eq!(file.active_computer(), Some(&record_of('A', 'B')));
+
+        // On a tie the active record names this computer.
+        let file = load(Some('E'), &[record_of('A', 'B'), record_of('D', 'E')]);
+        assert_eq!(file.local(), Some("D".repeat(64).as_str()));
+        assert_eq!(keys(&file), ["e".repeat(64)]);
+        assert_eq!(file.active_computer(), Some(&record_of('D', 'E')));
+
+        // Without one, every load settles the tie the same way.
+        let file = load(None, &[record_of('A', 'B'), record_of('D', 'E')]);
+        assert_eq!(file.local(), Some("A".repeat(64).as_str()));
+        assert_eq!(keys(&file), ["b".repeat(64)]);
+        assert!(file.enabled().is_empty());
+        assert_eq!(file.active(), None);
+    }
+
+    #[test]
+    fn loading_never_rewrites_and_saving_writes_version_4() {
+        let directory = TestDirectory::new();
+        let path = directory.path("sharing.json");
+        write_raw(&path, V3_FILE.as_bytes());
+        let migrated = SetupFile::load(&path).unwrap();
+        assert_eq!(SetupFile::load(&path).unwrap(), migrated);
+        assert_eq!(fs::read(&path).unwrap(), V3_FILE.as_bytes());
+
+        migrated.save(&path).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["version"], 4);
+        assert_eq!(written["clock"], 2);
+        let mut fields: Vec<&str> = written
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "clock",
+                "enabled",
+                "groups",
+                "interfaceId",
+                "local",
+                "paused",
+                "version"
+            ]
+        );
+        assert!(
+            written["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|group| group.get("interfaceId").is_none())
+        );
+        assert_eq!(SetupFile::load(&path).unwrap(), migrated);
     }
 
     #[test]
@@ -2193,43 +3054,86 @@ pub(crate) mod tests {
         write_raw(&path, &vec![b'x'; MAX_SETUP_FILE_BYTES as usize + 1]);
         assert!(SetupFile::load(&path).is_err());
 
+        let rejected = |value: &serde_json::Value| {
+            write_raw(&path, &serde_json::to_vec(value).unwrap());
+            SetupFile::load(&path).is_err()
+        };
+        let valid = serde_json::to_value(file_with(preferences())).unwrap();
+        assert!(!rejected(&valid));
         for (level, field) in [
-            ("file", "enabled"),
+            ("file", "active"),
+            ("file", "computers"),
+            ("record", "interfaceId"),
             ("record", "enabled"),
             ("record", "sourcePlatform"),
         ] {
-            let mut unknown = serde_json::to_value(file_with(preferences())).unwrap();
+            let mut unknown = valid.clone();
             let target = if level == "file" {
                 unknown.as_object_mut().unwrap()
             } else {
-                unknown["computers"][&"b".repeat(64)]
-                    .as_object_mut()
-                    .unwrap()
+                unknown["groups"][0].as_object_mut().unwrap()
             };
             target.insert(field.into(), serde_json::Value::Bool(false));
-            write_raw(&path, &serde_json::to_vec(&unknown).unwrap());
-            assert!(SetupFile::load(&path).is_err(), "{level}");
+            assert!(rejected(&unknown), "{level} {field}");
         }
 
-        let mut other_version = serde_json::to_value(file_with(preferences())).unwrap();
+        // A file that breaks its own rules is an error, never reset.
+        let breaks: [fn(&mut serde_json::Value); 10] = [
+            |file| file["enabled"] = serde_json::json!(["B".repeat(64)]),
+            |file| file["enabled"] = serde_json::json!(["c".repeat(64), "b".repeat(64)]),
+            |file| file["enabled"] = serde_json::json!(["a".repeat(64)]),
+            |file| file["local"] = serde_json::json!("a".repeat(64)),
+            |file| file["local"] = serde_json::json!("C".repeat(64)),
+            |file| file["clock"] = serde_json::json!(0),
+            |file| file["interfaceId"] = serde_json::json!(""),
+            |file| file["groups"][0]["layout"]["control"] = serde_json::json!({}),
+            |file| {
+                let group = file["groups"][0].clone();
+                file["groups"].as_array_mut().unwrap().push(group);
+            },
+            |file| {
+                file.as_object_mut().unwrap().remove("paused");
+            },
+        ];
+        for (index, change) in breaks.iter().enumerate() {
+            let mut broken = valid.clone();
+            change(&mut broken);
+            assert!(rejected(&broken), "{index}");
+        }
+
+        let mut other_version = valid.clone();
         other_version["version"] = serde_json::json!(SETUP_FILE_VERSION + 1);
         write_raw(&path, &serde_json::to_vec(&other_version).unwrap());
         assert_eq!(SetupFile::load(&path).unwrap(), SetupFile::default());
 
-        let mut old_record = serde_json::to_value(file_with(preferences())).unwrap();
-        old_record["computers"][&"b".repeat(64)] = v014_record();
-        write_raw(&path, &serde_json::to_vec(&old_record).unwrap());
-        assert!(SetupFile::load(&path).is_err());
+        // A version 3 file is read as strictly as that version read it before it is migrated.
+        let v3: serde_json::Value =
+            serde_json::from_slice(&v3_file(Some('B'), &[preferences()])).unwrap();
+        assert!(!rejected(&v3));
+        let (b, c) = ("b".repeat(64), "c".repeat(64));
 
-        let mut wrong_key = serde_json::to_value(file_with(preferences())).unwrap();
-        let record = wrong_key["computers"][&"b".repeat(64)].take();
-        wrong_key["computers"][&"c".repeat(64)] = record;
-        write_raw(&path, &serde_json::to_vec(&wrong_key).unwrap());
-        assert!(SetupFile::load(&path).is_err());
+        let mut old_record = v3.clone();
+        old_record["computers"][&b] = v014_record();
+        assert!(rejected(&old_record));
 
-        let mut upper_active = serde_json::to_value(file_with(preferences())).unwrap();
+        let mut wrong_key = v3.clone();
+        let computers = wrong_key["computers"].as_object_mut().unwrap();
+        let record = computers.remove(&b).unwrap();
+        computers.insert(c, record);
+        assert!(rejected(&wrong_key));
+
+        let mut upper_active = v3.clone();
         upper_active["active"] = serde_json::json!("B".repeat(64));
-        write_raw(&path, &serde_json::to_vec(&upper_active).unwrap());
+        assert!(rejected(&upper_active));
+
+        let mut unknown = v3.clone();
+        unknown["enabled"] = serde_json::json!([b]);
+        assert!(rejected(&unknown));
+
+        let too_many: Vec<SharingPreferences> = (0..=MAX_COMPUTERS)
+            .map(|index| record_for(&format!("{index:064X}")))
+            .collect();
+        write_raw(&path, &v3_file(None, &too_many));
         assert!(SetupFile::load(&path).is_err());
     }
 
@@ -2273,14 +3177,7 @@ pub(crate) mod tests {
         let mut too_many_links = preferences();
         too_many_links.layout.links = vec![too_many_links.layout.links[0].clone(); MAX_LINKS + 1];
         assert!(file_with(too_many_links).save(&path).is_err());
-
-        let mut too_many_computers = SetupFile::default();
-        for index in 0..=MAX_COMPUTERS {
-            let mut setup = preferences();
-            setup.peer_fingerprint = format!("{index:064X}");
-            too_many_computers.insert(setup);
-        }
-        assert!(too_many_computers.save(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

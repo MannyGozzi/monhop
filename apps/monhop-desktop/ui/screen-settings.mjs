@@ -5,11 +5,22 @@ import {
   autostartStatusText,
   showAutostartOpenSettings,
 } from "./autostart-model.mjs";
+import {
+  CLIPBOARD_NEEDS_CONNECTION,
+  clipboardAccessNotice,
+  clipboardNoticeText,
+  clipboardPeerLines,
+  clipboardStatusText,
+  lastTransferText,
+  normalizeClipboardView,
+} from "./clipboard-model.mjs";
 import { button, card, clear, el, note, rows, switchRow } from "./dom.mjs";
 
 export function renderSettings(nodes, ctx) {
   clear(nodes.settingsContent);
-  nodes.settingsContent.append(updatesCard(ctx), startupCard(ctx), aboutCard(ctx));
+  nodes.settingsContent.append(
+    ...[updatesCard(ctx), clipboardCard(ctx), startupCard(ctx), aboutCard(ctx)].filter(Boolean),
+  );
 }
 
 function updatesCard(ctx) {
@@ -64,6 +75,43 @@ function updatesCard(ctx) {
       }),
     ],
   });
+}
+
+// Hidden until app.js wires `state.clipboard = { view, pending }` from clipboard_status / the
+// "clipboard" event, so an app.js that predates this card keeps rendering exactly as it did.
+function clipboardCard(ctx) {
+  const { clipboard, computers, actions } = ctx;
+  if (!clipboard) return null;
+  const view = normalizeClipboardView(clipboard.view);
+  const canToggle = typeof actions.setClipboardEnabled === "function";
+  const children = [
+    rows([
+      switchRow("Share the clipboard", {
+        checked: view.enabled,
+        description:
+          "Off until you turn it on. Text and images you copy go to connected computers that " +
+          "also have it on. Files never. Password-manager items are skipped. Stays on your " +
+          "network.",
+        disabled: clipboard.pending || !ctx.core || !canToggle,
+        id: "settings-clipboard-enable",
+        onChange: actions.setClipboardEnabled,
+      }),
+    ]),
+    el("p", {
+      className: "note",
+      id: "settings-clipboard-status",
+      text: clipboardStatusText(view),
+    }),
+  ];
+  for (const line of clipboardPeerLines(view, computers)) children.push(note(line));
+  const accessNotice = clipboardAccessNotice(view);
+  if (accessNotice) children.push(note(accessNotice, "danger"));
+  const skipNotice = clipboardNoticeText(view);
+  if (skipNotice) children.push(note(skipNotice));
+  const lastText = lastTransferText(view);
+  if (lastText) children.push(note(lastText));
+  children.push(note(CLIPBOARD_NEEDS_CONNECTION));
+  return card({ id: "settings-clipboard", title: "Clipboard", children });
 }
 
 function startupCard(ctx) {

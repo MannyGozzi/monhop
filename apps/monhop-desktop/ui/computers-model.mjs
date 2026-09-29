@@ -6,9 +6,10 @@ const FINGERPRINT = /^[a-f0-9]{64}$/i;
 const PLATFORM = new Set(["windows", "macos"]);
 const MAX_U64 = "18446744073709551615";
 const MAX_COMPUTERS = 16;
+const MAX_ENABLED = 8;
 
 export function initialComputers() {
-  return { loaded: false, items: [], active: null, interfaceId: null };
+  return { loaded: false, items: [], active: null, enabled: [], paused: false, interfaceId: null };
 }
 
 // --- reading the computers again --------------------------------------------------------
@@ -105,12 +106,53 @@ export function normalizeComputers(value) {
   }
   // An active fingerprint nobody is paired with is dropped rather than carried as a state nothing can render.
   const active = cleanFingerprint(value.active);
+  const enabled = normalizeEnabledList(value.enabled, active, seen);
+  const enabledSet = new Set(enabled);
+  // No group record yet: a computer counts as a "member" exactly when it is enabled, which matches
+  // the only shape a fresh two-computer setup has ever had.
+  const memberSet = normalizeMemberSet(value.group, seen);
   return {
     loaded: true,
-    items,
+    items: items.map((computer) =>
+      Object.assign({}, computer, {
+        enabled: enabledSet.has(computer.fingerprint),
+        member: memberSet
+          ? memberSet.has(computer.fingerprint)
+          : enabledSet.has(computer.fingerprint),
+      }),
+    ),
     active: active && seen.has(active) ? active : null,
+    enabled,
+    paused: value.paused === true,
     interfaceId: cleanText(value.interfaceId, 512) || null,
   };
+}
+
+// The computers actually turned on: the new `enabled` list when the backend sent one (even empty,
+// which means "none"), otherwise today's single `active` fingerprint wrapped in a list. Bounded,
+// deduplicated, sorted so callers never see order flicker between polls, and never names a
+// fingerprint outside the paired list handed in `seen`.
+function normalizeEnabledList(rawEnabled, active, seen) {
+  if (!Array.isArray(rawEnabled)) return active && seen.has(active) ? [active] : [];
+  const fingerprints = new Set();
+  for (const raw of rawEnabled) {
+    const fingerprint = cleanFingerprint(raw);
+    if (fingerprint && seen.has(fingerprint)) fingerprints.add(fingerprint);
+  }
+  return [...fingerprints].toSorted().slice(0, MAX_ENABLED);
+}
+
+// The members of the currently active saved group, when the reply carries one; unrecognized shapes
+// and unpaired fingerprints are dropped rather than trusted.
+function normalizeMemberSet(group, seen) {
+  if (!group || typeof group !== "object" || Array.isArray(group) || !Array.isArray(group.members))
+    return null;
+  const members = new Set();
+  for (const raw of group.members) {
+    const fingerprint = cleanFingerprint(raw);
+    if (fingerprint && seen.has(fingerprint)) members.add(fingerprint);
+  }
+  return members;
 }
 
 export function findComputer(computers, fingerprint) {

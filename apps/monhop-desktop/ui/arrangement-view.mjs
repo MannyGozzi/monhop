@@ -5,11 +5,11 @@ import {
   describeArrangement,
   fitTransform,
   formatSize,
+  groupRects,
   movePlacement,
   movingIds,
   resolvePlacement,
   sameTransform,
-  sideRects,
   snapPlacement,
   tileRects,
   tiles,
@@ -28,22 +28,29 @@ import {
 } from "./arrangement-render.mjs";
 import { revealPanel, setRevealOpen } from "./accordion.mjs";
 import { switchRow } from "./dom.mjs";
+import {
+  groupAriaText,
+  membersFromOptions,
+  normalizeUseChoices,
+  nudgePixels,
+  nudgeTarget,
+  tileAriaText,
+} from "./arrangement-view-model.mjs";
 
 const MIN_STAGE_WIDTH = 280;
 const MIN_STAGE_HEIGHT = 190;
 const SNAP_PIXELS = 14;
-const NUDGE_PIXELS = 12;
-const COARSE_NUDGE_PIXELS = 48;
-const SIDES = ["local", "peer"];
+// Below this a group's rect moved a rounding difference, not a rearrangement worth FLIP-animating.
+const GROUP_MOVE_EPSILON = 0.5;
 const INSTRUCTIONS =
-  "Drag a computer against the other; the edge where they touch is where the pointer crosses. With a computer selected, arrow keys nudge it and Shift with an arrow moves it further.";
+  "Drag a computer against another; the edge where they touch is where the pointer crosses. With a computer selected, arrow keys nudge it and Shift with an arrow moves it further.";
 
 // Only one editor is mounted at a time, so the fitted view survives the rebuild a commit triggers.
 let storedView = null;
 let refitNext = true;
 
 function shapeOf(value) {
-  return `${value.tiles.map((t) => `${t.id}:${t.side}:${t.x}:${t.y}:${t.width}:${t.height}`).join(",")}`;
+  return `${value.tiles.map((t) => `${t.id}:${t.group ?? t.side}:${t.x}:${t.y}:${t.width}:${t.height}`).join(",")}`;
 }
 
 function focusKeyOf(node) {
@@ -56,16 +63,51 @@ function emptyPreview() {
   return layer;
 }
 
+function reducedMotion() {
+  return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+// What changed between two drawings' group rects: how far each continuing group moved (the inverse
+// translate a FLIP transition starts from), which groups are on screen for the first time, and which
+// ones are gone (their last node is handed to the leaving layer instead of being discarded).
+function groupMotion(previous, current) {
+  const moved = {};
+  const entered = [];
+  const left = [];
+  const seen = new Set();
+  for (const [key, rect] of Object.entries(current ?? {})) {
+    seen.add(key);
+    const was = previous?.[key];
+    if (!was) {
+      entered.push(key);
+      continue;
+    }
+    const delta = [was.x - rect.x, was.y - rect.y];
+    if (Math.abs(delta[0]) >= GROUP_MOVE_EPSILON || Math.abs(delta[1]) >= GROUP_MOVE_EPSILON)
+      moved[key] = delta;
+  }
+  for (const key of Object.keys(previous ?? {})) if (!seen.has(key)) left.push(key);
+  return { moved, entered, left };
+}
+
+function memberMaps(members) {
+  const labels = {};
+  const platforms = {};
+  const tones = {};
+  for (const key of members.order) {
+    labels[key] = members.byKey[key].label;
+    platforms[key] = members.byKey[key].platform;
+    tones[key] = members.byKey[key].tone;
+  }
+  return { labels, platforms, tones };
+}
+
 export function createArrangementView(options) {
-  const {
-    localPlatform,
-    peerPlatform,
-    localLabel: localOverride,
-    peerLabel: peerOverride,
-  } = options;
   let arrangement = options.arrangement;
   let shared = Array.isArray(options.shared) ? options.shared : [];
-  let inUse = useChoices(options.inUse);
+  let members = membersFromOptions(options) ?? membersFromOptions({});
+  let { labels, platforms, tones } = memberMaps(members);
+  let inUse = normalizeUseChoices(members.order, options.inUse);
   let disabled = options.disabled === true;
   let handlers = {
     onCommit: options.onCommit,
@@ -77,11 +119,6 @@ export function createArrangementView(options) {
   const root = document.createElement("section");
   root.className = "arrangement-editor";
   root.setAttribute("aria-labelledby", "arrangement-title");
-
-  const localName = localOverride ?? "This computer";
-  const peerName = peerOverride ?? "The other computer";
-  const labels = { local: localName, peer: peerName };
-  const platforms = { local: localPlatform, peer: peerPlatform };
 
   const heading = document.createElement("div");
   heading.className = "arrangement-heading";
@@ -113,15 +150,19 @@ export function createArrangementView(options) {
   let legend = legendFor(false);
   function legendFor(withShared) {
     return createLegend([
-      { kind: "group", label: localName, side: "local" },
-      { kind: "group", label: peerName, side: "peer" },
+      ...members.order.map((key) => ({
+        kind: "group",
+        label: labels[key],
+        side: key,
+        tone: tones[key],
+      })),
       { kind: "primary", label: "Primary display" },
       ...(withShared ? [{ kind: "shared", label: "Cabled to both computers" }] : []),
       { kind: "seam", label: "Pointer crossing" },
     ]);
   }
 
-  // One row per monitor cabled to both computers: which computer shows on it decides which side draws it.
+  // One row per monitor cabled to more than one computer: which computer shows on it decides which one draws it.
   const sharedRow = document.createElement("div");
   sharedRow.className = "arrangement-shared";
   const sharedPanel = revealPanel(sharedRow);
@@ -146,7 +187,7 @@ export function createArrangementView(options) {
     refitNext = true;
     handlers.onReset?.();
   });
-  const fit = controlButton("Fit", "Fit both computers in this canvas", false);
+  const fit = controlButton("Fit", "Fit every computer in this canvas", false);
   fit.dataset.arrangementFit = "true";
   fit.addEventListener("click", () => {
     refitNext = true;
@@ -156,13 +197,13 @@ export function createArrangementView(options) {
 
   root.append(heading, instructions, stage, legend, sharedPanel, usePanel, controls);
 
-  if (!arrangement?.groups?.local || !arrangement.groups?.peer || !arrangement.placement) {
+  if (!arrangement?.groups?.order?.length || !arrangement.placement) {
     status.textContent = arrangement?.message || "These displays cannot be arranged yet.";
     stage.dataset.state = "empty";
     const empty = document.createElement("p");
     empty.className = "arrangement-empty";
     empty.textContent =
-      "No displays to arrange. Reconnect both computers, then come back to this step.";
+      "No displays to arrange. Reconnect every computer, then come back to this step.";
     stage.append(empty);
     for (const control of controls.querySelectorAll("button")) control.disabled = true;
     return { element: root, update() {}, destroy() {} };
@@ -175,13 +216,18 @@ export function createArrangementView(options) {
   let drag = null;
   let transform = null;
   let stageSize = { width: MIN_STAGE_WIDTH, height: MIN_STAGE_HEIGHT };
-  let rects = { tiles: {}, sides: {} };
-  let nodes = { local: null, peer: null };
+  let rects = { tiles: {}, groups: {} };
+  let nodes = {};
   let rendered = { shape: null, scale: null, disabled: null };
   let groupLayer = null;
   let seamLayer = null;
   let previewLayer = null;
   let guideLayer = null;
+  // A block that leaves the group keeps fading here after `nodes`/`groupLayer` no longer hold it;
+  // it removes itself once its leave animation ends, so this layer persists across rebuilds.
+  const leavingLayer = svgNode("g");
+  leavingLayer.classList.add("arrangement-leaving");
+  leavingLayer.setAttribute("aria-hidden", "true");
   let announced = "";
 
   const resizeObserver =
@@ -230,25 +276,25 @@ export function createArrangementView(options) {
       control.className = "segmented is-compact";
       control.setAttribute("role", "radiogroup");
       control.setAttribute("aria-label", `Which computer shows on ${choice.name}`);
-      for (const side of SIDES) {
+      for (const key of groups.order) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "segmented-option";
-        button.dataset.focusKey = `arrangement-shared-${choice.monitor}-${side}`;
+        button.dataset.focusKey = `arrangement-shared-${choice.monitor}-${key}`;
         button.dataset.sharedMonitor = choice.monitor;
-        button.dataset.sharedSide = side;
+        button.dataset.sharedSide = key;
         button.setAttribute("role", "radio");
-        button.setAttribute("aria-checked", String(choice.side === side));
-        button.textContent = labels[side];
-        const locked = choice.side !== side && !choice.canSwap;
+        button.setAttribute("aria-checked", String(choice.side === key));
+        button.textContent = labels[key];
+        const locked = choice.side !== key && !choice.canSwap;
         button.disabled = disabled || locked;
         button.title = locked
-          ? `${labels[side]} would keep no display of its own.`
-          : `${choice.name} shows ${labels[side]}, so the pointer crosses onto it as that computer.`;
+          ? `${labels[key]} would keep no display of its own.`
+          : `${choice.name} shows ${labels[key]}, so the pointer crosses onto it as that computer.`;
         button.addEventListener("click", () => {
-          if (disabled || choice.side === side) return;
+          if (disabled || choice.side === key) return;
           refitNext = true;
-          handlers.onShowMonitor?.(choice.monitor, side);
+          handlers.onShowMonitor?.(choice.monitor, key);
         });
         control.append(button);
       }
@@ -261,7 +307,7 @@ export function createArrangementView(options) {
   }
 
   function renderUse() {
-    const withDisplays = SIDES.filter((side) => inUse[side].length);
+    const withDisplays = groups.order.filter((key) => inUse[key]?.length);
     if (!withDisplays.length) {
       setRevealOpen(usePanel, false, { focusTarget: fit });
       return;
@@ -272,25 +318,26 @@ export function createArrangementView(options) {
     useTitle.textContent = "Displays in use";
     const useHint = document.createElement("span");
     useHint.className = "arrangement-use-hint";
-    useHint.textContent = "Turn off a display that is showing the other computer or is not in use.";
+    useHint.textContent = "Turn off a display that is showing another computer or is not in use.";
     useHeading.append(useTitle, useHint);
     const columns = document.createElement("div");
     columns.className = "arrangement-use-groups";
-    for (const side of withDisplays) {
+    for (const key of withDisplays) {
       const group = document.createElement("div");
       group.className = "arrangement-use-group";
-      group.dataset.side = side;
+      group.dataset.side = key;
       const name = document.createElement("div");
       name.className = "arrangement-legend-item arrangement-use-title";
-      name.dataset.side = side;
+      name.dataset.side = key;
+      name.dataset.tone = tones[key];
       const swatch = document.createElement("span");
       swatch.className = "arrangement-legend-swatch";
       swatch.setAttribute("aria-hidden", "true");
       const text = document.createElement("span");
-      text.textContent = labels[side];
+      text.textContent = labels[key];
       name.append(swatch, text);
       group.append(name);
-      for (const display of inUse[side]) {
+      for (const display of inUse[key]) {
         const locked = display.inUse && !display.canLeave;
         const details = [formatSize(display.size[0], display.size[1])];
         if (display.primary) details.push("Primary");
@@ -338,7 +385,7 @@ export function createArrangementView(options) {
     // Nothing to place means nothing to measure: the message alone is the scene until displays return.
     if (!all.length) {
       svg.replaceChildren();
-      nodes = { local: null, peer: null };
+      nodes = {};
       rendered = { shape: null, scale: null, disabled: null };
       stage.dataset.state = "empty";
       stage.dataset.dragging = "false";
@@ -355,8 +402,10 @@ export function createArrangementView(options) {
     storedView = { key, transform };
     fit.classList.toggle("is-current", sameTransform(transform, ideal));
 
-    rects = { tiles: tileRects(all, transform), sides: sideRects(all, transform) };
-    const boxes = labelBoxes(rects.sides, labels, stageSize, VIEW_INSETS);
+    const previousGroupRects = rects.groups;
+    const previousNodes = nodes;
+    rects = { tiles: tileRects(all, transform), groups: groupRects(all, transform) };
+    const boxes = labelBoxes(rects.groups, labels, stageSize, VIEW_INSETS);
     stage.dataset.state = arrangement.connected
       ? "connected"
       : arrangement.valid
@@ -365,13 +414,13 @@ export function createArrangementView(options) {
     stage.dataset.dragging = "false";
 
     // The same displays at the same places and scale only need fresh seams; anything else is rebuilt.
-    if (
-      nodes.local &&
+    const sameSet =
+      rendered.shape !== null &&
       rendered.shape === shape &&
       rendered.scale === transform.scale &&
-      rendered.disabled === disabled
-    ) {
-      for (const groupKey of SIDES) refreshGroup(groupKey, boxes[groupKey]);
+      rendered.disabled === disabled;
+    if (sameSet) {
+      for (const groupKey of groups.order) refreshGroup(groupKey, boxes[groupKey]);
       replaceLayer("guideLayer", createGuideLayer([], stageSize));
       replaceLayer(
         "seamLayer",
@@ -382,20 +431,56 @@ export function createArrangementView(options) {
       guideLayer = createGuideLayer([], stageSize);
       groupLayer = svgNode("g");
       groupLayer.classList.add("arrangement-groups");
-      nodes = {
-        local: buildGroup("local", boxes.local),
-        peer: buildGroup("peer", boxes.peer),
-      };
-      groupLayer.append(nodes.local, nodes.peer);
+      const nextNodes = {};
+      for (const groupKey of groups.order)
+        nextNodes[groupKey] = buildGroup(groupKey, boxes[groupKey]);
+      for (const groupKey of groups.order) groupLayer.append(nextNodes[groupKey]);
+      nodes = nextNodes;
       seamLayer = createSeamLayer(arrangement.connected ? arrangement.seams : [], transform);
       previewLayer = emptyPreview();
-      svg.replaceChildren(guideLayer, groupLayer, seamLayer, previewLayer);
+      svg.replaceChildren(guideLayer, groupLayer, leavingLayer, seamLayer, previewLayer);
+      playGroupMotion(groupMotion(previousGroupRects, rects.groups), previousNodes);
     }
     rendered = { shape, scale: transform.scale, disabled };
     refineText(svg);
     restingStatus();
     if (!disabled && focused)
       svg.querySelector(`[data-focus-key="${focused}"]`)?.focus({ preventScroll: true });
+  }
+
+  // Plays a full-rebuild's motion: continuing groups FLIP from their last rect, a joining group
+  // fades and scales in (`data-motion="enter"`, styled in styles.css), and a group that just left
+  // keeps its last node fading in `leavingLayer` until its own leave animation ends. Reduced motion
+  // skips all of it: the rebuild already drew every node at its true, final position.
+  function playGroupMotion(motion, previousNodes) {
+    if (reducedMotion()) return;
+    const settled = [];
+    for (const [groupKey, [dx, dy]] of Object.entries(motion.moved)) {
+      const node = nodes[groupKey];
+      const rect = rects.groups[groupKey];
+      if (!node || !rect) continue;
+      setPosition(node, rect.x + dx, rect.y + dy);
+      settled.push({ node, rect });
+    }
+    for (const groupKey of motion.entered) {
+      const node = nodes[groupKey];
+      if (node) node.dataset.motion = "enter";
+    }
+    if (settled.length)
+      requestAnimationFrame(() => {
+        // Reading the box lays the offset out, so setting the true position below is a change the transition can run.
+        for (const { node } of settled) node.getBoundingClientRect();
+        for (const { node, rect } of settled) setPosition(node, rect.x, rect.y);
+      });
+    for (const groupKey of motion.left) {
+      const node = previousNodes?.[groupKey];
+      if (!node) continue;
+      node.dataset.motion = "leave";
+      node.removeAttribute("tabindex");
+      node.style.pointerEvents = "none";
+      leavingLayer.append(node);
+      node.addEventListener("animationend", () => node.remove(), { once: true });
+    }
   }
 
   function replaceLayer(name, next) {
@@ -408,13 +493,14 @@ export function createArrangementView(options) {
 
   function buildGroup(groupKey, labelBox) {
     const node = createGroupNode({
-      tiles: arrangement.tiles.filter((t) => t.side === groupKey),
+      tiles: arrangement.tiles.filter((t) => (t.group ?? t.side) === groupKey),
       tileRects: rects.tiles,
       groupKey,
       platform: platforms[groupKey],
       side: groupKey,
+      tone: tones[groupKey],
       label: labels[groupKey],
-      rect: rects.sides[groupKey],
+      rect: rects.groups[groupKey],
       labelBox,
       focusable: !disabled,
       focusTiles: false,
@@ -437,62 +523,36 @@ export function createArrangementView(options) {
     node.classList.remove("is-dragging");
     node.setAttribute("aria-label", groupAria(groupKey));
     node.replaceChild(
-      createGroupLabelNode(labels[groupKey], labelBox, rects.sides[groupKey]),
+      createGroupLabelNode(labels[groupKey], labelBox, rects.groups[groupKey]),
       node.firstChild,
     );
-    setPosition(node, rects.sides[groupKey].x, rects.sides[groupKey].y);
+    setPosition(node, rects.groups[groupKey].x, rects.groups[groupKey].y);
   }
 
   function groupAria(groupKey) {
-    const own = arrangement.tiles.filter((t) => t.side === groupKey);
-    const count = own.length;
-    const other = groupKey === "local" ? "peer" : "local";
-    const place = `Sits ${sideWord(groupKey)} of ${labels[other]}.`;
-    const crossing = arrangement.connected ? describeArrangement(arrangement) : "Not touching yet.";
-    const size = formatSize(groups[groupKey].width, groups[groupKey].height);
-    return `${labels[groupKey]}. ${count} display${count === 1 ? "" : "s"}, ${size} together. ${place} ${crossing} Drag, or use the arrow keys.`;
+    return groupAriaText({
+      key: groupKey,
+      tiles: arrangement.tiles,
+      groups,
+      rects: rects.groups,
+      labels,
+      connected: arrangement.connected,
+      crossingText: arrangement.connected ? describeArrangement(arrangement) : "",
+    });
   }
 
   function tileAria(tile, groupKey) {
-    const seams = arrangement.seams.filter(
-      (s) => (groupKey === "local" ? s.fromDisplay : s.toDisplay) === tile.id,
-    );
-    const contact = seams.length
-      ? `Crosses on its ${seams.map((s) => (groupKey === "local" ? s.fromEdge : s.toEdge)).join(" and ")} edge.`
-      : "Not touching the other computer.";
-    return `${tile.name}, ${formatSize(tile.width, tile.height)}${tile.primary ? ", primary display" : ""}, on ${labels[groupKey]}. ${contact} Drag, or use the arrow keys.`;
-  }
-
-  function sideWord(groupKey) {
-    const local = rects.sides.local;
-    const peer = rects.sides.peer;
-    const word =
-      peer.x >= local.x + local.width
-        ? "to the right"
-        : peer.x + peer.width <= local.x
-          ? "to the left"
-          : peer.y >= local.y + local.height
-            ? "below"
-            : peer.y + peer.height <= local.y
-              ? "above"
-              : "beside";
-    if (groupKey === "peer") return word;
-    return {
-      "to the right": "to the left",
-      "to the left": "to the right",
-      below: "above",
-      above: "below",
-      beside: "beside",
-    }[word];
+    return tileAriaText({
+      tile,
+      groupLabel: labels[groupKey],
+      seams: arrangement.seams,
+      otherGroupCount: groups.order.length - 1,
+    });
   }
 
   function scheduleRender() {
     if (destroyed || drag || frame !== null) return;
     frame = requestAnimationFrame(() => renderScene());
-  }
-
-  function movingNode(moving) {
-    return nodes[moving.side];
   }
 
   function candidateFor(deltaX, deltaY) {
@@ -548,11 +608,11 @@ export function createArrangementView(options) {
   }
 
   function startDrag(moving, keyboard) {
-    const node = movingNode(moving);
-    // Raising the group above the other one moves it in the DOM, which drops focus: take both before the drag exists.
-    groupLayer.append(nodes[moving.side]);
+    const node = nodes[moving.group];
+    // Raising the group above the others moves it in the DOM, which drops focus: take both before the drag exists.
+    groupLayer.append(node);
     node?.focus({ preventScroll: true });
-    const base = rects.sides[moving.side];
+    const base = rects.groups[moving.group];
     drag = {
       moving,
       node,
@@ -632,7 +692,7 @@ export function createArrangementView(options) {
     if (destroyed || disabled || event.button !== 0 || !transform) return;
     event.preventDefault();
     if (drag) endDrag();
-    startDrag({ side: groupKey }, false);
+    startDrag({ group: groupKey }, false);
     drag.pointerId = event.pointerId;
     drag.startClientX = event.clientX;
     drag.startClientY = event.clientY;
@@ -669,8 +729,8 @@ export function createArrangementView(options) {
 
   function onKeyDown(event, groupKey) {
     if (destroyed || disabled || !transform) return;
-    const moving = { side: groupKey };
-    const same = drag?.keyboard && drag.moving.side === moving.side;
+    const moving = { group: groupKey };
+    const same = drag?.keyboard && drag.moving.group === moving.group;
     if (event.key === "Escape") {
       if (!drag) return;
       event.preventDefault();
@@ -690,24 +750,21 @@ export function createArrangementView(options) {
       );
       return;
     }
-    const direction = {
-      ArrowLeft: [-1, 0],
-      ArrowRight: [1, 0],
-      ArrowUp: [0, -1],
-      ArrowDown: [0, 1],
-    }[event.key];
-    if (!direction) return;
+    const pixels = nudgePixels(event.key, event.shiftKey);
+    if (!pixels) return;
     event.preventDefault();
-    const step = event.shiftKey ? COARSE_NUDGE_PIXELS : NUDGE_PIXELS;
     if (same) {
-      moveDrag(drag.deltaX + direction[0] * step, drag.deltaY + direction[1] * step);
+      moveDrag(drag.deltaX + pixels[0], drag.deltaY + pixels[1]);
       return;
     }
-    const nudged = movePlacement(groups, arrangement.placement, moving, [
-      (direction[0] * step) / transform.scale,
-      (direction[1] * step) / transform.scale,
-    ]);
-    const target = resolvePlacement(groups, nudged, moving);
+    const target = nudgeTarget(
+      groups,
+      arrangement.placement,
+      moving,
+      event.key,
+      event.shiftKey,
+      transform.scale,
+    );
     if (!target) {
       announce("That direction has no touching position.");
       return;
@@ -734,14 +791,21 @@ export function createArrangementView(options) {
       if (destroyed) return;
       if (next.handlers) handlers = { ...handlers, ...next.handlers };
       if (Array.isArray(next.shared)) shared = next.shared;
-      if (next.inUse) inUse = useChoices(next.inUse);
+      if (Array.isArray(next.members)) {
+        const nextMembers = membersFromOptions({ members: next.members });
+        if (nextMembers) {
+          members = nextMembers;
+          ({ labels, platforms, tones } = memberMaps(members));
+        }
+      }
+      if (next.inUse) inUse = normalizeUseChoices(groups?.order ?? members.order, next.inUse);
       if (typeof next.disabled === "boolean") disabled = next.disabled;
       reset.disabled = disabled || next.canReset !== true;
       if (next.resetHint) reset.title = next.resetHint;
       // A gesture cannot outlive the editing it belongs to, so going busy drops it.
       if (disabled && drag) endDrag();
       const incoming = next.arrangement;
-      if (incoming?.groups?.local && incoming.groups?.peer && incoming.placement) {
+      if (incoming?.groups?.order?.length && incoming.placement) {
         if (drag && shapeOf(incoming) === shapeOf(arrangement)) {
           pending = incoming;
           capturePointer();
@@ -762,13 +826,6 @@ export function createArrangementView(options) {
       listenForPointer(false);
       stage.removeEventListener("keydown", onStageKeyDown);
     },
-  };
-}
-
-function useChoices(value) {
-  return {
-    local: Array.isArray(value?.local) ? value.local : [],
-    peer: Array.isArray(value?.peer) ? value.peer : [],
   };
 }
 

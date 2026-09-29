@@ -10,7 +10,7 @@ use std::{
     task::{Wake, Waker},
     time::Duration,
 };
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 
 const LOCAL: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 10), 24800);
 const PEER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 12), 24800);
@@ -38,6 +38,22 @@ impl Wake for CountWake {
     }
 }
 
+/// How a send toward one destination fails.
+#[derive(Clone, Copy)]
+enum SendFailure {
+    Kind(io::ErrorKind),
+    Os(i32),
+}
+
+impl SendFailure {
+    fn error(self) -> io::Error {
+        match self {
+            Self::Kind(kind) => kind.into(),
+            Self::Os(code) => io::Error::from_raw_os_error(code),
+        }
+    }
+}
+
 struct TestIo {
     local: SocketAddrV4,
     inbox: Arc<Mutex<Inbox>>,
@@ -51,6 +67,9 @@ struct TestIo {
     hard_send_error: AtomicBool,
     hard_write_error: AtomicBool,
     discard_sends: AtomicBool,
+    /// Sends to these destinations fail this way, and are counted in `failed_sends`.
+    send_failures: Mutex<Vec<(SocketAddrV4, SendFailure)>>,
+    failed_sends: AtomicUsize,
     receive_pending: Notify,
     write_pending: Notify,
     revoke_on_receive: Mutex<Option<RevocationSignal>>,
@@ -71,6 +90,8 @@ impl TestIo {
             hard_send_error: AtomicBool::new(false),
             hard_write_error: AtomicBool::new(false),
             discard_sends: AtomicBool::new(false),
+            send_failures: Mutex::default(),
+            failed_sends: AtomicUsize::new(0),
             receive_pending: Notify::new(),
             write_pending: Notify::new(),
             revoke_on_receive: Mutex::new(None),
@@ -78,10 +99,23 @@ impl TestIo {
         }
     }
     fn enqueue(&self, arrival: Arrival) {
-        self.inbox.lock().unwrap().queue.push_back(Ok(Packet {
-            arrival,
-            bytes: vec![42; arrival.length.min(64)],
-        }));
+        self.enqueue_bytes(arrival, vec![42; arrival.length.min(64)]);
+    }
+    fn enqueue_bytes(&self, arrival: Arrival, bytes: Vec<u8>) {
+        self.inbox
+            .lock()
+            .unwrap()
+            .queue
+            .push_back(Ok(Packet { arrival, bytes }));
+    }
+    fn fail_sends_to(&self, destination: SocketAddrV4, failure: SendFailure) {
+        self.send_failures
+            .lock()
+            .unwrap()
+            .push((destination, failure));
+    }
+    fn heal_sends(&self) {
+        self.send_failures.lock().unwrap().clear();
     }
 }
 impl DatagramIo for TestIo {
@@ -112,6 +146,17 @@ impl DatagramIo for TestIo {
         }
         if self.hard_send_error.load(Ordering::SeqCst) {
             return Err(io::ErrorKind::NetworkDown.into());
+        }
+        let failure = self
+            .send_failures
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(destination, _)| *destination == peer)
+            .map(|(_, failure)| *failure);
+        if let Some(failure) = failure {
+            self.failed_sends.fetch_add(1, Ordering::SeqCst);
+            return Err(failure.error());
         }
         if self.blocked.load(Ordering::SeqCst) {
             return Err(io::ErrorKind::WouldBlock.into());
@@ -167,15 +212,30 @@ impl DatagramIo for TestIo {
     }
 }
 
+/// A socket over `io` pinned to `local` and `members` without a lock, every member reachable.
+fn pinned_socket<I>(
+    io: I,
+    local: SocketAddrV4,
+    members: &[SocketAddrV4],
+    interface_index: u32,
+) -> GuardedSocket<I> {
+    GuardedSocket::pinned(
+        io,
+        local,
+        members,
+        interface_index,
+        Reachability::new(members.len()),
+        RevocationSignal::default(),
+    )
+}
+
 fn fixture() -> Arc<GuardedSocket<TestIo>> {
-    Arc::new(GuardedSocket {
-        io: Arc::new(TestIo::new(LOCAL, Arc::default(), Arc::default())),
-        local: LOCAL,
-        members: [PEER].into(),
-        interface_index: INDEX,
-        lifetime: watch::Sender::new(()),
-        signal: RevocationSignal::default(),
-    })
+    Arc::new(pinned_socket(
+        TestIo::new(LOCAL, Arc::default(), Arc::default()),
+        LOCAL,
+        &[PEER],
+        INDEX,
+    ))
 }
 fn arrival() -> Arrival {
     Arrival {
@@ -484,26 +544,18 @@ async fn connected_pair(
 fn memory_sockets() -> (Arc<GuardedSocket<TestIo>>, Arc<GuardedSocket<TestIo>>) {
     let first_inbox: Arc<Mutex<Inbox>> = Arc::default();
     let second_inbox: Arc<Mutex<Inbox>> = Arc::default();
-    let first = Arc::new(GuardedSocket {
-        io: Arc::new(TestIo::new(
-            LOCAL,
-            first_inbox.clone(),
-            second_inbox.clone(),
-        )),
-        local: LOCAL,
-        members: [PEER].into(),
-        interface_index: INDEX,
-        lifetime: watch::Sender::new(()),
-        signal: RevocationSignal::default(),
-    });
-    let second = Arc::new(GuardedSocket {
-        io: Arc::new(TestIo::new(PEER, second_inbox, first_inbox)),
-        local: PEER,
-        members: [LOCAL].into(),
-        interface_index: INDEX,
-        lifetime: watch::Sender::new(()),
-        signal: RevocationSignal::default(),
-    });
+    let first = Arc::new(pinned_socket(
+        TestIo::new(LOCAL, first_inbox.clone(), second_inbox.clone()),
+        LOCAL,
+        &[PEER],
+        INDEX,
+    ));
+    let second = Arc::new(pinned_socket(
+        TestIo::new(PEER, second_inbox, first_inbox),
+        PEER,
+        &[LOCAL],
+        INDEX,
+    ));
     (first, second)
 }
 
@@ -773,18 +825,16 @@ async fn a_standing_endpoint_serves_the_next_session_while_the_paused_close_drai
             "the next attempt starts while the ended session's close still drains"
         );
 
-        let resumed_socket = Arc::new(GuardedSocket {
-            io: Arc::new(TestIo::new(
+        let resumed_socket = Arc::new(pinned_socket(
+            TestIo::new(
                 PEER,
                 paused_socket.io.inbox.clone(),
                 paused_socket.io.target.clone(),
-            )),
-            local: PEER,
-            members: [LOCAL].into(),
-            interface_index: INDEX,
-            lifetime: watch::Sender::new(()),
-            signal: RevocationSignal::default(),
-        });
+            ),
+            PEER,
+            &[LOCAL],
+            INDEX,
+        ));
         let resumed = endpoint(resumed_socket.clone(), &theirs_id, &ours_id);
         let (ours, theirs) = session(&standing, &resumed, standing_dials).await;
         delivers(&theirs, &ours).await;
@@ -830,7 +880,7 @@ use super::super::{
 };
 use crate::{
     crypto::CertificateFingerprint,
-    policy::{InterfaceKind, InterfaceSnapshot, RouteSnapshot},
+    policy::{InterfaceKind, InterfaceSnapshot, PeerRoute, RouteSnapshot},
 };
 
 const MEMBERS: [SocketAddrV4; 3] = [
@@ -887,6 +937,7 @@ fn memory_network<const N: usize>(
             &memory_lock(local, members),
             local,
             members,
+            Reachability::new(members.len()),
             RevocationSignal::default(),
         )
         .unwrap()
@@ -945,25 +996,33 @@ fn a_member_set_admits_exactly_its_members_on_the_pinned_interface() {
         &substituted[..],
         &[][..],
     ] {
+        let reach = Reachability::new(members.len());
         assert_eq!(
-            GuardedSocket::new(io(), &lock, LOCAL, members, signal())
+            GuardedSocket::new(io(), &lock, LOCAL, members, reach, signal())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput
         );
     }
+    let reach = || Reachability::new(MEMBERS.len());
     let wrong_local = SocketAddrV4::new(*MEMBERS[0].ip(), 24800);
-    assert!(GuardedSocket::new(io(), &lock, wrong_local, &MEMBERS, signal()).is_err());
+    assert!(GuardedSocket::new(io(), &lock, wrong_local, &MEMBERS, reach(), signal()).is_err());
     let mut revoked = lock.clone();
-    let _ = revoked.revalidate(None, &[]);
+    let _ = revoked.revalidate::<PeerRoute>(None, &[]);
     assert_eq!(
-        GuardedSocket::new(io(), &revoked, LOCAL, &MEMBERS, signal())
+        GuardedSocket::new(io(), &revoked, LOCAL, &MEMBERS, reach(), signal())
             .unwrap_err()
             .kind(),
         io::ErrorKind::ConnectionAborted
     );
+    assert_eq!(
+        GuardedSocket::new(io(), &lock, LOCAL, &MEMBERS, Reachability::new(2), signal())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
 
-    let socket = GuardedSocket::new(io(), &lock, LOCAL, &MEMBERS, signal()).unwrap();
+    let socket = GuardedSocket::new(io(), &lock, LOCAL, &MEMBERS, reach(), signal()).unwrap();
     let member = |source| Arrival {
         source,
         ..arrival()
@@ -1035,6 +1094,7 @@ fn sends_reach_only_members_and_anything_else_revokes() {
             &lock,
             LOCAL,
             &MEMBERS,
+            Reachability::new(MEMBERS.len()),
             RevocationSignal::default(),
         )
         .unwrap()
@@ -1362,6 +1422,402 @@ fn connection_drivers_run_on_the_network_runtime_when_another_thread_dials() {
     assert!(handle.is_revoked());
 }
 
+/// Each platform's host-down, host-unreachable, no-buffer and network-unreachable send codes.
+fn unreachable_codes() -> Vec<i32> {
+    if cfg!(windows) {
+        vec![10_064, 10_065, 10_055, 10_051]
+    } else if cfg!(target_os = "macos") {
+        vec![64, 65, 55, 51]
+    } else {
+        Vec::new()
+    }
+}
+
+/// How a send to a host that stopped answering fails.
+#[cfg(windows)]
+const HOST_DOWN: SendFailure = SendFailure::Os(10_064);
+#[cfg(target_os = "macos")]
+const HOST_DOWN: SendFailure = SendFailure::Os(64);
+#[cfg(not(any(windows, target_os = "macos")))]
+const HOST_DOWN: SendFailure = SendFailure::Kind(io::ErrorKind::HostUnreachable);
+
+fn to(member: SocketAddrV4) -> Transmit<'static> {
+    Transmit {
+        destination: member.into(),
+        ..transmit()
+    }
+}
+
+/// A hub and two members on one memory link.
+fn two_member_network() -> [GuardedSocket<TestIo>; 3] {
+    memory_network([
+        (LOCAL, &MEMBERS[..2]),
+        (MEMBERS[0], &[LOCAL][..]),
+        (MEMBERS[1], &[LOCAL][..]),
+    ])
+}
+
+/// A hub endpoint admitting two members, and each member's endpoint admitting the hub.
+fn two_member_endpoints(
+    hub_id: &DeviceIdentity,
+    ids: &[DeviceIdentity; 2],
+) -> (GuardedEndpoint, Arc<TestIo>, [GuardedEndpoint; 2]) {
+    let [hub_socket, first_socket, second_socket] = two_member_network();
+    let hub_io = hub_socket.io.clone();
+    let hub = guarded(
+        hub_socket,
+        hub_id,
+        &[(MEMBERS[0], &ids[0]), (MEMBERS[1], &ids[1])],
+    );
+    let first = guarded(first_socket, &ids[0], &[(LOCAL, hub_id)]);
+    let second = guarded(second_socket, &ids[1], &[(LOCAL, hub_id)]);
+    (hub, hub_io, [first, second])
+}
+
+#[tokio::test]
+async fn an_unreachable_member_drops_datagrams_without_revoking_the_endpoint() {
+    let codes = unreachable_codes();
+    if let [_, host_unreachable, _, network_unreachable] = codes[..] {
+        assert_eq!(
+            io::Error::from_raw_os_error(host_unreachable).kind(),
+            io::ErrorKind::HostUnreachable
+        );
+        assert_eq!(
+            io::Error::from_raw_os_error(network_unreachable).kind(),
+            io::ErrorKind::NetworkUnreachable
+        );
+    }
+    let failures = [
+        SendFailure::Kind(io::ErrorKind::HostUnreachable),
+        SendFailure::Kind(io::ErrorKind::NetworkUnreachable),
+    ]
+    .into_iter()
+    .chain(codes.into_iter().map(SendFailure::Os));
+    for failure in failures {
+        let [hub, down, up] = two_member_network();
+        hub.io.fail_sends_to(MEMBERS[0], failure);
+        for _ in 0..3 {
+            hub.try_send(&to(MEMBERS[0])).unwrap();
+            hub.try_send(&to(MEMBERS[1])).unwrap();
+        }
+        assert!(!hub.signal.is_revoked());
+        assert_eq!(hub.dropped[0].sends.load(Ordering::SeqCst), 3);
+        assert_eq!(hub.dropped[1].sends.load(Ordering::SeqCst), 0);
+        assert_eq!(down.io.inbox.lock().unwrap().arrivals, 0);
+        assert_eq!(up.io.inbox.lock().unwrap().arrivals, 3);
+        hub.io.heal_sends();
+        hub.try_send(&to(MEMBERS[0])).unwrap();
+        assert_eq!(down.io.inbox.lock().unwrap().arrivals, 1);
+    }
+
+    // With live sessions, the member that went down costs the other member nothing.
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let (hub, hub_io, [down, up]) = two_member_endpoints(&hub_id, &ids);
+    let (from_down, from_up, accepted) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(
+            async { down.connect().unwrap().await.unwrap() },
+            async { up.connect().unwrap().await.unwrap() },
+            async {
+                [
+                    hub.accept_any().await.unwrap(),
+                    hub.accept_any().await.unwrap(),
+                ]
+            }
+        )
+    })
+    .await
+    .expect("both members connected");
+    let at_hub = |print: CertificateFingerprint| {
+        accepted
+            .iter()
+            .find(|(member, _)| *member == print)
+            .map(|(_, connection)| connection)
+            .expect("each member was accepted as itself")
+    };
+    let (at_down, at_up) = (at_hub(ids[0].fingerprint()), at_hub(ids[1].fingerprint()));
+
+    hub_io.fail_sends_to(MEMBERS[0], HOST_DOWN);
+    at_down
+        .send_datagram(b"lost while the member is down".to_vec().into())
+        .unwrap();
+    tokio::time::timeout(DEADLINE, async {
+        while hub_io.failed_sends.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the hub sent toward the member that is down");
+    delivers(at_up, &from_up).await;
+    delivers(&from_up, at_up).await;
+    assert!(!hub.is_revoked());
+    assert!(at_up.close_reason().is_none());
+
+    // Back before its idle timeout, that member's own session carries on.
+    hub_io.heal_sends();
+    delivers(at_down, &from_down).await;
+    delivers(&from_down, at_down).await;
+    assert!(!hub.is_revoked());
+    for endpoint in [&hub, &down, &up] {
+        endpoint.revoke();
+    }
+}
+
+#[test]
+fn a_policy_violation_still_revokes() {
+    let lock = memory_lock(LOCAL, &MEMBERS);
+    let fresh = || {
+        GuardedSocket::new(
+            TestIo::new(LOCAL, Arc::default(), Arc::default()),
+            &lock,
+            LOCAL,
+            &MEMBERS,
+            Reachability::new(MEMBERS.len()),
+            RevocationSignal::default(),
+        )
+        .unwrap()
+    };
+    // Neither a member that stopped answering nor one set aside by a route check excuses a
+    // transmit that leaves the pinned members, source address, or size bounds.
+    let excusing = || {
+        let socket = fresh();
+        for member in MEMBERS {
+            socket.io.fail_sends_to(member, HOST_DOWN);
+        }
+        socket.reachability.set(&[false, true, true]);
+        socket
+    };
+    let wrong_source = Some("192.168.50.99".parse().unwrap());
+    let large = vec![0; MAX_DATAGRAM_BYTES + 1];
+    let violations = [
+        to("192.168.50.14:24800".parse().unwrap()),
+        to(SocketAddrV4::new(*MEMBERS[0].ip(), 24801)),
+        to(LOCAL),
+        Transmit {
+            destination: "[::ffff:192.168.50.11]:24800".parse().unwrap(),
+            ..transmit()
+        },
+        Transmit {
+            src_ip: wrong_source,
+            ..to(MEMBERS[0])
+        },
+        Transmit {
+            src_ip: wrong_source,
+            ..to(MEMBERS[1])
+        },
+        Transmit {
+            segment_size: Some(4),
+            ..to(MEMBERS[0])
+        },
+        Transmit {
+            contents: &[],
+            ..to(MEMBERS[1])
+        },
+        Transmit {
+            contents: &large,
+            ..to(MEMBERS[2])
+        },
+    ];
+    for tx in &violations {
+        let socket = excusing();
+        assert_eq!(
+            socket.try_send(tx).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(socket.signal.is_revoked());
+        assert_eq!(socket.io.sends.load(Ordering::SeqCst), 0);
+    }
+
+    // Any other send failure toward a member still revokes, and so does a short write.
+    #[cfg(windows)]
+    let access_denied = 10_013; // WSAEACCES
+    #[cfg(not(windows))]
+    let access_denied = 13; // EACCES
+    for failure in [
+        SendFailure::Kind(io::ErrorKind::NetworkDown),
+        SendFailure::Kind(io::ErrorKind::PermissionDenied),
+        SendFailure::Kind(io::ErrorKind::ConnectionRefused),
+        SendFailure::Kind(io::ErrorKind::Other),
+        SendFailure::Os(access_denied),
+    ] {
+        let socket = fresh();
+        socket.io.fail_sends_to(MEMBERS[1], failure);
+        assert_eq!(
+            socket.try_send(&to(MEMBERS[1])).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(socket.signal.is_revoked());
+    }
+    let socket = fresh();
+    socket.io.partial_send.store(true, Ordering::SeqCst);
+    assert_eq!(
+        socket.try_send(&to(MEMBERS[2])).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(socket.signal.is_revoked());
+}
+
+#[tokio::test]
+async fn a_member_set_aside_by_a_route_check_is_absent_until_one_finds_it() {
+    let [hub, first, second] = two_member_network();
+    hub.reachability.set(&[false, true]);
+    hub.try_send(&to(MEMBERS[0])).unwrap();
+    hub.try_send(&to(MEMBERS[1])).unwrap();
+    assert_eq!(hub.io.sends.load(Ordering::SeqCst), 1);
+    assert_eq!(hub.dropped[0].sends.load(Ordering::SeqCst), 1);
+    assert_eq!(first.io.inbox.lock().unwrap().arrivals, 0);
+    assert_eq!(second.io.inbox.lock().unwrap().arrivals, 1);
+    let from = |source| Arrival {
+        source,
+        ..arrival()
+    };
+    hub.io.enqueue(from(MEMBERS[0]));
+    hub.io.enqueue(from(MEMBERS[1]));
+    let mut cx = Context::from_waker(Waker::noop());
+    let (result, meta) = receive(&hub, &mut cx);
+    assert!(matches!(result, Poll::Ready(Ok(1))));
+    assert_eq!(meta.addr, MEMBERS[1].into());
+    assert!(receive(&hub, &mut cx).0.is_pending());
+    assert!(!hub.signal.is_revoked());
+
+    // The next check that finds its route admits it again.
+    hub.reachability.set(&[true, true]);
+    hub.try_send(&to(MEMBERS[0])).unwrap();
+    assert_eq!(first.io.inbox.lock().unwrap().arrivals, 1);
+    hub.io.enqueue(from(MEMBERS[0]));
+    let (result, meta) = receive(&hub, &mut cx);
+    assert!(matches!(result, Poll::Ready(Ok(1))));
+    assert_eq!(meta.addr, MEMBERS[0].into());
+
+    // A dial to it fails at once with its own error, and only for that member.
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let (hub, _, [first, second]) = two_member_endpoints(&hub_id, &ids);
+    hub.set_reachable(&[false, true]);
+    assert_eq!(
+        hub.connect_member(ids[0].fingerprint()).unwrap_err().kind(),
+        io::ErrorKind::HostUnreachable
+    );
+    assert!(hub.handle().admits(ids[0].fingerprint()));
+    for (index, member) in [(1, &second), (0, &first)] {
+        if index == 0 {
+            hub.set_reachable(&[true, true]);
+        }
+        let print = ids[index].fingerprint();
+        let (dialed, answered) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                async { hub.connect_member(print).unwrap().await.unwrap() },
+                async { member.accept().await.unwrap() }
+            )
+        })
+        .await
+        .expect("a reachable member answers");
+        hub.confirm_member(print, &dialed).unwrap();
+        delivers(&dialed, &answered).await;
+    }
+    assert!(!hub.is_revoked());
+    for endpoint in [&hub, &first, &second] {
+        endpoint.revoke();
+    }
+}
+
+#[tokio::test]
+async fn first_packet_flood_from_one_member_does_not_block_another_members_handshake() {
+    // Long-header Initial, Handshake and a short-header packet, by their first byte.
+    const INITIAL: u8 = 0xC3;
+    const HANDSHAKE: u8 = 0xE3;
+    const SHORT: u8 = 0x43;
+    let [hub, _, _] = two_member_network();
+    let send = |source, first| {
+        hub.io.enqueue_bytes(
+            Arrival {
+                source,
+                length: 64,
+                ..arrival()
+            },
+            vec![first; 64],
+        );
+    };
+    let drain = || {
+        let mut delivered = Vec::new();
+        loop {
+            let mut bytes = [0; 128];
+            let mut meta = [RecvMeta::default()];
+            match hub.poll_recv(
+                &mut Context::from_waker(Waker::noop()),
+                &mut [IoSliceMut::new(&mut bytes)],
+                &mut meta,
+            ) {
+                Poll::Ready(Ok(1)) => delivered.push((meta[0].addr, bytes[0])),
+                Poll::Pending => return delivered,
+                other => panic!("unexpected receive: {other:?}"),
+            }
+        }
+    };
+    for _ in 0..3 * FIRST_PACKET_BURST {
+        send(MEMBERS[0], INITIAL);
+    }
+    send(MEMBERS[1], INITIAL);
+    send(MEMBERS[0], HANDSHAKE);
+    send(MEMBERS[0], SHORT);
+    let delivered = drain();
+    let flooded = SocketAddr::from(MEMBERS[0]);
+    assert_eq!(
+        delivered
+            .iter()
+            .filter(|packet| **packet == (flooded, INITIAL))
+            .count(),
+        FIRST_PACKET_BURST as usize
+    );
+    for packet in [
+        (MEMBERS[1].into(), INITIAL),
+        (flooded, HANDSHAKE),
+        (flooded, SHORT),
+    ] {
+        assert!(delivered.contains(&packet), "{packet:?} was held back");
+    }
+    assert_eq!(
+        hub.dropped[0].first_packets.load(Ordering::SeqCst),
+        u64::from(2 * FIRST_PACKET_BURST)
+    );
+    assert_eq!(hub.dropped[1].first_packets.load(Ordering::SeqCst), 0);
+    assert!(!hub.signal.is_revoked());
+
+    // The budget earns one first packet back per interval.
+    hub.first_packets.lock().unwrap()[0].refilled = Instant::now() - FIRST_PACKET_REFILL;
+    send(MEMBERS[0], INITIAL);
+    send(MEMBERS[0], INITIAL);
+    assert_eq!(drain(), [(flooded, INITIAL)]);
+
+    // A member dialing far more handshakes than Quinn queues never holds up another's.
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let (hub, _, [flooding, other]) = two_member_endpoints(&hub_id, &ids);
+    let flood: Vec<_> = (0..2 * crate::crypto::MAX_PENDING_INCOMING)
+        .map(|_| flooding.connect().unwrap())
+        .collect();
+    let (dialed, accepted) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(async { other.connect().unwrap().await }, async {
+            loop {
+                match hub.accept_any().await {
+                    Ok((member, connection)) if member == ids[1].fingerprint() => {
+                        break connection;
+                    }
+                    Ok(_) => {}
+                    Err(_) => assert!(!hub.is_revoked(), "the flood revoked the endpoint"),
+                }
+            }
+        })
+    })
+    .await
+    .expect("the other member connected during the flood");
+    delivers(&dialed.unwrap(), &accepted).await;
+    drop(flood);
+    for endpoint in [&hub, &flooding, &other] {
+        endpoint.revoke();
+    }
+}
+
 #[tokio::test]
 #[ignore = "explicit localhost-only guarded QUIC probe; does not authorize a physical network"]
 async fn native_loopback_guarded_quic_delivers_and_revokes() {
@@ -1389,39 +1845,23 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
     let local_a = io_a.local_addr().unwrap();
     let local_b = io_b.local_addr().unwrap();
     // Only this private test fixture admits loopback. Production construction requires NetworkLock.
-    let first = Arc::new(GuardedSocket {
-        io: Arc::new(io_a),
-        local: local_a,
-        members: [local_b].into(),
-        interface_index: index,
-        lifetime: watch::Sender::new(()),
-        signal: RevocationSignal::default(),
-    });
-    let second = Arc::new(GuardedSocket {
-        io: Arc::new(io_b),
-        local: local_b,
-        members: [local_a].into(),
-        interface_index: index,
-        lifetime: watch::Sender::new(()),
-        signal: RevocationSignal::default(),
-    });
+    let first = Arc::new(pinned_socket(io_a, local_a, &[local_b], index));
+    let second = Arc::new(pinned_socket(io_b, local_b, &[local_a], index));
     let identity_a = DeviceIdentity::generate().unwrap();
     let identity_b = DeviceIdentity::generate().unwrap();
     let endpoint_a = endpoint(first.clone(), &identity_a, &identity_b);
     let endpoint_b = endpoint(second.clone(), &identity_b, &identity_a);
     let idle_io = make_io();
     let idle_address = idle_io.local_addr().unwrap();
-    let idle = Arc::new(GuardedSocket {
-        io: Arc::new(ObservedIo {
+    let idle = Arc::new(pinned_socket(
+        ObservedIo {
             inner: Arc::new(idle_io),
             pending: Notify::new(),
-        }),
-        local: idle_address,
-        members: [local_b].into(),
-        interface_index: index,
-        lifetime: watch::Sender::new(()),
-        signal: RevocationSignal::default(),
-    });
+        },
+        idle_address,
+        &[local_b],
+        index,
+    ));
     let idle_endpoint = endpoint(idle.clone(), &identity_a, &identity_b);
     tokio::time::timeout(DEADLINE, idle.io.pending.notified())
         .await

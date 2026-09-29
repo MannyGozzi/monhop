@@ -41,7 +41,6 @@ const OWN_SEAM: &str =
 
 /// One layout for a set of computers. Members, displays and crossings are named by identity, so
 /// every member reads the same meaning; where two copies meet, the greater `Stamp` wins.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GroupRecord {
@@ -56,7 +55,6 @@ pub struct GroupRecord {
     layout: LayoutRequest,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GroupMember {
@@ -69,7 +67,6 @@ pub struct GroupMember {
 /// A record's place in the one order every member applies; the greater stamp wins. Revision
 /// first, then the lower author DeviceId, then the lower content digest, so exchanging records
 /// pairwise in any order converges on one content.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Stamp {
     revision: u64,
@@ -202,7 +199,6 @@ impl GroupMember {
 
 impl GroupRecord {
     /// A validated record; `members` in any order, `author` in any case.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         revision: u64,
         author: &str,
@@ -224,7 +220,6 @@ impl GroupRecord {
     /// Today's pairwise record as a two-member group. Both computers' copies came from the same
     /// bytes, so they get the same content; the old decider's copy (lower DeviceId) is revision 2
     /// and the other's revision 1, so a pair whose copies drifted converges to the decider's.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_pairwise(
         record: &SharingPreferences,
         local_platform: Platform,
@@ -263,7 +258,6 @@ impl GroupRecord {
     }
 
     /// The pairwise record `local` keeps for a two-member group; the network is the file's.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn to_pairwise(
         &self,
         local: &str,
@@ -287,7 +281,6 @@ impl GroupRecord {
         Ok(record)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
@@ -308,9 +301,17 @@ impl GroupRecord {
     }
 
     /// `fingerprint` in any case.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn has_member(&self, fingerprint: &str) -> bool {
         self.index_of(fingerprint).is_some()
+    }
+
+    /// The members' lowercase fingerprints in member order, sorted once validated: the key of
+    /// the group's member set.
+    pub(crate) fn member_keys(&self) -> Vec<String> {
+        self.members
+            .iter()
+            .map(|member| fingerprint_key(&member.fingerprint))
+            .collect()
     }
 
     fn index_of(&self, fingerprint: &str) -> Option<usize> {
@@ -320,7 +321,6 @@ impl GroupRecord {
             .position(|member| fingerprint_key(&member.fingerprint) == key)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn validate(&self) -> Result<(), PreferenceError> {
         self.check().map_err(|_| PreferenceError::Invalid)
     }
@@ -439,7 +439,6 @@ impl GroupRecord {
     /// links sorted by their own JSON text, positions sorted by numeric display id, hidden ids
     /// sorted numerically, and the control map as is. Revision and author are left out, so two
     /// computers that made the same layout agree on it whoever stamped it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn content_digest(&self) -> [u8; 32] {
         let mut members = self.members.clone();
         members.sort_by_key(|member| fingerprint_key(&member.fingerprint));
@@ -470,7 +469,6 @@ impl GroupRecord {
         payload_digest(&serde_json::to_vec(&Content { members, layout }).unwrap_or_default())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stamp(&self) -> Stamp {
         Stamp {
             revision: self.revision,
@@ -492,7 +490,6 @@ impl GroupRecord {
     }
 
     /// The same content stamped as a new local change ("touch").
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn restamped(&self, revision: u64, author: &str) -> Result<Self, PreferenceError> {
         let record = Self {
             revision,

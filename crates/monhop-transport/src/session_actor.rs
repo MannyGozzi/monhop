@@ -21,7 +21,7 @@ use std::{
 };
 
 const CAPACITY: usize = crate::session::SESSION_QUEUE_CAPACITY;
-const TICK: Duration = Duration::from_millis(5);
+pub(crate) const TICK: Duration = Duration::from_millis(5);
 
 /// The rule that last stopped a receiver, as a code the desktop can name; never input content.
 static LAST_RECEIVER_FAILURE: AtomicU8 = AtomicU8::new(0);
@@ -51,7 +51,7 @@ pub const fn receiver_failure_code(failure: ReceiverFailure) -> u8 {
     }
 }
 
-fn note_receiver_failure(failure: ReceiverFailure) -> ActorFailure {
+pub(crate) fn note_receiver_failure(failure: ReceiverFailure) -> ActorFailure {
     LAST_RECEIVER_FAILURE.store(receiver_failure_code(failure), Ordering::Release);
     ActorFailure::Receiver
 }
@@ -71,35 +71,36 @@ pub enum ActorFailure {
     LocalDisplaysChanged,
 }
 
-struct Status {
-    stopped: AtomicU8,
-    cleanup_pending: AtomicBool,
-    native_ready: AtomicBool,
-    started: AtomicBool,
-    handoff_sent: AtomicBool,
-    active: AtomicBool,
-    held: AtomicBool,
-    display: AtomicU64,
-    stats: Stats,
-    response_waker: OnceLock<Arc<dyn Fn() + Send + Sync>>,
+#[derive(Default)]
+pub(crate) struct Status {
+    pub(crate) stopped: AtomicU8,
+    pub(crate) cleanup_pending: AtomicBool,
+    pub(crate) native_ready: AtomicBool,
+    pub(crate) started: AtomicBool,
+    pub(crate) handoff_sent: AtomicBool,
+    pub(crate) active: AtomicBool,
+    pub(crate) held: AtomicBool,
+    pub(crate) display: AtomicU64,
+    pub(crate) stats: Stats,
+    pub(crate) response_waker: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Receiver-side load counters for the session end report; never input content.
-struct Stats {
-    frames: AtomicU64,
-    batch_max: AtomicU64,
+pub(crate) struct Stats {
+    pub(crate) frames: AtomicU64,
+    pub(crate) batch_max: AtomicU64,
     /// Batches of 1, 2-3, 4-8 and 9+ frames; a smooth link keeps almost everything in the first.
-    batch_buckets: [AtomicU64; 4],
+    pub(crate) batch_buckets: [AtomicU64; 4],
     /// Batches whose injection took longer than 2 ms.
-    slow_applies: AtomicU64,
-    apply_max_micros: AtomicU64,
-    env_max_micros: AtomicU64,
-    reply_age_millis: AtomicU64,
-    ping_age_millis: AtomicU64,
-    frame_age_millis: AtomicU64,
-    gap_max_millis: AtomicU64,
-    holds: AtomicU64,
-    held_max_millis: AtomicU64,
+    pub(crate) slow_applies: AtomicU64,
+    pub(crate) apply_max_micros: AtomicU64,
+    pub(crate) env_max_micros: AtomicU64,
+    pub(crate) reply_age_millis: AtomicU64,
+    pub(crate) ping_age_millis: AtomicU64,
+    pub(crate) frame_age_millis: AtomicU64,
+    pub(crate) gap_max_millis: AtomicU64,
+    pub(crate) holds: AtomicU64,
+    pub(crate) held_max_millis: AtomicU64,
 }
 
 impl Default for Stats {
@@ -122,8 +123,29 @@ impl Default for Stats {
 }
 
 impl Stats {
-    fn max(slot: &AtomicU64, value: u64) {
+    pub(crate) fn max(slot: &AtomicU64, value: u64) {
         slot.fetch_max(value, Ordering::Relaxed);
+    }
+
+    pub(crate) fn report(&self) -> ReceiverStats {
+        let ping_age = self.ping_age_millis.load(Ordering::Relaxed);
+        let frame_age = self.frame_age_millis.load(Ordering::Relaxed);
+        ReceiverStats {
+            frames: self.frames.load(Ordering::Relaxed),
+            batch_max: self.batch_max.load(Ordering::Relaxed),
+            batch_buckets: std::array::from_fn(|index| {
+                self.batch_buckets[index].load(Ordering::Relaxed)
+            }),
+            slow_applies: self.slow_applies.load(Ordering::Relaxed),
+            apply_max_micros: self.apply_max_micros.load(Ordering::Relaxed),
+            env_max_micros: self.env_max_micros.load(Ordering::Relaxed),
+            reply_age_millis: self.reply_age_millis.load(Ordering::Relaxed),
+            ping_age_millis: (ping_age != u64::MAX).then_some(ping_age),
+            frame_age_millis: (frame_age != u64::MAX).then_some(frame_age),
+            gap_max_millis: self.gap_max_millis.load(Ordering::Relaxed),
+            holds: self.holds.load(Ordering::Relaxed),
+            held_max_millis: self.held_max_millis.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -149,13 +171,13 @@ pub struct ReceiverStats {
 }
 
 impl Status {
-    fn stop(&self, reason: ActorFailure) {
+    pub(crate) fn stop(&self, reason: ActorFailure) {
         let _ = self
             .stopped
             .compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    fn failure(&self) -> Option<ActorFailure> {
+    pub(crate) fn failure(&self) -> Option<ActorFailure> {
         match self.stopped.load(Ordering::Acquire) {
             0 => None,
             1 => Some(ActorFailure::Requested),
@@ -449,25 +471,7 @@ impl DestinationActor {
     }
 
     pub fn stats(&self) -> ReceiverStats {
-        let stats = &self.status.stats;
-        let ping_age = stats.ping_age_millis.load(Ordering::Relaxed);
-        let frame_age = stats.frame_age_millis.load(Ordering::Relaxed);
-        ReceiverStats {
-            frames: stats.frames.load(Ordering::Relaxed),
-            batch_max: stats.batch_max.load(Ordering::Relaxed),
-            batch_buckets: std::array::from_fn(|index| {
-                stats.batch_buckets[index].load(Ordering::Relaxed)
-            }),
-            slow_applies: stats.slow_applies.load(Ordering::Relaxed),
-            apply_max_micros: stats.apply_max_micros.load(Ordering::Relaxed),
-            env_max_micros: stats.env_max_micros.load(Ordering::Relaxed),
-            reply_age_millis: stats.reply_age_millis.load(Ordering::Relaxed),
-            ping_age_millis: (ping_age != u64::MAX).then_some(ping_age),
-            frame_age_millis: (frame_age != u64::MAX).then_some(frame_age),
-            gap_max_millis: stats.gap_max_millis.load(Ordering::Relaxed),
-            holds: stats.holds.load(Ordering::Relaxed),
-            held_max_millis: stats.held_max_millis.load(Ordering::Relaxed),
-        }
+        self.status.stats.report()
     }
 
     /// True while the source has been silent past the deadline and the receiver waits for its
@@ -518,7 +522,7 @@ impl Drop for DestinationActor {
     }
 }
 
-fn construct_destination<D, F>(
+pub(crate) fn construct_destination<D, F>(
     revocation: &RevocationSignal,
     status: &Status,
     ownership: InjectionPermit,
@@ -542,10 +546,10 @@ where
     }
 }
 
-struct DestinationGuard<D: WatchedDestination> {
-    destination: D,
-    status: Arc<Status>,
-    armed: bool,
+pub(crate) struct DestinationGuard<D: WatchedDestination> {
+    pub(crate) destination: D,
+    pub(crate) status: Arc<Status>,
+    pub(crate) armed: bool,
 }
 
 impl<D: WatchedDestination> InputDestination for DestinationGuard<D> {
@@ -562,7 +566,9 @@ impl<D: WatchedDestination> InputDestination for DestinationGuard<D> {
 }
 
 /// A panicking check stops the session like a panicking injection.
-fn check_environment<E: WatchedEnvironment>(environment: &mut E) -> Result<(), ActorFailure> {
+pub(crate) fn check_environment<E: WatchedEnvironment>(
+    environment: &mut E,
+) -> Result<(), ActorFailure> {
     match catch_unwind(AssertUnwindSafe(|| environment.validate())) {
         Ok(result) => result.map_err(ActorFailure::from),
         Err(payload) => {
@@ -574,13 +580,13 @@ fn check_environment<E: WatchedEnvironment>(environment: &mut E) -> Result<(), A
 
 /// Rechecks the environment every `DISPLAY_CHECK_INTERVAL` beside injection, so a slow native read
 /// never delays an event; a failure stops the session and wakes the injection thread to clean up.
-struct EnvironmentWatch {
+pub(crate) struct EnvironmentWatch {
     done: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl EnvironmentWatch {
-    fn start<E: WatchedEnvironment>(
+    pub(crate) fn start<E: WatchedEnvironment>(
         mut environment: E,
         status: Arc<Status>,
         revocation: RevocationSignal,
@@ -640,7 +646,7 @@ impl<D: WatchedDestination> Drop for DestinationGuard<D> {
     }
 }
 
-fn cleanup_without_receiver<D: WatchedDestination>(
+pub(crate) fn cleanup_without_receiver<D: WatchedDestination>(
     destination: &mut DestinationGuard<D>,
     status: &Status,
 ) {
@@ -792,12 +798,12 @@ fn run_receiver<D: WatchedDestination>(
     cleanup_receiver(receiver, destination, &status);
 }
 
-fn micros_since(origin: &SessionClock, start: Duration) -> u64 {
+pub(crate) fn micros_since(origin: &SessionClock, start: Duration) -> u64 {
     micros_u64(origin.elapsed().saturating_sub(start))
 }
 
 /// Stats first: a reader that acquires `held` then sees the hold it counts.
-fn note_hold(status: &Status, receiver: &InputReceiver, now: Duration) {
+pub(crate) fn note_hold(status: &Status, receiver: &InputReceiver, now: Duration) {
     let (holds, held_max) = receiver.hold_stats(now);
     status
         .stats
@@ -812,7 +818,7 @@ fn note_hold(status: &Status, receiver: &InputReceiver, now: Duration) {
         .store(receiver.held_since().is_some(), Ordering::Release);
 }
 
-fn stop_receiver(
+pub(crate) fn stop_receiver(
     status: &Status,
     receiver: &InputReceiver,
     failure: ReceiverFailure,
@@ -840,6 +846,32 @@ pub(crate) struct OutputSequences {
     pub(crate) epoch: SessionEpoch,
 }
 
+impl OutputSequences {
+    /// Heartbeats on the control epoch's own counter, anything else on the input epoch's, which
+    /// restarts at 0 when that epoch changes. None once the counter would wrap.
+    pub(crate) fn frame(&mut self, message: Message, receiver: &InputReceiver) -> Option<Frame> {
+        let control = matches!(message, Message::Ping(_) | Message::Pong(_));
+        let epoch = if control {
+            receiver.control_epoch()
+        } else {
+            receiver.epoch()
+        };
+        if !control && epoch != self.epoch {
+            self.epoch = epoch;
+            self.input = 0;
+        }
+        let sequence = if control {
+            &mut self.control
+        } else {
+            &mut self.input
+        };
+        let next = sequence.checked_add(1)?;
+        let frame = Frame::new(epoch, *sequence, message);
+        *sequence = next;
+        Some(frame)
+    }
+}
+
 fn emit(
     message: Message,
     receiver: &InputReceiver,
@@ -847,27 +879,10 @@ fn emit(
     outgoing: &SyncSender<Frame>,
     status: &Status,
 ) {
-    let control = matches!(message, Message::Ping(_) | Message::Pong(_));
-    let epoch = if control {
-        receiver.control_epoch()
-    } else {
-        receiver.epoch()
-    };
-    if !control && epoch != sequences.epoch {
-        sequences.epoch = epoch;
-        sequences.input = 0;
-    }
-    let sequence = if control {
-        &mut sequences.control
-    } else {
-        &mut sequences.input
-    };
-    let Some(next) = sequence.checked_add(1) else {
+    let Some(frame) = sequences.frame(message, receiver) else {
         status.stop(ActorFailure::SequenceExhausted);
         return;
     };
-    let frame = Frame::new(epoch, *sequence, message);
-    *sequence = next;
     if let Err(error) = outgoing.try_send(frame) {
         status.stop(match error {
             mpsc::TrySendError::Full(_) => ActorFailure::QueueFull,

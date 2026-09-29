@@ -3,6 +3,7 @@ import { platformLabel } from "./pairing-model.mjs";
 import { presence } from "./accordion.mjs";
 import { computerCard } from "./computer-card.mjs";
 import { createDashboardArrangement, DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
+import { homeEntries } from "./home-model.mjs";
 import { displayNoticeCopy } from "./sharing-model.mjs";
 import {
   DIM_LEVEL_STEP,
@@ -26,7 +27,7 @@ import {
 } from "./dom.mjs";
 
 export function renderHome(nodes, ctx) {
-  const { computers, state, actions, activeComputer, computersLoadFailure } = ctx;
+  const { computers, state, actions, active, computersLoadFailure } = ctx;
   clear(nodes.homeContent);
 
   if (computersLoadFailure) {
@@ -55,21 +56,32 @@ export function renderHome(nodes, ctx) {
       }),
     );
   } else {
-    if (activeComputer)
-      nodes.homeContent.append(
-        computerCard(ctx, activeComputer, {
-          scope: "home",
-          // This card draws the full-size arrangement itself, with the button that changes it.
-          viewport: false,
-          extras: activeExtras(ctx),
-          details: activeDetails(ctx),
-        }),
-      );
+    // With zero or one computer switched in, `homeEntries` hands back the same lone hero entry
+    // this screen has always drawn (or none); with several, the group picture leads and each gets
+    // its own live card instead.
+    const entries = homeEntries(computers, ctx.sharing.view, active);
+    for (const entry of entries) {
+      if (entry.type === "group") nodes.homeContent.append(groupArrangementCard(ctx, entries));
+      else if (entry.type === "hero" && ctx.activeComputer)
+        // `ctx.activeComputer`, not `entry.computer`: today's single-computer path keys everything
+        // (its saved layout, its last drop) off that one field, so the hero card keeps doing the same.
+        nodes.homeContent.append(
+          computerCard(ctx, ctx.activeComputer, {
+            scope: "home",
+            // This card draws the full-size arrangement itself, with the button that changes it.
+            viewport: false,
+            extras: activeExtras(ctx),
+            details: activeDetails(ctx),
+          }),
+        );
+      else if (entry.type === "live")
+        nodes.homeContent.append(computerCard(ctx, entry.computer, { scope: "home" }));
+    }
     const notice = presence("home-display-notice", displayNoticeCard(ctx));
     if (notice) nodes.homeContent.append(notice);
-    for (const computer of computers.items)
-      if (computer !== activeComputer)
-        nodes.homeContent.append(computerCard(ctx, computer, { scope: "home" }));
+    for (const entry of entries)
+      if (entry.type === "other")
+        nodes.homeContent.append(computerCard(ctx, entry.computer, { scope: "home" }));
   }
 
   // The hero stays first. Updates and machine preferences are secondary to the computer in use.
@@ -188,6 +200,38 @@ function dimmingCard({ core, dimming, actions }) {
       }),
     ],
   });
+}
+
+// Once more than one computer is switched in, the group's own picture leads instead of any one
+// computer's card carrying it. The app layer does not yet hand this screen a whole-group saved
+// layout to draw (each paired computer's own `setup` only ever covers this computer and that one
+// other), so this names who is sharing and links to the editor rather than guessing at a picture it
+// cannot draw correctly.
+function groupArrangementCard(ctx, entries) {
+  const { actions, busy } = ctx;
+  const names = entries
+    .filter((entry) => entry.type === "live")
+    .map((entry) => displayName(entry.computer));
+  return card({
+    id: "home-group-arrangement",
+    title: "Sharing with several computers",
+    description: `MonHop shares one keyboard and mouse across ${joinNames(names)}.`,
+    actions: [
+      button("Arrange displays", {
+        variant: "outline",
+        size: "sm",
+        disabled: busy,
+        focusKey: "home-group-arrange",
+        onClick: actions.changeLayout,
+      }),
+    ],
+  });
+}
+
+function joinNames(names) {
+  if (names.length < 2) return names.join("");
+  if (names.length === 2) return names.join(" and ");
+  return `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
 }
 
 // The computer in use carries what the others cannot: its saved layout.

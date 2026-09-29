@@ -13,15 +13,15 @@ use crate::{
     },
     session_source::{SourceController, SourceEffect, SourceMode},
     session_source_runtime::{
-        NativeCapture, NativeCaptureError, apply_outcome, apply_route, lease_budget,
-        native_capture_start_failure, normalize,
+        CaptureControl, NativeCapture, NativeCaptureError, apply_outcome,
+        native_capture_start_failure, normalize, renew_lease, retry_pending, settle_submitted,
     },
     session_startup::{StartupControl, startup_failure},
     session_wire::is_heartbeat,
 };
 use monhop_core::{
     FloorOwner, FloorState, NativeSessionClaim, Point, RevocationSignal, SharedFloor, TakeBackGate,
-    Topology, capture::MAX_SUPPRESSION_TTL,
+    Topology,
 };
 use monhop_protocol::{Frame, FrameScope, Message, SessionPurpose};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
@@ -199,7 +199,7 @@ pub async fn run_session(
                 workers
                     .capture
                     .as_ref()
-                    .and_then(NativeCapture::stop_reason),
+                    .and_then(CaptureControl::stop_reason),
                 workers
                     .capture
                     .as_ref()
@@ -359,7 +359,7 @@ pub async fn run_session(
             }
             let mut capture_drained = false;
             if let Some(capture) = &mut workers.capture {
-                source.set_capture_ready(capture.is_ready_for_suppression());
+                source.set_capture_ready(CaptureControl::is_ready_for_suppression(capture));
                 for _ in 0..DRAIN_LIMIT {
                     let Some(record) = capture
                         .try_next_event()
@@ -372,8 +372,12 @@ pub async fn run_session(
                         continue;
                     };
                     if outbound.is_some() {
-                        if let Some(failure) = source.bookkeeping(record).failure {
+                        let kept = source.bookkeeping(record);
+                        if let Some(failure) = kept.failure {
                             return Err(SessionFailure::SourceController(failure));
+                        }
+                        if kept.handover.is_some() {
+                            return Err(SessionFailure::Source);
                         }
                     } else {
                         let outcome = source.on_captured(record, origin.elapsed());
@@ -442,7 +446,7 @@ pub async fn run_session(
             }
             if housekeeping {
                 gaps.observe(origin.elapsed());
-                // Two quinn lock round trips: the tick, never every captured event, pays for them.
+                // Three quinn lock round trips: the tick, never each captured event, pays for them.
                 io.check()?;
                 let control = (
                     floor.snapshot().state,
@@ -455,13 +459,7 @@ pub async fn run_session(
                 }
                 if outbound.is_none() {
                     let capture = workers.capture.as_mut().ok_or(SessionFailure::Native)?;
-                    if let Some((ticket, issued)) = submitted {
-                        match capture.completed_control_revision() {
-                            Ok(completed) if completed >= ticket => submitted = None,
-                            Ok(_) if now.saturating_sub(issued) < MAX_SUPPRESSION_TTL => {}
-                            _ => return Err(SessionFailure::Native),
-                        }
-                    }
+                    settle_submitted(capture, &mut submitted, now)?;
                     let outcome = source.tick(origin.elapsed());
                     apply_outcome(
                         outcome,
@@ -473,22 +471,15 @@ pub async fn run_session(
                         &mut pending,
                         &mut submitted,
                     )?;
-                    if let Some((effect, since)) = pending.take() {
-                        if origin.elapsed().saturating_sub(since) >= MAX_SUPPRESSION_TTL {
-                            return Err(SessionFailure::Native);
-                        }
-                        if !apply_route(
-                            &effect,
-                            &mut source,
-                            capture,
-                            &io,
-                            generation,
-                            &origin,
-                            &mut submitted,
-                        )? {
-                            pending = Some((effect, since));
-                        }
-                    }
+                    retry_pending(
+                        &mut pending,
+                        &mut source,
+                        capture,
+                        &io,
+                        generation,
+                        &origin,
+                        &mut submitted,
+                    )?;
                     if source.mode() == SourceMode::Local
                         && floor.snapshot().state == FloorState::Free
                         && !source.capture_route().0
@@ -515,16 +506,9 @@ pub async fn run_session(
                         && pending.is_none()
                         && submitted.is_none()
                         && now.saturating_sub(last_renewed) >= DISPLAY_CHECK_INTERVAL
+                        && renew_lease(&mut source, capture, generation, &origin, &mut submitted)?
                     {
-                        let ttl = lease_budget(&mut source, origin.elapsed())?;
-                        match capture.renew_suppression(generation, ttl) {
-                            Ok(ticket) => {
-                                submitted = Some((ticket, origin.elapsed()));
-                                last_renewed = origin.elapsed();
-                            }
-                            Err(NativeCaptureError::ControlPending) => {}
-                            Err(_) => return Err(SessionFailure::Native),
-                        }
+                        last_renewed = origin.elapsed();
                     }
                     let inbound_active =
                         floor.snapshot().state.owner() == Some(FloorOwner::Inbound);
@@ -563,7 +547,7 @@ pub async fn run_session(
         workers
             .capture
             .as_ref()
-            .and_then(NativeCapture::stop_reason),
+            .and_then(CaptureControl::stop_reason),
         workers
             .destination
             .as_ref()

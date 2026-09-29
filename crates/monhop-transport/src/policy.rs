@@ -49,6 +49,22 @@ pub struct RouteSnapshot {
     pub next_hop: Ipv4Addr,
 }
 
+/// One pinned peer's route as a check read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerRoute {
+    /// The route the platform uses; it must stay on-link through the selected interface.
+    Found(RouteSnapshot),
+    /// The platform has no usable route to this peer right now, such as a neighbor entry rejected
+    /// after the peer stopped answering. It sets aside only this peer, and never a lone one.
+    Unreachable,
+}
+
+impl From<RouteSnapshot> for PeerRoute {
+    fn from(route: RouteSnapshot) -> Self {
+        Self::Found(route)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PolicyError {
     InvalidInterface,
@@ -66,6 +82,7 @@ pub enum PolicyError {
     SessionClosed,
     DiscoveryDisabled,
     InvalidPeerSet,
+    PeerUnreachable,
 }
 
 impl std::fmt::Display for PolicyError {
@@ -94,18 +111,22 @@ impl std::fmt::Display for PolicyError {
             Self::InvalidPeerSet => {
                 "the paired peers must be 1 to 7 distinct addresses, each with its own route"
             }
+            Self::PeerUnreachable => "the paired peer cannot be reached on the selected network",
         })
     }
 }
 
 impl std::error::Error for PolicyError {}
 
-/// One selected interface and the fixed set of on-link peers it admits. Any peer's route failing
-/// revokes the whole lock.
+/// One selected interface and the fixed set of on-link peers it admits. An interface change, or
+/// any found route leaving the interface or using a gateway, revokes the whole lock; a peer
+/// without a usable route is only set aside until a later check finds one.
 #[derive(Clone, Debug)]
 pub struct NetworkLock {
     selected: InterfaceSnapshot,
     peers: Vec<Ipv4Addr>,
+    /// Whether the last check found each peer's route, in peer order.
+    reachable: Vec<bool>,
     revoked: bool,
 }
 
@@ -120,9 +141,9 @@ impl NetworkLock {
     }
 
     /// `routes` names each peer with its current route; the peers keep this order.
-    pub fn new_group(
+    pub fn new_group<R: Copy + Into<PeerRoute>>(
         selected: InterfaceSnapshot,
-        routes: &[(Ipv4Addr, RouteSnapshot)],
+        routes: &[(Ipv4Addr, R)],
         allow_discovery: bool,
     ) -> Result<Self, PolicyError> {
         if allow_discovery {
@@ -132,16 +153,18 @@ impl NetworkLock {
         if routes.is_empty() || routes.len() > MAX_PINNED_PEERS {
             return Err(PolicyError::InvalidPeerSet);
         }
-        for (index, (peer, route)) in routes.iter().enumerate() {
+        for (index, (peer, _)) in routes.iter().enumerate() {
             if routes[..index].iter().any(|(earlier, _)| earlier == peer) {
                 return Err(PolicyError::InvalidPeerSet);
             }
             validate_peer(&selected, *peer)?;
-            validate_route(&selected, *route)?;
         }
+        let peers = routes.iter().map(|(peer, _)| *peer).collect();
+        let reachable = validate_routes(&selected, routes)?;
         Ok(Self {
             selected,
-            peers: routes.iter().map(|(peer, _)| *peer).collect(),
+            peers,
+            reachable,
             revoked: false,
         })
     }
@@ -154,35 +177,47 @@ impl NetworkLock {
         &self.peers
     }
 
+    /// Whether the last check found each peer's route, in peer order.
+    pub fn reachable(&self) -> &[bool] {
+        &self.reachable
+    }
+
     pub fn is_revoked(&self) -> bool {
         self.revoked
     }
 
     /// Revocation is sticky: restoring the old address must not silently resume input forwarding.
-    /// `routes` must name every peer, in order, with its current route.
-    pub fn revalidate(
+    /// `routes` must name every peer, in order, with its current route. A peer set aside as
+    /// unreachable is admitted again as soon as a check finds its route.
+    pub fn revalidate<R: Copy + Into<PeerRoute>>(
         &mut self,
         current: Option<&InterfaceSnapshot>,
-        routes: &[(Ipv4Addr, RouteSnapshot)],
+        routes: &[(Ipv4Addr, R)],
     ) -> Result<(), PolicyError> {
         if self.revoked {
             return Err(PolicyError::SessionClosed);
         }
         let result = match current {
-            Some(current) if current == &self.selected => self.validate_routes(current, routes),
+            Some(current) if current == &self.selected => self.revalidate_routes(current, routes),
             _ => Err(PolicyError::InterfaceChanged),
         };
-        if result.is_err() {
-            self.revoked = true;
+        match result {
+            Ok(reachable) => {
+                self.reachable = reachable;
+                Ok(())
+            }
+            Err(error) => {
+                self.revoked = true;
+                Err(error)
+            }
         }
-        result
     }
 
-    fn validate_routes(
+    fn revalidate_routes<R: Copy + Into<PeerRoute>>(
         &self,
         current: &InterfaceSnapshot,
-        routes: &[(Ipv4Addr, RouteSnapshot)],
-    ) -> Result<(), PolicyError> {
+        routes: &[(Ipv4Addr, R)],
+    ) -> Result<Vec<bool>, PolicyError> {
         if routes.len() != self.peers.len()
             || routes
                 .iter()
@@ -191,9 +226,7 @@ impl NetworkLock {
         {
             return Err(PolicyError::InvalidPeerSet);
         }
-        routes
-            .iter()
-            .try_for_each(|(_, route)| validate_route(current, *route))
+        validate_routes(current, routes)
     }
 
     pub fn authorize_packet(
@@ -208,11 +241,33 @@ impl NetworkLock {
         if local != self.selected.address || arrival_interface != self.selected.index {
             return Err(PolicyError::WrongInterface);
         }
-        if !self.peers.contains(&source) {
+        let Some(peer) = self.peers.iter().position(|peer| *peer == source) else {
             return Err(PolicyError::OffLinkPeer);
+        };
+        if !self.reachable[peer] {
+            return Err(PolicyError::PeerUnreachable);
         }
         Ok(())
     }
+}
+
+/// Every found route must be on-link through `interface`; the result says which peers had one.
+/// A lone peer without a route is an error: there is no other peer to keep the lock for.
+fn validate_routes<R: Copy + Into<PeerRoute>>(
+    interface: &InterfaceSnapshot,
+    routes: &[(Ipv4Addr, R)],
+) -> Result<Vec<bool>, PolicyError> {
+    let reachable = routes
+        .iter()
+        .map(|(_, route)| match (*route).into() {
+            PeerRoute::Found(route) => validate_route(interface, route).map(|()| true),
+            PeerRoute::Unreachable => Ok(false),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if reachable == [false] {
+        return Err(PolicyError::PeerUnreachable);
+    }
+    Ok(reachable)
 }
 
 pub fn is_private_or_link_local(address: Ipv4Addr) -> bool {
@@ -562,9 +617,63 @@ mod tests {
     }
 
     #[test]
+    fn a_member_without_a_route_is_set_aside_until_a_check_finds_it() {
+        let mut routes: Vec<(Ipv4Addr, PeerRoute)> = member_routes()
+            .into_iter()
+            .map(|(member, route)| (member, route.into()))
+            .collect();
+        routes[1].1 = PeerRoute::Unreachable;
+        let mut group = NetworkLock::new_group(selected(), &routes, false).unwrap();
+        assert_eq!(group.reachable(), [true, false, true]);
+        assert_eq!(
+            group.authorize_packet(selected().address, MEMBERS[1], 7),
+            Err(PolicyError::PeerUnreachable)
+        );
+        assert!(
+            group
+                .authorize_packet(selected().address, MEMBERS[2], 7)
+                .is_ok()
+        );
+
+        group
+            .revalidate(Some(&selected()), &member_routes())
+            .unwrap();
+        assert_eq!(group.reachable(), [true, true, true]);
+        routes[1].1 = PeerRoute::Unreachable;
+        routes[0].1 = PeerRoute::Unreachable;
+        group.revalidate(Some(&selected()), &routes).unwrap();
+        assert_eq!(group.reachable(), [false, false, true]);
+        assert!(!group.is_revoked());
+
+        // A found route stays exactly as strict beside a member set aside.
+        routes[2].1 = PeerRoute::Found(RouteSnapshot {
+            next_hop: Ipv4Addr::new(192, 168, 50, 1),
+            ..route()
+        });
+        assert_eq!(
+            group.revalidate(Some(&selected()), &routes),
+            Err(PolicyError::RoutedPeer)
+        );
+        assert!(group.is_revoked());
+
+        // A lone peer has no one to be set aside from.
+        let alone = [(PEER, PeerRoute::Unreachable)];
+        assert_eq!(
+            NetworkLock::new_group(selected(), &alone, false).unwrap_err(),
+            PolicyError::PeerUnreachable
+        );
+        let mut single = lock();
+        assert_eq!(
+            single.revalidate(Some(&selected()), &alone),
+            Err(PolicyError::PeerUnreachable)
+        );
+        assert!(single.is_revoked());
+    }
+
+    #[test]
     fn a_member_set_is_one_to_seven_distinct_on_link_private_peers_with_direct_routes() {
         assert_eq!(
-            NetworkLock::new_group(selected(), &[], false).unwrap_err(),
+            NetworkLock::new_group::<RouteSnapshot>(selected(), &[], false).unwrap_err(),
             PolicyError::InvalidPeerSet
         );
         let seven: Vec<_> = (11..18)

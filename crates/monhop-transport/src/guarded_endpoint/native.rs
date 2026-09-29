@@ -10,13 +10,13 @@ use std::{
 use monhop_core::RevocationSignal;
 
 use crate::policy::{
-    InterfaceKind, InterfaceSnapshot, NetworkLock, PolicyError, RouteSnapshot, validate_interface,
-    validate_peer,
+    InterfaceKind, InterfaceSnapshot, NetworkLock, PeerRoute, PolicyError, RouteSnapshot,
+    validate_interface, validate_peer,
 };
 
 #[cfg(target_os = "macos")]
 use super::NetworkSelection;
-use super::{PinnedNetwork, RouteCheckFailure};
+use super::{PinnedNetwork, RouteCheckFailure, socket::Reachability};
 
 #[cfg(target_os = "macos")]
 use monhop_platform_macos::{
@@ -77,6 +77,7 @@ pub(super) type Watch = network_watch::NetworkChangeWatch;
 pub(super) struct PreparedNetwork {
     pub socket: NativeSocket,
     pub lock: NetworkLock,
+    pub reachability: Arc<Reachability>,
     pub signal: RevocationSignal,
     pub watch: Watch,
 }
@@ -84,6 +85,7 @@ pub(super) struct PreparedNetwork {
 struct PreparedSelection {
     initial: Adapter,
     lock: NetworkLock,
+    reachability: Arc<Reachability>,
     signal: RevocationSignal,
     watch: Watch,
 }
@@ -92,6 +94,7 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
     let PreparedSelection {
         initial,
         mut lock,
+        reachability,
         signal,
         watch,
     } = prepare_selection(pinned, None)?;
@@ -118,10 +121,12 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
     }
 
     revalidate_selection(&initial, pinned, &mut lock, &signal, None)?;
+    reachability.set(lock.reachable());
 
     Ok(PreparedNetwork {
         socket,
         lock,
+        reachability,
         signal,
         watch,
     })
@@ -147,6 +152,7 @@ pub(super) fn request_local_network_access_after_local_action(
         mut lock,
         signal,
         watch: _watch,
+        ..
     } = prepare_selection(&pinned, Some(cancel))?;
 
     request_with_gates(
@@ -163,7 +169,7 @@ pub(super) fn request_local_network_access_after_local_action(
 }
 
 /// Each pinned peer with its current route, in the pinned order.
-type PeerRoutes = Vec<(Ipv4Addr, RouteSnapshot)>;
+type PeerRoutes = Vec<(Ipv4Addr, PeerRoute)>;
 
 fn prepare_selection(
     pinned: &PinnedNetwork,
@@ -175,21 +181,31 @@ fn prepare_selection(
     require_cancel_active(cancel)?;
     validate_initial_adapter(&initial)?;
 
-    let watched: PinnedLock = Arc::default();
+    let reachability = Reachability::new(pinned.peers.len());
+    let watched: PinnedLock = Arc::new(Watched {
+        lock: Mutex::new(None),
+        reachability: reachability.clone(),
+    });
     let watch = start_watch(&initial, pinned, &watched)?;
     let signal = watch.revocation_signal();
     require_active(&signal, cancel)?;
 
     let (selected, routes) = current_selection(&initial, pinned, &signal, cancel)?;
     let lock = NetworkLock::new_group(selected, &routes, false).map_err(policy_category)?;
-    *watched
-        .lock()
-        .map_err(|_| io::Error::from(io::ErrorKind::Other))? = Some(lock.clone());
+    {
+        let mut watched_lock = watched
+            .lock
+            .lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+        reachability.set(lock.reachable());
+        *watched_lock = Some(lock.clone());
+    }
     require_active(&signal, cancel)?;
 
     Ok(PreparedSelection {
         initial,
         lock,
+        reachability,
         signal,
         watch,
     })
@@ -217,9 +233,10 @@ fn current_selection(
     let observed = observe_selected_adapter(initial, pinned)?;
     require_active(signal, cancel)?;
     let selected = interface_snapshot(&observed)?;
+    let sole = pinned.peers.len() == 1;
     let mut routes = Vec::with_capacity(pinned.peers.len());
     for peer in &pinned.peers {
-        routes.push(peer_route(&selected, *peer.ip())?);
+        routes.push(peer_route(&selected, *peer.ip(), sole)?);
         require_active(signal, cancel)?;
     }
     Ok((selected, routes))
@@ -229,9 +246,33 @@ fn current_selection(
 fn peer_route(
     selected: &InterfaceSnapshot,
     peer: Ipv4Addr,
-) -> io::Result<(Ipv4Addr, RouteSnapshot)> {
+    sole: bool,
+) -> io::Result<(Ipv4Addr, PeerRoute)> {
     validate_peer(selected, peer).map_err(policy_category)?;
-    Ok((peer, route_snapshot(selected, peer)?))
+    Ok((peer, member_route(route_snapshot(selected, peer), sole)?))
+}
+
+/// A route the platform reports unreachable sets aside only that member. A lone member's route
+/// failing still fails the whole check, as does every other failure: with one member there is no
+/// other session to protect.
+fn member_route(route: io::Result<RouteSnapshot>, sole: bool) -> io::Result<PeerRoute> {
+    match route {
+        Ok(route) => Ok(PeerRoute::Found(route)),
+        Err(error) if !sole && unreachable_route(&error) => {
+            log::debug!("network check: a member has no usable route: {error}");
+            Ok(PeerRoute::Unreachable)
+        }
+        Err(error) => Err(route_check_error(error)),
+    }
+}
+
+/// The kinds each platform's route lookup gives a peer it cannot reach right now; anything else
+/// is a failed check.
+fn unreachable_route(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -273,8 +314,14 @@ fn enumerate_current() -> io::Result<Vec<Adapter>> {
     network::enumerate_adapters()
 }
 
-/// The watcher's private copy of the session lock; empty until the first snapshot is taken.
-type PinnedLock = Arc<Mutex<Option<NetworkLock>>>;
+/// The watcher's private copy of the session lock, empty until the first snapshot is taken, and
+/// the member reachability each check that keeps the lock hands to the socket and dialer.
+struct Watched {
+    lock: Mutex<Option<NetworkLock>>,
+    reachability: Arc<Reachability>,
+}
+
+type PinnedLock = Arc<Watched>;
 
 #[cfg(target_os = "macos")]
 fn start_watch(
@@ -301,7 +348,8 @@ fn start_watch(
 
 /// Runs on the native change-notice thread: the same adapter, attachment, peer, and on-link route
 /// revalidation the session performs, for every pinned peer. Anything unreadable, or a notice
-/// before the first snapshot, reads as a change.
+/// before the first snapshot, reads as a change. A check that keeps the lock sets each member's
+/// reachability, so a member set aside earlier is admitted again once its route is back.
 fn pinned_check(
     initial: &Adapter,
     pinned: &PinnedNetwork,
@@ -319,18 +367,31 @@ fn pinned_check(
                     error.kind()
                 );
             });
+        let sole = pinned.peers.len() == 1;
         let routes = current.as_ref().ok().map(|current| {
             pinned
                 .peers
                 .iter()
-                .map(|peer| peer_route(current, *peer.ip()))
+                .map(|peer| peer_route(current, *peer.ip(), sole))
                 .collect::<io::Result<PeerRoutes>>()
         });
-        let Ok(mut lock) = watched.lock() else {
-            return false;
-        };
-        pinned_facts_hold(lock.as_mut(), current.ok().as_ref(), routes)
+        recheck(&watched, current.ok().as_ref(), routes)
     })
+}
+
+fn recheck(
+    watched: &Watched,
+    current: Option<&InterfaceSnapshot>,
+    routes: Option<io::Result<PeerRoutes>>,
+) -> bool {
+    let Ok(mut lock) = watched.lock.lock() else {
+        return false;
+    };
+    let holds = pinned_facts_hold(lock.as_mut(), current, routes);
+    if holds && let Some(lock) = lock.as_ref() {
+        watched.reachability.set(lock.reachable());
+    }
+    holds
 }
 
 fn pinned_facts_hold(
@@ -430,7 +491,7 @@ fn adapter_kind(adapter: &Adapter) -> Option<InterfaceKind> {
 }
 
 fn route_snapshot(selected: &InterfaceSnapshot, peer: Ipv4Addr) -> io::Result<RouteSnapshot> {
-    let route = network::best_route(selected.address, peer).map_err(route_check_error)?;
+    let route = network::best_route(selected.address, peer)?;
     Ok(RouteSnapshot {
         interface_index: route.interface_index,
         source: route.source,
@@ -532,7 +593,7 @@ mod tests {
     }
 
     fn peer_routes(route: RouteSnapshot) -> PeerRoutes {
-        vec![(PEER, route)]
+        vec![(PEER, route.into())]
     }
 
     fn adapter() -> Adapter {
@@ -556,6 +617,45 @@ mod tests {
             source: Ipv4Addr::new(192, 168, 50, 10),
             next_hop: Ipv4Addr::UNSPECIFIED,
         }
+    }
+
+    fn member_routes() -> PeerRoutes {
+        [11, 12, 13]
+            .map(|host| (Ipv4Addr::new(192, 168, 50, host), route().into()))
+            .to_vec()
+    }
+
+    fn gateway() -> PeerRoute {
+        PeerRoute::Found(RouteSnapshot {
+            next_hop: Ipv4Addr::new(192, 168, 50, 1),
+            ..route()
+        })
+    }
+
+    /// The watcher's state after a bind that found `routes`.
+    fn watching(selected: &InterfaceSnapshot, routes: &PeerRoutes) -> Watched {
+        let lock = NetworkLock::new_group(selected.clone(), routes, false).unwrap();
+        let reachability = Reachability::new(routes.len());
+        reachability.set(lock.reachable());
+        Watched {
+            lock: Mutex::new(Some(lock)),
+            reachability,
+        }
+    }
+
+    fn reaches(watched: &Watched) -> Vec<bool> {
+        (0..watched.reachability.len())
+            .map(|member| watched.reachability.reaches(member))
+            .collect()
+    }
+
+    fn revoked(watched: &Watched) -> bool {
+        watched
+            .lock
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(NetworkLock::is_revoked)
     }
 
     #[test]
@@ -653,9 +753,7 @@ mod tests {
     #[test]
     fn a_change_notice_revokes_the_whole_set_when_any_member_route_fails() {
         let selected = interface_snapshot(&adapter()).unwrap();
-        let members: PeerRoutes = [11, 12, 13]
-            .map(|host| (Ipv4Addr::new(192, 168, 50, host), route()))
-            .to_vec();
+        let members = member_routes();
         let lock = NetworkLock::new_group(selected.clone(), &members, false).unwrap();
         let mut unchanged = lock.clone();
         assert!(pinned_facts_hold(
@@ -665,7 +763,7 @@ mod tests {
         ));
         for member in 0..members.len() {
             let mut routed = members.clone();
-            routed[member].1.next_hop = Ipv4Addr::new(192, 168, 50, 1);
+            routed[member].1 = gateway();
             let mut lock = lock.clone();
             assert!(!pinned_facts_hold(
                 Some(&mut lock),
@@ -681,6 +779,142 @@ mod tests {
             Some(Ok(members[1..].to_vec()))
         ));
         assert!(missing.is_revoked());
+    }
+
+    #[test]
+    fn a_member_route_failure_isolates_only_that_member() {
+        // Only the kinds a platform gives an unreachable peer set a member aside.
+        for kind in [
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+        ] {
+            assert_eq!(
+                member_route(Err(io::Error::from(kind)), false).unwrap(),
+                PeerRoute::Unreachable
+            );
+        }
+        for kind in [io::ErrorKind::Other, io::ErrorKind::NotFound] {
+            let error = member_route(Err(io::Error::from(kind)), false).unwrap_err();
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<RouteCheckFailure>())
+            );
+        }
+
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let members = member_routes();
+        let watched = watching(&selected, &members);
+        let mut second_down = members.clone();
+        second_down[1].1 = PeerRoute::Unreachable;
+        assert!(recheck(&watched, Some(&selected), Some(Ok(second_down))));
+        assert_eq!(reaches(&watched), [true, false, true]);
+        assert!(!revoked(&watched));
+
+        let mut outer_down = members.clone();
+        outer_down[0].1 = PeerRoute::Unreachable;
+        outer_down[2].1 = PeerRoute::Unreachable;
+        assert!(recheck(&watched, Some(&selected), Some(Ok(outer_down))));
+        assert_eq!(reaches(&watched), [false, true, false]);
+
+        // The next check that finds their routes admits them again.
+        assert!(recheck(
+            &watched,
+            Some(&selected),
+            Some(Ok(members.clone()))
+        ));
+        assert_eq!(reaches(&watched), [true, true, true]);
+        assert!(!revoked(&watched));
+
+        // A bind may start with a member already set aside.
+        let mut bound_down = members;
+        bound_down[2].1 = PeerRoute::Unreachable;
+        assert_eq!(
+            reaches(&watching(&selected, &bound_down)),
+            [true, true, false]
+        );
+    }
+
+    #[test]
+    fn an_interface_change_still_revokes_every_member() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let mut set_aside = member_routes();
+        set_aside[1].1 = PeerRoute::Unreachable;
+        let mut other_network = selected.clone();
+        other_network.network_signature = vec![2; 32];
+        let mut renumbered = selected.clone();
+        renumbered.index = 9;
+        let mut readdressed = selected.clone();
+        readdressed.address = Ipv4Addr::new(192, 168, 50, 20);
+        let mut resubnetted = selected.clone();
+        resubnetted.prefix_len = 16;
+        for current in [other_network, renumbered, readdressed, resubnetted] {
+            let watched = watching(&selected, &set_aside);
+            assert!(!recheck(
+                &watched,
+                Some(&current),
+                Some(Ok(set_aside.clone()))
+            ));
+            assert!(revoked(&watched));
+        }
+
+        // A found route stays exactly as strict while another member is set aside.
+        let elsewhere = PeerRoute::Found(RouteSnapshot {
+            interface_index: 9,
+            ..route()
+        });
+        let other_source = PeerRoute::Found(RouteSnapshot {
+            source: Ipv4Addr::new(192, 168, 50, 20),
+            ..route()
+        });
+        for found in [gateway(), elsewhere, other_source] {
+            let watched = watching(&selected, &set_aside);
+            let mut routes = set_aside.clone();
+            routes[2].1 = found;
+            assert!(!recheck(&watched, Some(&selected), Some(Ok(routes))));
+            assert!(revoked(&watched));
+        }
+
+        let watched = watching(&selected, &set_aside);
+        assert!(!recheck(&watched, None, None));
+        let watched = watching(&selected, &set_aside);
+        assert!(!recheck(
+            &watched,
+            Some(&selected),
+            Some(Err(io::Error::from(io::ErrorKind::Other)))
+        ));
+    }
+
+    #[test]
+    fn a_group_of_one_still_revokes_on_its_route_failure() {
+        // Its lone member's route failing fails the check, whatever the platform calls it.
+        for kind in [
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::Other,
+        ] {
+            let error = member_route(Err(io::Error::from(kind)), true).unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<RouteCheckFailure>())
+            );
+            let selected = interface_snapshot(&adapter()).unwrap();
+            let watched = watching(&selected, &peer_routes(route()));
+            assert!(!recheck(&watched, Some(&selected), Some(Err(error))));
+        }
+
+        // The lock refuses a lone unreachable member too, at bind and on a check.
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let alone = vec![(PEER, PeerRoute::Unreachable)];
+        assert_eq!(
+            NetworkLock::new_group(selected.clone(), &alone, false).unwrap_err(),
+            PolicyError::PeerUnreachable
+        );
+        let watched = watching(&selected, &peer_routes(route()));
+        assert!(!recheck(&watched, Some(&selected), Some(Ok(alone))));
+        assert!(revoked(&watched));
     }
 
     #[test]

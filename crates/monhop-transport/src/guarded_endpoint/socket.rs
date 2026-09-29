@@ -4,8 +4,12 @@ use std::{
     io::{self, IoSliceMut},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use monhop_core::revocation::RevocationSignal;
@@ -13,14 +17,116 @@ use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 
-use super::native::NativeSocket;
-use crate::policy::{MAX_PINNED_PEERS, NetworkLock};
+use super::{TokenBucket, native::NativeSocket};
+use crate::{
+    crypto::MAX_PENDING_INCOMING,
+    policy::{MAX_PINNED_PEERS, NetworkLock},
+};
 
 const MAX_DATAGRAM_BYTES: usize = 65_507;
 const RECEIVE_BUDGET: usize = 32;
+/// QUIC first packets one member may send back to back; each can queue a handshake in Quinn.
+const FIRST_PACKET_BURST: u32 = 8;
+/// How often a member's first-packet budget regains one packet.
+const FIRST_PACKET_REFILL: Duration = Duration::from_millis(100);
+// Every member's whole burst fits Quinn's incoming queue at once, so no member's flood fills it.
+const _: () = assert!(MAX_PINNED_PEERS * FIRST_PACKET_BURST as usize <= MAX_PENDING_INCOMING);
 type WritableFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>;
+
+/// Raw send errors, beyond the unreachable kinds, that say one destination cannot take a datagram
+/// now: its host is down or has no route, or the send buffers are momentarily full.
+#[cfg(windows)]
+const UNREACHABLE_SEND_ERRORS: [i32; 4] = [
+    10_064, // WSAEHOSTDOWN
+    10_065, // WSAEHOSTUNREACH
+    10_055, // WSAENOBUFS
+    10_051, // WSAENETUNREACH
+];
+#[cfg(target_os = "macos")]
+const UNREACHABLE_SEND_ERRORS: [i32; 4] = [
+    64, // EHOSTDOWN
+    65, // EHOSTUNREACH
+    55, // ENOBUFS
+    51, // ENETUNREACH
+];
+#[cfg(not(any(windows, target_os = "macos")))]
+const UNREACHABLE_SEND_ERRORS: [i32; 0] = [];
+
+/// A send that failed only for this datagram's destination: QUIC loss recovery resends it, and
+/// one member that cannot be reached never ends the others' sessions.
+fn destination_unreachable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable
+    ) || error
+        .raw_os_error()
+        .is_some_and(|code| UNREACHABLE_SEND_ERRORS.contains(&code))
+}
+
+/// A QUIC long-header Initial, the only packet that makes Quinn queue a new incoming handshake.
+fn is_first_packet(datagram: &[u8]) -> bool {
+    datagram.first().is_some_and(|first| first & 0xB0 == 0x80)
+}
+
+/// Which members the last route check could reach. A member without a usable route is absent:
+/// nothing is sent to it, nothing from it reaches Quinn and dials to it fail, until a later check
+/// finds its route. Shared by the route checks, the socket and the dialer.
+pub(super) struct Reachability {
+    unreachable: Box<[AtomicBool]>,
+}
+
+impl Reachability {
+    /// Every member starts reachable.
+    pub(super) fn new(members: usize) -> Arc<Self> {
+        Arc::new(Self {
+            unreachable: (0..members).map(|_| AtomicBool::new(false)).collect(),
+        })
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.unreachable.len()
+    }
+
+    pub(super) fn reaches(&self, member: usize) -> bool {
+        self.unreachable
+            .get(member)
+            .is_some_and(|unreachable| !unreachable.load(Ordering::Acquire))
+    }
+
+    /// Takes one route check's verdict, in member order.
+    pub(super) fn set(&self, reachable: &[bool]) {
+        for (member, (flag, &reachable)) in self.unreachable.iter().zip(reachable).enumerate() {
+            let was_unreachable = flag.swap(!reachable, Ordering::AcqRel);
+            if was_unreachable == reachable {
+                if reachable {
+                    log::info!("guarded socket: member slot {member} is reachable again");
+                } else {
+                    log::warn!(
+                        "guarded socket: member slot {member} has no usable route; its datagrams \
+                         are dropped until a check finds one"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Datagrams one member lost at this socket without a revocation, for diagnostics.
+#[derive(Default)]
+struct Dropped {
+    sends: AtomicU64,
+    first_packets: AtomicU64,
+}
+
+/// Counts one drop, logging the count at powers of two so a lasting outage stays a few lines.
+fn count_drop(counter: &AtomicU64, member: usize, what: &str, cause: &dyn fmt::Display) {
+    let dropped = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if dropped.is_power_of_two() {
+        log::debug!("guarded socket: {dropped} {what} for member slot {member} dropped: {cause}");
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct Arrival {
@@ -67,6 +173,10 @@ pub(super) struct GuardedSocket<I> {
     local: SocketAddrV4,
     /// Fixed for the socket's life: exactly the lock's peers, each with its pinned port.
     members: Box<[SocketAddrV4]>,
+    /// In member order, like everything else below indexed by member.
+    reachability: Arc<Reachability>,
+    first_packets: Mutex<Box<[TokenBucket]>>,
+    dropped: Box<[Dropped]>,
     interface_index: u32,
     signal: RevocationSignal,
     /// Dropped with the socket, ending every `lifetime()` wait. Declared after `io`, so the OS
@@ -83,11 +193,13 @@ impl<I> fmt::Debug for GuardedSocket<I> {
 }
 
 impl<I: DatagramIo> GuardedSocket<I> {
+    /// `reachability` is the route checks' verdict for exactly `members`, in the same order.
     pub(super) fn new(
         io: I,
         lock: &NetworkLock,
         local: SocketAddrV4,
         members: &[SocketAddrV4],
+        reachability: Arc<Reachability>,
         signal: RevocationSignal,
     ) -> io::Result<Self> {
         if lock.is_revoked() || signal.is_revoked() {
@@ -95,6 +207,7 @@ impl<I: DatagramIo> GuardedSocket<I> {
         }
         if local.port() == 0
             || !members_match_lock(members, lock)
+            || reachability.len() != members.len()
             || *local.ip() != lock.selected().address
             || io.local_addr()? != local
         {
@@ -103,14 +216,44 @@ impl<I: DatagramIo> GuardedSocket<I> {
                 "socket does not match the authorized network",
             ));
         }
-        Ok(Self {
+        Ok(Self::pinned(
+            io,
+            local,
+            members,
+            lock.selected().index,
+            reachability,
+            signal,
+        ))
+    }
+}
+
+impl<I> GuardedSocket<I> {
+    /// Only after the checks `new` makes, or in a test fixture pinning addresses of its own.
+    fn pinned(
+        io: I,
+        local: SocketAddrV4,
+        members: &[SocketAddrV4],
+        interface_index: u32,
+        reachability: Arc<Reachability>,
+        signal: RevocationSignal,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
             io: Arc::new(io),
             local,
             members: members.into(),
-            interface_index: lock.selected().index,
+            reachability,
+            first_packets: Mutex::new(
+                members
+                    .iter()
+                    .map(|_| TokenBucket::new(FIRST_PACKET_BURST, FIRST_PACKET_REFILL, now))
+                    .collect(),
+            ),
+            dropped: members.iter().map(|_| Dropped::default()).collect(),
+            interface_index,
             signal,
             lifetime: watch::Sender::new(()),
-        })
+        }
     }
 }
 
@@ -136,6 +279,10 @@ impl<I> GuardedSocket<I> {
 
     pub(super) fn revocation(&self) -> RevocationSignal {
         self.signal.clone()
+    }
+
+    pub(super) fn reachability(&self) -> Arc<Reachability> {
+        self.reachability.clone()
     }
 }
 
@@ -166,28 +313,61 @@ impl<I: DatagramIo> GuardedSocket<I> {
         }
     }
 
-    fn permits(&self, packet: Arrival) -> bool {
-        self.members.contains(&packet.source)
-            && packet.destination == *self.local.ip()
-            && packet.interface_index == self.interface_index
+    /// The reachable member a datagram came from, if it arrived on the pinned address and
+    /// interface.
+    fn sender(&self, packet: Arrival) -> Option<usize> {
+        if packet.length == 0
+            || packet.destination != *self.local.ip()
+            || packet.interface_index != self.interface_index
+        {
+            return None;
+        }
+        let member = self
+            .members
+            .iter()
+            .position(|member| *member == packet.source)?;
+        self.reachability.reaches(member).then_some(member)
+    }
+
+    /// Whether `member`'s first-packet budget admits one more, so a flood from one recorded
+    /// address never fills Quinn's incoming queue for the others.
+    fn admits_first_packet(&self, member: usize) -> bool {
+        let mut budgets = self
+            .first_packets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if budgets[member].take(Instant::now()) {
+            return true;
+        }
+        drop(budgets);
+        count_drop(
+            &self.dropped[member].first_packets,
+            member,
+            "first packets",
+            &"over the rate limit",
+        );
+        false
     }
 
     /// The member a transmit is for, if it also keeps the pinned source address and size bounds.
-    fn permitted_destination(&self, transmit: &Transmit<'_>) -> Option<SocketAddrV4> {
+    fn permitted_destination(&self, transmit: &Transmit<'_>) -> Option<(usize, SocketAddrV4)> {
         let SocketAddr::V4(destination) = transmit.destination else {
             return None;
         };
-        if !self.members.contains(&destination)
-            || transmit
-                .src_ip
-                .is_some_and(|ip| ip != IpAddr::V4(*self.local.ip()))
+        let member = self
+            .members
+            .iter()
+            .position(|member| *member == destination)?;
+        if transmit
+            .src_ip
+            .is_some_and(|ip| ip != IpAddr::V4(*self.local.ip()))
             || transmit.segment_size.is_some()
             || transmit.contents.is_empty()
             || transmit.contents.len() > MAX_DATAGRAM_BYTES
         {
             return None;
         }
-        Some(destination)
+        Some((member, destination))
     }
 }
 
@@ -204,10 +384,20 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
         if self.signal.is_revoked() {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        let Some(destination) = self.permitted_destination(transmit) else {
+        let Some((member, destination)) = self.permitted_destination(transmit) else {
             self.revoke_because(&"a transmit left the pinned peers, address, or size bounds");
             return Err(io::ErrorKind::WouldBlock.into());
         };
+        // Reported as sent: QUIC loss recovery owns a datagram that cannot leave.
+        if !self.reachability.reaches(member) {
+            count_drop(
+                &self.dropped[member].sends,
+                member,
+                "datagrams",
+                &"no usable route",
+            );
+            return Ok(());
+        }
         // No outgoing source/ECN ancillary data: IP_PKTINFO could override macOS interface pinning.
         let result = self.io.try_send_to(transmit.contents, destination);
         if self.signal.is_revoked() {
@@ -216,6 +406,10 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
         match result {
             Ok(length) if length == transmit.contents.len() => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(error),
+            Err(error) if destination_unreachable(&error) => {
+                count_drop(&self.dropped[member].sends, member, "datagrams", &error);
+                Ok(())
+            }
             Ok(_) => {
                 self.revoke_because(&"a datagram was written short");
                 Err(io::ErrorKind::WouldBlock.into())
@@ -269,7 +463,10 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
                     "invalid received datagram length",
                 ))));
             }
-            if packet.length == 0 || !self.permits(packet) {
+            let Some(member) = self.sender(packet) else {
+                continue;
+            };
+            if is_first_packet(&buffer[..packet.length]) && !self.admits_first_packet(member) {
                 continue;
             }
             *output = RecvMeta {

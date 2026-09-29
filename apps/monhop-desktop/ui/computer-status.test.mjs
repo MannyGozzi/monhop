@@ -330,3 +330,228 @@ test("the header pill names the computer in use, or why there is nothing to repo
   assert.equal(live.label, "Sharing");
   assert.equal(live.detail, "Either computer's keyboard and mouse can control the other");
 });
+
+// --- the multi-computer `peers` shape ---------------------------------------------------
+
+function peer(patch = {}) {
+  return { fingerprint: WINDOWS, phase: "off", message: "", held: false, ...patch };
+}
+
+test("a computer named in view.peers reads its own phase, message and held flag from there", () => {
+  const sharing = computerStatus(
+    computer,
+    view({ peers: [peer({ phase: "sharing" })] }),
+    null,
+    LOCAL_NAME,
+  );
+  assert.equal(sharing.key, "sharing");
+  assert.equal(sharing.label, "Sharing");
+  assert.equal(sharing.detail, "Either computer's keyboard and mouse can control the other");
+
+  const held = computerStatus(
+    computer,
+    view({ peers: [peer({ phase: "sharing", held: true })] }),
+    null,
+  );
+  assert.equal(held.key, "reconnecting");
+  assert.match(held.detail, /Input stays on this computer/);
+
+  const connected = computerStatus(computer, view({ peers: [peer({ phase: "connected" })] }), null);
+  assert.equal(connected.key, "connected");
+  assert.match(connected.detail, /Arrange the displays/);
+
+  // Editing still comes from the shared view, not the peer entry: one editor for the whole group.
+  const editing = computerStatus(
+    computer,
+    view({ peers: [peer({ phase: "connected" })], editing: true }),
+    null,
+  );
+  assert.equal(editing.key, "editing");
+  assert.match(editing.detail, /Sharing resumes after you apply/);
+
+  const off = computerStatus(
+    computer,
+    view({ peers: [peer({ phase: "off", message: "Paused. Input is local." })] }),
+    null,
+  );
+  assert.equal(off.key, "paused");
+  assert.equal(off.label, "Paused");
+
+  const stopping = computerStatus(computer, view({ peers: [peer({ phase: "stopping" })] }), null);
+  assert.equal(stopping.label, "Stopping…");
+
+  const failed = computerStatus(
+    computer,
+    view({ peers: [peer({ phase: "error", message: "The other computer refused." })] }),
+    null,
+  );
+  assert.equal(failed.key, "error");
+  assert.equal(failed.detail, "The other computer refused.");
+
+  // No message yet: an error reads as still connecting, exactly like the legacy shape.
+  const unconfirmed = computerStatus(computer, view({ peers: [peer({ phase: "error" })] }), null);
+  assert.equal(unconfirmed.label, "Connecting…");
+});
+
+test("a member with no trust record yet reads as not paired, not as an error", () => {
+  const notPaired = computerStatus(
+    computer,
+    view({ peers: [peer({ phase: "notPaired", message: "Not paired with this computer." })] }),
+    null,
+  );
+  assert.equal(notPaired.key, "attention");
+  assert.equal(notPaired.label, "Not paired");
+  assert.equal(notPaired.detail, "Not paired with this computer.");
+  assert.notEqual(notPaired.tone, "error");
+
+  // With no message from the backend, a plain fallback still names the computer.
+  const noMessage = computerStatus(computer, view({ peers: [peer({ phase: "notPaired" })] }), null);
+  assert.equal(noMessage.detail, "Pair with Office Windows PC to share input with it.");
+});
+
+test("a computer not named in view.peers falls back to the legacy fields unchanged", () => {
+  // peers present (even non-empty) but naming a different computer: this one is untouched by it.
+  const untouched = computerStatus(
+    computer,
+    view({
+      phase: "sharing",
+      peerFingerprint: WINDOWS,
+      active: WINDOWS,
+      peers: [peer({ fingerprint: MAC, phase: "sharing" })],
+    }),
+    WINDOWS,
+    LOCAL_NAME,
+  );
+  assert.equal(untouched.key, "sharing");
+
+  // peers explicitly empty: identical to peers being absent altogether.
+  const empty = computerStatus(
+    computer,
+    view({ phase: "sharing", peerFingerprint: WINDOWS, active: WINDOWS, peers: [] }),
+    WINDOWS,
+    LOCAL_NAME,
+  );
+  assert.equal(empty.key, "sharing");
+});
+
+// --- the header pill across several enabled computers -----------------------------------
+
+function computersOf(...fingerprints) {
+  return normalizeComputers({
+    computers: fingerprints.map((fingerprint, index) => ({
+      fingerprint,
+      name: `Computer ${index + 1}`,
+      platform: "windows",
+    })),
+  });
+}
+
+const THIRD = "d".repeat(64);
+
+test("the header pill sums up sharing across every enabled computer", () => {
+  const computers = computersOf(WINDOWS, MAC, THIRD);
+  const allSharing = activeStatus({
+    computers,
+    sharingView: view({
+      peers: [
+        peer({ fingerprint: WINDOWS, phase: "sharing" }),
+        peer({ fingerprint: MAC, phase: "sharing" }),
+      ],
+    }),
+    enabled: [WINDOWS, MAC],
+    nativeAvailable: true,
+    localName: LOCAL_NAME,
+  });
+  assert.equal(allSharing.key, "sharing");
+  assert.equal(allSharing.detail, "Sharing with 2 computers.");
+
+  const mixed = activeStatus({
+    computers,
+    sharingView: view({
+      peers: [
+        peer({ fingerprint: WINDOWS, phase: "sharing" }),
+        peer({ fingerprint: MAC, phase: "sharing" }),
+        peer({ fingerprint: THIRD, phase: "connected" }),
+      ],
+    }),
+    enabled: [WINDOWS, MAC, THIRD],
+    nativeAvailable: true,
+    localName: LOCAL_NAME,
+  });
+  assert.equal(mixed.key, "connecting");
+  assert.equal(mixed.detail, "Connecting to 1 of 3 computers.");
+
+  const noneYet = activeStatus({
+    computers,
+    sharingView: view({
+      peers: [
+        peer({ fingerprint: WINDOWS, phase: "connecting" }),
+        peer({ fingerprint: MAC, phase: "connecting" }),
+      ],
+    }),
+    enabled: [WINDOWS, MAC],
+    nativeAvailable: true,
+    localName: LOCAL_NAME,
+  });
+  assert.equal(noneYet.detail, "Connecting to 2 computers.");
+});
+
+test("a paused group reads as paused, whatever each computer's own phase is", () => {
+  const paused = activeStatus({
+    computers: computersOf(WINDOWS, MAC),
+    sharingView: view({
+      paused: true,
+      peers: [
+        peer({ fingerprint: WINDOWS, phase: "off" }),
+        peer({ fingerprint: MAC, phase: "off" }),
+      ],
+    }),
+    enabled: [WINDOWS, MAC],
+    nativeAvailable: true,
+    localName: LOCAL_NAME,
+  });
+  assert.equal(paused.key, "paused");
+  assert.equal(paused.label, "Paused");
+  assert.equal(paused.detail, "Paused for 2 computers.");
+});
+
+test("an unpaired member in the group is called out as something to connect, not a failure", () => {
+  const status = activeStatus({
+    computers: computersOf(WINDOWS, MAC),
+    sharingView: view({
+      peers: [
+        peer({ fingerprint: WINDOWS, phase: "sharing" }),
+        peer({ fingerprint: MAC, phase: "notPaired", message: "Not paired with this computer." }),
+      ],
+    }),
+    enabled: [WINDOWS, MAC],
+    nativeAvailable: true,
+    localName: LOCAL_NAME,
+  });
+  assert.equal(status.key, "error");
+  assert.equal(status.detail, "Can't connect to 1 of 2 computers.");
+});
+
+test("zero and one enabled computers keep today's exact wording even with an `enabled` list passed in", () => {
+  const computers = computersOf(WINDOWS);
+  const zero = activeStatus({
+    computers,
+    sharingView: view(),
+    enabled: [],
+    nativeAvailable: true,
+    localName: LOCAL_NAME,
+  });
+  assert.equal(zero.label, "No computer");
+  assert.equal(zero.detail, "Choose a computer to use.");
+
+  const one = activeStatus({
+    computers,
+    sharingView: view({ phase: "sharing", peerFingerprint: WINDOWS, active: WINDOWS }),
+    enabled: [WINDOWS],
+    active: WINDOWS,
+    nativeAvailable: true,
+    localName: LOCAL_NAME,
+  });
+  assert.equal(one.label, "Sharing");
+  assert.equal(one.detail, "Either computer's keyboard and mouse can control the other");
+});

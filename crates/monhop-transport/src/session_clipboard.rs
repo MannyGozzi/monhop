@@ -49,8 +49,11 @@ struct Limits {
     header: Duration,
     text_body: Duration,
     png_body: Duration,
+    /// Also the least time between two rate-limit violations, so a burst the path bunched up
+    /// counts once instead of disabling the link.
     inbound_window: Duration,
-    /// Longer than `inbound_window`, so path jitter can never make a paced sender look too fast.
+    /// Longer than `inbound_window`, so only path jitter above the difference can make a paced
+    /// sender look too fast.
     outbound_window: Duration,
 }
 
@@ -230,6 +233,8 @@ pub enum Refusal {
     /// The body missed its deadline, which a slow path can cause, so it is not a violation.
     TimedOut,
     PeerReset,
+    /// Over the stream rate after this window's one `Violation::RateLimited` was counted.
+    RateLimited,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +250,7 @@ pub enum Violation {
     InvalidState,
     InvalidText(ClipboardTextError),
     InvalidPng(ClipboardPngError),
+    /// Over the stream rate; counted at most once per rate window.
     RateLimited,
 }
 
@@ -309,6 +315,7 @@ fn attach_with(
             content: None,
             last_state: 0,
             last_content: 0,
+            last_rate_violation: None,
             violations: 0,
             disabled: false,
         }
@@ -643,6 +650,7 @@ struct Receiver {
     content: Option<ContentRead>,
     last_state: u64,
     last_content: u64,
+    last_rate_violation: Option<Instant>,
     violations: u8,
     disabled: bool,
 }
@@ -698,8 +706,14 @@ impl Receiver {
         }
         if self.accepted.len() >= MAX_STREAMS_PER_WINDOW {
             stop(&mut stream, CODE_REFUSED);
-            self.violation(None, Violation::RateLimited);
-            return;
+            if self
+                .last_rate_violation
+                .is_some_and(|at| now.duration_since(at) < window)
+            {
+                return self.refused(None, Refusal::RateLimited);
+            }
+            self.last_rate_violation = Some(now);
+            return self.violation(None, Violation::RateLimited);
         }
         self.accepted.push_back(now);
         let started_at = std::time::Instant::now();
@@ -1249,6 +1263,55 @@ mod tests {
         assert!(
             started.elapsed() >= limits.outbound_window,
             "the sender waited for its budget instead of opening every stream at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sustained_flood_counts_one_violation_per_window() {
+        let limits = Limits {
+            inbound_window: Duration::from_millis(300),
+            ..Limits::PRODUCTION
+        };
+        let pair = connection_pair().await;
+        let mut link = attach_scaled(&pair.server, pair.client_id, limits);
+        let client = pair.client.clone();
+        let started = Instant::now();
+        let flood = tokio::spawn(async move {
+            for sequence in 1.. {
+                let Ok(mut stream) = client.open_uni().await else {
+                    break;
+                };
+                let state = [header(ClipboardKind::State, sequence, 1), vec![1]].concat();
+                if stream.write_all(&state).await.is_ok() {
+                    let _ = stream.finish();
+                }
+            }
+        });
+
+        let (mut counted, mut uncounted) = (0, 0);
+        loop {
+            match link.note().await {
+                ClipboardNote::Refused {
+                    reason: Refusal::Violation(violation),
+                    ..
+                } => {
+                    assert_eq!(violation, Violation::RateLimited);
+                    counted += 1;
+                }
+                ClipboardNote::Refused {
+                    reason: Refusal::RateLimited,
+                    ..
+                } => uncounted += 1,
+                ClipboardNote::Disabled => break,
+                _ => {}
+            }
+        }
+        flood.abort();
+        assert_eq!(counted, MAX_VIOLATIONS);
+        assert!(uncounted > 0, "most over-limit streams were not counted");
+        assert!(
+            started.elapsed() >= limits.inbound_window * u32::from(MAX_VIOLATIONS - 1),
+            "a flood still disables the link, one window at a time"
         );
     }
 

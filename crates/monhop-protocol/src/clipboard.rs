@@ -203,6 +203,15 @@ impl fmt::Display for ClipboardPngError {
 
 impl Error for ClipboardPngError {}
 
+/// Whether an image of these pixel dimensions is within the clipboard caps: each side in
+/// `1..=MAX_CLIPBOARD_SIDE` and the area at most [`MAX_CLIPBOARD_PIXELS`].
+pub fn image_within_caps(width: u32, height: u32) -> bool {
+    let side = 1..=MAX_CLIPBOARD_SIDE;
+    side.contains(&width)
+        && side.contains(&height)
+        && u64::from(width) * u64::from(height) <= MAX_CLIPBOARD_PIXELS
+}
+
 /// Reads only the signature and IHDR chunk (the first [`PNG_PREFIX_LEN`] bytes) to recover
 /// dimensions before any decode. Never inflates or checks a CRC; the receiver still fully decodes
 /// (with checksums) and re-encodes before the bytes reach the OS clipboard.
@@ -223,11 +232,7 @@ pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), ClipboardPngError> {
     }
     let width = u32::from_be_bytes(prefix[16..20].try_into().expect("4-byte slice"));
     let height = u32::from_be_bytes(prefix[20..24].try_into().expect("4-byte slice"));
-    let side = 1..=MAX_CLIPBOARD_SIDE;
-    if !side.contains(&width) || !side.contains(&height) {
-        return Err(ClipboardPngError::InvalidDimensions);
-    }
-    if u64::from(width) * u64::from(height) > MAX_CLIPBOARD_PIXELS {
+    if !image_within_caps(width, height) {
         return Err(ClipboardPngError::InvalidDimensions);
     }
     let bit_depth = prefix[24];

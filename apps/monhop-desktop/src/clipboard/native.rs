@@ -95,6 +95,9 @@ pub struct Snapshot {
 pub enum NativeError {
     /// Another process held the clipboard through every retry.
     Busy,
+    /// The change marker moved after the caller approved the write, so nothing was written: the
+    /// newer local copy wins.
+    Changed,
     Failed,
 }
 
@@ -102,6 +105,7 @@ impl fmt::Display for NativeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Busy => "the clipboard is busy",
+            Self::Changed => "the clipboard changed before the write",
             Self::Failed => "the clipboard operation failed",
         })
     }
@@ -109,6 +113,16 @@ impl fmt::Display for NativeError {
 
 impl Error for NativeError {}
 
+/// Writes follow one sequence so a received item can neither overwrite a newer local copy nor
+/// ever be seen without MonHop's source marker:
+/// 1. open the clipboard (macOS has no open: do all of this in one pass on the owning thread);
+/// 2. re-read the change marker, and if it differs from `expected` (the value
+///    `EchoGuard::may_apply` approved) write nothing and return `NativeError::Changed`;
+/// 3. empty it, then write every content format and the source marker in this same session;
+/// 4. close, and return the change marker read right after.
+///
+/// The caller records the item with `EchoGuard::begin_apply` before the write, so an item that
+/// fails partway still never goes back out.
 pub trait NativeClipboard {
     /// A counter every clipboard change moves (Windows sequence number, macOS changeCount).
     fn change_marker(&self) -> u64;
@@ -125,15 +139,22 @@ pub trait NativeClipboard {
     /// Checks markers first and never reads past a concealed, files or MonHop item.
     fn read(&mut self, limits: &ReadLimits) -> Result<Snapshot, NativeError>;
 
-    /// `text` is wire text (LF line ends); returns the change marker right after the write.
-    fn write_text(&mut self, text: &str, marker: SourceMarker) -> Result<u64, NativeError>;
+    /// `text` is wire text (LF line ends). See the trait docs for the write sequence.
+    fn write_text(
+        &mut self,
+        text: &str,
+        marker: SourceMarker,
+        expected: u64,
+    ) -> Result<u64, NativeError>;
 
-    /// `png` is MonHop's own re-encode; Windows also writes a CF_DIBV5 built from `rgba`.
+    /// `png` is MonHop's own re-encode; Windows also writes a CF_DIBV5 built from `rgba`. See the
+    /// trait docs for the write sequence.
     fn write_png(
         &mut self,
         png: &[u8],
         rgba: Option<&Rgba>,
         marker: SourceMarker,
+        expected: u64,
     ) -> Result<u64, NativeError>;
 }
 
@@ -171,12 +192,20 @@ mod tests {
             self.source = None;
         }
 
-        fn write(&mut self, item: Item, marker: SourceMarker) -> u64 {
+        fn write(
+            &mut self,
+            item: Item,
+            marker: SourceMarker,
+            expected: u64,
+        ) -> Result<u64, NativeError> {
+            if self.marker != expected {
+                return Err(NativeError::Changed);
+            }
             // A single write can move the platform counter more than once.
             self.marker += 2;
             self.item = Some(item);
             self.source = Some(marker);
-            self.marker
+            Ok(self.marker)
         }
     }
 
@@ -228,8 +257,14 @@ mod tests {
             })
         }
 
-        fn write_text(&mut self, text: &str, marker: SourceMarker) -> Result<u64, NativeError> {
-            Ok(self.write(Item::Text(windows_line_ends(text).into_owned()), marker))
+        fn write_text(
+            &mut self,
+            text: &str,
+            marker: SourceMarker,
+            expected: u64,
+        ) -> Result<u64, NativeError> {
+            let item = Item::Text(windows_line_ends(text).into_owned());
+            self.write(item, marker, expected)
         }
 
         fn write_png(
@@ -237,9 +272,10 @@ mod tests {
             png: &[u8],
             rgba: Option<&Rgba>,
             marker: SourceMarker,
+            expected: u64,
         ) -> Result<u64, NativeError> {
             self.dib_beside_png = rgba.is_some();
-            Ok(self.write(Item::Png(png.to_vec()), marker))
+            self.write(Item::Png(png.to_vec()), marker, expected)
         }
     }
 
@@ -272,10 +308,11 @@ mod tests {
 
         let incoming = accept_incoming(b"from a peer\n".to_vec()).unwrap();
         let started_at = Instant::now() + Duration::from_secs(1);
-        assert!(guard.may_apply(started_at, clipboard.change_marker()));
-        let marker = guard.next_marker();
-        let after = clipboard.write_text(&incoming, marker).unwrap();
-        guard.applied(guard.text_key(&incoming), after);
+        let approved = clipboard.change_marker();
+        assert!(guard.may_apply(started_at, approved));
+        let marker = guard.begin_apply(guard.text_key(&incoming));
+        let after = clipboard.write_text(&incoming, marker, approved).unwrap();
+        guard.applied(after);
         assert!(tick(&mut clipboard, &mut guard, &limits).is_none());
 
         clipboard.marker += 1;
@@ -289,11 +326,27 @@ mod tests {
         let image = Rgba::new(1, 1, vec![9, 8, 7, 255]).unwrap();
         let peer_png = encode_png(&image, MAX_CLIPBOARD_PNG as usize).unwrap();
         let (decoded, png) = reencode_png(&peer_png).unwrap();
-        let marker = guard.next_marker();
-        let after = clipboard.write_png(&png, Some(&decoded), marker).unwrap();
-        guard.applied(guard.png_key(&png), after);
+        let approved = clipboard.change_marker();
+        let marker = guard.begin_apply(guard.png_key(&png));
+        let after = clipboard
+            .write_png(&png, Some(&decoded), marker, approved)
+            .unwrap();
+        guard.applied(after);
         assert!(clipboard.dib_beside_png);
         assert!(tick(&mut clipboard, &mut guard, &limits).is_none());
+
+        // A copy between the approval and the write wins, and nothing it wrote is shared back.
+        let approved = clipboard.change_marker();
+        clipboard.copy(Item::Text("copied just now".into()));
+        let marker = guard.begin_apply(guard.text_key(&incoming));
+        assert_eq!(
+            clipboard.write_text(&incoming, marker, approved),
+            Err(NativeError::Changed)
+        );
+        let verdict = tick(&mut clipboard, &mut guard, &limits);
+        assert!(
+            matches!(verdict, Some(Verdict::Share(Outgoing::Text(ref text))) if text == "copied just now")
+        );
 
         clipboard.copy(Item::Concealed);
         let verdict = tick(&mut clipboard, &mut guard, &limits);
@@ -325,6 +378,10 @@ mod tests {
         assert_eq!(
             NativeError::Failed.to_string(),
             "the clipboard operation failed"
+        );
+        assert_eq!(
+            NativeError::Changed.to_string(),
+            "the clipboard changed before the write"
         );
     }
 

@@ -79,6 +79,25 @@ fn before_nul(text: &str) -> &str {
     text.find('\0').map_or(text, |end| &text[..end])
 }
 
+/// Drops every CR directly before an LF, whole runs of them where `normalize_outgoing` drops one,
+/// so the result is the same however many times a text was normalized or given CRLF line ends.
+fn lf_line_ends(text: &str) -> Cow<'_, str> {
+    if !text.contains("\r\n") {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for piece in text.split_inclusive('\n') {
+        match piece.strip_suffix('\n') {
+            Some(line) => {
+                out.push_str(line.trim_end_matches('\r'));
+                out.push('\n');
+            }
+            None => out.push_str(piece),
+        }
+    }
+    Cow::Owned(out)
+}
+
 fn is_lone_url(text: &str) -> bool {
     let text = text.trim();
     if text.contains(char::is_whitespace) {
@@ -256,8 +275,7 @@ impl EchoGuard {
         Verdict::Share(outgoing)
     }
 
-    /// The marker to write beside the next item received from a peer.
-    pub fn next_marker(&mut self) -> SourceMarker {
+    fn next_marker(&mut self) -> SourceMarker {
         self.writes += 1;
         SourceMarker {
             token: self.token,
@@ -265,9 +283,10 @@ impl EchoGuard {
         }
     }
 
-    /// Key of wire text, as a later local copy of it would normalize to.
+    /// Key of text whatever its line ends: CRLF, LF, or extra CRs before an LF all key alike, so
+    /// received text a platform or clipboard manager re-wrote still matches.
     pub fn text_key(&self, text: &str) -> ContentKey {
-        self.key(KeyKind::Text, text.as_bytes())
+        self.key(KeyKind::Text, lf_line_ends(text).as_bytes())
     }
 
     pub fn png_key(&self, png: &[u8]) -> ContentKey {
@@ -278,15 +297,22 @@ impl EchoGuard {
         ContentKey(self.keys.hash_one((kind as u8, bytes)))
     }
 
-    /// Records a finished write of received content: its change marker is skipped, and the same
-    /// content reappearing without the source marker (a clipboard manager) is not sent back.
-    pub fn applied(&mut self, key: ContentKey, marker_after: u64) {
-        self.own_write = Some(marker_after);
+    /// Call right before writing received content; returns the source marker to write beside it.
+    /// The content counts as crossed from here on, so any part of it that lands, even from a
+    /// write that fails midway, is never sent back.
+    pub fn begin_apply(&mut self, key: ContentKey) -> SourceMarker {
         self.last_content = Some(key);
+        self.next_marker()
+    }
+
+    /// Records a finished write by the change marker right after it, so that change is skipped.
+    pub fn applied(&mut self, marker_after: u64) {
+        self.own_write = Some(marker_after);
     }
 
     /// A paste never overwrites what the user copied since the incoming transfer started, nor a
-    /// change this guard has not observed yet.
+    /// change this guard has not observed yet. The adapter's write re-checks the marker while
+    /// the clipboard is open, which closes the gap between this check and the write.
     pub fn may_apply(&self, started_at: Instant, current_marker: u64) -> bool {
         let unobserved = current_marker != self.last_seen && self.own_write != Some(current_marker);
         let copied_since = self.local_change_at.is_some_and(|at| at >= started_at);
@@ -446,8 +472,8 @@ mod tests {
     #[test]
     fn own_writes_are_skipped_by_their_change_marker() {
         let mut guard = EchoGuard::new(1);
-        let _ = guard.next_marker();
-        guard.applied(guard.text_key("from peer"), 3);
+        let _ = guard.begin_apply(guard.text_key("from peer"));
+        guard.applied(3);
         assert_eq!(guard.observe(3, Instant::now()), Observation::OwnWrite);
         assert_eq!(guard.observe(3, Instant::now()), Observation::Unchanged);
         assert_eq!(guard.observe(4, Instant::now()), Observation::Changed);
@@ -470,14 +496,66 @@ mod tests {
     #[test]
     fn received_content_reappearing_unmarked_is_not_sent_back() {
         let mut guard = EchoGuard::new(0);
-        guard.applied(guard.text_key("line one\nline two"), 1);
+        let _ = guard.begin_apply(guard.text_key("line one\nline two"));
+        guard.applied(1);
         let verdict = guard.judge(local_text(2, "line one\r\nline two"));
         assert!(matches!(verdict, Verdict::Repeat), "{verdict:?}");
 
         let png = one_pixel_png();
-        guard.applied(guard.png_key(&png), 3);
+        let _ = guard.begin_apply(guard.png_key(&png));
+        guard.applied(3);
         let verdict = guard.judge(snapshot(4, Origin::Local, Content::Png(png)));
         assert!(matches!(verdict, Verdict::Repeat), "{verdict:?}");
+    }
+
+    #[test]
+    fn an_applied_item_is_recognized_even_if_the_write_failed_midway() {
+        let mut guard = EchoGuard::new(0);
+        let _ = guard.begin_apply(guard.text_key("from a peer"));
+        // The text landed, then the write failed before the source marker and the change marker
+        // were recorded: to this guard it is an ordinary local change.
+        assert_eq!(guard.observe(1, Instant::now()), Observation::Changed);
+        let verdict = guard.judge(local_text(1, "from a peer"));
+        assert!(matches!(verdict, Verdict::Repeat), "{verdict:?}");
+
+        let png = one_pixel_png();
+        let _ = guard.begin_apply(guard.png_key(&png));
+        assert_eq!(guard.observe(2, Instant::now()), Observation::Changed);
+        let verdict = guard.judge(snapshot(2, Origin::Local, Content::Png(png)));
+        assert!(matches!(verdict, Verdict::Repeat), "{verdict:?}");
+    }
+
+    #[test]
+    fn crlf_text_received_and_recopied_is_not_echoed() {
+        let incoming = accept_incoming(b"one\r\ntwo\r\r\nthree\nfour".to_vec()).unwrap();
+        // As Windows writes it, and as macOS leaves it.
+        for recopied in [windows_line_ends(&incoming).into_owned(), incoming.clone()] {
+            let mut guard = EchoGuard::new(0);
+            let _ = guard.begin_apply(guard.text_key(&incoming));
+            guard.applied(1);
+            assert_eq!(guard.observe(1, Instant::now()), Observation::OwnWrite);
+            // A clipboard manager copies it again, without MonHop's source marker.
+            assert_eq!(guard.observe(2, Instant::now()), Observation::Changed);
+            let verdict = guard.judge(local_text(2, &recopied));
+            assert!(
+                matches!(verdict, Verdict::Repeat),
+                "{recopied:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_keys_ignore_how_line_ends_were_written() {
+        let guard = EchoGuard::new(0);
+        let key = guard.text_key("a\nb\n\nc");
+        for same in ["a\r\nb\r\n\r\nc", "a\r\r\nb\n\r\r\r\nc", "a\nb\n\nc"] {
+            assert!(guard.text_key(same) == key, "{same:?}");
+        }
+        for different in ["a\rb\n\nc", "a\nb\nc", "a\nb\n\nc\r", "a\nb\n\nc\n"] {
+            assert!(guard.text_key(different) != key, "{different:?}");
+        }
+        assert_eq!(lf_line_ends("x\r\r\n"), "x\n");
+        assert!(matches!(lf_line_ends("x\ry\n"), Cow::Borrowed(_)));
     }
 
     #[test]
@@ -572,7 +650,8 @@ mod tests {
     fn a_paste_right_after_our_own_write_is_allowed() {
         let start = Instant::now();
         let mut guard = EchoGuard::new(0);
-        guard.applied(guard.text_key("first"), 1);
+        let _ = guard.begin_apply(guard.text_key("first"));
+        guard.applied(1);
         assert!(guard.may_apply(start, 1));
         assert_eq!(guard.observe(1, start), Observation::OwnWrite);
         assert!(guard.may_apply(start, 1));

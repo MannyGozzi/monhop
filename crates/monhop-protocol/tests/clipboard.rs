@@ -281,3 +281,17 @@ fn png_rejects_an_interlace_method_other_than_zero_or_one() {
         Err(ClipboardPngError::InvalidInterlace)
     );
 }
+
+#[test]
+fn image_caps_accept_the_edges_and_refuse_past_them() {
+    use monhop_protocol::clipboard::{MAX_CLIPBOARD_PIXELS, MAX_CLIPBOARD_SIDE, image_within_caps};
+    assert!(image_within_caps(1, 1));
+    assert!(image_within_caps(MAX_CLIPBOARD_SIDE, 1));
+    assert!(!image_within_caps(0, 1));
+    assert!(!image_within_caps(1, 0));
+    assert!(!image_within_caps(MAX_CLIPBOARD_SIDE + 1, 1));
+    let square = (MAX_CLIPBOARD_PIXELS as f64).sqrt() as u32;
+    assert!(image_within_caps(square, square));
+    assert!(!image_within_caps(square + 1, square + 1));
+    assert!(!image_within_caps(MAX_CLIPBOARD_SIDE, MAX_CLIPBOARD_SIDE));
+}

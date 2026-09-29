@@ -228,7 +228,7 @@ impl fmt::Debug for SourceEffects {
 }
 
 /// Result from one controller operation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct SourceOutcome {
     pub effects: SourceEffects,
     pub failure: Option<SourceFailure>,
@@ -241,7 +241,9 @@ pub struct SourceOutcome {
 
 /// The pointer leaving one peer's display straight for a third peer's, after the first peer
 /// acknowledged its release. Native capture stays remote throughout.
-#[derive(Clone, Copy, PartialEq)]
+///
+/// Move-only: exactly one controller takes it, or exactly one orphan restore completes it.
+#[derive(PartialEq)]
 pub struct Handover {
     to: PointerTarget,
     entry: Point,
@@ -953,7 +955,8 @@ impl SourceController {
     /// received input frame or Ping does not refresh this budget. Only a validated `Pong` does.
     /// An error does not emit cleanup effects because this query is intended for the native lease
     /// owner; it must decline renewal and let the bounded lease expire, while the next controller
-    /// operation emits the normal fail-closed cleanup effects.
+    /// operation emits the normal fail-closed cleanup effects. A remote route another controller
+    /// issued or took over is never renewed here: its lease is that controller's to keep.
     pub fn suppression_budget(&mut self, now: Duration) -> Result<Duration, SourceFailure> {
         if let Some(failure) = self.failure {
             return Err(failure);
@@ -965,6 +968,9 @@ impl SourceController {
         if self.held_since.is_some() {
             return Err(SourceFailure::PeerHealth(HealthError::DeadlineExpired));
         }
+        if self.capture_route.remote && !self.capture_route.owned {
+            return Err(SourceFailure::Ownership);
+        }
         self.health
             .remaining(now)
             .map_err(SourceFailure::PeerHealth)
@@ -972,6 +978,12 @@ impl SourceController {
 
     pub fn capture_route(&self) -> (bool, u64) {
         (self.capture_route.remote, self.capture_route.revision)
+    }
+
+    /// Whether the current capture route is this controller's: the initial local one, one it
+    /// issued, or one it took over by handover. Only then may it renew or restore that route.
+    pub fn owns_capture_route(&self) -> bool {
+        self.capture_route.owned
     }
 
     /// Returns the display relative motion lands on, the active one or the one a hop between the
@@ -1390,6 +1402,9 @@ impl SourceController {
                         self.push_input(Message::Motion(Motion::Absolute(sent)), &mut effects);
                     }
                     if handover {
+                        // As at a fresh crossing, only modifiers and buttons follow the pointer
+                        // onto another computer: with both motions, at most 15 effects of
+                        // MAX_SOURCE_EFFECTS, so held ordinary keys cannot all fit as well.
                         self.transfer_to_remote(&mut effects);
                     } else {
                         self.synchronize_reanchored_remote_input(&mut effects);
@@ -1484,11 +1499,13 @@ impl SourceController {
         let checked = self.failure.is_none()
             && self.observe_time(now, &mut effects)
             && self.check_health(now, &mut effects);
+        // A peer already past the retreat point would only hand the pointer straight home.
         let acceptable = checked
             && self.failure.is_none()
             && self.enabled
             && self.capture_ready
             && self.held_since.is_none()
+            && now.saturating_sub(self.health.last_response()) < RETREAT_AFTER
             && matches!(self.state, State::Local { .. })
             && self.floor_claim.is_none()
             && self.peer == Some(handover.to.machine)
@@ -2546,10 +2563,19 @@ impl SourceController {
             PushEnd::Crossed => PushEnd::Cleared,
             why => why,
         };
+        let homeward = || {
+            self.topology.links().iter().any(|link| {
+                link.from_display == push.display
+                    && link.from_edge == push.edge
+                    && self.is_home_display(link.to_display)
+            })
+        };
         let edge = if self.is_home_display(push.display) {
             "seam-out"
-        } else {
+        } else if homeward() {
             "seam-back"
+        } else {
+            "handover"
         };
         let platform = self
             .home_platform()

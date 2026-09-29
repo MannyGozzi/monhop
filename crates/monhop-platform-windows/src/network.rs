@@ -8,7 +8,7 @@ use std::{
 };
 use windows_sys::{
     Win32::{
-        Foundation::HANDLE,
+        Foundation::{ERROR_HOST_UNREACHABLE, ERROR_NETWORK_UNREACHABLE, HANDLE},
         NetworkManagement::{
             IpHelper::*,
             Ndis::IfOperStatusUp,
@@ -141,13 +141,15 @@ pub fn enumerate_adapters() -> io::Result<Vec<Adapter>> {
 }
 
 /// Reads the actual best route, without forcing Windows to pretend the selected NIC is best.
+/// No route to the peer is `HostUnreachable` or `NetworkUnreachable`; every other failure keeps
+/// its own kind.
 pub fn best_route(source: Ipv4Addr, peer: Ipv4Addr) -> io::Result<Route> {
     let source = sockaddr(source);
     let destination = sockaddr(peer);
     let mut best_source = SOCKADDR_INET::default();
     let mut route = MIB_IPFORWARD_ROW2::default();
     // SAFETY: all pointers refer to initialized in/out structures for this synchronous call.
-    win_result(unsafe {
+    route_lookup_result(unsafe {
         GetBestRoute2(
             ptr::null(),
             0,
@@ -381,6 +383,20 @@ fn win_result(code: u32) -> io::Result<()> {
     }
 }
 
+/// Callers set aside only the one peer a route lookup cannot reach, so those failures carry the
+/// unreachable kinds whatever std maps the codes to.
+fn route_lookup_result(code: u32) -> io::Result<()> {
+    let kind = match code {
+        ERROR_HOST_UNREACHABLE => io::ErrorKind::HostUnreachable,
+        ERROR_NETWORK_UNREACHABLE => io::ErrorKind::NetworkUnreachable,
+        _ => return win_result(code),
+    };
+    Err(io::Error::new(
+        kind,
+        io::Error::from_raw_os_error(code as i32),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +419,26 @@ mod tests {
             ethernet: false,
             wifi: true,
             attachment,
+        }
+    }
+
+    #[test]
+    fn only_a_missing_route_reads_as_unreachable() {
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND};
+        assert!(route_lookup_result(0).is_ok());
+        for (code, kind) in [
+            (ERROR_HOST_UNREACHABLE, io::ErrorKind::HostUnreachable),
+            (ERROR_NETWORK_UNREACHABLE, io::ErrorKind::NetworkUnreachable),
+        ] {
+            assert_eq!(route_lookup_result(code).unwrap_err().kind(), kind);
+        }
+        for code in [ERROR_NOT_FOUND, ERROR_INVALID_PARAMETER] {
+            let error = route_lookup_result(code).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code as i32));
+            assert!(!matches!(
+                error.kind(),
+                io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable
+            ));
         }
     }
 

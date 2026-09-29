@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   CONTROL_PAUSE_HINT,
   clearForgetFor,
+  computerTone,
   controlSwitchRows,
   displaysFreshness,
+  isComputerEnabled,
   isForgetArmed,
   keepForgetArmed,
   keepForgetListed,
@@ -15,6 +17,8 @@ import {
   loadGate,
   newestFirst,
   pressForget,
+  resolveEnabledList,
+  toggleComputerEnabled,
 } from "./computer-card-model.mjs";
 
 const WINDOWS = "b".repeat(64);
@@ -284,4 +288,72 @@ test("a computer's rows are ordered, keyed, gated and locked in one pass", () =>
       [true, true],
       JSON.stringify(patch),
     );
+});
+
+test("a group's control record gives each member its own direction, keyed by fingerprint", () => {
+  const control = {
+    localToPeer: true,
+    peerToLocal: true,
+    members: [
+      { fingerprint: WINDOWS, allowed: true },
+      { fingerprint: MAC, allowed: false },
+    ],
+  };
+  const windowsRows = controlSwitchRows(control, "This Mac", "Office Windows PC", false, WINDOWS);
+  assert.equal(windowsRows[1].checked, true);
+  const macRows = controlSwitchRows(control, "This Mac", "Studio Mac", false, MAC);
+  assert.equal(macRows[1].checked, false);
+  // Local's own direction is one toggle for the whole group, not per member.
+  assert.equal(windowsRows[0].checked, true);
+  assert.equal(macRows[0].checked, true);
+  // No fingerprint, or no members list: the legacy single-peer field, unchanged.
+  assert.deepEqual(
+    controlSwitchRows(control, "This Mac", "Office Windows PC", false).map((r) => r.checked),
+    controlSwitchRows(control, "This Mac", "Office Windows PC", false, undefined).map(
+      (r) => r.checked,
+    ),
+  );
+  assert.equal(
+    controlSwitchRows({ localToPeer: true, peerToLocal: false }, "This Mac", "X", false, WINDOWS)[1]
+      .checked,
+    false,
+  );
+});
+
+test("which computers are switched in follows the live view first, then the polled list, then a bare active fingerprint", () => {
+  assert.deepEqual(resolveEnabledList({ enabled: [MAC] }, { enabled: [WINDOWS] }, WINDOWS), [MAC]);
+  assert.deepEqual(resolveEnabledList(null, { enabled: [WINDOWS] }, MAC), [WINDOWS]);
+  assert.deepEqual(resolveEnabledList(null, { enabled: [] }, WINDOWS), [WINDOWS]);
+  assert.deepEqual(resolveEnabledList(null, null, null), []);
+  assert.equal(isComputerEnabled(WINDOWS, [WINDOWS, MAC]), true);
+  assert.equal(isComputerEnabled(WINDOWS, [MAC]), false);
+  assert.equal(isComputerEnabled(WINDOWS, null), false);
+});
+
+test("a card's tone follows its position among the computers switched in", () => {
+  const c3 = "d".repeat(64);
+  assert.equal(computerTone(WINDOWS, [WINDOWS, MAC, c3]), "peer");
+  assert.equal(computerTone(MAC, [WINDOWS, MAC, c3]), "peer-2");
+  assert.equal(computerTone(c3, [WINDOWS, MAC, c3]), "peer-3");
+  // Not in the list at all: the same tone the first position draws in, never uncolored.
+  assert.equal(computerTone(WINDOWS, []), "peer");
+  assert.equal(computerTone(WINDOWS, null), "peer");
+});
+
+test("toggling a computer calls the new per-computer action, falling back to today's when the app has not wired it up yet", () => {
+  const calls = [];
+  const withNewAction = { setComputerEnabled: (fp, next) => calls.push(["new", fp, next]) };
+  toggleComputerEnabled(withNewAction, WINDOWS, false);
+  assert.deepEqual(calls, [["new", WINDOWS, true]]);
+  calls.length = 0;
+  toggleComputerEnabled(withNewAction, WINDOWS, true);
+  assert.deepEqual(calls, [["new", WINDOWS, false]]);
+
+  calls.length = 0;
+  const legacyOnly = { useComputer: (fp) => calls.push(["legacy", fp]) };
+  toggleComputerEnabled(legacyOnly, WINDOWS, false);
+  assert.deepEqual(calls, [["legacy", WINDOWS]]);
+  calls.length = 0;
+  toggleComputerEnabled(legacyOnly, WINDOWS, true);
+  assert.deepEqual(calls, [["legacy", null]]);
 });

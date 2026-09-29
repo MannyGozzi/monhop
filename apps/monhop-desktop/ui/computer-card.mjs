@@ -5,10 +5,14 @@ import { platformLabel } from "./pairing-model.mjs";
 import { displayNoticeCopy, isConnected, noticePresentation } from "./sharing-model.mjs";
 import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
 import {
+  computerTone,
   controlSwitchRows,
   displaysFreshness,
+  isComputerEnabled,
   layoutChips,
   layoutRows,
+  resolveEnabledList,
+  toggleComputerEnabled,
 } from "./computer-card-model.mjs";
 import {
   button,
@@ -58,7 +62,9 @@ export function computerCard(
   const name = displayName(computer);
   const local = localName(ctx);
   const status = computerStatus(computer, ctx.sharing.view, active, local);
-  const inUse = fingerprint === active;
+  const enabledList = resolveEnabledList(ctx.sharing.view, ctx.computers, active);
+  const enabled = isComputerEnabled(fingerprint, enabledList);
+  const tone = computerTone(fingerprint, enabledList);
   const pending = renamePending === fingerprint;
   const editing = renaming === fingerprint || pending;
   const key = `${scope}-${fingerprint}`;
@@ -72,6 +78,7 @@ export function computerCard(
           children: [
             el("span", {
               className: "computer-icon-wrap",
+              dataset: enabled ? { tone } : {},
               children: [platformGlyph(computer.platform)],
             }),
             el("div", {
@@ -102,21 +109,21 @@ export function computerCard(
           className: "computer-actions",
           children: [
             scope === "home"
-              ? sharingPill(ctx, fingerprint, name, inUse)
-              : useToggle(ctx, fingerprint, scope, inUse),
+              ? sharingPill(ctx, fingerprint, name, enabled)
+              : useToggle(ctx, fingerprint, scope, enabled),
           ],
         }),
       ],
     }),
     presence(
       `${key}-detail`,
-      scope === "home" && inUse && status.key === "sharing" ? note(status.detail) : null,
+      scope === "home" && enabled && status.key === "sharing" ? note(status.detail) : null,
     ),
     presence(
       `${key}-control`,
-      scope === "home" && inUse ? controlSwitches(ctx, computer, name, local) : null,
+      scope === "home" && enabled ? controlSwitches(ctx, computer, name, local) : null,
     ),
-    presence(`${key}-notice`, noticeLine(ctx, computer, inUse)),
+    presence(`${key}-notice`, noticeLine(ctx, computer, enabled)),
     presence(`${key}-viewport`, viewport ? cardArrangement(ctx, computer, key) : null),
     presence(
       `${key}-extras`,
@@ -142,9 +149,13 @@ export function computerCard(
     node.style.setProperty("--live-delay", `${-Math.round(liveElapsed)}ms`);
   }
   const identity = node.querySelector(".computer-identity");
-  if (inUse && ["home", "setup"].includes(scope) && identity)
+  // Only the one computer `active` still names gets the morph: a view transition name must be
+  // unique on the page, and with several computers enabled at once there is no single "the" card
+  // for it to belong to.
+  const isPrimary = fingerprint === active;
+  if (isPrimary && ["home", "setup"].includes(scope) && identity)
     identity.dataset.sharedTransition = "active-computer-identity";
-  if (scope === "home" && inUse) node.classList.add("home-hero");
+  if (scope === "home" && enabled) node.classList.add("home-hero");
   if (busy) node.dataset.busy = "true";
   return node;
 }
@@ -165,17 +176,17 @@ reducedMotion.addEventListener("change", () => {
   queuePills();
 });
 
-function sharingPill(ctx, fingerprint, name, inUse) {
+function sharingPill(ctx, fingerprint, name, enabled) {
   const pill = pills.get(fingerprint) ?? buildPill(fingerprint);
   pills.set(fingerprint, pill);
   const control = pill.button;
-  control.setAttribute("aria-label", `${inUse ? "Pause sharing" : "Start sharing"} with ${name}`);
-  control.setAttribute("aria-pressed", String(inUse));
+  control.setAttribute("aria-label", `${enabled ? "Pause sharing" : "Start sharing"} with ${name}`);
+  control.setAttribute("aria-pressed", String(enabled));
   if (ctx.busy) control.setAttribute("aria-busy", "true");
   else control.removeAttribute("aria-busy");
   control.disabled = ctx.busy;
-  pill.press = () => ctx.actions.useComputer(inUse ? null : fingerprint);
-  pill.want = { ...pill.want, inUse, busy: ctx.busy };
+  pill.press = () => toggleComputerEnabled(ctx.actions, fingerprint, enabled);
+  pill.want = { ...pill.want, inUse: enabled, busy: ctx.busy };
   pill.moved = true;
   queuePills();
   return pill.wrap;
@@ -509,16 +520,16 @@ function pressPill(pill, down) {
 
 // One button for both states, so pressing it keeps the focus and the glyph morphs in place
 // instead of one control being swapped for another.
-function useToggle(ctx, fingerprint, scope, inUse) {
+function useToggle(ctx, fingerprint, scope, enabled) {
   const { actions, busy } = ctx;
-  const state = inUse ? "sharing" : "idle";
+  const state = enabled ? "sharing" : "idle";
   const node = iconButton({
     id: `${scope}-use-${fingerprint}`,
-    label: inUse ? "Pause sharing with this computer" : "Use this computer",
-    art: useGlyphs(inUse),
+    label: enabled ? "Pause sharing with this computer" : "Use this computer",
+    art: useGlyphs(enabled),
     size: "sm",
     disabled: busy,
-    onClick: () => actions.useComputer(inUse ? null : fingerprint),
+    onClick: () => toggleComputerEnabled(actions, fingerprint, enabled),
   });
   node.classList.add("use-toggle");
   node.dataset.state = state;
@@ -610,12 +621,18 @@ function localName(ctx) {
   return platformLabel(ctx.state.snapshot?.platform ?? ctx.platform, true);
 }
 
-// MonHop is always bidirectional: each direction of control is its own switch. Home shows both only
-// for the computer in use, since that is the only pairing sharing input right now.
+// MonHop is always bidirectional: each direction of control is its own switch. Home shows both for
+// every computer switched on, each keyed to its own entry in the group's control record.
 function controlSwitches(ctx, computer, peerName, local) {
   const { actions, sharing } = ctx;
   const syncing = sharing.pending?.kind === "control" || sharing.view?.control?.syncing === true;
-  const controls = controlSwitchRows(sharing.view?.control, local, peerName, syncing);
+  const controls = controlSwitchRows(
+    sharing.view?.control,
+    local,
+    peerName,
+    syncing,
+    computer.fingerprint,
+  );
   return el("div", {
     className: "rows control-switches",
     children: controls.map((control) =>
@@ -688,9 +705,9 @@ function cardArrangement(ctx, computer, key) {
 
 // A display change MonHop is already settling says so on the card itself. Only a change the user
 // has to act on is worth the banner Home puts above everything.
-function noticeLine(ctx, computer, inUse) {
+function noticeLine(ctx, computer, enabled) {
   const notice = ctx.sharing.view?.displayNotice;
-  if (!inUse || !notice || noticePresentation(notice.kind) !== "inline") return null;
+  if (!enabled || !notice || noticePresentation(notice.kind) !== "inline") return null;
   const copy = displayNoticeCopy(notice.kind, displayName(computer));
   return el("p", {
     className: "notice-line",

@@ -6,7 +6,7 @@ use monhop_core::{
     PointerTarget, SharedFloor, TakeBackGate, Topology,
 };
 use monhop_protocol::{DisplayDescription, DisplayTopology, Frame, Message, SessionEpoch};
-use monhop_transport::session_health::PEER_LIVENESS;
+use monhop_transport::session_health::{PEER_LIVENESS, RETREAT_AFTER};
 use monhop_transport::session_receiver::{
     DestinationAction, DestinationFailure, InputDestination, InputReceiver,
 };
@@ -339,6 +339,11 @@ impl Group {
 
     fn capture(&mut self, event: NormalizedInput) -> Option<Handover> {
         let record = self.tag(event);
+        self.dispatch(record)
+    }
+
+    /// Hands one record, tagged whenever it was captured, to both controllers.
+    fn dispatch(&mut self, record: TaggedInput) -> Option<Handover> {
         let now = self.now;
         let mut handed = None;
         for side in [Side::X, Side::Y] {
@@ -365,6 +370,15 @@ impl Group {
         let accepted = self.source(side).accept_handover(handover, now);
         assert!(accepted.handover.is_none(), "the handover is taken");
         assert!(self.apply(side, accepted).is_none());
+    }
+
+    /// One health challenge to `side`'s peer and its answer, which makes that link fresh again.
+    fn heartbeat(&mut self, side: Side) {
+        let now = self.now;
+        let challenged = self.source(side).tick(now);
+        assert!(self.apply(side, challenged).is_none());
+        assert!(matches!(self.queued(side)[..], [Message::Ping(_)]));
+        assert!(self.deliver(side).is_none());
     }
 }
 
@@ -714,4 +728,257 @@ fn a_handover_passes_the_floor_from_one_peer_to_the_next_without_ever_freeing_it
     assert_eq!(group.source(Side::X).capture_route(), (false, 2));
     assert_eq!(group.source(Side::X).mode(), SourceMode::Local);
     assert_eq!(group.source(Side::Y).mode(), SourceMode::Local);
+}
+
+#[test]
+fn accept_handover_refusal_returns_the_handover_and_leaves_the_floor() {
+    let mut group = Group::new();
+    let handover = handed_over_by_x(&mut group);
+    let claim = handover.claim();
+    let untouched = |group: &mut Group| {
+        assert_eq!(group.floor.snapshot(), claim);
+        assert_eq!(group.source(Side::Y).mode(), SourceMode::Local);
+        assert!(!group.source(Side::Y).owns_capture_route());
+        assert!(group.queued(Side::Y).is_empty());
+        assert!(group.restores.is_empty());
+    };
+
+    // Capture that cannot suppress yet refuses it, and the same handover comes back.
+    group.source(Side::Y).set_capture_ready(false);
+    let now = group.now;
+    let refused = group.source(Side::Y).accept_handover(handover, now);
+    assert_eq!(refused.failure, None);
+    assert!(refused.effects.is_empty());
+    let handover = refused.handover.expect("the refused handover comes back");
+    assert_eq!(handover.claim(), claim);
+    assert_eq!(
+        handover.to(),
+        PointerTarget::new(device(PEER_Y), DisplayId(3))
+    );
+    assert_eq!(handover.return_at(), trip_start());
+    untouched(&mut group);
+
+    // So does a link whose last reply is past the retreat point, short of the liveness deadline.
+    group.source(Side::Y).set_capture_ready(true);
+    group.now = RETREAT_AFTER;
+    let now = group.now;
+    let refused = group.source(Side::Y).accept_handover(handover, now);
+    assert_eq!(refused.failure, None);
+    assert!(refused.effects.is_empty());
+    let handover = refused.handover.expect("the refused handover comes back");
+    untouched(&mut group);
+
+    // Once that peer answers afresh, the handover is taken.
+    group.heartbeat(Side::Y);
+    group.accept(handover, Side::Y);
+    assert_eq!(group.floor_owner(), (FloorState::Sending, slot(PEER_Y)));
+    assert!(group.source(Side::Y).owns_capture_route());
+    assert!(group.deliver(Side::Y).is_none());
+    assert_eq!(group.source(Side::Y).mode(), SourceMode::Remote);
+    assert!(group.restores.is_empty());
+}
+
+#[test]
+fn abandon_or_hold_on_x_during_a_pending_handover_restores_local_input() {
+    let pending = || {
+        let mut group = Group::new();
+        group.reach();
+        cross_to_x(&mut group);
+        assert!(push_on_from_x(&mut group).is_none());
+        assert_eq!(
+            group.source(Side::X).mode(),
+            SourceMode::AwaitRemoteReleaseAcknowledgement
+        );
+        group
+    };
+
+    // X's link ends first: no handover, and the restore is the caller's to complete.
+    let mut group = pending();
+    let now = group.now;
+    let ended = group.source(Side::X).abandon(now);
+    assert_eq!(ended.failure, Some(SourceFailure::LinkEnded));
+    assert!(ended.handover.is_none());
+    assert!(ended.effects.iter().any(|effect| matches!(
+        effect,
+        SourceEffect::RestoreLocalAt { display, position, .. }
+            if (*display, *position) == (DisplayId(1), trip_start().1)
+    )));
+    assert_eq!(group.floor_owner(), (FloorState::Returning, slot(PEER_X)));
+    assert_eq!(group.source(Side::Y).mode(), SourceMode::Local);
+
+    // X's link stalls instead: it holds and restores where the trip began, and the late
+    // acknowledgement hands nothing over.
+    let mut group = pending();
+    group.now = RETREAT_AFTER;
+    let now = group.now;
+    let held = group.source(Side::X).tick(now);
+    assert!(group.apply(Side::X, held).is_none());
+    assert!(group.source(Side::X).held_since().is_some());
+    assert_eq!(group.restores, [(DisplayId(1), trip_start().1)]);
+    assert_eq!(group.route, (false, 2));
+    assert_eq!(group.source(Side::Y).capture_route(), (false, 2));
+    assert!(group.deliver(Side::X).is_none());
+    assert_eq!(group.injected(Side::X).last(), Some(&Injected::ReleaseAll));
+    assert_eq!(group.floor_owner(), (FloorState::Free, FloorPeer::NONE));
+    assert_eq!(group.source(Side::X).mode(), SourceMode::Local);
+    assert_eq!(group.source(Side::Y).mode(), SourceMode::Local);
+    assert!(group.queued(Side::Y).is_empty());
+}
+
+#[test]
+fn a_hold_on_y_after_accepting_restores_local_input() {
+    let mut group = Group::new();
+    let handover = handed_over_by_x(&mut group);
+    group.accept(handover, Side::Y);
+    assert_eq!(
+        group.source(Side::Y).mode(),
+        SourceMode::AwaitActivationAcknowledgement
+    );
+
+    // Y's link stalls before it acknowledges: the route is Y's controller's now, so it restores.
+    group.now = RETREAT_AFTER;
+    let now = group.now;
+    let held = group.source(Side::Y).tick(now);
+    assert!(group.apply(Side::Y, held).is_none());
+    assert!(group.source(Side::Y).held_since().is_some());
+    assert_eq!(group.restores, [(DisplayId(1), trip_start().1)]);
+    assert_eq!(group.route, (false, 2));
+    assert_eq!(group.source(Side::X).capture_route(), (false, 2));
+
+    // The late activation acknowledgement is ignored; the barrier's frees the floor.
+    assert!(group.deliver(Side::Y).is_none());
+    assert_eq!(group.injected(Side::Y).last(), Some(&Injected::ReleaseAll));
+    assert_eq!(group.source(Side::Y).mode(), SourceMode::Local);
+    assert_eq!(
+        group.floors,
+        [
+            (FloorState::Free, FloorPeer::NONE),
+            (FloorState::Requesting, slot(PEER_X)),
+            (FloorState::Sending, slot(PEER_X)),
+            (FloorState::Returning, slot(PEER_X)),
+            (FloorState::Sending, slot(PEER_Y)),
+            (FloorState::Free, FloorPeer::NONE),
+        ]
+    );
+}
+
+#[test]
+fn a_handover_back_from_y_to_x() {
+    let mut group = Group::new();
+    let handover = handed_over_by_x(&mut group);
+    group.accept(handover, Side::Y);
+    assert!(group.deliver(Side::Y).is_none());
+    assert_eq!(group.source(Side::Y).mode(), SourceMode::Remote);
+
+    // Clear of the edge Y was entered through, back onto it, and pushed through onto X.
+    for event in [moved(30.0), moved(-31.0), push(-1.0)] {
+        assert!(group.capture(event).is_none());
+    }
+    assert_eq!(group.queued(Side::Y).last(), Some(&Message::ReleaseAll));
+    assert_eq!(group.floor_owner(), (FloorState::Returning, slot(PEER_Y)));
+    let back = group
+        .deliver(Side::Y)
+        .expect("Y's release acknowledgement hands the pointer back");
+    assert_eq!(back.to(), PointerTarget::new(device(PEER_X), DisplayId(2)));
+    assert_eq!(back.return_at(), trip_start());
+    assert_eq!(back.route_revision(), 1);
+    assert_eq!(group.source(Side::Y).capture_route(), (true, 1));
+    assert!(!group.source(Side::Y).owns_capture_route());
+
+    group.accept(back, Side::X);
+    assert_eq!(group.queued(Side::X), [activation(PEER_X, 99.0)]);
+    assert!(group.deliver(Side::X).is_none());
+    assert_eq!(group.source(Side::X).mode(), SourceMode::Remote);
+    assert_eq!(group.source(Side::Y).mode(), SourceMode::Local);
+    assert!(group.source(Side::X).owns_capture_route());
+    assert_eq!(group.route, (true, 1));
+    assert!(group.restores.is_empty());
+    assert_eq!(
+        group.floors,
+        [
+            (FloorState::Free, FloorPeer::NONE),
+            (FloorState::Requesting, slot(PEER_X)),
+            (FloorState::Sending, slot(PEER_X)),
+            (FloorState::Returning, slot(PEER_X)),
+            (FloorState::Sending, slot(PEER_Y)),
+            (FloorState::Returning, slot(PEER_Y)),
+            (FloorState::Sending, slot(PEER_X)),
+        ]
+    );
+
+    // Coming home from X is the trip's one local restore.
+    let now = group.now;
+    let home = group.source(Side::X).request_local(now);
+    assert!(group.apply(Side::X, home).is_none());
+    assert!(group.deliver(Side::X).is_none());
+    assert_eq!(group.restores, [(DisplayId(1), trip_start().1)]);
+    assert_eq!(group.floor_owner(), (FloorState::Free, FloorPeer::NONE));
+    assert_eq!(group.source(Side::Y).capture_route(), (false, 2));
+    assert_eq!(group.source(Side::X).mode(), SourceMode::Local);
+}
+
+#[test]
+fn y_accepts_records_tagged_with_the_returning_generation() {
+    let mut group = Group::new();
+    group.reach();
+    cross_to_x(&mut group);
+    assert!(push_on_from_x(&mut group).is_none());
+    assert_eq!(group.floor_owner(), (FloorState::Returning, slot(PEER_X)));
+    // Captured while X awaits its release acknowledgement, dispatched once Y has taken over.
+    let late = group.tag(moved(5.0));
+    let handover = group.deliver(Side::X).expect("a handover");
+    group.accept(handover, Side::Y);
+    assert_eq!(group.floor_owner(), (FloorState::Sending, slot(PEER_Y)));
+    assert!(group.dispatch(late).is_none());
+    // Motion captured under no floor this trip held is not carried.
+    let unclaimed = TaggedInput {
+        floor_generation: 0,
+        ..group.tag(moved(50.0))
+    };
+    assert!(group.dispatch(unclaimed).is_none());
+
+    assert!(group.deliver(Side::Y).is_none());
+    assert_eq!(group.source(Side::Y).mode(), SourceMode::Remote);
+    assert_eq!(
+        group.injected(Side::Y),
+        [
+            Injected::Move(Point::new(1.0, 50.0)),
+            Injected::Move(Point::new(6.0, 50.0)),
+        ]
+    );
+}
+
+#[test]
+fn a_non_owned_remote_route_never_renews_suppression() {
+    let mut group = Group::new();
+    group.reach();
+    cross_to_x(&mut group);
+    let now = group.now;
+    // Y adopted the route X issued: only X renews its lease.
+    assert!(group.source(Side::X).owns_capture_route());
+    assert!(group.source(Side::X).suppression_budget(now).is_ok());
+    assert!(!group.source(Side::Y).owns_capture_route());
+    assert_eq!(
+        group.source(Side::Y).suppression_budget(now),
+        Err(SourceFailure::Ownership)
+    );
+
+    // X keeps the lease until the handover leaves it, then never renews it again.
+    assert!(push_on_from_x(&mut group).is_none());
+    assert!(group.source(Side::X).suppression_budget(now).is_ok());
+    let handover = group.deliver(Side::X).expect("a handover");
+    assert!(!group.source(Side::X).owns_capture_route());
+    assert_eq!(
+        group.source(Side::X).suppression_budget(now),
+        Err(SourceFailure::Ownership)
+    );
+    group.accept(handover, Side::Y);
+    assert!(group.source(Side::Y).owns_capture_route());
+    assert!(group.source(Side::Y).suppression_budget(now).is_ok());
+    assert_eq!(
+        group.source(Side::X).suppression_budget(now),
+        Err(SourceFailure::Ownership)
+    );
+    // Declining a renewal is no failure: X's link runs on.
+    assert_eq!(group.source(Side::X).failure(), None);
 }

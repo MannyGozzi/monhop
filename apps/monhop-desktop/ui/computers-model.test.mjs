@@ -24,6 +24,10 @@ const MAC = "c".repeat(64);
 const localId = "18446744073709551614";
 const peerId = "18446744073709551615";
 
+// A hex fingerprint that sorts (and numbers) the same way its argument does, for tests that need
+// several distinct known computers.
+const fp = (n) => n.toString(16).padStart(64, "0");
+
 const edge = (from, fromEdge, to, toEdge) => ({
   fromDisplay: from,
   fromEdge,
@@ -266,6 +270,120 @@ test("reads asked for while one runs coalesce into exactly one more after it", (
   assert.equal(finished.again, false);
   assert.equal(finished.load.running, false);
   assert.equal(requestComputersLoad(finished.load).start, true);
+});
+
+test("the enabled list is sorted, deduplicated, hex fingerprints only, and drops unknown ones", () => {
+  const known = Array.from({ length: 5 }, (_, index) => fp(index + 1));
+  const view = normalizeComputers({
+    computers: known.map((fingerprint) => ({ fingerprint, platform: "windows" })),
+    // Out of order, duplicated (once uppercase), and naming a computer nobody is paired with.
+    enabled: [
+      known[3],
+      known[0].toUpperCase(),
+      known[0],
+      known[1],
+      "not-hex-at-all",
+      "f".repeat(64), // a fingerprint that is not in the paired list
+    ],
+  });
+  assert.deepEqual(view.enabled, [known[0], known[1], known[3]].toSorted());
+});
+
+test("more than 8 valid enabled computers are capped to the lowest 8, sorted", () => {
+  const known = Array.from({ length: 9 }, (_, index) => fp(index + 1));
+  const view = normalizeComputers({
+    computers: known.map((fingerprint) => ({ fingerprint, platform: "windows" })),
+    enabled: known,
+  });
+  assert.equal(view.enabled.length, 8);
+  assert.deepEqual(view.enabled, known.slice(0, 8));
+});
+
+test("the enabled list falls back to the single active computer only when the field is absent", () => {
+  const withActive = normalizeComputers({
+    computers: [{ fingerprint: WINDOWS, platform: "windows" }],
+    active: WINDOWS,
+  });
+  assert.deepEqual(withActive.enabled, [WINDOWS]);
+
+  // An explicit empty list means "nothing enabled" and is honored, not treated as absent.
+  const explicitlyEmpty = normalizeComputers({
+    computers: [{ fingerprint: WINDOWS, platform: "windows" }],
+    active: WINDOWS,
+    enabled: [],
+  });
+  assert.deepEqual(explicitlyEmpty.enabled, []);
+
+  // No active fingerprint and no enabled field: nothing is enabled.
+  assert.deepEqual(
+    normalizeComputers({ computers: [{ fingerprint: WINDOWS, platform: "windows" }] }).enabled,
+    [],
+  );
+});
+
+test("paused is a plain boolean, false unless the reply says otherwise", () => {
+  assert.equal(normalizeComputers({ computers: [] }).paused, false);
+  assert.equal(normalizeComputers({ computers: [], paused: true }).paused, true);
+  for (const value of [1, "true", null, undefined, {}])
+    assert.equal(normalizeComputers({ computers: [], paused: value }).paused, false, String(value));
+  assert.equal(initialComputers().paused, false);
+  assert.deepEqual(initialComputers().enabled, []);
+});
+
+test("each computer carries its own enabled and member flags", () => {
+  const view = normalizeComputers({
+    computers: [
+      { fingerprint: WINDOWS, platform: "windows" },
+      { fingerprint: MAC, platform: "macos" },
+    ],
+    enabled: [WINDOWS],
+    group: { members: [WINDOWS, MAC] },
+  });
+  const windows = findComputer(view, WINDOWS);
+  const mac = findComputer(view, MAC);
+  assert.equal(windows.enabled, true);
+  assert.equal(windows.member, true);
+  // Not enabled, but still named by the saved group's own member list.
+  assert.equal(mac.enabled, false);
+  assert.equal(mac.member, true);
+});
+
+test("without a group record, member falls back to enabled", () => {
+  const view = normalizeComputers({
+    computers: [
+      { fingerprint: WINDOWS, platform: "windows" },
+      { fingerprint: MAC, platform: "macos" },
+    ],
+    enabled: [WINDOWS],
+  });
+  assert.equal(findComputer(view, WINDOWS).member, true);
+  assert.equal(findComputer(view, MAC).member, false);
+  // A group with no recognizable member list at all is the same as no group: falls back to enabled.
+  for (const group of [null, "group", [], { members: "nope" }]) {
+    const malformed = normalizeComputers({
+      computers: [{ fingerprint: WINDOWS, platform: "windows" }],
+      enabled: [WINDOWS],
+      group,
+    });
+    assert.equal(malformed.items[0].member, true, JSON.stringify(group));
+  }
+  // A recognized but entirely garbage member list is trusted as an (empty) answer, not discarded:
+  // nothing in it is a real fingerprint, so no computer is a member.
+  const emptied = normalizeComputers({
+    computers: [{ fingerprint: WINDOWS, platform: "windows" }],
+    enabled: [WINDOWS],
+    group: { members: [1, 2] },
+  });
+  assert.equal(emptied.items[0].member, false);
+  // A group naming a fingerprint nobody is paired with drops it rather than inventing a member.
+  const stray = normalizeComputers({
+    computers: [{ fingerprint: WINDOWS, platform: "windows" }],
+    group: { members: [WINDOWS, MAC] },
+  });
+  assert.deepEqual(
+    stray.items.map((item) => item.member),
+    [true],
+  );
 });
 
 test("a computer without a name falls back to its platform", () => {

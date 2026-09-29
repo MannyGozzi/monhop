@@ -50,9 +50,11 @@ const DATAGRAM_BUFFER_SIZE: usize = 8 * 1024;
 const CRYPTO_BUFFER_SIZE: usize = 8 * 1024;
 const MAX_IDLE_TIMEOUT_MILLIS: u32 = 10_000;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(3);
-const MAX_PENDING_INCOMING: usize = 8;
+/// Handshakes Quinn may queue before the accept path takes them; beyond it first packets are
+/// ignored. The guarded socket keeps every member's first-packet burst within it.
+pub(crate) const MAX_PENDING_INCOMING: usize = 64;
 const INCOMING_BUFFER_SIZE: u64 = 32 * 1024;
-const TOTAL_INCOMING_BUFFER_SIZE: u64 = 256 * 1024;
+const TOTAL_INCOMING_BUFFER_SIZE: u64 = MAX_PENDING_INCOMING as u64 * INCOMING_BUFFER_SIZE;
 /// The most unidirectional streams a connection may grant for clipboard transfers.
 pub(crate) const CLIPBOARD_UNI_STREAMS: u32 = 2;
 // The control stream plus every clipboard stream fit the connection window at once.

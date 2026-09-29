@@ -1,20 +1,24 @@
 //! Native capture conversion and bounded route command submission.
 use crate::{
-    session::{NativeCaptureStartupFailure, SESSION_POLL_INTERVAL, SessionFailure, SessionIo},
+    session::{
+        LinkIo, NativeCaptureStartupFailure, SESSION_POLL_INTERVAL, SessionFailure, SessionIo,
+    },
     session_clock::SessionClock,
     session_native::{MAC_POINTS_PER_DETENT, WINDOWS_UNITS_PER_DETENT},
     session_source::{
-        MotionTarget, NormalizedInput, SourceController, SourceEffect, SourceOutcome, TaggedInput,
+        MotionTarget, NormalizedInput, SourceController, SourceEffect, SourceEffects,
+        SourceOutcome, TaggedInput,
     },
 };
 use monhop_core::{
     Platform, Point, PointerGesture,
-    capture::{CaptureEvent, CapturedEvent, StopReason},
+    capture::{CaptureEvent, CapturedEvent, MAX_SUPPRESSION_TTL, StopReason},
 };
 #[cfg(target_os = "macos")]
 pub(crate) use monhop_platform_macos::native_capture::{NativeCapture, NativeCaptureError};
 #[cfg(windows)]
 pub(crate) use monhop_platform_windows::native_capture::{NativeCapture, NativeCaptureError};
+use monhop_protocol::Frame;
 use std::time::Duration;
 
 /// The two platform error enums are distinct types, so the arms they share are written once here
@@ -75,12 +79,104 @@ pub(crate) fn native_capture_start_failure(error: NativeCaptureError) -> Session
     SessionFailure::NativeCaptureStartup(failure)
 }
 
+/// Why native capture refused a route command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureRefusal {
+    /// An earlier command is still being applied: submit this one again later.
+    Pending,
+    /// Only from `activate_remote`: input held since capture started keeps suppression refused
+    /// while capture itself runs on.
+    NotReady,
+    /// Capture stopped or its control failed.
+    Failed,
+}
+
+/// The one native capture that every source controller on this computer routes through.
+pub(crate) trait CaptureControl {
+    fn activate_remote(&mut self, generation: u64, ttl: Duration) -> Result<u64, CaptureRefusal>;
+    fn restore_local_at(&mut self, generation: u64, position: Point)
+    -> Result<u64, CaptureRefusal>;
+    fn renew_suppression(&mut self, generation: u64, ttl: Duration) -> Result<u64, CaptureRefusal>;
+    /// `None` once native control failed.
+    fn completed_control_revision(&self) -> Option<u64>;
+    fn is_ready_for_suppression(&self) -> bool;
+    fn stop_reason(&self) -> Option<StopReason>;
+    fn request_stop(&self);
+}
+
+/// The authenticated link to one controller's peer.
+pub(crate) trait OutboundFrames {
+    fn send_outbound(&self, frame: Frame) -> Result<(), SessionFailure>;
+}
+
+impl CaptureControl for NativeCapture {
+    fn activate_remote(&mut self, generation: u64, ttl: Duration) -> Result<u64, CaptureRefusal> {
+        NativeCapture::activate_remote(self, generation, ttl)
+            .map_err(|error| activation_refusal(error, NativeCapture::stop_reason(self)))
+    }
+    fn restore_local_at(
+        &mut self,
+        generation: u64,
+        position: Point,
+    ) -> Result<u64, CaptureRefusal> {
+        NativeCapture::restore_local_at(self, generation, position).map_err(refusal)
+    }
+    fn renew_suppression(&mut self, generation: u64, ttl: Duration) -> Result<u64, CaptureRefusal> {
+        NativeCapture::renew_suppression(self, generation, ttl).map_err(refusal)
+    }
+    fn completed_control_revision(&self) -> Option<u64> {
+        NativeCapture::completed_control_revision(self).ok()
+    }
+    fn is_ready_for_suppression(&self) -> bool {
+        NativeCapture::is_ready_for_suppression(self)
+    }
+    fn stop_reason(&self) -> Option<StopReason> {
+        NativeCapture::stop_reason(self)
+    }
+    fn request_stop(&self) {
+        NativeCapture::request_stop(self);
+    }
+}
+
+impl OutboundFrames for SessionIo {
+    fn send_outbound(&self, frame: Frame) -> Result<(), SessionFailure> {
+        SessionIo::send_outbound(self, frame)
+    }
+}
+
+impl OutboundFrames for LinkIo {
+    fn send_outbound(&self, frame: Frame) -> Result<(), SessionFailure> {
+        LinkIo::send_outbound(self, frame)
+    }
+}
+
+fn refusal(error: NativeCaptureError) -> CaptureRefusal {
+    if matches!(error, NativeCaptureError::ControlPending) {
+        CaptureRefusal::Pending
+    } else {
+        CaptureRefusal::Failed
+    }
+}
+
+/// The readiness guard refuses with `Stopped(InvalidInput)` without stopping capture; the same
+/// error once capture has stopped is final.
+fn activation_refusal(error: NativeCaptureError, stopped: Option<StopReason>) -> CaptureRefusal {
+    match error {
+        NativeCaptureError::Stopped(StopReason::InvalidInput) if stopped.is_none() => {
+            CaptureRefusal::NotReady
+        }
+        error => refusal(error),
+    }
+}
+
+/// The pairwise runtime's outcome: a controller failure stops capture at once, and a handover,
+/// which two computers never make, is a broken controller.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_outcome(
+pub(crate) fn apply_outcome<C: CaptureControl, O: OutboundFrames>(
     outcome: SourceOutcome,
     controller: &mut SourceController,
-    capture: &mut NativeCapture,
-    io: &SessionIo,
+    capture: &mut C,
+    out: &O,
     generation: u64,
     origin: &SessionClock,
     pending: &mut Option<(SourceEffect, Duration)>,
@@ -90,15 +186,44 @@ pub(crate) fn apply_outcome(
         capture.request_stop();
         return Err(SessionFailure::SourceController(failure));
     }
-    for effect in outcome.effects.iter() {
+    if outcome.handover.is_some() {
+        return Err(SessionFailure::Source);
+    }
+    apply_effects(
+        &outcome.effects,
+        controller,
+        capture,
+        out,
+        generation,
+        origin,
+        pending,
+        submitted,
+    )
+}
+
+/// Frames go to the controller's peer and route changes to native capture. A route change that
+/// native control is still busy for waits in `pending`; a second one meanwhile is a broken
+/// controller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_effects<C: CaptureControl, O: OutboundFrames>(
+    effects: &SourceEffects,
+    controller: &mut SourceController,
+    capture: &mut C,
+    out: &O,
+    generation: u64,
+    origin: &SessionClock,
+    pending: &mut Option<(SourceEffect, Duration)>,
+    submitted: &mut Option<(u64, Duration)>,
+) -> Result<(), SessionFailure> {
+    for effect in effects.iter() {
         match effect {
-            SourceEffect::RemoteFrame(frame) => io.send_outbound(frame.clone())?,
+            SourceEffect::RemoteFrame(frame) => out.send_outbound(frame.clone())?,
             _ => {
                 if pending.is_some() {
                     return Err(SessionFailure::Source);
                 }
                 if !apply_route(
-                    effect, controller, capture, io, generation, origin, submitted,
+                    effect, controller, capture, out, generation, origin, submitted,
                 )? {
                     *pending = Some((effect.clone(), origin.elapsed()));
                 }
@@ -121,11 +246,11 @@ pub(crate) fn lease_budget(
 }
 
 /// True once the effect is settled: submitted, or refused and unwound. False means retry it.
-pub(crate) fn apply_route(
+pub(crate) fn apply_route<C: CaptureControl, O: OutboundFrames>(
     effect: &SourceEffect,
     controller: &mut SourceController,
-    capture: &mut NativeCapture,
-    io: &SessionIo,
+    capture: &mut C,
+    out: &O,
     generation: u64,
     origin: &SessionClock,
     submitted: &mut Option<(u64, Duration)>,
@@ -147,26 +272,26 @@ pub(crate) fn apply_route(
             if let Some(failure) = bound.failure {
                 return Err(SessionFailure::SourceController(failure));
             }
-            if !bound.effects.is_empty() {
+            if !bound.effects.is_empty() || bound.handover.is_some() {
                 return Err(SessionFailure::Source);
             }
             Ok(true)
         }
-        Err(NativeCaptureError::ControlPending) => Ok(false),
+        Err(CaptureRefusal::Pending) => Ok(false),
         // Input held since capture started keeps suppression refused: the seam stays a wall.
-        Err(NativeCaptureError::Stopped(StopReason::InvalidInput))
-            if matches!(effect, SourceEffect::ActivateRemote { .. })
-                && capture.stop_reason().is_none() =>
-        {
+        Err(CaptureRefusal::NotReady) if matches!(effect, SourceEffect::ActivateRemote { .. }) => {
             let unwound = controller.refuse_capture_activation(request, origin.elapsed());
             if let Some(failure) = unwound.failure {
                 return Err(SessionFailure::SourceController(failure));
+            }
+            if unwound.handover.is_some() {
+                return Err(SessionFailure::Source);
             }
             for effect in unwound.effects.iter() {
                 let SourceEffect::RemoteFrame(frame) = effect else {
                     return Err(SessionFailure::Source);
                 };
-                io.send_outbound(frame.clone())?;
+                out.send_outbound(frame.clone())?;
             }
             Ok(true)
         }
@@ -174,6 +299,67 @@ pub(crate) fn apply_route(
             controller.fail_capture_route_submission(request, origin.elapsed());
             Err(SessionFailure::Native)
         }
+    }
+}
+
+/// Resubmits the route change native control was busy for; one still waiting after a whole lease
+/// means native control stalled.
+pub(crate) fn retry_pending<C: CaptureControl, O: OutboundFrames>(
+    pending: &mut Option<(SourceEffect, Duration)>,
+    controller: &mut SourceController,
+    capture: &mut C,
+    out: &O,
+    generation: u64,
+    origin: &SessionClock,
+    submitted: &mut Option<(u64, Duration)>,
+) -> Result<(), SessionFailure> {
+    if let Some((effect, since)) = pending.take() {
+        if origin.elapsed().saturating_sub(since) >= MAX_SUPPRESSION_TTL {
+            return Err(SessionFailure::Native);
+        }
+        if !apply_route(
+            &effect, controller, capture, out, generation, origin, submitted,
+        )? {
+            *pending = Some((effect, since));
+        }
+    }
+    Ok(())
+}
+
+/// Clears the submitted command once native control completed it; one outstanding for a whole
+/// lease means native control stalled.
+pub(crate) fn settle_submitted<C: CaptureControl>(
+    capture: &C,
+    submitted: &mut Option<(u64, Duration)>,
+    now: Duration,
+) -> Result<(), SessionFailure> {
+    if let Some((ticket, issued)) = *submitted {
+        match capture.completed_control_revision() {
+            Some(completed) if completed >= ticket => *submitted = None,
+            Some(_) if now.saturating_sub(issued) < MAX_SUPPRESSION_TTL => {}
+            _ => return Err(SessionFailure::Native),
+        }
+    }
+    Ok(())
+}
+
+/// Extends remote suppression by the controller's lease budget. True once the renewal is
+/// submitted, false while native control is busy.
+pub(crate) fn renew_lease<C: CaptureControl>(
+    controller: &mut SourceController,
+    capture: &mut C,
+    generation: u64,
+    origin: &SessionClock,
+    submitted: &mut Option<(u64, Duration)>,
+) -> Result<bool, SessionFailure> {
+    let ttl = lease_budget(controller, origin.elapsed())?;
+    match capture.renew_suppression(generation, ttl) {
+        Ok(ticket) => {
+            *submitted = Some((ticket, origin.elapsed()));
+            Ok(true)
+        }
+        Err(CaptureRefusal::Pending) => Ok(false),
+        Err(_) => Err(SessionFailure::Native),
     }
 }
 
@@ -425,6 +611,311 @@ mod tests {
             .is_none()
         );
     }
+    #[test]
+    fn only_an_activation_refused_while_capture_runs_is_not_ready() {
+        use NativeCaptureError::{ControlFailed, ControlPending, Stopped};
+        let held = Stopped(StopReason::InvalidInput);
+        assert_eq!(activation_refusal(held, None), CaptureRefusal::NotReady);
+        assert_eq!(
+            activation_refusal(held, Some(StopReason::InvalidInput)),
+            CaptureRefusal::Failed
+        );
+        assert_eq!(
+            activation_refusal(Stopped(StopReason::NativeFailure), None),
+            CaptureRefusal::Failed
+        );
+        assert_eq!(
+            activation_refusal(ControlPending, None),
+            CaptureRefusal::Pending
+        );
+        assert_eq!(refusal(held), CaptureRefusal::Failed);
+        assert_eq!(refusal(ControlPending), CaptureRefusal::Pending);
+        assert_eq!(refusal(ControlFailed), CaptureRefusal::Failed);
+    }
+
+    const HOME: u8 = 1;
+    const PEER: u8 = 2;
+    const THIRD: u8 = 3;
+
+    fn device(machine: u8) -> monhop_core::DeviceId {
+        monhop_core::DeviceId([machine; 16])
+    }
+
+    /// Display 1 has the peer's display 2 on its right, and display 2 has a third computer's
+    /// display 3 on its right: a topology in which a controller can hand over.
+    fn group_topology() -> monhop_core::Topology {
+        use monhop_core::{
+            Display, DisplayId, Edge, EdgeLink, LogicalSize, Machine, NativeSize, NormalizedSpan,
+        };
+        let full = NormalizedSpan::new(0.0, 1.0).unwrap();
+        let link = |from: u8, from_edge, to: u8, to_edge| {
+            EdgeLink::new(
+                DisplayId(u64::from(from)),
+                from_edge,
+                full,
+                DisplayId(u64::from(to)),
+                to_edge,
+                full,
+                1.0,
+            )
+            .unwrap()
+        };
+        let display = |machine: u8| {
+            Display::new(
+                DisplayId(u64::from(machine)),
+                device(machine),
+                format!("display-{machine}"),
+                NativeSize::new(100, 100),
+                LogicalSize::new(100.0, 100.0),
+                Point::new(0.0, 0.0),
+                1.0,
+                None,
+                true,
+            )
+        };
+        monhop_core::Topology::new(
+            vec![
+                Machine::new(device(HOME), Platform::Windows),
+                Machine::new(device(PEER), Platform::MacOs),
+                Machine::new(device(THIRD), Platform::Windows),
+            ],
+            vec![display(HOME), display(PEER), display(THIRD)],
+            vec![
+                link(HOME, Edge::Right, PEER, Edge::Left),
+                link(PEER, Edge::Left, HOME, Edge::Right),
+                link(PEER, Edge::Right, THIRD, Edge::Left),
+                link(THIRD, Edge::Left, PEER, Edge::Right),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Grants every route change at once and queues its barrier for the next capture read.
+    #[derive(Default)]
+    struct FakeCapture {
+        route: (bool, u64),
+        barrier: Option<(bool, u64)>,
+        stopped: std::cell::Cell<bool>,
+    }
+
+    impl FakeCapture {
+        fn reroute(&mut self, remote: bool) -> Result<u64, CaptureRefusal> {
+            self.route = (remote, self.route.1 + 1);
+            self.barrier = Some(self.route);
+            Ok(self.route.1)
+        }
+    }
+
+    impl CaptureControl for FakeCapture {
+        fn activate_remote(&mut self, _: u64, _: Duration) -> Result<u64, CaptureRefusal> {
+            self.reroute(true)
+        }
+        fn restore_local_at(&mut self, _: u64, _: Point) -> Result<u64, CaptureRefusal> {
+            self.reroute(false)
+        }
+        fn renew_suppression(&mut self, _: u64, _: Duration) -> Result<u64, CaptureRefusal> {
+            Ok(self.route.1)
+        }
+        fn completed_control_revision(&self) -> Option<u64> {
+            Some(self.route.1)
+        }
+        fn is_ready_for_suppression(&self) -> bool {
+            true
+        }
+        fn stop_reason(&self) -> Option<StopReason> {
+            self.stopped.get().then_some(StopReason::Requested)
+        }
+        fn request_stop(&self) {
+            self.stopped.set(true);
+        }
+    }
+
+    #[derive(Default)]
+    struct Outbox(std::cell::RefCell<std::collections::VecDeque<Frame>>);
+
+    impl OutboundFrames for Outbox {
+        fn send_outbound(&self, frame: Frame) -> Result<(), SessionFailure> {
+            self.0.borrow_mut().push_back(frame);
+            Ok(())
+        }
+    }
+
+    struct Ignored;
+
+    impl crate::session_receiver::InputDestination for Ignored {
+        fn apply(
+            &mut self,
+            _: crate::session_receiver::DestinationAction,
+        ) -> Result<(), crate::session_receiver::DestinationFailure> {
+            Ok(())
+        }
+    }
+
+    /// The outbound half of a pairwise session, driven through `apply_outcome` at a fixed time,
+    /// with its peer's receiver answering every frame.
+    struct Pairwise {
+        floor: monhop_core::SharedFloor,
+        source: SourceController,
+        native: FakeCapture,
+        outbox: Outbox,
+        peer: crate::session_receiver::InputReceiver,
+        reply_epoch: monhop_protocol::SessionEpoch,
+        reply_sequence: u64,
+        heartbeat_sequence: u64,
+        origin: SessionClock,
+        pending: Option<(SourceEffect, Duration)>,
+        submitted: Option<(u64, Duration)>,
+    }
+
+    impl Pairwise {
+        fn new() -> Self {
+            use monhop_core::{DisplayId, FloorPeer, SharedFloor, TakeBackGate};
+            use monhop_protocol::{DisplayDescription, DisplayTopology, SessionEpoch};
+            let epoch = SessionEpoch::new(3).unwrap();
+            let floor = SharedFloor::new();
+            let mut source = SourceController::new(
+                group_topology(),
+                device(HOME),
+                DisplayId(u64::from(HOME)),
+                epoch,
+                3,
+                Duration::ZERO,
+            )
+            .unwrap()
+            .with_floor(floor.clone(), true)
+            .with_peer(device(PEER), FloorPeer::slot(1).unwrap())
+            .unwrap();
+            source.set_reachable(&[device(THIRD)]);
+            let displays = DisplayTopology::new(vec![DisplayDescription {
+                id: DisplayId(u64::from(PEER)),
+                name: format!("display-{PEER}"),
+                native_width: 100,
+                native_height: 100,
+                logical_origin: Point::new(0.0, 0.0),
+                logical_size: Point::new(100.0, 100.0),
+                scale_factor: 1.0,
+                is_primary: true,
+                monitor: None,
+            }])
+            .unwrap();
+            let peer = crate::session_receiver::InputReceiver::new(displays, epoch, Duration::ZERO)
+                .with_floor(TakeBackGate::new(SharedFloor::new()), false, true);
+            Self {
+                floor,
+                source,
+                native: FakeCapture::default(),
+                outbox: Outbox::default(),
+                peer,
+                reply_epoch: epoch,
+                reply_sequence: 0,
+                heartbeat_sequence: 3,
+                origin: SessionClock::with_test_reader(|| Duration::ZERO),
+                pending: None,
+                submitted: None,
+            }
+        }
+
+        fn apply(&mut self, outcome: SourceOutcome) -> Result<(), SessionFailure> {
+            apply_outcome(
+                outcome,
+                &mut self.source,
+                &mut self.native,
+                &self.outbox,
+                1,
+                &self.origin,
+                &mut self.pending,
+                &mut self.submitted,
+            )?;
+            if let Some((remote, revision)) = self.native.barrier.take() {
+                self.capture(NormalizedInput::RouteChanged { remote, revision })?;
+            }
+            Ok(())
+        }
+
+        fn capture(&mut self, event: NormalizedInput) -> Result<(), SessionFailure> {
+            let record = TaggedInput {
+                event,
+                routing_revision: self.native.route.1,
+                remote: self.native.route.0,
+                floor_generation: self.floor.snapshot().generation,
+            };
+            let outcome = self.source.on_captured(record, Duration::ZERO);
+            self.apply(outcome)
+        }
+
+        fn respond(&mut self, frame: &Frame) -> Option<Frame> {
+            use monhop_protocol::Message;
+            let reply = self
+                .peer
+                .receive(frame, Duration::ZERO, &mut Ignored)
+                .expect("the peer accepts the frame");
+            self.peer.flush(&mut Ignored).expect("the peer delivers it");
+            let message = reply?;
+            if matches!(message, Message::Ping(_) | Message::Pong(_)) {
+                let sequence = self.heartbeat_sequence;
+                self.heartbeat_sequence += 1;
+                return Some(Frame::new(self.peer.control_epoch(), sequence, message));
+            }
+            let epoch = self.peer.epoch();
+            if epoch != self.reply_epoch {
+                self.reply_epoch = epoch;
+                self.reply_sequence = 0;
+            }
+            let sequence = self.reply_sequence;
+            self.reply_sequence += 1;
+            Some(Frame::new(epoch, sequence, message))
+        }
+
+        /// Delivers queued frames and applies the replies, up to the first reply whose outcome
+        /// hands the pointer over, which comes back unapplied.
+        fn deliver(&mut self) -> Result<Option<SourceOutcome>, SessionFailure> {
+            loop {
+                let next = self.outbox.0.borrow_mut().pop_front();
+                let Some(frame) = next else {
+                    return Ok(None);
+                };
+                if let Some(reply) = self.respond(&frame) {
+                    let outcome = self.source.on_remote_frame(&reply, Duration::ZERO);
+                    if outcome.handover.is_some() {
+                        return Ok(Some(outcome));
+                    }
+                    self.apply(outcome)?;
+                }
+            }
+        }
+    }
+
+    fn moved(dx: f64) -> NormalizedInput {
+        NormalizedInput::RelativeMotion(Point::new(dx, 0.0))
+    }
+
+    #[test]
+    fn a_handover_is_a_broken_controller_in_the_pairwise_runtime() {
+        use crate::session_source::{PUSH_THROUGH_DISTANCE, SourceMode};
+        let mut pair = Pairwise::new();
+        pair.capture(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0)))
+            .unwrap();
+        pair.capture(moved(PUSH_THROUGH_DISTANCE)).unwrap();
+        assert!(pair.deliver().unwrap().is_none());
+        assert_eq!(pair.source.mode(), SourceMode::Remote);
+        assert_eq!(pair.native.route, (true, 1));
+
+        pair.capture(moved(98.0)).unwrap();
+        pair.capture(moved(PUSH_THROUGH_DISTANCE)).unwrap();
+        assert_eq!(
+            pair.source.mode(),
+            SourceMode::AwaitRemoteReleaseAcknowledgement
+        );
+        let handed = pair
+            .deliver()
+            .unwrap()
+            .expect("the release acknowledgement hands the pointer over");
+        assert_eq!(handed.failure, None);
+        let queued = pair.outbox.0.borrow().len();
+        assert_eq!(pair.apply(handed), Err(SessionFailure::Source));
+        assert_eq!(pair.outbox.0.borrow().len(), queued);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_startup_failures_retain_the_operation_and_code() {

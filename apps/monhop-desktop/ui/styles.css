@@ -35,6 +35,13 @@
   --destructive: light-dark(oklch(.57 .21 24), oklch(.7 .19 22));
   --display-local: light-dark(oklch(.6 .11 195), oklch(.78 .1 195));
   --display-peer: light-dark(oklch(.57 .14 272), oklch(.76 .11 272));
+  /* peer-2..6: hues placed away from local/peer and from primary/warning/success (roughly 28/73/152),
+     so a third through eighth computer's tone stays distinguishable from every other tone, in both themes. */
+  --display-peer-2: light-dark(oklch(.6 .13 112), oklch(.78 .11 112));
+  --display-peer-3: light-dark(oklch(.58 .11 173), oklch(.77 .1 173));
+  --display-peer-4: light-dark(oklch(.6 .14 233), oklch(.78 .12 233));
+  --display-peer-5: light-dark(oklch(.6 .17 305), oklch(.78 .14 305));
+  --display-peer-6: light-dark(oklch(.6 .16 335), oklch(.78 .13 335));
   --caption-close: oklch(.55 .2 27);
   --caption-close-foreground: oklch(1 0 0);
   --switch-track-off: light-dark(oklch(.2 .01 275 / 16%), oklch(1 0 0 / 15%));
@@ -564,6 +571,15 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .computer-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--gap-3); }
 .computer-identity { display: flex; align-items: center; gap: var(--gap-3); min-width: 0; }
 .computer-icon-wrap { --tone: var(--display-peer); display: grid; flex: none; width: var(--avatar-size); height: var(--avatar-size); place-items: center; border-radius: var(--radius-group); background: linear-gradient(135deg, color-mix(in oklab, var(--tone) var(--mix-icon), var(--card)), color-mix(in oklab, var(--tone) var(--mix-faint), var(--card))); box-shadow: var(--shadow-tile); color: var(--tone); }
+/* data-tone names the member the card belongs to ("local", "peer", "peer-2" .. "peer-6"), same as
+   the arrangement groups below; the un-toned default above stays a plain peer tint until it is set. */
+.computer-icon-wrap[data-tone="local"] { --tone: var(--display-local); }
+.computer-icon-wrap[data-tone="peer"] { --tone: var(--display-peer); }
+.computer-icon-wrap[data-tone="peer-2"] { --tone: var(--display-peer-2); }
+.computer-icon-wrap[data-tone="peer-3"] { --tone: var(--display-peer-3); }
+.computer-icon-wrap[data-tone="peer-4"] { --tone: var(--display-peer-4); }
+.computer-icon-wrap[data-tone="peer-5"] { --tone: var(--display-peer-5); }
+.computer-icon-wrap[data-tone="peer-6"] { --tone: var(--display-peer-6); }
 .platform-glyph { width: var(--avatar-glyph); height: var(--avatar-glyph); flex: none; stroke-width: var(--icon-stroke); }
 .computer-copy { display: grid; gap: var(--gap-half); min-width: 0; }
 .computer-copy > .swap { display: grid; justify-items: start; max-width: 100%; }
@@ -696,9 +712,24 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-stage[data-dragging="true"] { cursor: grabbing; }
 .arrangement-empty { max-width: var(--empty-copy-width); margin: 0; color: var(--muted-foreground); font-size: var(--text-sm); text-align: center; }
 .arrangement-canvas { display: block; width: 100%; height: 100%; }
+/* Never give this selector `scale` or `transform: scale(...)`: the group's position comes from
+   setPosition's SVG transform="translate(...)" attribute (arrangement-view.mjs), and verified live,
+   any CSS scale on this same element pivots around a point that ignores that attribute entirely
+   (its `transform-origin` is resolved before the attribute's translate is folded in), so the group
+   jumps toward a corner instead of shrinking in place. The enter/leave rules below scale the child
+   .arrangement-monitor tiles instead, which carry no attribute transform of their own. */
 .arrangement-group { color: var(--display-local); outline: none; transition: transform var(--motion-spring) var(--ease-spring), opacity var(--motion-base) var(--ease-out), filter var(--motion-base) var(--ease-out); }
 .arrangement-group.is-local { color: var(--display-local); }
 .arrangement-group.is-peer { color: var(--display-peer); }
+/* data-tone (arrangement-render.mjs) is the general hook members beyond local/peer rely on; the
+   class rules above keep working for the two-computer case, which still sets both. */
+.arrangement-group[data-tone="local"] { color: var(--display-local); }
+.arrangement-group[data-tone="peer"] { color: var(--display-peer); }
+.arrangement-group[data-tone="peer-2"] { color: var(--display-peer-2); }
+.arrangement-group[data-tone="peer-3"] { color: var(--display-peer-3); }
+.arrangement-group[data-tone="peer-4"] { color: var(--display-peer-4); }
+.arrangement-group[data-tone="peer-5"] { color: var(--display-peer-5); }
+.arrangement-group[data-tone="peer-6"] { color: var(--display-peer-6); }
 .arrangement-group[tabindex], .arrangement-monitor[tabindex] { cursor: grab; outline: none; }
 .arrangement-group[tabindex]:hover, .arrangement-monitor[tabindex]:hover { filter: var(--filter-raised); }
 /* The dragged group follows the pointer one to one; only its lift animates. */
@@ -716,6 +747,9 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-primary-marker { fill: currentColor; stroke: var(--card); stroke-width: var(--hairline-width); }
 .arrangement-shared-marker { color: currentColor; stroke-width: var(--icon-stroke-bold); pointer-events: none; }
 .arrangement-seams, .arrangement-preview, .arrangement-guides { pointer-events: none; }
+/* Un-isolated, so this layer paints in the same stacking context as groupLayer (svg.replaceChildren
+   order in arrangement-view.mjs) instead of jumping in front of or behind live groups while it fades. */
+.arrangement-leaving { position: absolute; pointer-events: none; }
 .arrangement-seam-underlay { stroke: var(--surface-inset); stroke-linecap: round; stroke-width: var(--seam-underlay-width); }
 .arrangement-seam { stroke: var(--primary); stroke-linecap: round; stroke-width: var(--stroke-bold); filter: var(--filter-seam-glow); }
 .arrangement-seams.is-preview .arrangement-seam { stroke-dasharray: var(--gap-1) var(--gap-1); }
@@ -725,6 +759,14 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-legend-item { display: inline-flex; align-items: center; gap: var(--gap-2); min-width: 0; }
 .arrangement-legend-swatch { --tone: var(--display-local); flex: none; width: var(--legend-swatch); height: var(--legend-swatch); border-radius: var(--radius-swatch); background: color-mix(in oklab, var(--tone) var(--mix-icon), var(--card)); box-shadow: inset 0 0 0 var(--hairline-width) var(--tone); }
 .arrangement-legend-item[data-side="peer"] .arrangement-legend-swatch { --tone: var(--display-peer); }
+/* data-tone covers members beyond local/peer (createLegend, arrangement-render.mjs); data-side only
+   ever names "local"/"peer", so peer-2..6 rely on this and data-tone="peer" is kept for symmetry. */
+.arrangement-legend-item[data-tone="peer"] .arrangement-legend-swatch { --tone: var(--display-peer); }
+.arrangement-legend-item[data-tone="peer-2"] .arrangement-legend-swatch { --tone: var(--display-peer-2); }
+.arrangement-legend-item[data-tone="peer-3"] .arrangement-legend-swatch { --tone: var(--display-peer-3); }
+.arrangement-legend-item[data-tone="peer-4"] .arrangement-legend-swatch { --tone: var(--display-peer-4); }
+.arrangement-legend-item[data-tone="peer-5"] .arrangement-legend-swatch { --tone: var(--display-peer-5); }
+.arrangement-legend-item[data-tone="peer-6"] .arrangement-legend-swatch { --tone: var(--display-peer-6); }
 .arrangement-legend-item[data-kind="primary"] .arrangement-legend-swatch { border-radius: var(--radius-circle); background: var(--foreground); box-shadow: none; }
 .arrangement-legend-item[data-kind="seam"] .arrangement-legend-swatch { width: var(--legend-seam-width); height: var(--stroke-bold); background: var(--primary); box-shadow: none; }
 .arrangement-legend-item[data-kind="shared"] .arrangement-legend-swatch { width: var(--icon-size-sm); height: var(--icon-size-sm); background: none; box-shadow: none; color: var(--foreground); stroke-width: var(--icon-stroke-bold); }
@@ -761,6 +803,15 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
    offset one frame later is what this transition runs. Each tile scales about its own centre. */
 .dashboard-arrangement-canvas .arrangement-monitor { transform-box: fill-box; transform-origin: center; }
 @media (prefers-reduced-motion: no-preference) {
+  /* The group only fades (verified live: any scale on it fights its SVG transform="translate(...)"
+     attribute from setPosition in arrangement-view.mjs, see the comment above .arrangement-group).
+     Its .arrangement-monitor tiles carry the scale instead, each safely around its own centre, which
+     reads as the same "block pops in/out" motion. Finite durations so leave's `animationend` fires
+     on the group either way, which is what removes the node from arrangement-view.mjs's leavingLayer. */
+  .arrangement-group[data-motion="enter"] { animation: fade-in var(--motion-slow) var(--ease-out) both; }
+  .arrangement-group[data-motion="enter"] .arrangement-monitor { animation: tile-in var(--motion-slow) var(--ease-out) both; }
+  .arrangement-group[data-motion="leave"] { animation: page-out var(--motion-base) var(--ease-out) both; }
+  .arrangement-group[data-motion="leave"] .arrangement-monitor { animation: tile-out var(--motion-base) var(--ease-out) both; }
   .dashboard-arrangement-canvas .arrangement-monitor[data-motion="settle"] { transition: transform var(--motion-spring) var(--ease-spring), opacity var(--motion-slow) var(--ease-out); }
   .dashboard-arrangement-canvas .arrangement-monitor[data-motion="enter"] { animation: tile-in var(--motion-slow) var(--ease-out) both; }
   .dashboard-arrangement-canvas .arrangement-seams[data-motion="enter"] { animation: fade-in var(--motion-slow) var(--ease-out) both; }
@@ -812,6 +863,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes pop-in { from { opacity: 0; transform: scale(var(--scale-pop)); } }
 @keyframes tile-in { from { opacity: 0; transform: scale(var(--scale-enter)); } }
+@keyframes tile-out { to { opacity: 0; transform: scale(var(--scale-pop)); } }
 @keyframes theme-pop { from { opacity: 0; transform: rotate(calc(var(--rotate-open) * -1)) scale(var(--scale-pop)); } }
 @keyframes live-ring { from { opacity: var(--opacity-live-ring); transform: scale(1); } to { opacity: 0; transform: scale(var(--scale-live-ring)); } }
 @keyframes notice-dot { 0%, 100% { opacity: var(--opacity-dim); } 50% { opacity: 1; } }
