@@ -15,6 +15,7 @@ import {
   canSaveArrangement,
   displayNoticeCopy,
   failPending,
+  groupFromView,
   hasAppliedCurrentLayout,
   hasAppliedLayout,
   displayUseChoices,
@@ -990,4 +991,222 @@ test("no input-computer or source wording remains in this model", async () => {
     source,
     new RegExp(["source[S]ide", "sharing[R]ole", "choose[S]ource", "input[S]ource"].join("|")),
   );
+});
+
+// --- N-member groups -------------------------------------------------------
+
+const thirdId = "18446744073709551613";
+const thirdFingerprint = "c".repeat(64);
+const localFingerprint = "a".repeat(64);
+const peerFingerprint = "b".repeat(64);
+
+function threeMembers(patch = {}) {
+  const thirdDisplay = {
+    id: thirdId,
+    name: "Third PC",
+    origin: [0, 0],
+    size: [1920, 1080],
+    scale: 1,
+    primary: true,
+    ...patch.thirdDisplay,
+  };
+  return [
+    {
+      fingerprint: localFingerprint,
+      local: true,
+      platform: "macos",
+      displays: connectedView.localDisplays,
+    },
+    {
+      fingerprint: peerFingerprint,
+      local: false,
+      platform: "windows",
+      displays: connectedView.peerDisplays,
+    },
+    { fingerprint: thirdFingerprint, local: false, platform: "windows", displays: [thirdDisplay] },
+  ];
+}
+
+test("groupFromView keys a three-member view by fingerprint, local first", () => {
+  const group = groupFromView({ ...connectedView, members: threeMembers() });
+  assert.deepEqual(group.order, [localFingerprint, peerFingerprint, thirdFingerprint]);
+  assert.equal(group.localKey, localFingerprint);
+  assert.equal(group.byKey[localFingerprint].local, true);
+  assert.equal(group.byKey[peerFingerprint].local, false);
+});
+
+test("groupFromView maps today's legacy fields to exactly two members", () => {
+  const group = groupFromView(connectedView);
+  assert.deepEqual(group.order, ["local", "peer"]);
+  assert.equal(group.byKey.local.local, true);
+  assert.equal(group.byKey.peer.local, false);
+  assert.equal(group.localKey, "local");
+  // The legacy `peers[]` shape (this computer's own displays plus one entry per remote one) maps the
+  // same way, keeping the literal "local"/"peer" keys for exactly two members.
+  const viaPeers = groupFromView({
+    localDisplays: connectedView.localDisplays,
+    localPlatform: "macos",
+    peers: [
+      { fingerprint: peerFingerprint, platform: "windows", displays: connectedView.peerDisplays },
+    ],
+  });
+  assert.deepEqual(viaPeers.order, ["local", "peer"]);
+});
+
+test("a three-member draft produces an apply payload spanning every member", () => {
+  const view = { ...connectedView, members: threeMembers() };
+  const state = initializeArrangement(applySharingView(initialSharingState(), view));
+  const arrangement = arrangementForSharing(state);
+  assert.equal(arrangement.connected, true);
+  assert.deepEqual(arrangement.groups.order, [localFingerprint, peerFingerprint, thirdFingerprint]);
+  assert.equal(canApplySetup(state), true);
+  const native = layoutForSave(state);
+  const memberOf = {
+    [localId]: localFingerprint,
+    [peerId]: peerFingerprint,
+    [thirdId]: thirdFingerprint,
+  };
+  assert.ok(native.links.length > 0);
+  for (const link of native.links)
+    assert.notEqual(memberOf[link.fromDisplay], memberOf[link.toDisplay]);
+  assert.deepEqual(
+    native.arrangement.positions.map((p) => p.display).toSorted(),
+    [localId, peerId, thirdId].toSorted(),
+  );
+  assert.deepEqual(native.arrangement.hidden, []);
+});
+
+test("a crossing whose two ends fall in the same member is rejected, even with three members present", () => {
+  const cLeft = {
+    id: "601",
+    name: "C Left",
+    origin: [0, 0],
+    size: [1024, 768],
+    scale: 1,
+    primary: true,
+  };
+  const cRight = {
+    id: "602",
+    name: "C Right",
+    origin: [1024, 0],
+    size: [1024, 768],
+    scale: 1,
+    primary: false,
+  };
+  const view = {
+    ...connectedView,
+    members: [
+      {
+        fingerprint: localFingerprint,
+        local: true,
+        platform: "macos",
+        displays: connectedView.localDisplays,
+      },
+      {
+        fingerprint: peerFingerprint,
+        local: false,
+        platform: "windows",
+        displays: connectedView.peerDisplays,
+      },
+      {
+        fingerprint: thirdFingerprint,
+        local: false,
+        platform: "windows",
+        displays: [cLeft, cRight],
+      },
+    ],
+  };
+  const state = applySharingView(initialSharingState(), view);
+  const layout = {
+    crossings: [
+      { id: "x", fromDisplay: "601", fromEdge: "right", toDisplay: "602", toEdge: "left" },
+    ],
+  };
+  const result = validateLayout(state, layout);
+  assert.equal(result.ok, false);
+  assert.match(result.message, /different computers/);
+});
+
+test("a member's last display cannot be marked not in use, with three members present", () => {
+  const view = { ...connectedView, members: threeMembers() };
+  const state = initializeArrangement(applySharingView(initialSharingState(), view));
+  const refused = setDisplayInUse(state, thirdId, false);
+  assert.deepEqual(hiddenDisplayIds(refused), []);
+  assert.match(refused.message, /only display/);
+});
+
+test("display ids must be unique across every member", () => {
+  const members = threeMembers({ thirdDisplay: { ...connectedView.peerDisplays[0] } });
+  // Standing alone (no legacy fields to fall back on) a duplicate id makes the whole group unusable.
+  assert.equal(groupFromView({ members }), null);
+  const normalized = normalizeSharingView({ ...connectedView, members });
+  assert.equal(normalized.members, null);
+  // The legacy fields still carry a valid two-member picture, so the reply is still usable.
+  assert.equal(normalized.recognized, true);
+});
+
+test("a malformed members array is dropped without throwing", () => {
+  const tooMany = Array.from({ length: 9 }, (_, index) => ({
+    fingerprint: String(index).repeat(64).slice(0, 64),
+    local: index === 0,
+    platform: "macos",
+    displays: connectedView.localDisplays,
+  }));
+  for (const members of [
+    "nope",
+    null,
+    [null, undefined, 42],
+    [{ fingerprint: "not-hex", local: true, displays: connectedView.localDisplays }],
+    [{ fingerprint: localFingerprint, local: "yes", displays: connectedView.localDisplays }],
+    [{ fingerprint: localFingerprint, local: true, displays: [] }],
+    [
+      { fingerprint: localFingerprint, local: true, displays: connectedView.localDisplays },
+      { fingerprint: localFingerprint, local: false, displays: connectedView.peerDisplays },
+    ],
+    tooMany,
+  ]) {
+    assert.doesNotThrow(() => groupFromView({ members }));
+    assert.doesNotThrow(() => normalizeSharingView({ ...connectedView, members }));
+    const normalized = normalizeSharingView({ ...connectedView, members });
+    assert.equal(normalized.recognized, true);
+    assert.equal(normalized.members, null);
+  }
+});
+
+test("polling continues while any paired computer is enabled, even with nothing active", () => {
+  const state = applySharingView(initialSharingState(), { ...offView, enabled: [peerFingerprint] });
+  assert.equal(shouldPollSharing(state), true);
+  assert.equal(shouldPollSharing(applySharingView(initialSharingState(), offView)), false);
+  // Bounded and deduplicated like every other fingerprint list; malformed entries are dropped.
+  const bounded = normalizeSharingView({
+    ...offView,
+    enabled: [peerFingerprint, peerFingerprint, "not-hex", thirdFingerprint],
+  });
+  assert.deepEqual(bounded.enabled, [peerFingerprint, thirdFingerprint]);
+});
+
+test("control names which members may control each other in a group of more than two", () => {
+  const view = normalizeSharingView({
+    ...offView,
+    phase: "sharing",
+    sharingActive: true,
+    control: {
+      localToPeer: true,
+      peerToLocal: true,
+      members: [
+        { fingerprint: "B".repeat(64), allowed: true },
+        { fingerprint: "C".repeat(64), allowed: false },
+      ],
+    },
+  });
+  assert.deepEqual(view.control.members, [
+    { fingerprint: peerFingerprint, allowed: true },
+    { fingerprint: thirdFingerprint, allowed: false },
+  ]);
+  // A malformed members list drops just that field; the rest of control stays usable.
+  const malformed = normalizeSharingView({
+    ...offView,
+    control: { localToPeer: true, peerToLocal: true, members: "nope" },
+  });
+  assert.equal(malformed.control.members, undefined);
 });

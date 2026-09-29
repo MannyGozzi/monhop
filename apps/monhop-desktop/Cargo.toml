@@ -15,6 +15,7 @@ tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-t
 monhop-platform-macos = { path = "../../crates/monhop-platform-macos", version = "=0.2.2" }
 monhop-platform-windows = { path = "../../crates/monhop-platform-windows", version = "=0.2.2" }
 log = "=0.4.34"
+png = "=0.18.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
 tauri = { version = "=2.11.5", default-features = false, features = ["wry", "compression", "common-controls-v6", "custom-protocol", "tray-icon", "macos-private-api"] }
@@ -34,7 +35,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = ["
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.38.2"
-windows = { version = "=0.61.3", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "=0.61.3", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", default-features = false, features = ["config-json"] }

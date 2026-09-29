@@ -327,8 +327,21 @@ impl SecureQuicConfig {
         identity: &DeviceIdentity,
         verified_server: &VerifiedPeer,
     ) -> Result<quinn::ClientConfig, CryptoError> {
+        Self::client_recording(identity, verified_server, RefusedCertificate::default())
+    }
+
+    /// As [`Self::client`], noting in `refused` any certificate the pin refuses.
+    pub(crate) fn client_recording(
+        identity: &DeviceIdentity,
+        verified_server: &VerifiedPeer,
+        refused: RefusedCertificate,
+    ) -> Result<quinn::ClientConfig, CryptoError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = Arc::new(PinnedServerVerifier::new(verified_server, &provider)?);
+        let verifier = Arc::new(PinnedServerVerifier::new(
+            verified_server,
+            &provider,
+            refused,
+        )?);
         let mut tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| CryptoError::TlsConfiguration)?
@@ -353,8 +366,21 @@ impl SecureQuicConfig {
         identity: &DeviceIdentity,
         verified_client: &VerifiedPeer,
     ) -> Result<quinn::ServerConfig, CryptoError> {
+        Self::server_recording(identity, verified_client, RefusedCertificate::default())
+    }
+
+    /// As [`Self::server`], noting in `refused` any certificate the pin refuses.
+    pub(crate) fn server_recording(
+        identity: &DeviceIdentity,
+        verified_client: &VerifiedPeer,
+        refused: RefusedCertificate,
+    ) -> Result<quinn::ServerConfig, CryptoError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = Arc::new(PinnedClientVerifier::new(verified_client, &provider)?);
+        let verifier = Arc::new(PinnedClientVerifier::new(
+            verified_client,
+            &provider,
+            refused,
+        )?);
         let tls = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| CryptoError::TlsConfiguration)?
@@ -464,12 +490,14 @@ impl ClientCertVerifier for RefuseEveryClient {
 struct PinnedServerVerifier {
     expected_certificate: Vec<u8>,
     inner: Arc<WebPkiServerVerifier>,
+    refused: RefusedCertificate,
 }
 
 impl PinnedServerVerifier {
     fn new(
         verified_peer: &VerifiedPeer,
         provider: &Arc<rustls::crypto::CryptoProvider>,
+        refused: RefusedCertificate,
     ) -> Result<Self, CryptoError> {
         let roots = peer_root_store(verified_peer)?;
         let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
@@ -478,6 +506,7 @@ impl PinnedServerVerifier {
         Ok(Self {
             expected_certificate: verified_peer.certificate_der.clone(),
             inner,
+            refused,
         })
     }
 }
@@ -497,7 +526,12 @@ impl ServerCertVerifier for PinnedServerVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, RustlsError> {
-        verify_exact_leaf(end_entity, intermediates, &self.expected_certificate)?;
+        verify_exact_leaf(
+            end_entity,
+            intermediates,
+            &self.expected_certificate,
+            &self.refused,
+        )?;
         self.inner
             .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
     }
@@ -530,12 +564,14 @@ impl ServerCertVerifier for PinnedServerVerifier {
 struct PinnedClientVerifier {
     expected_certificate: Vec<u8>,
     inner: Arc<dyn ClientCertVerifier>,
+    refused: RefusedCertificate,
 }
 
 impl PinnedClientVerifier {
     fn new(
         verified_peer: &VerifiedPeer,
         provider: &Arc<rustls::crypto::CryptoProvider>,
+        refused: RefusedCertificate,
     ) -> Result<Self, CryptoError> {
         let roots = peer_root_store(verified_peer)?;
         let inner = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
@@ -544,6 +580,7 @@ impl PinnedClientVerifier {
         Ok(Self {
             expected_certificate: verified_peer.certificate_der.clone(),
             inner,
+            refused,
         })
     }
 }
@@ -573,7 +610,12 @@ impl ClientCertVerifier for PinnedClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, RustlsError> {
-        verify_exact_leaf(end_entity, intermediates, &self.expected_certificate)?;
+        verify_exact_leaf(
+            end_entity,
+            intermediates,
+            &self.expected_certificate,
+            &self.refused,
+        )?;
         self.inner
             .verify_client_cert(end_entity, intermediates, now)
     }
@@ -631,25 +673,32 @@ fn peer_root_store(verified_peer: &VerifiedPeer) -> Result<RootCertStore, Crypto
     Ok(roots)
 }
 
-/// The certificate a pin last refused in this process, kept only for one diagnostic log line.
-static LAST_REFUSED: Mutex<Option<CertificateFingerprint>> = Mutex::new(None);
+/// The certificate one pinned configuration last refused, kept only for one diagnostic log line.
+/// Each paired computer's configurations share their own, so concurrent handshakes with other
+/// computers never overwrite it.
+#[derive(Clone, Default)]
+pub(crate) struct RefusedCertificate(Arc<Mutex<Option<CertificateFingerprint>>>);
 
-/// The certificate a pin refused since the last call, if any.
-pub(crate) fn take_refused_certificate() -> Option<CertificateFingerprint> {
-    LAST_REFUSED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take()
+impl RefusedCertificate {
+    /// The certificate refused since the last call, if any.
+    pub(crate) fn take(&self) -> Option<CertificateFingerprint> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+
+    fn note(&self, certificate: &CertificateDer<'_>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(CertificateFingerprint::from_certificate_der(certificate));
+    }
 }
 
 fn verify_exact_leaf(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
     expected_certificate: &[u8],
+    refused: &RefusedCertificate,
 ) -> Result<(), RustlsError> {
     if !intermediates.is_empty() || end_entity.as_ref() != expected_certificate {
-        *LAST_REFUSED.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(CertificateFingerprint::from_certificate_der(end_entity));
+        refused.note(end_entity);
         return Err(RustlsError::InvalidCertificate(
             CertificateError::ApplicationVerificationFailure,
         ));

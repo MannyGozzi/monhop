@@ -834,10 +834,10 @@ fn stop_receiver(
     status.stop(note_receiver_failure(failure));
 }
 
-struct OutputSequences {
-    control: u64,
-    input: u64,
-    epoch: SessionEpoch,
+pub(crate) struct OutputSequences {
+    pub(crate) control: u64,
+    pub(crate) input: u64,
+    pub(crate) epoch: SessionEpoch,
 }
 
 fn emit(

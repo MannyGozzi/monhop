@@ -38,7 +38,7 @@ pub const MAX_SETUP_FILE_BYTES: u64 = 256 * 1024;
 pub const MAX_COMPUTERS: usize = 16;
 
 const MAX_INTERFACE_ID_BYTES: usize = 512;
-const MAX_LINKS: usize = 64;
+pub(crate) const MAX_LINKS: usize = 64;
 const TEMPORARY_FILE_ATTEMPTS: usize = 64;
 
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
@@ -67,15 +67,15 @@ impl From<monhop_core::Platform> for ComputerPlatform {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DisplaySnapshot {
-    id: String,
-    name: String,
-    origin: [f64; 2],
-    size: [f64; 2],
-    native_size: [u32; 2],
-    scale: f32,
-    primary: bool,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) origin: [f64; 2],
+    pub(crate) size: [f64; 2],
+    pub(crate) native_size: [u32; 2],
+    pub(crate) scale: f32,
+    pub(crate) primary: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    monitor: Option<String>,
+    pub(crate) monitor: Option<String>,
 }
 
 impl DisplaySnapshot {
@@ -89,13 +89,13 @@ impl DisplaySnapshot {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SharingPreferences {
-    version: u8,
-    interface_id: String,
-    local_fingerprint: String,
-    peer_fingerprint: String,
-    local_displays: Vec<DisplaySnapshot>,
-    peer_displays: Vec<DisplaySnapshot>,
-    layout: LayoutRequest,
+    pub(crate) version: u8,
+    pub(crate) interface_id: String,
+    pub(crate) local_fingerprint: String,
+    pub(crate) peer_fingerprint: String,
+    pub(crate) local_displays: Vec<DisplaySnapshot>,
+    pub(crate) peer_displays: Vec<DisplaySnapshot>,
+    pub(crate) layout: LayoutRequest,
 }
 
 /// Every paired computer's saved setup and which one MonHop shares input with. Loading never
@@ -970,7 +970,7 @@ pub(crate) fn save_bounded(path: &Path, bytes: &[u8], limit: u64) -> io::Result<
     Ok(())
 }
 
-fn same_display_geometry(left: &[DisplaySnapshot], right: &[DisplaySnapshot]) -> bool {
+pub(crate) fn same_display_geometry(left: &[DisplaySnapshot], right: &[DisplaySnapshot]) -> bool {
     left.len() == right.len()
         && left.iter().all(|display| {
             right.iter().any(|candidate| {
@@ -1002,7 +1002,7 @@ fn relabel(displays: &[DisplaySnapshot], live: &DisplayTopology) -> Vec<DisplayS
 }
 
 /// Everything but the id, name, and monitor identity: what a layout's crossings depend on.
-fn same_geometry(left: &DisplaySnapshot, right: &DisplaySnapshot) -> bool {
+pub(crate) fn same_geometry(left: &DisplaySnapshot, right: &DisplaySnapshot) -> bool {
     left.origin == right.origin
         && left.size == right.size
         && left.native_size == right.native_size
@@ -1025,7 +1025,7 @@ fn usable_monitor<'a>(display: &'a DisplaySnapshot, list: &[DisplaySnapshot]) ->
 /// Pairs remembered displays with the live displays that are the same monitor: by EDID identity
 /// where both lists report one for exactly one display, otherwise by OS id. Two displays that
 /// report different identities never pair, even when one has taken the other's id.
-fn pair_displays<'a>(
+pub(crate) fn pair_displays<'a>(
     remembered: &'a [DisplaySnapshot],
     live: &'a [DisplaySnapshot],
 ) -> Vec<(&'a DisplaySnapshot, &'a DisplaySnapshot)> {
@@ -1062,7 +1062,7 @@ fn pair_displays<'a>(
 }
 
 /// Every display on both sides paired with the same monitor on the other, whatever the geometry.
-fn same_displays<'a>(
+pub(crate) fn same_displays<'a>(
     remembered: &'a [DisplaySnapshot],
     live: &'a [DisplaySnapshot],
 ) -> Option<Vec<(&'a DisplaySnapshot, &'a DisplaySnapshot)>> {
@@ -1071,7 +1071,7 @@ fn same_displays<'a>(
 }
 
 /// Remembered id to live id, for every paired display.
-fn id_map<'a>(
+pub(crate) fn id_map<'a>(
     pairs: impl Iterator<Item = &'a (&'a DisplaySnapshot, &'a DisplaySnapshot)>,
 ) -> BTreeMap<String, String> {
     pairs
@@ -1080,7 +1080,10 @@ fn id_map<'a>(
 }
 
 /// The layout with every display id it names rewritten through `map`; unmapped ids stand.
-fn remap_layout(layout: &LayoutRequest, map: &BTreeMap<String, String>) -> LayoutRequest {
+pub(crate) fn remap_layout(
+    layout: &LayoutRequest,
+    map: &BTreeMap<String, String>,
+) -> LayoutRequest {
     let rename = |id: &String| map.get(id).cloned().unwrap_or_else(|| id.clone());
     let mut remapped = layout.clone();
     for link in &mut remapped.links {
@@ -1116,7 +1119,7 @@ pub(crate) fn snapshots(topology: &DisplayTopology) -> Vec<DisplaySnapshot> {
 }
 
 /// The inverse of `snapshots`: saved displays as the topology an inspection carries.
-fn topology_of(displays: &[DisplaySnapshot]) -> Option<DisplayTopology> {
+pub(crate) fn topology_of(displays: &[DisplaySnapshot]) -> Option<DisplayTopology> {
     let displays = displays
         .iter()
         .map(|display| {
@@ -1145,7 +1148,7 @@ fn monitor_from_key(key: &str) -> Option<MonitorIdentity> {
     MonitorIdentity::new(vendor, product, serial)
 }
 
-fn validate_fingerprint(value: &str) -> Result<(), PreferenceError> {
+pub(crate) fn validate_fingerprint(value: &str) -> Result<(), PreferenceError> {
     let fingerprint =
         CertificateFingerprint::parse_full(value).map_err(|_| PreferenceError::Invalid)?;
     if fingerprint.full_hex() == value {
@@ -1155,7 +1158,7 @@ fn validate_fingerprint(value: &str) -> Result<(), PreferenceError> {
     }
 }
 
-fn validate_displays(displays: &[DisplaySnapshot]) -> Result<(), PreferenceError> {
+pub(crate) fn validate_displays(displays: &[DisplaySnapshot]) -> Result<(), PreferenceError> {
     if displays.is_empty() || displays.len() > monhop_core::MAX_DISPLAYS {
         return Err(PreferenceError::Invalid);
     }

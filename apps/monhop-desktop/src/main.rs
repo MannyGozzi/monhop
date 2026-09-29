@@ -3,10 +3,12 @@
 mod appearance;
 mod arrangement_library;
 mod autostart;
+mod clipboard;
 mod computers;
 mod dimming;
 #[cfg(target_os = "macos")]
 mod display_labels;
+mod group_record;
 mod launch;
 mod lifecycle;
 mod links;

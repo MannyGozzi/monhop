@@ -4,8 +4,8 @@ use crate::session_clock::millis_u64;
 use crate::session_health::{HOLD_LIMIT, HealthError, PEER_LIVENESS, PeerHealth, hold_stats};
 use crate::session_startup::ReadyControl;
 use monhop_core::{
-    DisplayId, FloorSnapshot, FloorState, GesturePhase, HidUsage, ModifierState, MouseButton,
-    Point, PointerGesture, SharedFloor, SystemGesture, TakeBackGate,
+    DisplayId, FloorPeer, FloorSnapshot, FloorState, GesturePhase, HidUsage, ModifierState,
+    MouseButton, Point, PointerGesture, SharedFloor, SystemGesture, TakeBackGate,
     gesture_latch::TOUCH_STREAM_IDLE,
 };
 use monhop_protocol::{
@@ -76,6 +76,10 @@ pub enum ReceiverFailure {
 pub struct InputReceiver {
     gate: TakeBackGate,
     floor_generation: Option<u64>,
+    /// The peer this receiver claims the floor for.
+    slot: FloorPeer,
+    /// Other receivers share the gate: native and admission side effects need this slot's claim.
+    shared: bool,
     local_lower: bool,
     enabled: bool,
     yielding: bool,
@@ -118,6 +122,8 @@ impl InputReceiver {
         Self {
             gate: TakeBackGate::new(SharedFloor::new()),
             floor_generation: None,
+            slot: FloorPeer::SOLE,
+            shared: false,
             local_lower: false,
             enabled: true,
             yielding: false,
@@ -150,16 +156,37 @@ impl InputReceiver {
         self
     }
 
-    /// Called before queued input: cleanup is local and never waits for a peer response.
+    /// One of several receivers on one gate, receiving for `slot`: it claims the floor for that
+    /// slot, and touches native input or the gate only while that claim holds the floor.
+    pub fn shared(mut self, slot: FloorPeer) -> Self {
+        self.slot = slot;
+        self.shared = true;
+        self
+    }
+
+    /// Called before queued input: cleanup is local and never waits for a peer response. A shared
+    /// receiver leaves the trigger to its set, which hands it to the floor's owner only.
     pub fn take_back(
         &mut self,
         destination: &mut impl InputDestination,
     ) -> Result<Option<Message>, ReceiverFailure> {
+        if self.shared {
+            return Ok(None);
+        }
         let Some(generation) = self.gate.take_triggered() else {
             return Ok(None);
         };
+        self.yield_to_local(generation, destination)
+    }
+
+    /// Answers the take-back that produced the Yielding floor at `generation`.
+    pub(crate) fn yield_to_local(
+        &mut self,
+        generation: u64,
+        destination: &mut impl InputDestination,
+    ) -> Result<Option<Message>, ReceiverFailure> {
         let floor = self.gate.floor().snapshot();
-        if self.floor_generation.is_none()
+        if !self.holds(floor)
             || floor.state != FloorState::Yielding
             || floor.generation != generation
         {
@@ -176,7 +203,27 @@ impl InputReceiver {
     }
 
     fn suppress_injection(&self) -> bool {
-        self.yielding || self.gate.floor().snapshot().state == FloorState::Yielding
+        if self.yielding {
+            return true;
+        }
+        let floor = self.gate.floor().snapshot();
+        floor.state == FloorState::Yielding || (self.shared && !self.holds(floor))
+    }
+
+    /// Whether `floor` is this receiver's claim. Pairwise, having claimed is enough; shared, the
+    /// floor must still be the inbound claim made for this slot.
+    fn holds(&self, floor: FloorSnapshot) -> bool {
+        match self.floor_generation {
+            None => false,
+            Some(_) if !self.shared => true,
+            Some(generation) => floor.peer == self.slot && is_inbound_claim(floor, generation),
+        }
+    }
+
+    /// Whether native input and the gate are this receiver's to change: always when pairwise, and
+    /// only while its claim holds the floor when shared.
+    fn owns_native(&self) -> bool {
+        !self.shared || self.holds(self.gate.floor().snapshot())
     }
 
     fn release_floor(&mut self) {
@@ -195,20 +242,38 @@ impl InputReceiver {
             let floor = self.gate.floor().snapshot();
             match floor.state {
                 FloorState::Free => {}
+                // The simultaneous-request tie-break is pairwise: only this peer's own request.
+                FloorState::Requesting if self.shared && floor.peer != self.slot => {
+                    return Err(DeclineReason::Busy);
+                }
                 FloorState::Requesting if !self.local_lower => {}
                 FloorState::Requesting => return Err(DeclineReason::Contended),
                 FloorState::Sending | FloorState::Returning => return Err(DeclineReason::Busy),
                 FloorState::Receiving | FloorState::Yielding => {
-                    if self.floor_generation.is_some() {
+                    if self.holds(floor) {
                         return Ok(());
                     }
                     return Err(DeclineReason::Busy);
                 }
             }
-            if let Ok(receiving) = self.gate.floor().transition(floor, FloorState::Receiving) {
-                self.floor_generation = Some(receiving.generation);
-                self.gate.open_injection(receiving.generation);
-                return Ok(());
+            let claimed = if self.shared {
+                self.gate
+                    .floor()
+                    .claim(floor, FloorState::Receiving, self.slot)
+            } else {
+                self.gate.floor().transition(floor, FloorState::Receiving)
+            };
+            match claimed {
+                Ok(receiving) => {
+                    self.floor_generation = Some(receiving.generation);
+                    self.gate.open_injection(receiving.generation);
+                    return Ok(());
+                }
+                // Refused rather than raced: the floor did not move, so retrying cannot succeed.
+                Err(current) if self.shared && current == floor => {
+                    return Err(DeclineReason::Busy);
+                }
+                Err(_) => {}
             }
         }
     }
@@ -326,7 +391,9 @@ impl InputReceiver {
             && now.saturating_sub(self.gesture_seen) >= TOUCH_STREAM_IDLE
         {
             self.open_gestures = [false; 2];
-            if let Err(failure) = deliver(destination, DestinationAction::EndGestures) {
+            if self.owns_native()
+                && let Err(failure) = deliver(destination, DestinationAction::EndGestures)
+            {
                 return Err(self.stop(failure, destination));
             }
         }
@@ -348,7 +415,9 @@ impl InputReceiver {
         destination: &mut impl InputDestination,
     ) -> Result<(), ReceiverFailure> {
         log::warn!("receiver held: no fresh reply for {PEER_LIVENESS:?}; injected input released");
-        self.gate.open_injection(0);
+        if self.owns_native() {
+            self.gate.open_injection(0);
+        }
         self.active = None;
         self.pending_move = None;
         self.cleanup_pending = true;
@@ -482,12 +551,17 @@ impl InputReceiver {
         match &frame.message {
             Message::ReleaseAll => {
                 // Closing admission precedes native cleanup and the floor becoming available.
-                if self.floor_generation.is_some() {
-                    self.gate.open_injection(0);
+                // Without the floor it is still acknowledged, but never releases the owner's input.
+                if self.owns_native() {
+                    if self.floor_generation.is_some() {
+                        self.gate.open_injection(0);
+                    }
+                    self.release_injected(destination)
+                        .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                    self.gate.note_injected_released();
+                } else {
+                    self.open_gestures = [false; 2];
                 }
-                self.release_injected(destination)
-                    .map_err(|_| ReceiverFailure::NativeDelivery)?;
-                self.gate.note_injected_released();
                 self.release_floor();
                 self.keys.fill(false);
                 self.buttons.fill(false);
@@ -616,7 +690,9 @@ impl InputReceiver {
             log::warn!("receiver stopped: {failure:?}");
         }
         let failure = *self.failure.get_or_insert(failure);
-        self.gate.open_injection(0);
+        if self.owns_native() {
+            self.gate.open_injection(0);
+        }
         self.active = None;
         self.pending_move = None;
         self.cleanup_pending = true;
@@ -624,14 +700,23 @@ impl InputReceiver {
         failure
     }
 
+    /// A shared receiver without the floor injected nothing, so its cleanup is bookkeeping only.
     pub fn retry_cleanup(&mut self, destination: &mut impl InputDestination) {
-        if self.cleanup_pending && self.release_injected(destination).is_ok() {
-            self.keys.fill(false);
-            self.buttons.fill(false);
-            self.cleanup_pending = false;
-            self.gate.note_injected_released();
-            self.release_floor();
+        if !self.cleanup_pending {
+            return;
         }
+        let native = self.owns_native();
+        if native && self.release_injected(destination).is_err() {
+            return;
+        }
+        self.open_gestures = [false; 2];
+        self.keys.fill(false);
+        self.buttons.fill(false);
+        self.cleanup_pending = false;
+        if native {
+            self.gate.note_injected_released();
+        }
+        self.release_floor();
     }
 
     /// Ends gestures before keys and buttons, and attempts both even when the first fails.
@@ -729,20 +814,24 @@ fn unchanged_at(gesture: PointerGesture, phase: GesturePhase) -> PointerGesture 
     }
 }
 
+/// Whether `floor` is still the inbound claim made at `generation`: Receiving at it, or the
+/// Yielding a take-back made from it (Receiving keeps its peer and moves only to Yielding or Free).
+fn is_inbound_claim(floor: FloorSnapshot, generation: u64) -> bool {
+    match floor.state {
+        FloorState::Receiving => floor.generation == generation,
+        FloorState::Yielding => {
+            floor.generation == generation || generation.checked_add(1) == Some(floor.generation)
+        }
+        _ => false,
+    }
+}
+
 /// Frees this half's claim at `generation`: Receiving, or the Yielding a take-back made from it.
 /// The capture callback may yield between any snapshot and the swap, so the swap retries until it
 /// lands or the floor is no longer this claim's.
 fn release_inbound(floor: &SharedFloor, generation: u64, mut current: FloorSnapshot) {
     loop {
-        let ours = match current.state {
-            FloorState::Receiving => current.generation == generation,
-            FloorState::Yielding => {
-                current.generation == generation
-                    || generation.checked_add(1) == Some(current.generation)
-            }
-            _ => false,
-        };
-        if !ours {
+        if !is_inbound_claim(current, generation) {
             return;
         }
         match floor.transition(current, FloorState::Free) {
@@ -1451,6 +1540,256 @@ mod tests {
         assert_eq!(freed.state, FloorState::Free);
         assert_eq!(receiver.take_back(&mut target), Ok(None));
         assert_eq!(floor.snapshot(), freed);
+    }
+
+    /// Yields the floor the way the capture callback does on local motion.
+    fn take_back_locally(gate: &TakeBackGate) {
+        use monhop_core::capture::{CaptureEvent, CaptureStop, capture_channel};
+        let stop = CaptureStop::new();
+        let (mut producer, _consumer) = capture_channel(stop.clone());
+        let mut physical = monhop_core::capture_physical::PhysicalCapture::new(Duration::ZERO)
+            .with_take_back(gate.clone());
+        physical.process(
+            CaptureEvent::LogicalRelativeMotion { dx: 6.0, dy: 0.0 },
+            false,
+            Duration::ZERO,
+            &mut producer,
+            &stop,
+        );
+    }
+
+    /// Every native call, admission change and floor move of the pairwise path, in order.
+    #[test]
+    fn a_pairwise_receivers_activation_hold_and_release_are_unchanged() {
+        use DestinationAction::{EndGestures, MoveTo, ReleaseAll};
+        let floor = SharedFloor::new();
+        let gate = TakeBackGate::new(floor.clone());
+        let mut receiver = receiver().with_floor(gate.clone(), false, true);
+        let mut target = Destination::default();
+        let at = Duration::ZERO;
+        assert_eq!(receiver.tick(at, &mut target), Ok(Some(Message::Ping(1))));
+        assert_eq!(
+            receiver.receive(&activate(), at, &mut target),
+            Ok(Some(Message::ActivationAck(DisplayId(1))))
+        );
+        let first = floor.snapshot();
+        assert_eq!(
+            (first.state, first.peer),
+            (FloorState::Receiving, FloorPeer::SOLE)
+        );
+        assert!(gate.admits_injection());
+        assert_eq!(
+            receiver.receive(&frame(2, 1, key(true)), at, &mut target),
+            Ok(None)
+        );
+
+        // A stall closes admission, releases natively and frees the floor before its barrier.
+        assert_eq!(receiver.tick(PEER_LIVENESS, &mut target), Ok(None));
+        assert!(!gate.admits_injection());
+        assert_eq!(floor.snapshot().state, FloorState::Free);
+        let at = PEER_LIVENESS + Duration::from_millis(100);
+        assert_eq!(
+            receiver.receive(&frame(2, 2, Message::ReleaseAll), at, &mut target),
+            Ok(Some(Message::ReleaseAck))
+        );
+        assert!(receiver.held_since().is_none());
+        assert_eq!(floor.snapshot().state, FloorState::Free);
+
+        let again = frame(
+            3,
+            0,
+            Message::ActivateDisplayAt {
+                display_id: DisplayId(1),
+                position: Point::new(5.0, 5.0),
+            },
+        );
+        assert_eq!(
+            receiver.receive(&again, at, &mut target),
+            Ok(Some(Message::ActivationAck(DisplayId(1))))
+        );
+        let second = floor.snapshot();
+        assert_eq!(
+            (second.state, second.peer),
+            (FloorState::Receiving, FloorPeer::SOLE)
+        );
+        assert!(second.generation > first.generation);
+        assert!(gate.admits_injection());
+        assert_eq!(
+            receiver.receive(&frame(3, 1, key(true)), at, &mut target),
+            Ok(None)
+        );
+
+        take_back_locally(&gate);
+        assert_eq!(floor.snapshot().state, FloorState::Yielding);
+        assert_eq!(receiver.take_back(&mut target), Ok(Some(Message::TakeBack)));
+        assert_eq!(receiver.take_back(&mut target), Ok(None));
+        assert_eq!(
+            receiver.receive(&frame(3, 2, key(false)), at, &mut target),
+            Ok(None)
+        );
+        assert_eq!(
+            receiver.receive(&frame(3, 3, Message::ReleaseAll), at, &mut target),
+            Ok(Some(Message::ReleaseAck))
+        );
+        assert_eq!(floor.snapshot().state, FloorState::Free);
+        assert!(!gate.admits_injection());
+        assert_eq!(
+            target.calls,
+            [
+                MoveTo(Point::new(10.0, 10.0)),
+                press(true),
+                EndGestures,
+                ReleaseAll,
+                EndGestures,
+                ReleaseAll,
+                MoveTo(Point::new(5.0, 5.0)),
+                press(true),
+                EndGestures,
+                ReleaseAll,
+                EndGestures,
+                ReleaseAll,
+            ]
+        );
+    }
+
+    fn press(pressed: bool) -> DestinationAction {
+        DestinationAction::Key {
+            usage: HidUsage(4),
+            pressed,
+        }
+    }
+
+    fn shared(gate: &TakeBackGate, slot: u8, local_lower: bool) -> InputReceiver {
+        receiver()
+            .with_floor(gate.clone(), local_lower, true)
+            .shared(FloorPeer::slot(slot).unwrap())
+    }
+
+    #[test]
+    fn shared_receiver_without_the_floor_never_releases_or_closes_admission() {
+        use DestinationAction::{EndGestures, MoveTo, ReleaseAll};
+        let floor = SharedFloor::new();
+        let gate = TakeBackGate::new(floor.clone());
+        let mut owner = shared(&gate, 1, false);
+        let mut owner_target = Destination::default();
+        let at = Duration::ZERO;
+        assert_eq!(
+            owner.receive(&activate(), at, &mut owner_target),
+            Ok(Some(Message::ActivationAck(DisplayId(1))))
+        );
+        assert_eq!(
+            owner.receive(&frame(2, 1, key(true)), at, &mut owner_target),
+            Ok(None)
+        );
+        gate.note_injected_press();
+        let owned = floor.snapshot();
+
+        // Another peer's barrier, stall and failure change nothing native or admitted.
+        let mut other = shared(&gate, 2, false);
+        let mut other_target = Destination::default();
+        assert_eq!(
+            other.receive(&frame(1, 0, Message::ReleaseAll), at, &mut other_target),
+            Ok(Some(Message::ReleaseAck))
+        );
+        assert_eq!(other.tick(PEER_LIVENESS, &mut other_target), Ok(None));
+        assert!(other.held_since().is_some());
+        other.stop(ReceiverFailure::PeerStopped, &mut other_target);
+        other.retry_cleanup(&mut other_target);
+        assert!(!other.cleanup_pending());
+        assert!(other_target.calls.is_empty());
+        assert_eq!(floor.snapshot(), owned);
+        assert!(gate.admits_injection());
+        assert!(gate.injected_held(), "the owner's press is still counted");
+
+        // The owner still injects, and still releases its own input.
+        assert_eq!(
+            owner.receive(&frame(2, 2, key(false)), at, &mut owner_target),
+            Ok(None)
+        );
+        assert_eq!(
+            owner.receive(&frame(2, 3, Message::ReleaseAll), at, &mut owner_target),
+            Ok(Some(Message::ReleaseAck))
+        );
+        assert_eq!(floor.snapshot().state, FloorState::Free);
+        assert!(!gate.admits_injection());
+        assert!(!gate.injected_held());
+        assert_eq!(
+            owner_target.calls,
+            [
+                MoveTo(Point::new(10.0, 10.0)),
+                press(true),
+                press(false),
+                EndGestures,
+                ReleaseAll,
+            ]
+        );
+    }
+
+    #[test]
+    fn requesting_steal_is_pairwise_only() {
+        let declined = |reason| -> Result<Option<Message>, ReceiverFailure> {
+            Ok(Some(Message::ActivationDeclined {
+                display_id: DisplayId(1),
+                reason,
+            }))
+        };
+        let acked = Ok(Some(Message::ActivationAck(DisplayId(1))));
+        let peer = FloorPeer::slot(1).unwrap();
+        let floor = SharedFloor::new();
+        let gate = TakeBackGate::new(floor.clone());
+        let request = floor
+            .claim(floor.snapshot(), FloorState::Requesting, peer)
+            .unwrap();
+        let mut target = Destination::default();
+        let at = Duration::ZERO;
+        // Only the requesting peer's own receiver may break the tie, and only as pairwise does.
+        assert_eq!(
+            shared(&gate, 2, false).receive(&activate(), at, &mut target),
+            declined(DeclineReason::Busy)
+        );
+        assert_eq!(
+            shared(&gate, 1, true).receive(&activate(), at, &mut target),
+            declined(DeclineReason::Contended)
+        );
+        assert_eq!(floor.snapshot(), request);
+        assert_eq!(
+            shared(&gate, 1, false).receive(&activate(), at, &mut target),
+            acked
+        );
+        let stolen = floor.snapshot();
+        assert_eq!((stolen.state, stolen.peer), (FloorState::Receiving, peer));
+        assert!(stolen.generation > request.generation);
+        assert!(gate.admits_injection());
+
+        let floor = SharedFloor::new();
+        let request = floor
+            .transition(floor.snapshot(), FloorState::Requesting)
+            .unwrap();
+        let mut pairwise = receiver().with_floor(TakeBackGate::new(floor.clone()), false, true);
+        assert_eq!(pairwise.receive(&activate(), at, &mut target), acked);
+        let stolen = floor.snapshot();
+        assert_eq!(
+            (stolen.state, stolen.peer),
+            (FloorState::Receiving, FloorPeer::SOLE)
+        );
+        assert!(stolen.generation > request.generation);
+    }
+
+    #[test]
+    fn a_shared_receiver_without_a_group_slot_declines_instead_of_claiming() {
+        let floor = SharedFloor::new();
+        let free = floor.snapshot();
+        let mut receiver = receiver()
+            .with_floor(TakeBackGate::new(floor.clone()), false, true)
+            .shared(FloorPeer::NONE);
+        assert_eq!(
+            receiver.receive(&activate(), Duration::ZERO, &mut Destination::default()),
+            Ok(Some(Message::ActivationDeclined {
+                display_id: DisplayId(1),
+                reason: DeclineReason::Busy,
+            }))
+        );
+        assert_eq!(floor.snapshot(), free);
     }
 
     use GesturePhase::{Began, Cancelled, Changed, Ended};

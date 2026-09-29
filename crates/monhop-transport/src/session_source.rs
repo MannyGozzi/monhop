@@ -14,9 +14,10 @@
 use std::{fmt, time::Duration};
 
 use monhop_core::{
-    DeviceId, DisplayId, Edge, EdgeTransition, FloorOwner, FloorSnapshot, FloorState, HidUsage,
-    LogicalRect, ModifierState, MouseButton, Platform, Point, PointerGesture, PointerOwnership,
-    PointerTarget, SharedFloor, SystemGesture, Topology, TransitionAcknowledgement,
+    DeviceId, DisplayId, Edge, EdgeTransition, FloorOwner, FloorPeer, FloorSnapshot, FloorState,
+    HidUsage, LogicalRect, MAX_GROUP_PEERS, ModifierState, MouseButton, Platform, Point,
+    PointerGesture, PointerOwnership, PointerTarget, SharedFloor, SystemGesture, Topology,
+    TransitionAcknowledgement,
     clicks::{ClickCounter, SINGLE_CLICK},
 };
 use monhop_protocol::{
@@ -231,6 +232,58 @@ impl fmt::Debug for SourceEffects {
 pub struct SourceOutcome {
     pub effects: SourceEffects,
     pub failure: Option<SourceFailure>,
+    /// The floor and the remote capture route, still held for this computer, for the controller
+    /// of `handover.to()`'s peer to take with [`SourceController::accept_handover`]. From
+    /// `accept_handover` itself it is the refused handover coming back: nothing took it, so the
+    /// caller restores local input at its return position and then frees its claim.
+    pub handover: Option<Handover>,
+}
+
+/// The pointer leaving one peer's display straight for a third peer's, after the first peer
+/// acknowledged its release. Native capture stays remote throughout.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Handover {
+    to: PointerTarget,
+    entry: Point,
+    to_edge: Edge,
+    /// Motion since the crossing, in the entered display's units.
+    carried: Point,
+    at_button: Option<Point>,
+    return_target: PointerTarget,
+    return_position: Point,
+    /// Returning for the peer that handed over.
+    claim: FloorSnapshot,
+    /// The free floor generation the trip began from.
+    claimed_from: u64,
+    route_revision: u64,
+}
+
+impl Handover {
+    /// The third peer's display the pointer enters.
+    pub fn to(&self) -> PointerTarget {
+        self.to
+    }
+
+    /// The local display and position input returns to if no controller takes the handover.
+    pub fn return_at(&self) -> (PointerTarget, Point) {
+        (self.return_target, self.return_position)
+    }
+
+    /// The Returning floor the handover still holds.
+    pub fn claim(&self) -> FloorSnapshot {
+        self.claim
+    }
+
+    /// The remote capture route that stays in place.
+    pub fn route_revision(&self) -> u64 {
+        self.route_revision
+    }
+}
+
+impl fmt::Debug for Handover {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Handover([redacted])")
+    }
 }
 
 /// Construction failures.
@@ -239,6 +292,7 @@ pub enum SourceConfigError {
     UnknownLocalDisplay,
     LocalDisplayBelongsToAnotherMachine,
     Ownership,
+    UnknownPeer,
 }
 
 /// A sticky source-controller failure. No variant includes input values.
@@ -261,6 +315,8 @@ pub enum SourceFailure {
     SequenceExhausted,
     RouteRequestExhausted,
     EffectCapacityExceeded,
+    /// The peer's link ended while the rest of the group runs on.
+    LinkEnded,
 }
 
 /// Observable source routing mode.
@@ -334,6 +390,13 @@ pub struct SourceController {
     recent_motion: RecentMotion,
     peer_offset: Point,
     topology: Topology,
+    /// The one machine this controller's link reaches; seams onto any other are not its own.
+    peer: Option<DeviceId>,
+    slot: FloorPeer,
+    /// Third peers whose controllers can take a handover right now.
+    reachable: [Option<DeviceId>; MAX_GROUP_PEERS],
+    /// Set by the release acknowledgement that completes a handover, taken by `outcome`.
+    handover: Option<Handover>,
     ownership: PointerOwnership,
     home: PointerTarget,
     state: State,
@@ -387,6 +450,9 @@ enum State {
         /// `carried` when a button first changed in flight between the other computer's
         /// displays, where that change lands.
         at_button: Option<Point>,
+        /// Taken over from another peer's controller: the receiver holds nothing of this
+        /// computer's yet, so its acknowledgement transfers held input as a fresh crossing does.
+        handover: bool,
     },
     AwaitRemoteBarrier {
         target: PointerTarget,
@@ -409,9 +475,13 @@ enum State {
         local: PointerTarget,
         local_position: Point,
         /// Motion since an edge return began, which the restore moves on from `local_position`;
-        /// `None` for a return that lands exactly where it was sent.
+        /// `None` for a return that lands exactly where it was sent. During a handover it is in
+        /// the handover display's units instead.
         carried: Option<Point>,
         ownership_epoch: Option<u64>,
+        /// The acknowledgement hands the pointer to a third peer instead of restoring locally;
+        /// `local` and `local_position` stay the restore point if it cannot.
+        handover: Option<HandoverTarget>,
     },
     AwaitLocalBarrier {
         local: PointerTarget,
@@ -420,6 +490,14 @@ enum State {
         ticket: Option<u64>,
     },
     Failed,
+}
+
+#[derive(Clone, Copy)]
+struct HandoverTarget {
+    to: PointerTarget,
+    entry: Point,
+    to_edge: Edge,
+    at_button: Option<Point>,
 }
 
 /// Outward push held against one linked edge: a run of pushing motion, arriving included, whose
@@ -534,6 +612,9 @@ impl RecentMotion {
 struct CaptureRoute {
     remote: bool,
     revision: u64,
+    /// This controller issued the route, so only it may restore it. A route adopted from another
+    /// peer's controller is tracked for tagging and revisions alone.
+    owned: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -580,6 +661,16 @@ impl SourceController {
         let home = PointerTarget::new(local_machine, local_display);
         let ownership =
             PointerOwnership::new(local_machine, home).map_err(|_| SourceConfigError::Ownership)?;
+        // A pairwise topology names its peer; a group's must be named with `with_peer`.
+        let peer = {
+            let mut others = topology
+                .displays()
+                .map(|display| display.machine)
+                .filter(|machine| *machine != local_machine);
+            others
+                .next()
+                .filter(|first| others.all(|machine| machine == *first))
+        };
         Ok(Self {
             floor: SharedFloor::new(),
             floor_claim: None,
@@ -596,6 +687,10 @@ impl SourceController {
             recent_motion: RecentMotion::default(),
             peer_offset: Point::default(),
             topology,
+            peer,
+            slot: FloorPeer::SOLE,
+            reachable: [None; MAX_GROUP_PEERS],
+            handover: None,
             ownership,
             home,
             state: State::Local {
@@ -612,6 +707,7 @@ impl SourceController {
             capture_route: CaptureRoute {
                 remote: false,
                 revision: 0,
+                owned: true,
             },
             next_route_request: 1,
             failed_route_request: None,
@@ -638,6 +734,73 @@ impl SourceController {
         self.floor = floor;
         self.enabled = enabled;
         self
+    }
+
+    /// Names the one peer of a group topology this controller's link reaches, and the floor slot
+    /// that peer holds the floor under.
+    pub fn with_peer(mut self, peer: DeviceId, slot: FloorPeer) -> Result<Self, SourceConfigError> {
+        let known = self
+            .topology
+            .displays()
+            .any(|display| display.machine == peer);
+        if peer == self.home.machine || !known || slot == FloorPeer::NONE {
+            return Err(SourceConfigError::UnknownPeer);
+        }
+        self.peer = Some(peer);
+        self.slot = slot;
+        Ok(self)
+    }
+
+    /// The third peers whose controllers can take a handover now; every other seam between two
+    /// peers stays a wall.
+    pub fn set_reachable(&mut self, peers: &[DeviceId]) {
+        self.reachable = [None; MAX_GROUP_PEERS];
+        for (slot, peer) in self.reachable.iter_mut().zip(peers) {
+            *slot = Some(*peer);
+        }
+    }
+
+    /// Starts a controller that joins a running group from the group's physical ledger and its
+    /// current capture route, which another controller issued.
+    pub fn seed_from_group(
+        &mut self,
+        keys: &[HidUsage],
+        buttons: &[MouseButton],
+        route: (bool, u64),
+        capture_ready: bool,
+    ) -> Result<(), SourceFailure> {
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+        if !matches!(self.state, State::Local { .. }) || self.floor_claim.is_some() {
+            return Err(SourceFailure::Ownership);
+        }
+        let (remote, revision) = route;
+        if (remote && revision == 0) || revision < self.capture_route.revision {
+            return Err(SourceFailure::RouteMismatch);
+        }
+        if keys.iter().any(|usage| !usage.is_valid()) {
+            return Err(SourceFailure::InvalidKeyState);
+        }
+        for state in &mut self.keys {
+            state.physical = false;
+        }
+        for state in &mut self.buttons {
+            state.physical = false;
+        }
+        for usage in keys {
+            self.keys[usize::from(usage.0)].physical = true;
+        }
+        for button in buttons {
+            self.buttons[button.index()].physical = true;
+        }
+        self.capture_route = CaptureRoute {
+            remote,
+            revision,
+            owned: false,
+        };
+        self.capture_ready = capture_ready;
+        Ok(())
     }
 
     pub fn floor_generation(&self) -> u64 {
@@ -695,7 +858,8 @@ impl SourceController {
             State::AwaitActivation {
                 capture_already_remote: false,
                 ..
-            } | State::AwaitRemoteBarrier { .. }
+            } | State::AwaitActivation { handover: true, .. }
+                | State::AwaitRemoteBarrier { .. }
                 | State::AwaitReleaseAcknowledgement {
                     carried: Some(_),
                     ..
@@ -938,7 +1102,7 @@ impl SourceController {
                 self.take_back = false;
                 self.declined = Some((return_target.display, target.display, Some(now), now));
                 log::info!("return: this computer's capture could not take over input yet");
-                self.begin_return_to(return_target, return_position, None, &mut effects);
+                self.begin_return_to(return_target, return_position, None, None, &mut effects);
             }
             _ => self.fail(SourceFailure::NativeControl, &mut effects),
         }
@@ -1107,6 +1271,7 @@ impl SourceController {
                 capture_already_remote,
                 carried,
                 at_button,
+                handover,
             } => {
                 let decline = match frame.message {
                     Message::ActivationDeclined { display_id, reason }
@@ -1145,7 +1310,9 @@ impl SourceController {
                     // A pressed seam retries every DECLINE_RETRY_AFTER: one line per streak.
                     if self.decline_logged != Some((target.display, reason)) {
                         self.decline_logged = Some((target.display, reason));
-                        if capture_already_remote {
+                        if handover {
+                            log::info!("return: the handover was declined ({reason:?})");
+                        } else if capture_already_remote {
                             log::info!("return: the other computer declined control ({reason:?})");
                         } else {
                             log::info!("crossing declined by the other computer ({reason:?})");
@@ -1167,6 +1334,7 @@ impl SourceController {
                             local_position: return_position,
                             carried: None,
                             ownership_epoch: None,
+                            handover: None,
                         };
                     } else {
                         self.state = State::Local {
@@ -1221,7 +1389,11 @@ impl SourceController {
                         let sent = self.peer_point(target.display, changed);
                         self.push_input(Message::Motion(Motion::Absolute(sent)), &mut effects);
                     }
-                    self.synchronize_reanchored_remote_input(&mut effects);
+                    if handover {
+                        self.transfer_to_remote(&mut effects);
+                    } else {
+                        self.synchronize_reanchored_remote_input(&mut effects);
+                    }
                     if self.failure.is_none() && position != changed {
                         let sent = self.peer_point(target.display, position);
                         self.push_input(Message::Motion(Motion::Absolute(sent)), &mut effects);
@@ -1301,7 +1473,109 @@ impl SourceController {
             _ => return self.outcome(effects),
         };
         log::info!("return: requested on this computer");
-        self.begin_return_to(local, local_position, None, &mut effects);
+        self.begin_return_to(local, local_position, None, None, &mut effects);
+        self.outcome(effects)
+    }
+
+    /// Takes the floor and remote capture route another peer's controller handed over, and asks
+    /// this peer to activate at the entry. Refused, the handover comes back in the outcome.
+    pub fn accept_handover(&mut self, handover: Handover, now: Duration) -> SourceOutcome {
+        let mut effects = SourceEffects::default();
+        let checked = self.failure.is_none()
+            && self.observe_time(now, &mut effects)
+            && self.check_health(now, &mut effects);
+        let acceptable = checked
+            && self.failure.is_none()
+            && self.enabled
+            && self.capture_ready
+            && self.held_since.is_none()
+            && matches!(self.state, State::Local { .. })
+            && self.floor_claim.is_none()
+            && self.peer == Some(handover.to.machine)
+            && self.is_peer_display(handover.to.display)
+            && handover.return_target.machine == self.home.machine
+            && self.is_home_display(handover.return_target.display)
+            && handover.route_revision != 0
+            && handover.route_revision >= self.capture_route.revision;
+        let taken = acceptable
+            .then(|| self.floor.hand_over(handover.claim, self.slot).ok())
+            .flatten();
+        let Some(sending) = taken else {
+            if self.failure.is_none() {
+                log::info!("handover: this computer's link could not take the pointer");
+            }
+            self.handover = Some(handover);
+            return self.outcome(effects);
+        };
+        self.floor_claim = Some(sending);
+        self.free_generation = handover.claimed_from;
+        self.rebase_pointer = false;
+        self.capture_route = CaptureRoute {
+            remote: true,
+            revision: handover.route_revision,
+            owned: true,
+        };
+        self.take_back = false;
+        self.declined = None;
+        self.state = State::Local {
+            target: handover.return_target,
+            cursor: Some(handover.return_position),
+        };
+        self.begin_remote_activation(
+            handover.to,
+            handover.entry,
+            handover.to_edge,
+            handover.return_target,
+            handover.return_position,
+            true,
+            &mut effects,
+        );
+        if let State::AwaitActivation {
+            carried,
+            at_button,
+            handover: taken_over,
+            ..
+        } = &mut self.state
+        {
+            *carried = handover.carried;
+            *at_button = handover.at_button;
+            *taken_over = true;
+        }
+        self.outcome(effects)
+    }
+
+    /// Adopts a capture route barrier another peer's controller issued. It only tags records and
+    /// advances revisions: this controller never restores a route it did not issue.
+    pub fn observe_foreign_route(
+        &mut self,
+        remote: bool,
+        revision: u64,
+        now: Duration,
+    ) -> SourceOutcome {
+        let mut effects = SourceEffects::default();
+        if self.failure.is_some() || !self.observe_time(now, &mut effects) {
+            return self.outcome(effects);
+        }
+        if !matches!(self.state, State::Local { .. }) || revision <= self.capture_route.revision {
+            self.fail(SourceFailure::UnexpectedRouteBarrier, &mut effects);
+        } else {
+            self.capture_route = CaptureRoute {
+                remote,
+                revision,
+                owned: false,
+            };
+        }
+        self.outcome(effects)
+    }
+
+    /// The link to this peer is gone: fails with [`SourceFailure::LinkEnded`]. Its frames go
+    /// nowhere; a local restore it yields is the caller's to complete before freeing the floor.
+    pub fn abandon(&mut self, now: Duration) -> SourceOutcome {
+        let mut effects = SourceEffects::default();
+        if self.failure.is_none() {
+            self.last_now = self.last_now.max(now);
+            self.fail(SourceFailure::LinkEnded, &mut effects);
+        }
         self.outcome(effects)
     }
 
@@ -1321,11 +1595,13 @@ impl SourceController {
     }
 
     /// `entry_guard` is the home edge an edge return lands on; every other return leaves none.
+    /// With `handover` the acknowledgement hands the pointer on instead of restoring it.
     fn begin_return_to(
         &mut self,
         local: PointerTarget,
         local_position: Point,
         entry_guard: Option<(DisplayId, Edge)>,
+        handover: Option<HandoverTarget>,
         effects: &mut SourceEffects,
     ) {
         if let Some(owned) = self.floor_claim {
@@ -1347,8 +1623,9 @@ impl SourceController {
             self.state = State::AwaitReleaseAcknowledgement {
                 local,
                 local_position,
-                carried: entry_guard.map(|_| Point::default()),
+                carried: (entry_guard.is_some() || handover.is_some()).then(Point::default),
                 ownership_epoch: Some(ownership_epoch),
+                handover,
             };
         }
     }
@@ -1543,7 +1820,7 @@ impl SourceController {
     }
 
     fn native_may_be_remote(&self) -> bool {
-        self.capture_route.remote
+        (self.capture_route.remote && self.capture_route.owned)
             || matches!(
                 self.state,
                 State::AwaitRemoteBarrier { .. }
@@ -1564,7 +1841,11 @@ impl SourceController {
                 ticket: Some(expected),
                 ..
             } if remote && revision == expected => {
-                self.capture_route = CaptureRoute { remote, revision };
+                self.capture_route = CaptureRoute {
+                    remote,
+                    revision,
+                    owned: true,
+                };
                 // Held input lands where the handover entered; the hand's motion since moves on.
                 self.transfer_to_remote(effects);
                 let landed = self.carried_on(target.display, position, carried);
@@ -1587,7 +1868,11 @@ impl SourceController {
                 ticket: Some(expected),
                 ..
             } if !remote && revision == expected => {
-                self.capture_route = CaptureRoute { remote, revision };
+                self.capture_route = CaptureRoute {
+                    remote,
+                    revision,
+                    owned: true,
+                };
                 // The native restore placed the cursor at `position` before this barrier.
                 self.anchored_return = true;
                 self.state = State::Local {
@@ -1691,15 +1976,23 @@ impl SourceController {
                 at,
             } => {
                 let change = self.update_button(button, pressed);
-                if change.was_physical != pressed
-                    && let State::AwaitActivation {
-                        capture_already_remote: true,
-                        carried,
-                        at_button,
-                        ..
-                    } = &mut self.state
-                {
-                    at_button.get_or_insert(*carried);
+                if change.was_physical != pressed {
+                    match &mut self.state {
+                        State::AwaitActivation {
+                            capture_already_remote: true,
+                            carried,
+                            at_button,
+                            ..
+                        }
+                        | State::AwaitReleaseAcknowledgement {
+                            carried: Some(carried),
+                            handover: Some(HandoverTarget { at_button, .. }),
+                            ..
+                        } => {
+                            at_button.get_or_insert(*carried);
+                        }
+                        _ => {}
+                    }
                 }
                 let State::Remote { position, .. } = self.state else {
                     return;
@@ -1832,26 +2125,27 @@ impl SourceController {
             target,
             cursor: Some(anchor),
         };
-        let (edge, transition) =
-            match self.linked_edge(target.display, anchor, None, guarded, |_| true) {
-                Ok(Some(found)) if !self.is_home_display(found.1.to_display) => found,
-                Ok(_) => {
-                    let touching = self.touching(target.display, anchor);
-                    for (slot, touching) in touching.into_iter().enumerate() {
-                        let why = if touching {
-                            PushEnd::Cleared
-                        } else {
-                            PushEnd::Inward
-                        };
-                        self.end_push_in(slot, why);
-                    }
-                    return;
+        let ours = |transition: &EdgeTransition| self.is_ours(transition.to_display);
+        let (edge, transition) = match self.linked_edge(target.display, anchor, None, guarded, ours)
+        {
+            Ok(Some(found)) if !self.is_home_display(found.1.to_display) => found,
+            Ok(_) => {
+                let touching = self.touching(target.display, anchor);
+                for (slot, touching) in touching.into_iter().enumerate() {
+                    let why = if touching {
+                        PushEnd::Cleared
+                    } else {
+                        PushEnd::Inward
+                    };
+                    self.end_push_in(slot, why);
                 }
-                Err(()) => {
-                    self.fail(SourceFailure::Topology, effects);
-                    return;
-                }
-            };
+                return;
+            }
+            Err(()) => {
+                self.fail(SourceFailure::Topology, effects);
+                return;
+            }
+        };
         let Ok(display) = self.topology.display(target.display) else {
             self.fail(SourceFailure::Topology, effects);
             return;
@@ -1977,9 +2271,10 @@ impl SourceController {
                 return;
             }
         };
-        // The other computer cannot take input while the link is down, and capture that cannot
-        // suppress yet cannot hand input over: either way the seam is a wall.
-        if self.held_since.is_some() || !self.capture_ready {
+        // The other computer cannot take input while the link is down, capture that cannot
+        // suppress yet cannot hand input over, and another peer's display is its controller's to
+        // cross onto: each way the seam is a wall.
+        if self.held_since.is_some() || !self.capture_ready || self.peer != Some(target.machine) {
             self.state = State::Local {
                 target: from,
                 cursor: Some(return_position),
@@ -2005,18 +2300,31 @@ impl SourceController {
             }
         }
         let snapshot = self.floor.snapshot();
-        match self.floor.transition(snapshot, FloorState::Requesting) {
+        match self
+            .floor
+            .claim(snapshot, FloorState::Requesting, self.slot)
+        {
             Ok(requesting) => self.floor_claim = Some(requesting),
             Err(_) => return,
         }
         self.declined = None;
-        self.begin_remote_activation(target, transition, from, return_position, false, effects);
+        self.begin_remote_activation(
+            target,
+            transition.entry_point,
+            transition.to_edge,
+            from,
+            return_position,
+            false,
+            effects,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn begin_remote_activation(
         &mut self,
         target: PointerTarget,
-        transition: EdgeTransition,
+        entry: Point,
+        to_edge: Edge,
         return_target: PointerTarget,
         return_position: Point,
         capture_already_remote: bool,
@@ -2031,8 +2339,7 @@ impl SourceController {
         };
         self.input_epoch = next_epoch;
         self.outbound_input_sequence = 0;
-        let entry = transition.entry_point;
-        self.entry_guard = Some((target.display, transition.to_edge));
+        self.entry_guard = Some((target.display, to_edge));
         // A local push outlives the request, so pushing on through a prompt decline retries
         // without starting over.
         if capture_already_remote {
@@ -2047,6 +2354,7 @@ impl SourceController {
             capture_already_remote,
             carried: Point::default(),
             at_button: None,
+            handover: false,
         };
         self.push_input(
             Message::ActivateDisplayAt {
@@ -2071,8 +2379,9 @@ impl SourceController {
             push.display == target.display && outward(push.edge, delta) < 0.0
         });
         let guarded = self.guarded_entry_edge(target.display, anchor);
+        let ours = |transition: &EdgeTransition| self.is_ours(transition.to_display);
         let (edge, transition) =
-            match self.linked_edge(target.display, anchor, Some(delta), guarded, |_| true) {
+            match self.linked_edge(target.display, anchor, Some(delta), guarded, ours) {
                 Ok(Some(found)) => found,
                 Ok(None) => return,
                 Err(()) => {
@@ -2148,6 +2457,25 @@ impl SourceController {
 
     fn is_home_display(&self, display_id: DisplayId) -> bool {
         self.is_display_of(self.home.machine, display_id)
+    }
+
+    fn is_peer_display(&self, display_id: DisplayId) -> bool {
+        self.peer
+            .is_some_and(|peer| self.is_display_of(peer, display_id))
+    }
+
+    /// This computer's or its own peer's: every display of a pairwise topology.
+    fn is_ours(&self, display_id: DisplayId) -> bool {
+        self.is_home_display(display_id) || self.is_peer_display(display_id)
+    }
+
+    /// A third peer's display whose controller can take the pointer over from this one's peer.
+    fn may_hand_over_to(&self, display_id: DisplayId) -> bool {
+        self.topology.display(display_id).is_ok_and(|display| {
+            display.machine != self.home.machine
+                && Some(display.machine) != self.peer
+                && self.reachable.contains(&Some(display.machine))
+        })
     }
 
     fn is_display_of(&self, machine: DeviceId, display_id: DisplayId) -> bool {
@@ -2287,6 +2615,11 @@ impl SourceController {
             State::AwaitActivation { target, .. } | State::AwaitRemoteBarrier { target, .. } => {
                 Some(target.display)
             }
+            State::AwaitReleaseAcknowledgement {
+                carried: Some(_),
+                handover: Some(handover),
+                ..
+            } => Some(handover.to.display),
             State::AwaitReleaseAcknowledgement {
                 local,
                 carried: Some(_),
@@ -2466,9 +2799,13 @@ impl SourceController {
         let heading = self.recent_motion.sum;
         let within =
             |transition: &EdgeTransition| self.is_display_of(target.machine, transition.to_display);
-        let beyond = |transition: &EdgeTransition| !within(transition);
+        let beyond = |transition: &EdgeTransition| {
+            self.is_home_display(transition.to_display)
+                || self.may_hand_over_to(transition.to_display)
+        };
         // Motion stopped at a boundary with another of the controlled computer's displays goes on
-        // at once, unless the hand heads straight home through a seam there, which takes a push.
+        // at once, unless the hand heads straight home, or on to a third peer, through a seam
+        // there, which takes a push.
         let (onward, seam, home) = match (
             self.linked_edge(target.display, next, Some(stopped), guarded, within),
             self.linked_edge(target.display, position, Some(delta), guarded, beyond),
@@ -2537,15 +2874,36 @@ impl SourceController {
                 target,
                 transition.entry_point,
                 Some((target.display, transition.to_edge)),
+                None,
                 effects,
             );
         } else if target.machine == from.machine {
             self.begin_remote_activation(
                 target,
-                transition,
+                transition.entry_point,
+                transition.to_edge,
                 return_target,
                 return_position,
                 true,
+                effects,
+            );
+        } else if self.may_hand_over_to(target.display)
+            && self.floor_claim.is_some()
+            && self.capture_route.remote
+            && self.capture_route.owned
+        {
+            log::info!("handover: the pointer crossed on to another computer");
+            // Released here and acknowledged, the pointer goes on without coming home between.
+            self.begin_return_to(
+                return_target,
+                return_position,
+                None,
+                Some(HandoverTarget {
+                    to: target,
+                    entry: transition.entry_point,
+                    to_edge: transition.to_edge,
+                    at_button: None,
+                }),
                 effects,
             );
         } else {
@@ -2724,13 +3082,12 @@ impl SourceController {
             local_position,
             carried,
             ownership_epoch,
+            handover,
         } = self.state
         else {
             self.fail(SourceFailure::InvalidReleaseAcknowledgement, effects);
             return;
         };
-        let local_position =
-            self.carried_on(local.display, local_position, carried.unwrap_or_default());
         if let Some(epoch) = ownership_epoch
             && self
                 .ownership
@@ -2745,6 +3102,35 @@ impl SourceController {
         }
         self.remote_target = None;
         self.clear_remote_delivery();
+        if let Some(target) = handover {
+            let Some(claim) = self.floor_claim.take() else {
+                self.fail(SourceFailure::Ownership, effects);
+                return;
+            };
+            // The floor and the remote route pass on as they are; the restore is not this
+            // controller's any more, so local input comes back only when the floor comes home.
+            self.handover = Some(Handover {
+                to: target.to,
+                entry: target.entry,
+                to_edge: target.to_edge,
+                carried: carried.unwrap_or_default(),
+                at_button: target.at_button,
+                return_target: local,
+                return_position: local_position,
+                claim,
+                claimed_from: self.free_generation,
+                route_revision: self.capture_route.revision,
+            });
+            self.capture_route.owned = false;
+            self.rebase_pointer = true;
+            self.state = State::Local {
+                target: local,
+                cursor: None,
+            };
+            return;
+        }
+        let local_position =
+            self.carried_on(local.display, local_position, carried.unwrap_or_default());
         if self.capture_route.remote {
             let Some(request) = self.allocate_route_request(effects) else {
                 return;
@@ -3058,7 +3444,7 @@ impl SourceController {
                 {
                     self.take_back = false;
                     log::info!("return: the other computer took control back");
-                    self.begin_return_to(return_target, return_position, None, &mut effects);
+                    self.begin_return_to(return_target, return_position, None, None, &mut effects);
                 } else if matches!(self.state, State::Local { .. }) {
                     self.take_back = false;
                 }
@@ -3072,6 +3458,7 @@ impl SourceController {
         SourceOutcome {
             effects,
             failure: self.failure,
+            handover: self.handover.take(),
         }
     }
 }

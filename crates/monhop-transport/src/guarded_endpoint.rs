@@ -11,17 +11,19 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use monhop_core::revocation::RevocationSignal;
-use tokio::{sync::watch, task::JoinSet};
+use quinn::AsyncUdpSocket;
+use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use crate::{
     crypto::{
-        CertificateFingerprint, DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig,
-        VerifiedPeer,
+        CertificateFingerprint, DeviceIdentity, LOCAL_TLS_SERVER_NAME, RefusedCertificate,
+        SecureQuicConfig, VerifiedPeer,
     },
     policy::{MAX_PINNED_PEERS, is_private_or_link_local},
 };
@@ -30,6 +32,12 @@ use socket::{DatagramIo, GuardedSocket};
 
 /// Incoming handshakes one member may have running at once; more are refused until one ends.
 const MAX_MEMBER_HANDSHAKES: usize = 2;
+/// Incoming handshakes one member may start back to back before its budget runs dry.
+const MEMBER_HANDSHAKE_BURST: u32 = 4;
+/// How often a member's budget regains one incoming handshake.
+const MEMBER_HANDSHAKE_REFILL: Duration = Duration::from_secs(1);
+/// An incoming handshake still unfinished after this is closed, freeing its member's slot.
+const INCOMING_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Identifies a failed native route check without exposing platform error details.
 #[derive(Debug)]
@@ -45,10 +53,33 @@ impl std::error::Error for RouteCheckFailure {}
 
 /// A paired computer's incoming handshake failed, or finished without binding to that computer.
 /// Either way its connection is closed; other members are unaffected.
+///
+/// Neither `member` nor `cause` is authenticated: `member` names whichever member's recorded
+/// address the attempt came from, and any cause but [`Self::certificate_refused`] may be a close
+/// the remote sent before the handshake proved who it was.
 pub struct MemberHandshakeFailure {
     pub member: CertificateFingerprint,
     /// None when the handshake finished but did not come from the member's address and pin.
     pub cause: Option<quinn::ConnectionError>,
+    /// The certificate this computer's pin refused on this attempt, when it refused one.
+    pub refused: Option<CertificateFingerprint>,
+}
+
+impl MemberHandshakeFailure {
+    /// Whether this computer's pin refused the certificate presented on this attempt: the only
+    /// handshake failure that says the member's identity changed.
+    pub fn certificate_refused(&self) -> bool {
+        self.cause.as_ref().is_some_and(refused_by_this_computer)
+    }
+
+    fn into_io_error(self) -> io::Error {
+        let kind = if self.cause.is_some() {
+            io::ErrorKind::Other
+        } else {
+            io::ErrorKind::PermissionDenied
+        };
+        io::Error::new(kind, self)
+    }
 }
 
 impl fmt::Debug for MemberHandshakeFailure {
@@ -57,6 +88,10 @@ impl fmt::Debug for MemberHandshakeFailure {
             .debug_struct("MemberHandshakeFailure")
             .field("member", &self.member.short_hex())
             .field("cause", &self.cause)
+            .field(
+                "refused",
+                &self.refused.map(CertificateFingerprint::short_hex),
+            )
             .finish()
     }
 }
@@ -77,6 +112,20 @@ impl std::error::Error for MemberHandshakeFailure {
             .as_ref()
             .map(|cause| cause as &(dyn std::error::Error + 'static))
     }
+}
+
+/// This computer's pin refused the certificate presented on this connection. Quinn reports an
+/// alert this computer raised as a transport error and a remote's close as `ConnectionClosed`; the
+/// pin's refusal is raised as `AccessDenied`.
+pub(crate) fn refused_by_this_computer(error: &quinn::ConnectionError) -> bool {
+    matches!(
+        error,
+        quinn::ConnectionError::TransportError(local)
+            if local.code
+                == quinn::TransportErrorCode::crypto(
+                    rustls::AlertDescription::AccessDenied.into()
+                )
+    )
 }
 
 /// A user-selected adapter identity and exact numeric endpoints. No discovery or port fallback.
@@ -116,7 +165,7 @@ pub struct GroupMember {
 }
 
 /// A user-selected adapter and the fixed set of paired computers one endpoint admits. The set
-/// never changes for the endpoint's life; a different set needs a new bind.
+/// never grows for the endpoint's life; a different set needs a new bind.
 #[derive(Clone)]
 pub struct GroupSelection {
     pub stable_id: String,
@@ -135,22 +184,27 @@ impl GroupSelection {
             self.local,
             &addresses,
         )?;
-        let local = identity.fingerprint();
-        for (index, member) in self.members.iter().enumerate() {
-            let pin = member.pin.fingerprint();
-            if pin == local
-                || self.members[..index]
-                    .iter()
-                    .any(|earlier| earlier.pin.fingerprint() == pin)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "each paired computer needs its own certificate",
-                ));
-            }
-        }
+        validate_pins(identity, &self.members)?;
         Ok(pinned)
     }
+}
+
+fn validate_pins(identity: &DeviceIdentity, members: &[GroupMember]) -> io::Result<()> {
+    let local = identity.fingerprint();
+    for (index, member) in members.iter().enumerate() {
+        let pin = member.pin.fingerprint();
+        if pin == local
+            || members[..index]
+                .iter()
+                .any(|earlier| earlier.pin.fingerprint() == pin)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "each paired computer needs its own certificate",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The adapter, local address and paired peer addresses one socket is pinned to.
@@ -209,20 +263,34 @@ struct Member {
     fingerprint: CertificateFingerprint,
     client: quinn::ClientConfig,
     server: Arc<quinn::ServerConfig>,
+    /// What this member's two pins last refused.
+    refused: RefusedCertificate,
+    /// Set once the member is forgotten, and never cleared for the endpoint's life.
+    forgotten: AtomicBool,
+}
+
+impl Member {
+    fn admitted(&self) -> bool {
+        !self.forgotten.load(Ordering::SeqCst)
+    }
 }
 
 fn member_configs(identity: &DeviceIdentity, members: &[GroupMember]) -> io::Result<Box<[Member]>> {
     members
         .iter()
         .map(|member| {
+            let refused = RefusedCertificate::default();
             Ok(Member {
                 address: member.address,
                 fingerprint: member.pin.fingerprint(),
-                client: SecureQuicConfig::client(identity, &member.pin)
+                client: SecureQuicConfig::client_recording(identity, &member.pin, refused.clone())
                     .map_err(io::Error::other)?,
                 server: Arc::new(
-                    SecureQuicConfig::server(identity, &member.pin).map_err(io::Error::other)?,
+                    SecureQuicConfig::server_recording(identity, &member.pin, refused.clone())
+                        .map_err(io::Error::other)?,
                 ),
+                refused,
+                forgotten: AtomicBool::new(false),
             })
         })
         .collect()
@@ -237,8 +305,10 @@ struct Shared {
 }
 
 impl Shared {
+    /// Only a member still admitted: a forgotten one is no longer paired on this endpoint.
     fn member(&self, fingerprint: CertificateFingerprint) -> io::Result<&Member> {
-        self.members
+        let member = self
+            .members
             .iter()
             .find(|member| member.fingerprint == fingerprint)
             .ok_or_else(|| {
@@ -246,7 +316,46 @@ impl Shared {
                     io::ErrorKind::InvalidInput,
                     "that computer is not paired on this endpoint",
                 )
-            })
+            })?;
+        if !member.admitted() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "that computer is no longer paired on this endpoint",
+            ));
+        }
+        Ok(member)
+    }
+
+    /// The admitted member recorded at exactly `remote`, IP and port.
+    fn admitted_index(&self, remote: SocketAddr) -> Option<usize> {
+        let SocketAddr::V4(remote) = remote else {
+            return None;
+        };
+        self.members
+            .iter()
+            .position(|member| member.address == remote)
+            .filter(|&index| self.members[index].admitted())
+    }
+
+    fn admits(&self, fingerprint: CertificateFingerprint) -> bool {
+        self.member(fingerprint).is_ok()
+    }
+
+    fn forget(&self, fingerprint: CertificateFingerprint) {
+        if let Some(member) = self
+            .members
+            .iter()
+            .find(|member| member.fingerprint == fingerprint)
+        {
+            member.forgotten.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn take_refused(&self, fingerprint: CertificateFingerprint) -> Option<CertificateFingerprint> {
+        self.members
+            .iter()
+            .find(|member| member.fingerprint == fingerprint)
+            .and_then(|member| member.refused.take())
     }
 
     fn endpoint(&self) -> Option<quinn::Endpoint> {
@@ -310,30 +419,40 @@ impl Shared {
         let member = self.member(fingerprint).inspect_err(|_| {
             connection.close(0_u32.into(), b"not a paired computer");
         })?;
-        bind_to_member(member, connection)
+        if let Err(error) = self.check_active() {
+            connection.close(0_u32.into(), b"network revoked");
+            return Err(error);
+        }
+        if bind_to_member(member, connection) {
+            Ok(())
+        } else {
+            Err(unbound(member).into_io_error())
+        }
     }
 }
 
 /// A finished connection must come from the member's recorded address and present exactly its
 /// pinned certificate; anything else is closed.
-fn bind_to_member(member: &Member, connection: &quinn::Connection) -> io::Result<()> {
+fn bind_to_member(member: &Member, connection: &quinn::Connection) -> bool {
     if connection.remote_address() == SocketAddr::V4(member.address)
         && observed_fingerprint(connection) == Some(member.fingerprint)
     {
-        return Ok(());
+        return true;
     }
     log::warn!(
         "guarded endpoint: a connection did not bind to paired computer {}; closed",
         member.fingerprint.short_hex()
     );
     connection.close(0_u32.into(), b"not the paired computer");
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        MemberHandshakeFailure {
-            member: member.fingerprint,
-            cause: None,
-        },
-    ))
+    false
+}
+
+fn unbound(member: &Member) -> MemberHandshakeFailure {
+    MemberHandshakeFailure {
+        member: member.fingerprint,
+        cause: None,
+        refused: None,
+    }
 }
 
 fn observed_fingerprint(connection: &quinn::Connection) -> Option<CertificateFingerprint> {
@@ -354,17 +473,29 @@ fn observed_fingerprint(connection: &quinn::Connection) -> Option<CertificateFin
 pub struct GuardedEndpoint {
     endpoint: quinn::Endpoint,
     shared: Arc<Shared>,
-    network: tokio::runtime::Handle,
-    handshakes: tokio::sync::Mutex<Handshakes>,
+    /// Empty once an accept loop elsewhere took it; incoming connections never have two owners.
+    acceptor: tokio::sync::Mutex<Option<Acceptor>>,
     socket_lifetime: watch::Receiver<()>,
     _watch: Option<native::Watch>,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
-/// Incoming handshakes still running, so one member's stalled attempt never holds up another's.
-struct Handshakes {
+/// Every incoming handshake and its admission. One exists per endpoint, so two accept loops never
+/// split incoming connections between them.
+pub(crate) struct Acceptor {
+    shared: Arc<Shared>,
+    network: tokio::runtime::Handle,
     running: JoinSet<Handshake>,
     pending: Arc<[AtomicUsize]>,
+    budgets: Box<[HandshakeBudget]>,
+}
+
+/// What one accept produced.
+pub(crate) enum Accepted {
+    /// A finished handshake, already bound to this member's address and pin.
+    Member(CertificateFingerprint, quinn::Connection),
+    /// One member's attempt failed; its connection is closed.
+    Failed(MemberHandshakeFailure),
 }
 
 struct Handshake {
@@ -382,6 +513,196 @@ struct PendingSlot {
 impl Drop for PendingSlot {
     fn drop(&mut self) {
         self.pending[self.member].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A token bucket over one member's incoming handshakes, so a flood from one recorded address
+/// never takes another member's turn or the network thread.
+struct HandshakeBudget {
+    tokens: u32,
+    refilled: Instant,
+}
+
+impl HandshakeBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: MEMBER_HANDSHAKE_BURST,
+            refilled: now,
+        }
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        if self.tokens < MEMBER_HANDSHAKE_BURST {
+            let earned = now.saturating_duration_since(self.refilled).as_nanos()
+                / MEMBER_HANDSHAKE_REFILL.as_nanos();
+            let earned = u32::try_from(earned).unwrap_or(u32::MAX);
+            if earned > 0 {
+                self.tokens = self
+                    .tokens
+                    .saturating_add(earned)
+                    .min(MEMBER_HANDSHAKE_BURST);
+                // Below the cap, earned < BURST, so the product cannot overflow.
+                self.refilled = if self.tokens == MEMBER_HANDSHAKE_BURST {
+                    now
+                } else {
+                    self.refilled + MEMBER_HANDSHAKE_REFILL * earned
+                };
+            }
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        // A full bucket earns nothing, so its refill clock starts at the first take.
+        if self.tokens == MEMBER_HANDSHAKE_BURST {
+            self.refilled = now;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+impl Acceptor {
+    fn new(shared: Arc<Shared>, network: tokio::runtime::Handle) -> Self {
+        let now = Instant::now();
+        let members = shared.members.len();
+        Self {
+            pending: (0..members).map(|_| AtomicUsize::new(0)).collect(),
+            budgets: (0..members).map(|_| HandshakeBudget::new(now)).collect(),
+            running: JoinSet::new(),
+            shared,
+            network,
+        }
+    }
+
+    /// The next finished handshake from an admitted member, or one member's failed attempt.
+    /// Incoming from a member `claimed` rejects is refused before any TLS runs, and so is every
+    /// attempt past the member's concurrency and rate budget. Handshakes run concurrently and
+    /// outlive a dropped call for the next one to return. An error means the endpoint is revoked.
+    pub(crate) async fn accept_any(
+        &mut self,
+        claimed: &impl Fn(CertificateFingerprint) -> bool,
+    ) -> io::Result<Accepted> {
+        self.shared.check_active()?;
+        let Some(endpoint) = self.shared.endpoint() else {
+            return Err(socket::revoked_error());
+        };
+        loop {
+            tokio::select! {
+                biased;
+                Some(finished) = self.running.join_next(), if !self.running.is_empty() => {
+                    match finished {
+                        Ok(handshake) => {
+                            if let Some(accepted) = self.finish_handshake(handshake)? {
+                                return Ok(accepted);
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("guarded endpoint: an incoming handshake stopped: {error}");
+                        }
+                    }
+                }
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        return Err(self.shared.stopped("accept"));
+                    };
+                    self.shared.check_active()?;
+                    self.start_handshake(&endpoint, incoming, claimed)?;
+                }
+            }
+        }
+    }
+
+    fn start_handshake(
+        &mut self,
+        endpoint: &quinn::Endpoint,
+        incoming: quinn::Incoming,
+        claimed: &impl Fn(CertificateFingerprint) -> bool,
+    ) -> io::Result<()> {
+        let Some(index) = self.shared.admitted_index(incoming.remote_address()) else {
+            incoming.ignore();
+            return Ok(());
+        };
+        if !claimed(self.shared.members[index].fingerprint) {
+            incoming.refuse();
+            return Ok(());
+        }
+        // A stateless retry proves the sender receives at the member's address before any TLS
+        // runs or budget is spent, so a blind spoofer can neither start a handshake nor close one.
+        if !incoming.remote_address_validated() {
+            if let Err(error) = incoming.retry() {
+                error.into_incoming().ignore();
+            }
+            return Ok(());
+        }
+        if self.pending[index].load(Ordering::Relaxed) >= MAX_MEMBER_HANDSHAKES
+            || !self.budgets[index].take(Instant::now())
+        {
+            incoming.refuse();
+            return Ok(());
+        }
+        let server = self.shared.members[index].server.clone();
+        let connecting = match register_incoming(endpoint, &self.shared.signal, incoming, server) {
+            Ok(connecting) => connecting,
+            Err(error) => {
+                self.shared.check_active()?;
+                log::debug!("guarded endpoint: an incoming handshake could not start: {error}");
+                return Ok(());
+            }
+        };
+        self.pending[index].fetch_add(1, Ordering::Relaxed);
+        let slot = PendingSlot {
+            pending: self.pending.clone(),
+            member: index,
+        };
+        // Dropping an unfinished handshake at its deadline closes it.
+        self.running.spawn_on(
+            async move {
+                let result = tokio::time::timeout(INCOMING_HANDSHAKE_DEADLINE, connecting)
+                    .await
+                    .unwrap_or(Err(quinn::ConnectionError::TimedOut));
+                Handshake {
+                    member: index,
+                    result,
+                    _slot: slot,
+                }
+            },
+            &self.network,
+        );
+        Ok(())
+    }
+
+    /// None for a member forgotten while its handshake ran: its connection is closed unreported.
+    fn finish_handshake(&self, handshake: Handshake) -> io::Result<Option<Accepted>> {
+        let member = &self.shared.members[handshake.member];
+        let connection = match handshake.result {
+            Ok(connection) => connection,
+            Err(_) if !member.admitted() => return Ok(None),
+            Err(cause) => {
+                let refused = if refused_by_this_computer(&cause) {
+                    member.refused.take()
+                } else {
+                    None
+                };
+                return Ok(Some(Accepted::Failed(MemberHandshakeFailure {
+                    member: member.fingerprint,
+                    cause: Some(cause),
+                    refused,
+                })));
+            }
+        };
+        if let Err(error) = self.shared.check_active() {
+            connection.close(0_u32.into(), b"network revoked");
+            return Err(error);
+        }
+        if !member.admitted() {
+            connection.close(0_u32.into(), b"not a paired computer");
+            return Ok(None);
+        }
+        Ok(Some(if bind_to_member(member, &connection) {
+            Accepted::Member(member.fingerprint, connection)
+        } else {
+            Accepted::Failed(unbound(member))
+        }))
     }
 }
 
@@ -417,13 +738,26 @@ impl EndpointHandle {
     }
 
     /// Checks that `connection` came from `member`'s recorded address with exactly its pinned
-    /// certificate. Anything else closes the connection.
+    /// certificate on an endpoint still active. Anything else closes the connection.
     pub fn confirm_member(
         &self,
         member: CertificateFingerprint,
         connection: &quinn::Connection,
     ) -> io::Result<()> {
         self.shared.confirm_member(member, connection)
+    }
+
+    /// Whether `member` is paired on this endpoint and not forgotten.
+    pub fn admits(&self, member: CertificateFingerprint) -> bool {
+        self.shared.admits(member)
+    }
+
+    /// The certificate `member`'s pins refused since the last call, for one diagnostic line.
+    pub(crate) fn take_refused_certificate(
+        &self,
+        member: CertificateFingerprint,
+    ) -> Option<CertificateFingerprint> {
+        self.shared.take_refused(member)
     }
 
     pub fn is_revoked(&self) -> bool {
@@ -433,6 +767,23 @@ impl EndpointHandle {
     pub fn revoker(&self) -> EndpointRevoker {
         EndpointRevoker {
             shared: self.shared.clone(),
+        }
+    }
+}
+
+/// What carries QUIC for one endpoint: the socket, its revocation and its lifetime.
+struct Carrier {
+    socket: Arc<dyn AsyncUdpSocket>,
+    signal: RevocationSignal,
+    lifetime: watch::Receiver<()>,
+}
+
+impl Carrier {
+    fn guarded<I: DatagramIo>(socket: GuardedSocket<I>) -> Self {
+        Self {
+            signal: socket.revocation(),
+            lifetime: socket.lifetime(),
+            socket: Arc::new(socket),
         }
     }
 }
@@ -489,44 +840,49 @@ impl GuardedEndpoint {
             &pinned.peers,
             prepared.signal,
         )?;
-        Self::assemble(socket, members, refusing, runtime, Some(prepared.watch))
+        Self::assemble(
+            Carrier::guarded(socket),
+            members,
+            refusing,
+            runtime,
+            Some(prepared.watch),
+        )
     }
 
     /// No default client config: every dial names one member's pinned configuration.
-    fn assemble<I: DatagramIo>(
-        socket: GuardedSocket<I>,
+    fn assemble(
+        carrier: Carrier,
         members: Box<[Member]>,
         refusing: quinn::ServerConfig,
         runtime: HandleRuntime,
         watch: Option<native::Watch>,
     ) -> io::Result<Self> {
-        let signal = socket.revocation();
-        let socket_lifetime = socket.lifetime();
+        let Carrier {
+            socket,
+            signal,
+            lifetime,
+        } = carrier;
         let network = runtime.handle().clone();
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             Some(refusing),
-            Arc::new(socket),
+            socket,
             Arc::new(runtime),
         )?;
         if signal.is_revoked() {
             endpoint.close(0_u32.into(), b"network revoked");
             return Err(socket::revoked_error());
         }
-        let pending = members.iter().map(|_| AtomicUsize::new(0)).collect();
+        let shared = Arc::new(Shared {
+            members,
+            signal,
+            endpoint: Mutex::new(Some(endpoint.clone())),
+        });
         Ok(Self {
-            shared: Arc::new(Shared {
-                members,
-                signal,
-                endpoint: Mutex::new(Some(endpoint.clone())),
-            }),
+            acceptor: tokio::sync::Mutex::new(Some(Acceptor::new(shared.clone(), network))),
+            shared,
             endpoint,
-            network,
-            handshakes: tokio::sync::Mutex::new(Handshakes {
-                running: JoinSet::new(),
-                pending,
-            }),
-            socket_lifetime,
+            socket_lifetime: lifetime,
             _watch: watch,
             _owner_thread: PhantomData,
         })
@@ -539,31 +895,8 @@ impl GuardedEndpoint {
 
     /// Accepts only the configured peer identity. No alternate TLS configuration is exposed.
     pub async fn accept(&self) -> io::Result<quinn::Connection> {
-        let member = self.sole_member()?;
-        self.check_active()?;
-        loop {
-            let Some(incoming) = self.endpoint.accept().await else {
-                return Err(self.shared.stopped("accept"));
-            };
-            self.check_active()?;
-            if incoming.remote_address() != SocketAddr::V4(member.address) {
-                incoming.ignore();
-                continue;
-            }
-            let connecting = register_incoming(
-                &self.endpoint,
-                &self.shared.signal,
-                incoming,
-                member.server.clone(),
-            )?;
-            let connection = connecting.await.map_err(io::Error::other)?;
-            if let Err(error) = self.check_active() {
-                connection.close(0_u32.into(), b"network revoked");
-                return Err(error);
-            }
-            bind_to_member(member, &connection)?;
-            return Ok(connection);
-        }
+        self.sole_member()?;
+        self.accept_any().await.map(|(_, connection)| connection)
     }
 
     /// Dials `member`'s recorded address with only its pinned configuration. Once the handshake
@@ -573,7 +906,7 @@ impl GuardedEndpoint {
     }
 
     /// Checks that `connection` came from `member`'s recorded address with exactly its pinned
-    /// certificate. Anything else closes the connection.
+    /// certificate on an endpoint still active. Anything else closes the connection.
     pub fn confirm_member(
         &self,
         member: CertificateFingerprint,
@@ -584,103 +917,42 @@ impl GuardedEndpoint {
 
     /// The next finished handshake from any member, already bound to that member. Each attempt
     /// uses only the pinned configuration of the member at its exact address; any other address is
-    /// ignored without a reply. Handshakes run concurrently, so a stalled one never holds up
-    /// another member, and they outlive a dropped call for the next one to return. A
-    /// `MemberHandshakeFailure` ends one attempt only; any other error means the endpoint is
-    /// revoked.
+    /// ignored without a reply, and an unvalidated address is answered only with a retry.
+    /// Handshakes run concurrently, so a stalled one never holds up another member, and they
+    /// outlive a dropped call for the next one to return. A `MemberHandshakeFailure` ends one
+    /// attempt only; any other error means the endpoint is revoked or its incoming connections
+    /// belong to another accept loop.
     pub async fn accept_any(&self) -> io::Result<(CertificateFingerprint, quinn::Connection)> {
-        self.check_active()?;
-        let mut handshakes = self.handshakes.lock().await;
-        loop {
-            tokio::select! {
-                biased;
-                Some(finished) = handshakes.running.join_next(),
-                    if !handshakes.running.is_empty() =>
-                {
-                    match finished {
-                        Ok(handshake) => return self.finish_handshake(handshake),
-                        Err(error) => {
-                            log::warn!("guarded endpoint: an incoming handshake stopped: {error}");
-                        }
-                    }
-                }
-                incoming = self.endpoint.accept() => {
-                    let Some(incoming) = incoming else {
-                        return Err(self.shared.stopped("accept"));
-                    };
-                    self.check_active()?;
-                    self.start_handshake(&mut handshakes, incoming)?;
-                }
-            }
+        let mut acceptor = self.acceptor.lock().await;
+        let acceptor = acceptor.as_mut().ok_or_else(accepted_elsewhere)?;
+        match acceptor.accept_any(&|_| true).await? {
+            Accepted::Member(member, connection) => Ok((member, connection)),
+            Accepted::Failed(failure) => Err(failure.into_io_error()),
         }
     }
 
-    fn start_handshake(
-        &self,
-        handshakes: &mut Handshakes,
-        incoming: quinn::Incoming,
-    ) -> io::Result<()> {
-        let found = match incoming.remote_address() {
-            SocketAddr::V4(remote) => self
-                .shared
-                .members
-                .iter()
-                .position(|member| member.address == remote),
-            SocketAddr::V6(_) => None,
-        };
-        let Some(index) = found else {
-            incoming.ignore();
-            return Ok(());
-        };
-        if handshakes.pending[index].load(Ordering::Relaxed) >= MAX_MEMBER_HANDSHAKES {
-            incoming.refuse();
-            return Ok(());
-        }
-        let server = self.shared.members[index].server.clone();
-        let connecting =
-            match register_incoming(&self.endpoint, &self.shared.signal, incoming, server) {
-                Ok(connecting) => connecting,
-                Err(error) => {
-                    self.check_active()?;
-                    log::debug!("guarded endpoint: an incoming handshake could not start: {error}");
-                    return Ok(());
-                }
-            };
-        handshakes.pending[index].fetch_add(1, Ordering::Relaxed);
-        let slot = PendingSlot {
-            pending: handshakes.pending.clone(),
-            member: index,
-        };
-        handshakes.running.spawn_on(
-            async move {
-                Handshake {
-                    member: index,
-                    result: connecting.await,
-                    _slot: slot,
-                }
-            },
-            &self.network,
-        );
-        Ok(())
+    /// Hands every incoming connection to one accept loop elsewhere on the network runtime; this
+    /// endpoint's own accepts fail from then on.
+    pub(crate) fn take_acceptor(&self) -> io::Result<Acceptor> {
+        self.acceptor
+            .try_lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .ok_or_else(accepted_elsewhere)
     }
 
-    fn finish_handshake(
+    /// Stops admitting `member` without a rebind: its incoming is ignored, and dialing or
+    /// confirming it fails. The socket still passes its packets until the next bind.
+    pub(crate) fn forget_member(&self, member: CertificateFingerprint) {
+        self.shared.forget(member);
+    }
+
+    /// The certificate `member`'s pins refused since the last call, for one diagnostic line.
+    pub(crate) fn take_refused_certificate(
         &self,
-        handshake: Handshake,
-    ) -> io::Result<(CertificateFingerprint, quinn::Connection)> {
-        let member = &self.shared.members[handshake.member];
-        let connection = handshake.result.map_err(|cause| {
-            io::Error::other(MemberHandshakeFailure {
-                member: member.fingerprint,
-                cause: Some(cause),
-            })
-        })?;
-        if let Err(error) = self.check_active() {
-            connection.close(0_u32.into(), b"network revoked");
-            return Err(error);
-        }
-        bind_to_member(member, &connection)?;
-        Ok((member.fingerprint, connection))
+        member: CertificateFingerprint,
+    ) -> Option<CertificateFingerprint> {
+        self.shared.take_refused(member)
     }
 
     /// A handle other threads can hold to dial members or revoke.
@@ -730,10 +1002,6 @@ impl GuardedEndpoint {
         self.endpoint.close(0_u32.into(), b"network revoked");
     }
 
-    fn check_active(&self) -> io::Result<()> {
-        self.shared.check_active()
-    }
-
     /// The single-peer calls name no member, so they refuse an endpoint admitting several.
     fn sole_member(&self) -> io::Result<&Member> {
         match &*self.shared.members {
@@ -746,6 +1014,10 @@ impl GuardedEndpoint {
     }
 }
 
+fn accepted_elsewhere() -> io::Error {
+    io::Error::other("another accept loop owns this endpoint's incoming connections")
+}
+
 #[cfg(test)]
 impl GuardedEndpoint {
     /// A group endpoint over a test socket that is already pinned, checked as a bind checks it.
@@ -756,7 +1028,7 @@ impl GuardedEndpoint {
     ) -> io::Result<Self> {
         selection.validate(identity)?;
         Self::assemble(
-            socket,
+            Carrier::guarded(socket),
             member_configs(identity, &selection.members)?,
             SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?,
             HandleRuntime::current()?,
@@ -809,6 +1081,250 @@ impl Drop for GuardedEndpoint {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+    }
+}
+
+/// Plain loopback UDP for endpoint tests. Admission, pins, retry, budgets and binding run as on
+/// the pinned socket; that socket's interface and address filters do not.
+#[cfg(test)]
+pub(crate) mod loopback {
+    use std::{
+        io::IoSliceMut,
+        net::{Ipv4Addr, UdpSocket},
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use quinn::{
+        Runtime, UdpPoller,
+        udp::{RecvMeta, Transmit},
+    };
+
+    use super::*;
+
+    pub(crate) fn bind() -> UdpSocket {
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()
+    }
+
+    pub(crate) fn address(socket: &UdpSocket) -> SocketAddrV4 {
+        match socket.local_addr().unwrap() {
+            SocketAddr::V4(address) => address,
+            SocketAddr::V6(_) => unreachable!("bound to IPv4 loopback"),
+        }
+    }
+
+    pub(crate) fn pin(identity: &DeviceIdentity) -> VerifiedPeer {
+        VerifiedPeer::from_certificate_der(
+            identity.certificate_der(),
+            &identity.fingerprint().full_hex(),
+        )
+        .unwrap()
+    }
+
+    /// Stops like the pinned socket: nothing leaves once revoked, and the receive driver ends.
+    struct Loopback {
+        inner: Arc<dyn AsyncUdpSocket>,
+        signal: RevocationSignal,
+        _lifetime: watch::Sender<()>,
+    }
+
+    impl fmt::Debug for Loopback {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Loopback")
+        }
+    }
+
+    impl AsyncUdpSocket for Loopback {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            self.inner.clone().create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+            if self.signal.is_revoked() {
+                return Ok(());
+            }
+            self.inner.try_send(transmit)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context<'_>,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            if self.signal.poll_revoked(cx).is_ready() {
+                return Poll::Ready(Err(socket::revoked_error()));
+            }
+            self.inner.poll_recv(cx, bufs, meta)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            self.inner.max_transmit_segments()
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            self.inner.max_receive_segments()
+        }
+
+        fn may_fragment(&self) -> bool {
+            self.inner.may_fragment()
+        }
+    }
+
+    impl GuardedEndpoint {
+        /// A group endpoint on `socket` admitting exactly `members`, each pinned as a bind pins it.
+        pub(crate) fn over_loopback(
+            socket: UdpSocket,
+            identity: &DeviceIdentity,
+            members: &[GroupMember],
+        ) -> io::Result<Self> {
+            validate_pins(identity, members)?;
+            let lifetime = watch::Sender::new(());
+            let signal = RevocationSignal::default();
+            let carrier = Carrier {
+                lifetime: lifetime.subscribe(),
+                socket: Arc::new(Loopback {
+                    inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
+                    signal: signal.clone(),
+                    _lifetime: lifetime,
+                }),
+                signal,
+            };
+            Self::assemble(
+                carrier,
+                member_configs(identity, members)?,
+                SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?,
+                HandleRuntime::current()?,
+                None,
+            )
+        }
+    }
+
+    /// A plain peer's socket that hears only its first `heard` receives and keeps the first byte
+    /// of every datagram it drops.
+    pub(crate) struct Hearing {
+        inner: Arc<dyn AsyncUdpSocket>,
+        heard: AtomicUsize,
+        dropped: Mutex<Vec<u8>>,
+    }
+
+    impl Hearing {
+        /// The first byte of every datagram dropped so far.
+        pub(crate) fn dropped(&self) -> Vec<u8> {
+            self.dropped.lock().unwrap().clone()
+        }
+    }
+
+    impl fmt::Debug for Hearing {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Hearing")
+        }
+    }
+
+    impl AsyncUdpSocket for Hearing {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            self.inner.clone().create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+            self.inner.try_send(transmit)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context<'_>,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            loop {
+                let count = match self.inner.poll_recv(cx, bufs, meta) {
+                    Poll::Ready(Ok(count)) => count,
+                    other => return other,
+                };
+                let hears = self
+                    .heard
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok();
+                if hears {
+                    return Poll::Ready(Ok(count));
+                }
+                let mut dropped = self.dropped.lock().unwrap();
+                for (buffer, meta) in bufs.iter().zip(meta.iter()).take(count) {
+                    let stride = meta.stride.max(1);
+                    dropped.extend((0..meta.len).step_by(stride).map(|start| buffer[start]));
+                }
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        fn max_transmit_segments(&self) -> usize {
+            self.inner.max_transmit_segments()
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            self.inner.max_receive_segments()
+        }
+
+        fn may_fragment(&self) -> bool {
+            self.inner.may_fragment()
+        }
+    }
+
+    /// A plain, unguarded peer on `socket` that dials with `identity`, pinning `server`, and hears
+    /// only its first `heard` receives.
+    pub(crate) fn peer(
+        socket: UdpSocket,
+        identity: &DeviceIdentity,
+        server: &VerifiedPeer,
+        heard: usize,
+    ) -> (quinn::Endpoint, Arc<Hearing>) {
+        let hearing = Arc::new(Hearing {
+            inner: quinn::TokioRuntime.wrap_udp_socket(socket).unwrap(),
+            heard: AtomicUsize::new(heard),
+            dropped: Mutex::default(),
+        });
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            hearing.clone(),
+            Arc::new(quinn::TokioRuntime),
+        )
+        .unwrap();
+        endpoint.set_default_client_config(SecureQuicConfig::client(identity, server).unwrap());
+        (endpoint, hearing)
+    }
+
+    /// A plain peer that hears everything.
+    pub(crate) fn dialer(
+        socket: UdpSocket,
+        identity: &DeviceIdentity,
+        server: &VerifiedPeer,
+    ) -> quinn::Endpoint {
+        peer(socket, identity, server, usize::MAX).0
+    }
+
+    /// A plain peer that accepts only `client`, answering without address validation.
+    pub(crate) fn listener(
+        socket: UdpSocket,
+        identity: &DeviceIdentity,
+        client: &VerifiedPeer,
+    ) -> quinn::Endpoint {
+        quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(SecureQuicConfig::server(identity, client).unwrap()),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .unwrap()
     }
 }
 
@@ -970,5 +1486,311 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    #[test]
+    fn a_member_handshake_budget_refills_one_per_interval_up_to_its_burst() {
+        let start = Instant::now();
+        let mut budget = HandshakeBudget::new(start);
+        for _ in 0..MEMBER_HANDSHAKE_BURST {
+            assert!(budget.take(start));
+        }
+        assert!(!budget.take(start));
+        assert!(!budget.take(start + MEMBER_HANDSHAKE_REFILL / 2));
+        assert!(budget.take(start + MEMBER_HANDSHAKE_REFILL));
+        assert!(!budget.take(start + MEMBER_HANDSHAKE_REFILL));
+        let idle = start + MEMBER_HANDSHAKE_REFILL * 100;
+        for _ in 0..MEMBER_HANDSHAKE_BURST {
+            assert!(budget.take(idle));
+        }
+        assert!(!budget.take(idle));
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use std::net::UdpSocket;
+
+    use super::{
+        loopback::{self, pin},
+        *,
+    };
+
+    const DEADLINE: Duration = Duration::from_secs(2);
+
+    /// A hub endpoint on loopback admitting one member per identity, and each member's socket.
+    fn hub(
+        hub_id: &DeviceIdentity,
+        members: &[&DeviceIdentity],
+    ) -> (GuardedEndpoint, Vec<(UdpSocket, SocketAddrV4)>) {
+        let sockets: Vec<_> = members
+            .iter()
+            .map(|_| {
+                let socket = loopback::bind();
+                let address = loopback::address(&socket);
+                (socket, address)
+            })
+            .collect();
+        let group: Vec<_> = members
+            .iter()
+            .zip(&sockets)
+            .map(|(identity, (_, address))| GroupMember {
+                address: *address,
+                pin: pin(identity),
+            })
+            .collect();
+        let hub = GuardedEndpoint::over_loopback(loopback::bind(), hub_id, &group).unwrap();
+        (hub, sockets)
+    }
+
+    fn local(hub: &GuardedEndpoint) -> SocketAddr {
+        hub.endpoint.local_addr().unwrap()
+    }
+
+    /// A spoofer that can send from a member's recorded address but never receive there gets
+    /// only retries: no TLS flight is sent and no connection state is created for it.
+    #[tokio::test]
+    async fn unvalidated_incoming_is_retried_before_tls() {
+        let hub_id = DeviceIdentity::generate().unwrap();
+        let spoofed_id = DeviceIdentity::generate().unwrap();
+        let member_id = DeviceIdentity::generate().unwrap();
+        let (hub, mut sockets) = hub(&hub_id, &[&spoofed_id, &member_id]);
+        let (member_socket, _) = sockets.pop().unwrap();
+        let (spoofed_socket, _) = sockets.pop().unwrap();
+        let (spoofer, deaf) = loopback::peer(spoofed_socket, &spoofed_id, &pin(&hub_id), 0);
+        let blind = spoofer.connect(local(&hub), LOCAL_TLS_SERVER_NAME).unwrap();
+
+        tokio::select! {
+            _ = hub.accept_any() => panic!("a spoofed attempt finished a handshake"),
+            () = async {
+                while deaf.dropped().len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+            () = tokio::time::sleep(DEADLINE) => panic!("the spoofed address got no answer"),
+        }
+        let answers = deaf.dropped();
+        assert!(
+            answers.iter().all(|first| first & 0xF0 == 0xF0),
+            "only retry packets answer an unvalidated address: {answers:02X?}"
+        );
+        assert_eq!(hub.endpoint.stats().accepted_handshakes, 0);
+        assert_eq!(hub.endpoint.open_connections(), 0);
+        drop(blind);
+
+        // A member that receives at its address passes the retry and connects.
+        let member = loopback::dialer(member_socket, &member_id, &pin(&hub_id));
+        let (dialed, accepted) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                async {
+                    member
+                        .connect(local(&hub), LOCAL_TLS_SERVER_NAME)
+                        .unwrap()
+                        .await
+                },
+                hub.accept_any()
+            )
+        })
+        .await
+        .expect("a validated member connects");
+        dialed.unwrap();
+        let (accepted, _connection) = accepted.unwrap();
+        assert!(accepted == member_id.fingerprint());
+        assert_eq!(hub.endpoint.stats().accepted_handshakes, 1);
+        hub.revoke();
+    }
+
+    /// Once a member passes the retry and then stops answering, its handshake is closed at the
+    /// deadline instead of holding a slot until the idle timeout.
+    #[tokio::test]
+    async fn a_stalled_incoming_handshake_ends_at_its_deadline() {
+        let hub_id = DeviceIdentity::generate().unwrap();
+        let member_id = DeviceIdentity::generate().unwrap();
+        let (hub, mut sockets) = hub(&hub_id, &[&member_id]);
+        let (socket, _) = sockets.pop().unwrap();
+        // Hears the retry, then nothing: the server's TLS flight never arrives.
+        let (stalled, _) = loopback::peer(socket, &member_id, &pin(&hub_id), 1);
+        let _attempt = stalled.connect(local(&hub), LOCAL_TLS_SERVER_NAME).unwrap();
+        let started = std::time::Instant::now();
+        let failed = tokio::time::timeout(INCOMING_HANDSHAKE_DEADLINE + DEADLINE, hub.accept_any())
+            .await
+            .expect("the stalled handshake ended at its deadline")
+            .err()
+            .expect("the stalled handshake failed");
+        assert!(started.elapsed() >= INCOMING_HANDSHAKE_DEADLINE - Duration::from_millis(100));
+        let failure = failed
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<MemberHandshakeFailure>())
+            .expect("one member's failure");
+        assert!(failure.member == member_id.fingerprint());
+        assert!(matches!(
+            failure.cause,
+            Some(quinn::ConnectionError::TimedOut)
+        ));
+        assert!(!failure.certificate_refused());
+        hub.revoke();
+    }
+
+    #[tokio::test]
+    async fn handshake_rate_limit_is_per_member() {
+        let hub_id = DeviceIdentity::generate().unwrap();
+        let flooding_id = DeviceIdentity::generate().unwrap();
+        let other_id = DeviceIdentity::generate().unwrap();
+        let (hub, mut sockets) = hub(&hub_id, &[&flooding_id, &other_id]);
+        let (other_socket, _) = sockets.pop().unwrap();
+        let (flooding_socket, _) = sockets.pop().unwrap();
+        let flooding = loopback::dialer(flooding_socket, &flooding_id, &pin(&hub_id));
+        let other = loopback::dialer(other_socket, &other_id, &pin(&hub_id));
+
+        // One at a time, so only the rate budget, never the concurrency limit, can refuse.
+        let mut refused = None;
+        for attempt in 1..=MEMBER_HANDSHAKE_BURST * 5 {
+            let connecting = flooding
+                .connect(local(&hub), LOCAL_TLS_SERVER_NAME)
+                .unwrap();
+            let (dialed, accepted) = tokio::join!(
+                tokio::time::timeout(DEADLINE, connecting),
+                tokio::time::timeout(DEADLINE, hub.accept_any())
+            );
+            match dialed.expect("each attempt is answered") {
+                Ok(connection) => {
+                    let (member, _accepted) = accepted.unwrap().unwrap();
+                    assert!(member == flooding_id.fingerprint());
+                    connection.close(0_u32.into(), b"next attempt");
+                }
+                Err(error) => {
+                    assert!(accepted.is_err(), "a refused attempt reaches no accept");
+                    refused = Some((attempt, error));
+                    break;
+                }
+            }
+        }
+        let (attempt, error) = refused.expect("the flooding member ran out of budget");
+        assert!(attempt > MEMBER_HANDSHAKE_BURST, "refused after {attempt}");
+        assert!(
+            matches!(
+                &error,
+                quinn::ConnectionError::ConnectionClosed(close)
+                    if close.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED
+            ),
+            "{error}"
+        );
+
+        // The other member's budget is untouched.
+        let (dialed, accepted) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                async {
+                    other
+                        .connect(local(&hub), LOCAL_TLS_SERVER_NAME)
+                        .unwrap()
+                        .await
+                },
+                hub.accept_any()
+            )
+        })
+        .await
+        .expect("the other member connects at once");
+        dialed.unwrap();
+        assert!(accepted.unwrap().0 == other_id.fingerprint());
+        hub.revoke();
+    }
+
+    #[tokio::test]
+    async fn confirming_on_a_revoked_endpoint_closes_the_connection() {
+        let hub_id = DeviceIdentity::generate().unwrap();
+        let member_id = DeviceIdentity::generate().unwrap();
+        let (hub, mut sockets) = hub(&hub_id, &[&member_id]);
+        let (socket, member) = sockets.pop().unwrap();
+        let listener = loopback::listener(socket, &member_id, &pin(&hub_id));
+        let (dialed, _answered) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                async {
+                    hub.connect_member(member_id.fingerprint())
+                        .unwrap()
+                        .await
+                        .unwrap()
+                },
+                async { listener.accept().await.unwrap().await.unwrap() }
+            )
+        })
+        .await
+        .expect("the member answers");
+        assert_eq!(dialed.remote_address(), SocketAddr::V4(member));
+        // Only the signal: the connection itself still binds to the member's address and pin.
+        hub.shared.signal.revoke();
+        assert_eq!(
+            hub.confirm_member(member_id.fingerprint(), &dialed)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert!(dialed.close_reason().is_some());
+        hub.revoke();
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_member_is_ignored_and_can_no_longer_be_dialed_or_confirmed() {
+        let hub_id = DeviceIdentity::generate().unwrap();
+        let forgotten_id = DeviceIdentity::generate().unwrap();
+        let kept_id = DeviceIdentity::generate().unwrap();
+        let (hub, mut sockets) = hub(&hub_id, &[&forgotten_id, &kept_id]);
+        let (kept_socket, _) = sockets.pop().unwrap();
+        let (forgotten_socket, _) = sockets.pop().unwrap();
+        let forgotten = loopback::dialer(forgotten_socket, &forgotten_id, &pin(&hub_id));
+        let kept = loopback::dialer(kept_socket, &kept_id, &pin(&hub_id));
+
+        let (dialed, accepted) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                async {
+                    forgotten
+                        .connect(local(&hub), LOCAL_TLS_SERVER_NAME)
+                        .unwrap()
+                        .await
+                        .unwrap()
+                },
+                hub.accept_any()
+            )
+        })
+        .await
+        .expect("the member connects before it is forgotten");
+        let (_, connection) = accepted.unwrap();
+        hub.forget_member(forgotten_id.fingerprint());
+        assert!(!hub.handle().admits(forgotten_id.fingerprint()));
+        assert!(hub.handle().admits(kept_id.fingerprint()));
+        assert_eq!(
+            hub.connect_member(forgotten_id.fingerprint())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            hub.confirm_member(forgotten_id.fingerprint(), &connection)
+                .is_err()
+        );
+        tokio::time::timeout(DEADLINE, dialed.closed())
+            .await
+            .expect("confirming a forgotten member closes its connection");
+
+        let ignored = forgotten
+            .connect(local(&hub), LOCAL_TLS_SERVER_NAME)
+            .unwrap();
+        let kept_dial = kept.connect(local(&hub), LOCAL_TLS_SERVER_NAME).unwrap();
+        let (ignored, kept_dialed, (first, second)) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(500), ignored),
+            kept_dial,
+            async {
+                let first = hub.accept_any().await;
+                let second = tokio::time::timeout(Duration::from_millis(600), hub.accept_any());
+                (first, second.await)
+            }
+        );
+        assert!(ignored.is_err(), "a forgotten member gets no answer");
+        kept_dialed.unwrap();
+        assert!(first.unwrap().0 == kept_id.fingerprint());
+        assert!(second.is_err(), "nothing but the kept member was accepted");
+        let stats = hub.endpoint.stats();
+        assert_eq!(stats.accepted_handshakes, 2);
+        assert!(stats.ignored_handshakes > 0);
+        hub.revoke();
     }
 }

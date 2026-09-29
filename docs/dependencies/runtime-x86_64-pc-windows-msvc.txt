@@ -1,3 +1,4 @@
+adler2 v2.0.1 0BSD OR MIT OR Apache-2.0
 aho-corasick v1.1.5 Unlicense OR MIT
 alloc-no-stdlib v2.0.4 BSD-3-Clause
 alloc-stdlib v0.2.4 BSD-3-Clause
@@ -34,6 +35,8 @@ equivalent v1.0.2 Apache-2.0 OR MIT
 erased-serde v0.4.10 MIT OR Apache-2.0
 error-code v3.4.0 BSL-1.0
 fastrand v2.5.0 Apache-2.0 OR MIT
+fdeflate v0.3.7 MIT OR Apache-2.0
+flate2 v1.1.10 MIT OR Apache-2.0
 fnv v1.0.7 Apache-2.0 / MIT
 form_urlencoded v1.2.2 MIT OR Apache-2.0
 futures-channel v0.3.34 MIT OR Apache-2.0
@@ -79,6 +82,8 @@ lru-slab v0.1.2 MIT OR Apache-2.0 OR Zlib
 memchr v2.8.3 Unlicense OR MIT
 mime v0.3.17 MIT OR Apache-2.0
 minisign-verify v0.2.5 MIT
+miniz_oxide v0.8.9 MIT OR Zlib OR Apache-2.0
+miniz_oxide v0.9.1 MIT OR Zlib OR Apache-2.0
 mio v1.2.3 MIT
 monhop v0.2.2 (MonHop original source) GPL-3.0-or-later
 monhop-core v0.2.2 (MonHop original source) GPL-3.0-or-later
@@ -98,6 +103,7 @@ phf v0.13.1 MIT
 phf_shared v0.13.1 MIT
 pin-project-lite v0.2.17 Apache-2.0 OR MIT
 plist v1.10.1 MIT
+png v0.18.1 MIT OR Apache-2.0
 potential_utf v0.1.6 Unicode-3.0
 powerfmt v0.2.0 MIT OR Apache-2.0
 quick-xml v0.42.0 MIT
@@ -130,6 +136,7 @@ serde_spanned v1.1.1 MIT OR Apache-2.0
 serde_with v3.23.0 MIT OR Apache-2.0
 serialize-to-javascript v0.1.2 MIT OR Apache-2.0
 sha2 v0.11.0 MIT OR Apache-2.0
+simd-adler32 v0.3.10 MIT
 siphasher v1.0.3 MIT/Apache-2.0
 slab v0.4.12 MIT
 smallvec v1.16.0 MIT OR Apache-2.0
