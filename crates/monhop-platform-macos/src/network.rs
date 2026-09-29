@@ -41,13 +41,17 @@ const RTA_IFP: i32 = 0x10;
 const RTA_IFA: i32 = 0x20;
 const RTF_UP: i32 = 0x1;
 const RTF_GATEWAY: i32 = 0x2;
+const RTF_HOST: i32 = 0x4;
 const RTF_REJECT: i32 = 0x8;
 const RTF_LLINFO: i32 = 0x400;
+const RTF_STATIC: i32 = 0x800;
 const RTF_BLACKHOLE: i32 = 0x1000;
 const RTF_LOCAL: i32 = 0x20_0000;
 const RTF_BROADCAST: i32 = 0x40_0000;
 const RTF_MULTICAST: i32 = 0x80_0000;
 const RTF_IFSCOPE: i32 = 0x100_0000;
+const ESRCH: i32 = 3;
+const EHOSTDOWN: i32 = 64;
 pub(crate) const IPPROTO_IP: c_int = 0;
 const IP_RECVIF: c_int = 20;
 const IP_BOUND_IF: c_int = 25;
@@ -341,10 +345,16 @@ pub fn best_route(source: Ipv4Addr, peer: Ipv4Addr) -> io::Result<Route> {
                 "the requested source is not a live physical Ethernet or Wi-Fi interface",
             )
         })?;
-    let route = kernel_route_lookup(peer, scope)?;
+    let RouteReply { route, rejected } = kernel_route_lookup(peer, scope)?;
     if route.interface_index != scope || route.source != source {
         return Err(io::Error::other(
             "the kernel-selected route does not use the requested interface and source address",
+        ));
+    }
+    if rejected {
+        return Err(io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "the peer stopped answering address resolution on the selected interface",
         ));
     }
     Ok(route)
@@ -610,7 +620,7 @@ fn adapter_from_record(
     }
 }
 
-fn kernel_route_lookup(peer: Ipv4Addr, scope: u32) -> io::Result<Route> {
+fn kernel_route_lookup(peer: Ipv4Addr, scope: u32) -> io::Result<RouteReply> {
     // SAFETY: this opens the local routing-control plane, never a peer data endpoint.
     let fd = unsafe { socket(PF_ROUTE, SOCK_RAW, 0) };
     if fd < 0 {
@@ -653,7 +663,9 @@ fn kernel_route_lookup(peer: Ipv4Addr, scope: u32) -> io::Result<Route> {
         )
     };
     if written < 0 {
-        return Err(io::Error::last_os_error());
+        // XNU returns a failed lookup to the writer as well as in the reply.
+        let error = io::Error::last_os_error();
+        return Err(error.raw_os_error().map_or(error, route_lookup_error));
     }
     if usize::try_from(written).ok() != Some(size_of::<RouteRequest>()) {
         return Err(io::Error::new(
@@ -924,12 +936,20 @@ struct PollFd {
     revents: i16,
 }
 
+/// An RTM_GET answer. `rejected` marks the host entry the kernel sets RTF_REJECT on once address
+/// resolution gives up: that one peer is unreachable, while the interface itself is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RouteReply {
+    route: Route,
+    rejected: bool,
+}
+
 fn parse_route_reply(
     message: &[u8],
     expected_pid: i32,
     expected_sequence: i32,
     peer: Ipv4Addr,
-) -> io::Result<Option<Route>> {
+) -> io::Result<Option<RouteReply>> {
     if message.len() < size_of::<RtMsgHdr>() {
         return Err(io::Error::other("route reply is shorter than its header"));
     }
@@ -953,14 +973,19 @@ fn parse_route_reply(
     }
     let error = read_i32(message, offset_of!(RtMsgHdr, error))?;
     if error != 0 {
-        return Err(io::Error::from_raw_os_error(error));
+        return Err(route_lookup_error(error));
     }
     let interface_index = u32::from(read_u16(message, offset_of!(RtMsgHdr, interface_index))?);
     let flags = read_i32(message, offset_of!(RtMsgHdr, flags))?;
     let addresses = read_i32(message, offset_of!(RtMsgHdr, addresses))?;
+    let rejected = flags & RTF_REJECT != 0;
+    // Only the kernel's own address-resolution entry means one peer is down; any other reject
+    // route, a static host block included, is a configured block and fails the check.
     if interface_index == 0
         || flags & RTF_UP == 0
-        || flags & (RTF_REJECT | RTF_BLACKHOLE | RTF_LOCAL | RTF_BROADCAST | RTF_MULTICAST) != 0
+        || flags & (RTF_BLACKHOLE | RTF_LOCAL | RTF_BROADCAST | RTF_MULTICAST) != 0
+        || rejected && flags & (RTF_GATEWAY | RTF_STATIC) != 0
+        || rejected && flags & (RTF_HOST | RTF_LLINFO) != RTF_HOST | RTF_LLINFO
     {
         return Err(io::Error::other("macOS returned an ineligible route"));
     }
@@ -986,11 +1011,29 @@ fn parse_route_reply(
             .gateway
             .ok_or_else(|| io::Error::other("macOS route reply omitted its IPv4 gateway"))?
     };
-    Ok(Some(Route {
-        interface_index,
-        source,
-        next_hop,
+    Ok(Some(RouteReply {
+        route: Route {
+            interface_index,
+            source,
+            next_hop,
+        },
+        rejected,
     }))
+}
+
+/// Only "no route" and "host down" mean one peer is unreachable; every other error fails the check.
+fn route_lookup_error(errno: i32) -> io::Error {
+    match errno {
+        ESRCH => io::Error::new(
+            io::ErrorKind::NetworkUnreachable,
+            "macOS has no route to the peer",
+        ),
+        EHOSTDOWN => io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            "macOS reports the peer down",
+        ),
+        _ => io::Error::from_raw_os_error(errno),
+    }
 }
 
 #[derive(Default)]
@@ -1450,10 +1493,13 @@ mod tests {
         );
         assert_eq!(
             parse_route_reply(&message, 17, 9, peer).unwrap(),
-            Some(Route {
-                interface_index: 4,
-                source: Ipv4Addr::new(192, 168, 1, 10),
-                next_hop: Ipv4Addr::UNSPECIFIED,
+            Some(RouteReply {
+                route: Route {
+                    interface_index: 4,
+                    source: Ipv4Addr::new(192, 168, 1, 10),
+                    next_hop: Ipv4Addr::UNSPECIFIED,
+                },
+                rejected: false,
             })
         );
     }
@@ -1472,10 +1518,13 @@ mod tests {
         );
         assert_eq!(
             parse_route_reply(&message, 17, 9, peer).unwrap(),
-            Some(Route {
-                interface_index: 4,
-                source: Ipv4Addr::new(192, 168, 1, 10),
-                next_hop: Ipv4Addr::new(192, 168, 1, 1),
+            Some(RouteReply {
+                route: Route {
+                    interface_index: 4,
+                    source: Ipv4Addr::new(192, 168, 1, 10),
+                    next_hop: Ipv4Addr::new(192, 168, 1, 1),
+                },
+                rejected: false,
             })
         );
 
@@ -1496,12 +1545,83 @@ mod tests {
         );
         assert_eq!(
             parse_route_reply(&default_route, 18, 10, Ipv4Addr::new(203, 0, 113, 20)).unwrap(),
-            Some(Route {
-                interface_index: 4,
-                source: Ipv4Addr::new(192, 168, 1, 10),
-                next_hop: Ipv4Addr::new(192, 168, 1, 1),
+            Some(RouteReply {
+                route: Route {
+                    interface_index: 4,
+                    source: Ipv4Addr::new(192, 168, 1, 10),
+                    next_hop: Ipv4Addr::new(192, 168, 1, 1),
+                },
+                rejected: false,
             })
         );
+    }
+
+    #[test]
+    fn route_parser_reads_a_resolution_reject_as_one_peer_down() {
+        let peer = Ipv4Addr::new(192, 168, 1, 20);
+        let source = Ipv4Addr::new(192, 168, 1, 10);
+        let host = |flags| route_reply(17, 9, peer, None, source, None, flags);
+        assert_eq!(
+            parse_route_reply(
+                &host(RTF_UP | RTF_HOST | RTF_LLINFO | RTF_REJECT),
+                17,
+                9,
+                peer
+            )
+            .unwrap()
+            .map(|reply| reply.rejected),
+            Some(true)
+        );
+        assert_eq!(
+            parse_route_reply(&host(RTF_UP | RTF_HOST | RTF_LLINFO), 17, 9, peer)
+                .unwrap()
+                .map(|reply| reply.rejected),
+            Some(false)
+        );
+        for blocked in [
+            RTF_UP | RTF_HOST | RTF_LLINFO | RTF_REJECT | RTF_BLACKHOLE,
+            RTF_UP | RTF_HOST | RTF_LLINFO | RTF_REJECT | RTF_BROADCAST,
+            RTF_UP | RTF_HOST | RTF_LLINFO | RTF_REJECT | RTF_GATEWAY,
+            RTF_UP | RTF_HOST | RTF_LLINFO | RTF_REJECT | RTF_STATIC,
+            RTF_UP | RTF_HOST | RTF_REJECT | RTF_STATIC,
+            RTF_UP | RTF_HOST | RTF_REJECT,
+        ] {
+            let error = parse_route_reply(&host(blocked), 17, 9, peer).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other, "{blocked:#x}");
+        }
+        let subnet_block = route_reply(
+            17,
+            9,
+            Ipv4Addr::new(192, 168, 1, 0),
+            Some(24),
+            source,
+            None,
+            RTF_UP | RTF_REJECT,
+        );
+        let error = parse_route_reply(&subnet_block, 17, 9, peer).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn route_lookup_errors_separate_one_peer_down_from_a_failed_check() {
+        let peer = Ipv4Addr::new(192, 168, 1, 20);
+        let failed = |errno| {
+            let mut message = route_reply(
+                17,
+                9,
+                Ipv4Addr::new(192, 168, 1, 0),
+                Some(24),
+                Ipv4Addr::new(192, 168, 1, 10),
+                None,
+                RTF_UP,
+            );
+            write_i32(&mut message, offset_of!(RtMsgHdr, error), errno);
+            parse_route_reply(&message, 17, 9, peer).unwrap_err().kind()
+        };
+        assert_eq!(failed(ESRCH), io::ErrorKind::NetworkUnreachable);
+        assert_eq!(failed(EHOSTDOWN), io::ErrorKind::HostUnreachable);
+        assert_eq!(failed(65), io::ErrorKind::HostUnreachable);
+        assert_eq!(failed(1), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -1578,6 +1698,28 @@ mod tests {
             error.to_string(),
             "the kernel-selected route does not use the requested interface and source address"
         );
+    }
+
+    #[test]
+    #[ignore = "set MONHOP_TEST_SOURCE and MONHOP_TEST_SILENT_PEER to an unused address on its subnet"]
+    fn native_lookup_reports_a_neighbor_that_never_answers_as_host_unreachable() {
+        let source = test_ipv4("MONHOP_TEST_SOURCE");
+        let silent = test_ipv4("MONHOP_TEST_SILENT_PEER");
+        let socket = UdpSocket::bind((source, 0)).expect("expected a socket on the source");
+        let index = enumerate_adapters()
+            .expect("expected adapter diagnostics")
+            .into_iter()
+            .find(|adapter| adapter.address == source)
+            .expect("expected the source's interface")
+            .index;
+        restrict_udp_interface(&socket, index).expect("expected the probe pinned like a session");
+        // Each send is one address-resolution attempt; XNU marks the entry rejected once they run out.
+        for _ in 0..8 {
+            let _ = socket.send_to(&[0], (silent, 9));
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+        }
+        let error = best_route(source, silent).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::HostUnreachable, "{error}");
     }
 
     #[test]
