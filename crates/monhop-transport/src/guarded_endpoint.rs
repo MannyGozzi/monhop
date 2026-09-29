@@ -490,6 +490,7 @@ pub struct GuardedEndpoint {
     /// Empty once an accept loop elsewhere took it; incoming connections never have two owners.
     acceptor: tokio::sync::Mutex<Option<Acceptor>>,
     socket_lifetime: watch::Receiver<()>,
+    _readmission: Option<native::Readmission>,
     _watch: Option<native::Watch>,
     _owner_thread: PhantomData<Rc<()>>,
 }
@@ -855,7 +856,7 @@ impl GuardedEndpoint {
         let runtime = HandleRuntime::current()?;
         let members = member_configs(identity, &selection.members)?;
         let refusing = SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?;
-        let prepared = native::prepare(&pinned)?;
+        let prepared = native::prepare(&pinned, runtime.handle())?;
         let socket = GuardedSocket::new(
             prepared.socket,
             &prepared.lock,
@@ -870,6 +871,7 @@ impl GuardedEndpoint {
             refusing,
             runtime,
             Some(prepared.watch),
+            prepared.readmission,
         )
     }
 
@@ -880,6 +882,7 @@ impl GuardedEndpoint {
         refusing: quinn::ServerConfig,
         runtime: HandleRuntime,
         watch: Option<native::Watch>,
+        readmission: Option<native::Readmission>,
     ) -> io::Result<Self> {
         let Carrier {
             socket,
@@ -915,6 +918,7 @@ impl GuardedEndpoint {
             shared,
             endpoint,
             socket_lifetime: lifetime,
+            _readmission: readmission,
             _watch: watch,
             _owner_thread: PhantomData,
         })
@@ -1058,13 +1062,36 @@ impl GuardedEndpoint {
         selection: &GroupSelection,
         identity: &DeviceIdentity,
     ) -> io::Result<Self> {
+        Self::over_socket_rechecking(socket, selection, identity, None)
+    }
+
+    /// As `over_socket`, and while a member is set aside `recheck` runs its check on its interval
+    /// the way a bind runs its network watch's check.
+    fn over_socket_rechecking<I: DatagramIo>(
+        socket: GuardedSocket<I>,
+        selection: &GroupSelection,
+        identity: &DeviceIdentity,
+        recheck: Option<(native::SharedCheck, Duration)>,
+    ) -> io::Result<Self> {
         selection.validate(identity)?;
+        let carrier = Carrier::guarded(socket);
+        let runtime = HandleRuntime::current()?;
+        let readmission = recheck.map(|(check, interval)| {
+            native::Readmission::start(
+                runtime.handle(),
+                check,
+                carrier.signal.clone(),
+                carrier.reachability.clone(),
+                interval,
+            )
+        });
         Self::assemble(
-            Carrier::guarded(socket),
+            carrier,
             member_configs(identity, &selection.members)?,
             SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?,
-            HandleRuntime::current()?,
+            runtime,
             None,
+            readmission,
         )
     }
 
@@ -1237,6 +1264,7 @@ pub(crate) mod loopback {
                 member_configs(identity, members)?,
                 SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?,
                 HandleRuntime::current()?,
+                None,
                 None,
             )
         }

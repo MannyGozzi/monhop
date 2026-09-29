@@ -10,7 +10,6 @@ use std::{
 };
 
 use monhop_core::{MonitorIdentity, Platform, Point};
-use monhop_protocol::ControlPermissions;
 use monhop_transport::{
     crypto::CertificateFingerprint,
     pairing::opposite_platform,
@@ -23,19 +22,20 @@ use monhop_transport::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::computers::{ComputerList, LIST_FILE};
 use crate::group_record::{GroupRecord, MAX_GROUP_MEMBERS};
-use crate::sharing::{
-    ArrangementRequest, LayoutRequest, parse_display, parse_link, validated_layout,
-};
+use crate::sharing::{ArrangementRequest, LayoutRequest, parse_display, parse_link};
 
-/// One computer's saved setup record; also the wire format shared at Apply.
+/// A pairwise layout as the version 2 arrangement library and the version 3 setup file keep it.
 pub const SHARING_PREFERENCES_VERSION: u8 = 2;
 /// The file holding every group's record, the active group, and the network.
+pub const SETUP_FILE: &str = "sharing-groups.json";
 pub const SETUP_FILE_VERSION: u8 = 4;
+/// Where version 3 kept its setup, beside `SETUP_FILE`. It is only ever read, so an older MonHop
+/// still finds its own setup there.
+const V3_SETUP_FILE: &str = "sharing-setup.json";
 /// The file before groups: one record per paired computer, read only to migrate it.
 const SETUP_FILE_V3_VERSION: u8 = 3;
-/// The layout both computers exchange at Apply.
-const SHARED_SETUP_VERSION: u8 = 2;
 pub const MAX_SHARING_PREFERENCES_BYTES: u64 = 32 * 1024;
 pub const MAX_SETUP_FILE_BYTES: u64 = 512 * 1024;
 /// Paired computers this app keeps setups and names for.
@@ -68,6 +68,15 @@ impl From<monhop_core::Platform> for ComputerPlatform {
         match platform {
             monhop_core::Platform::Windows => Self::Windows,
             monhop_core::Platform::MacOs => Self::Macos,
+        }
+    }
+}
+
+impl From<ComputerPlatform> for monhop_core::Platform {
+    fn from(platform: ComputerPlatform) -> Self {
+        match platform {
+            ComputerPlatform::Windows => Self::Windows,
+            ComputerPlatform::Macos => Self::MacOs,
         }
     }
 }
@@ -129,14 +138,9 @@ pub struct SetupFile {
     clock: u64,
     /// Strictly sorted by member set, each set naming this computer.
     groups: Vec<GroupRecord>,
-    /// The two-member groups as pairwise records on the file's network, keyed by lowercase peer
-    /// fingerprint, so `computer` can lend them out.
+    /// Read from a file a newer MonHop wrote: empty here, and never saved over.
     #[serde(skip)]
-    pairwise: BTreeMap<String, SharingPreferences>,
-    /// `insert` was handed a record no group can hold, so saving fails as it did when the file
-    /// kept such a record.
-    #[serde(skip)]
-    refused: bool,
+    newer: bool,
 }
 
 impl Default for SetupFile {
@@ -149,8 +153,7 @@ impl Default for SetupFile {
             paused: false,
             clock: 0,
             groups: Vec::new(),
-            pairwise: BTreeMap::new(),
-            refused: false,
+            newer: false,
         }
     }
 }
@@ -177,50 +180,104 @@ struct VersionedFile {
 }
 
 impl SetupFile {
-    /// An absent file, or one another version wrote, is empty: the displays are arranged again.
-    /// A version 3 file is migrated in memory and rewritten only by the next save.
+    /// `path` is this version's file. While it is absent, the version 3 file beside it is
+    /// migrated in memory; that file is never written, so an older MonHop keeps its own setup,
+    /// and the next save writes `path`. A `path` a newer MonHop wrote loads empty and read-only,
+    /// an older file with nothing to migrate loads empty, and a damaged one is an error.
     pub fn load(path: &Path) -> io::Result<Self> {
-        Self::load_as(path, crate::sharing::local_platform())
+        Self::load_as(
+            path,
+            crate::sharing::local_platform(),
+            || listed_platforms(path),
+            stored_identity,
+        )
     }
 
-    /// `platform` is this computer's, which a migrated record names it with.
-    fn load_as(path: &Path, platform: Platform) -> io::Result<Self> {
-        let Some(bytes) = read_bounded(path, MAX_SETUP_FILE_BYTES)? else {
+    /// A migrated record names this computer with `platform` and each other computer with the
+    /// platform `listed` gives it, else the other platform. `identity` is this computer's
+    /// fingerprint as its identity store holds it, when that can be read.
+    fn load_as(
+        path: &Path,
+        platform: Platform,
+        listed: impl FnOnce() -> BTreeMap<String, Platform>,
+        identity: impl FnOnce() -> Option<String>,
+    ) -> io::Result<Self> {
+        if let Some(bytes) = read_bounded(path, MAX_SETUP_FILE_BYTES)? {
+            let file = match file_version(&bytes)? {
+                SETUP_FILE_VERSION => {
+                    serde_json::from_slice::<Self>(&bytes).map_err(|_| invalid_data())?
+                }
+                version if version > SETUP_FILE_VERSION => {
+                    log::warn!(
+                        "setup: the saved setup is version {version}, from a newer MonHop; it is kept as it is and nothing is saved over it"
+                    );
+                    return Ok(Self {
+                        newer: true,
+                        ..Self::default()
+                    });
+                }
+                _ => return Err(invalid_data()),
+            };
+            file.validate().map_err(|_| invalid_data())?;
+            return Ok(file);
+        }
+        let Some(bytes) = read_bounded(&path.with_file_name(V3_SETUP_FILE), MAX_SETUP_FILE_BYTES)?
+        else {
             return Ok(Self::default());
         };
-        let versioned: VersionedFile =
-            serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
-        let mut file = match versioned.version {
-            SETUP_FILE_VERSION => {
-                serde_json::from_slice::<Self>(&bytes).map_err(|_| invalid_data())?
-            }
+        let file = match file_version(&bytes)? {
             SETUP_FILE_V3_VERSION => {
                 let old: SetupFileV3 =
                     serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
                 old.validate().map_err(|_| invalid_data())?;
-                old.migrate(platform)
+                let identity = if old.computers.is_empty() {
+                    None
+                } else {
+                    identity()
+                };
+                old.migrate(platform, &listed(), identity.as_deref())
+            }
+            // Builds between version 3 and this one wrote version 4 in the old file's place.
+            SETUP_FILE_VERSION => {
+                serde_json::from_slice::<Self>(&bytes).map_err(|_| invalid_data())?
             }
             _ => return Ok(Self::default()),
         };
         file.validate().map_err(|_| invalid_data())?;
-        file.refresh_pairwise();
         Ok(file)
+    }
+
+    /// The file `load` reads for `path` right now: `path` itself, else the version 3 file it
+    /// migrates from.
+    pub(crate) fn stored_at(path: &Path) -> PathBuf {
+        if fs::symlink_metadata(path).is_ok() {
+            path.to_path_buf()
+        } else {
+            path.with_file_name(V3_SETUP_FILE)
+        }
+    }
+
+    /// Loaded from a file a newer MonHop wrote, which this version never saves over.
+    pub(crate) fn written_by_newer(&self) -> bool {
+        self.newer
     }
 
     /// Writes the whole file atomically, creating the setup folder on first use.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        if self.newer {
+            return Err(newer_file());
+        }
         self.validate().map_err(|_| invalid_data())?;
         let bytes = serde_json::to_vec(self).map_err(|_| invalid_data())?;
         fs::create_dir_all(preference_parent(path))?;
         save_bounded(path, &bytes, MAX_SETUP_FILE_BYTES)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// This computer's fingerprint as its records name it; None until a record names it.
     pub(crate) fn local(&self) -> Option<&str> {
         self.local.as_deref()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn enabled(&self) -> &[String] {
         &self.enabled
     }
@@ -230,18 +287,15 @@ impl SetupFile {
         self.paused
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn clock(&self) -> u64 {
         self.clock
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn groups(&self) -> &[GroupRecord] {
         &self.groups
     }
 
     /// The record for this computer and the enabled computers; None means they need arranging.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn active_group(&self) -> Option<&GroupRecord> {
         let members = self.active_members()?;
         self.groups
@@ -249,14 +303,47 @@ impl SetupFile {
             .find(|group| group.member_keys() == members)
     }
 
+    /// The record a card for that computer draws: the active group's while it names that
+    /// computer, else the pair's own, else the newest naming it.
+    pub(crate) fn group_with(&self, fingerprint: &str) -> Option<&GroupRecord> {
+        let naming = || {
+            self.groups
+                .iter()
+                .filter(|group| group.has_member(fingerprint))
+        };
+        self.active_group()
+            .filter(|group| group.has_member(fingerprint))
+            .or_else(|| naming().find(|group| group.members().len() == 2))
+            .or_else(|| naming().max_by_key(|group| group.stamp()))
+    }
+
     /// Keeps whichever of `record` and the record held for its members has the greater stamp
     /// (`record` on a tie, for its labels) and enables exactly its other members. Pause and the
     /// network stay as the user chose them. Ok(true) when `record` is now its members' record.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn adopt(
         &mut self,
         local: &str,
         record: GroupRecord,
+    ) -> Result<bool, PreferenceError> {
+        self.take(local, record, false)
+    }
+
+    /// Like `adopt`, but `record` replaces the record held for its members whatever that one's
+    /// stamp: a fixture that must hold exactly `record`.
+    #[cfg(test)]
+    pub(crate) fn store_agreed(
+        &mut self,
+        local: &str,
+        record: GroupRecord,
+    ) -> Result<(), PreferenceError> {
+        self.take(local, record, true).map(drop)
+    }
+
+    fn take(
+        &mut self,
+        local: &str,
+        record: GroupRecord,
+        replace: bool,
     ) -> Result<bool, PreferenceError> {
         record.validate()?;
         let local = CertificateFingerprint::parse_full(local)
@@ -274,15 +361,15 @@ impl SetupFile {
             .cloned()
             .collect();
         self.clock = self.clock.max(record.revision());
-        let newer = self
-            .groups
-            .iter()
-            .find(|group| group.member_keys() == members)
-            .is_none_or(|held| record.stamp() >= held.stamp());
+        let newer = replace
+            || self
+                .groups
+                .iter()
+                .find(|group| group.member_keys() == members)
+                .is_none_or(|held| record.stamp() >= held.stamp());
         if newer {
             self.store(record);
         }
-        self.refresh_pairwise();
         Ok(newer)
     }
 
@@ -292,6 +379,11 @@ impl SetupFile {
             [peer] if !self.paused => Some(peer),
             _ => None,
         }
+    }
+
+    /// The user chose computers to share with and has not paused.
+    pub fn sharing_chosen(&self) -> bool {
+        !self.paused && !self.enabled.is_empty()
     }
 
     /// Enables exactly that computer and resumes; None pauses and keeps the group.
@@ -305,69 +397,102 @@ impl SetupFile {
         }
     }
 
+    /// `set_active(Some)` as a local activation: when it changes what is shared, the resulting
+    /// group's record is touched so this choice wins over every copy made before it.
+    pub(crate) fn choose(&mut self, fingerprint: &CertificateFingerprint) {
+        let chosen = self.active() == Some(fingerprint_key(&fingerprint.full_hex()).as_str());
+        self.set_active(Some(fingerprint));
+        if !chosen {
+            self.touch_active();
+        }
+    }
+
+    /// Restamps the active group's record as this computer's newest change; false when that
+    /// group has no record here.
+    pub(crate) fn touch_active(&mut self) -> bool {
+        let (Some(local), Some(members)) = (self.local.clone(), self.active_members()) else {
+            return false;
+        };
+        let revision = self.clock.saturating_add(1);
+        let Some(held) = self
+            .groups
+            .iter_mut()
+            .find(|group| group.member_keys() == members)
+        else {
+            return false;
+        };
+        let Ok(touched) = held.restamped(revision, &local) else {
+            return false;
+        };
+        *held = touched;
+        self.clock = revision;
+        true
+    }
+
+    /// A revision seen elsewhere, so the next change made here is stamped past it.
+    pub(crate) fn observe_clock(&mut self, seen: u64) {
+        self.clock = self.clock.max(seen);
+    }
+
     pub fn interface_id(&self) -> Option<&str> {
         self.interface_id.as_deref()
     }
 
     pub fn set_interface_id(&mut self, interface_id: &str) {
         self.interface_id = Some(interface_id.to_owned());
-        self.refresh_pairwise();
     }
 
-    /// This computer's two-member record with that computer, on the file's network.
-    pub fn computer(&self, fingerprint: &str) -> Option<&SharingPreferences> {
-        self.pairwise.get(&fingerprint_key(fingerprint))
+    /// A copy to draw from and never save: each group replaced by `preview`'s answer for it,
+    /// the enabled group and the network left as they are.
+    pub(crate) fn previewed(&self, preview: impl FnMut(&GroupRecord) -> GroupRecord) -> Self {
+        Self {
+            groups: self.groups.iter().map(preview).collect(),
+            ..self.clone()
+        }
     }
 
-    pub fn active_computer(&self) -> Option<&SharingPreferences> {
-        self.active().and_then(|active| self.computer(active))
-    }
-
-    /// Lowercase fingerprints of every computer with a two-member record.
-    pub fn fingerprints(&self) -> impl Iterator<Item = &str> {
-        self.pairwise.keys().map(String::as_str)
-    }
-
-    /// Replaces this computer's two-member group with that computer, stamped as a new local
-    /// change. The file's network stays; only a file without one takes the record's.
-    pub fn insert(&mut self, setup: SharingPreferences) {
-        let platform = crate::sharing::local_platform();
-        let record = GroupRecord::from_pairwise(&setup, platform, opposite_platform(platform))
-            .and_then(|record| {
-                record.restamped(self.clock.saturating_add(1), &setup.local_fingerprint)
-            });
-        let Ok(record) = record else {
-            self.refused = true;
+    /// Forgets a paired computer. Each group naming it gives way to the group without it: the
+    /// record held for those members when there is one, else one derived as a local change. An
+    /// enabled computer leaves the enabled group, whose record is then touched.
+    pub fn forget(&mut self, fingerprint: &str) {
+        let key = fingerprint_key(fingerprint);
+        let was_enabled = self.enabled.contains(&key);
+        self.enabled.retain(|peer| *peer != key);
+        let Some(local) = self.local.clone() else {
             return;
         };
-        self.set_local(&setup.local_fingerprint);
-        if self.interface_id.is_none() {
-            self.interface_id = Some(setup.interface_id);
+        let (naming, mut kept): (Vec<GroupRecord>, Vec<GroupRecord>) =
+            std::mem::take(&mut self.groups)
+                .into_iter()
+                .partition(|group| group.has_member(&key));
+        let revision = self.clock.saturating_add(1);
+        let mut touched = false;
+        for group in &naming {
+            let Some(derived) = group.without_member(&key, revision, &local) else {
+                continue;
+            };
+            if !kept
+                .iter()
+                .any(|held| held.member_keys() == derived.member_keys())
+            {
+                kept.push(derived);
+                touched = true;
+            }
         }
-        self.clock = record.revision();
-        self.store(record);
-        self.refresh_pairwise();
-    }
-
-    /// A copy to draw from and never save: each record replaced by `preview`'s answer for it,
-    /// the active choice and the network left as they are.
-    pub(crate) fn previewed(
-        &self,
-        mut preview: impl FnMut(&SharingPreferences) -> SharingPreferences,
-    ) -> Self {
-        let mut previewed = self.clone();
-        for record in previewed.pairwise.values_mut() {
-            *record = preview(record);
+        let active = was_enabled.then(|| self.active_members()).flatten();
+        if let Some(held) = kept
+            .iter_mut()
+            .find(|group| Some(group.member_keys()) == active)
+            && let Ok(record) = held.restamped(revision, &local)
+        {
+            *held = record;
+            touched = true;
         }
-        previewed
-    }
-
-    /// Drops every record naming that computer, and that computer from the enabled group.
-    pub fn remove(&mut self, fingerprint: &str) {
-        let key = fingerprint_key(fingerprint);
-        self.groups.retain(|group| !group.has_member(&key));
-        self.enabled.retain(|peer| *peer != key);
-        self.refresh_pairwise();
+        kept.sort_by_cached_key(GroupRecord::member_keys);
+        self.groups = kept;
+        if touched {
+            self.clock = revision;
+        }
     }
 
     /// Records name this computer by one identity; those of an earlier one can never be used.
@@ -422,21 +547,8 @@ impl SetupFile {
         }
     }
 
-    fn refresh_pairwise(&mut self) {
-        self.pairwise = match (&self.local, &self.interface_id) {
-            (Some(local), Some(interface_id)) => self
-                .groups
-                .iter()
-                .filter_map(|group| group.to_pairwise(local, interface_id).ok())
-                .map(|record| (fingerprint_key(&record.peer_fingerprint), record))
-                .collect(),
-            _ => BTreeMap::new(),
-        };
-    }
-
     fn validate(&self) -> Result<(), PreferenceError> {
         if self.version != SETUP_FILE_VERSION
-            || self.refused
             || self.groups.len() > MAX_GROUPS
             || self.enabled.len() >= MAX_GROUP_MEMBERS
             || self.enabled.windows(2).any(|pair| pair[0] >= pair[1])
@@ -501,10 +613,16 @@ impl SetupFileV3 {
         Ok(())
     }
 
-    /// This computer is the identity most records name, the active record's on a tie. Every
-    /// record of it becomes a two-member group with its layout verbatim, stamped so that both
-    /// computers' copies of one pair agree (`GroupRecord::from_pairwise`).
-    fn migrate(self, platform: Platform) -> SetupFile {
+    /// This computer is `identity`, its identity store's; only when that could not be read, the
+    /// identity most records name, the active record's on a tie. Every record of it becomes a
+    /// two-member group with its layout verbatim, stamped so that both computers' copies of one
+    /// pair agree (`GroupRecord::from_pairwise`).
+    fn migrate(
+        self,
+        platform: Platform,
+        listed: &BTreeMap<String, Platform>,
+        identity: Option<&str>,
+    ) -> SetupFile {
         let active = self
             .active
             .as_ref()
@@ -514,16 +632,21 @@ impl SetupFileV3 {
             *votes.entry(record.local_fingerprint.as_str()).or_default() += 1;
         }
         let most = votes.values().copied().max().unwrap_or_default();
-        let local = active
-            .map(|record| record.local_fingerprint.as_str())
-            .filter(|local| votes.get(local) == Some(&most))
+        let local = identity
+            .and_then(|identity| CertificateFingerprint::parse_full(identity).ok())
+            .map(|identity| identity.full_hex())
             .or_else(|| {
-                votes
-                    .iter()
-                    .find(|(_, count)| **count == most)
-                    .map(|(local, _)| *local)
-            })
-            .map(str::to_owned);
+                active
+                    .map(|record| record.local_fingerprint.as_str())
+                    .filter(|local| votes.get(local) == Some(&most))
+                    .or_else(|| {
+                        votes
+                            .iter()
+                            .find(|(_, count)| **count == most)
+                            .map(|(local, _)| *local)
+                    })
+                    .map(str::to_owned)
+            });
         let interface_id = self
             .interface_id
             .clone()
@@ -535,7 +658,8 @@ impl SetupFileV3 {
                 earlier_identity += 1;
                 continue;
             }
-            match GroupRecord::from_pairwise(record, platform, opposite_platform(platform)) {
+            let peer_platform = listed_platform(listed, &record.peer_fingerprint, platform);
+            match GroupRecord::from_pairwise(record, platform, peer_platform) {
                 Ok(group) => groups.push(group),
                 Err(_) => unusable += 1,
             }
@@ -562,10 +686,59 @@ impl SetupFileV3 {
             paused: false,
             clock: MIGRATED_CLOCK,
             groups,
-            pairwise: BTreeMap::new(),
-            refused: false,
+            newer: false,
         }
     }
+}
+
+/// Each paired computer's platform as the computer list beside `path` records it, keyed by
+/// lowercase fingerprint; empty when the list is absent or unreadable.
+pub(crate) fn listed_platforms(path: &Path) -> BTreeMap<String, Platform> {
+    ComputerList::load(&path.with_file_name(LIST_FILE))
+        .map(|list| list.platforms())
+        .unwrap_or_default()
+}
+
+/// The platform a migrated pairwise record gives the other computer of a pair made on a
+/// `local` computer: the one the computer list records, else the other platform.
+pub(crate) fn listed_platform(
+    listed: &BTreeMap<String, Platform>,
+    peer: &str,
+    local: Platform,
+) -> Platform {
+    listed
+        .get(&fingerprint_key(peer))
+        .copied()
+        .unwrap_or_else(|| opposite_platform(local))
+}
+
+/// This computer's identity as its identity store holds it. Once found it is kept for the
+/// process: an identity is only ever created where there was none, never replaced.
+#[cfg(not(test))]
+fn stored_identity() -> Option<String> {
+    use monhop_transport::{identity_store::load_identity, native_storage::NativeIdentityStore};
+    static FOUND: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(found) = FOUND.get() {
+        return Some(found.clone());
+    }
+    match load_identity(&NativeIdentityStore) {
+        Ok(Some(identity)) => Some(
+            FOUND
+                .get_or_init(|| identity.fingerprint().full_hex())
+                .clone(),
+        ),
+        Ok(None) => None,
+        Err(error) => {
+            log::warn!("setup: this computer's identity could not be read to migrate: {error}");
+            None
+        }
+    }
+}
+
+/// Tests never read this computer's identity store.
+#[cfg(test)]
+fn stored_identity() -> Option<String> {
+    None
 }
 
 /// The lowercase form every view and file key uses; the input must already be a valid fingerprint.
@@ -577,76 +750,6 @@ pub(crate) fn fingerprint_key(fingerprint: &str) -> String {
 pub(crate) fn parse_fingerprint(value: &str) -> Result<CertificateFingerprint, String> {
     CertificateFingerprint::parse_full(value.trim())
         .map_err(|_| "That computer identity is not valid.".to_owned())
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SharedSetup {
-    version: u8,
-    sender_fingerprint: String,
-    receiver_fingerprint: String,
-    sender_displays: Vec<DisplaySnapshot>,
-    receiver_displays: Vec<DisplaySnapshot>,
-    layout: LayoutRequest,
-    /// The sender had to leave a crossing or a display out; neither computer remembers it.
-    left_out: bool,
-}
-
-pub(crate) fn shared_setup_bytes(
-    inspection: &InspectedPeer,
-    layout: LayoutRequest,
-    left_out: bool,
-) -> Result<Vec<u8>, PreferenceError> {
-    let saved = SharingPreferences::from_inspection(inspection, layout)?;
-    let shared = SharedSetup {
-        version: SHARED_SETUP_VERSION,
-        sender_fingerprint: saved.local_fingerprint,
-        receiver_fingerprint: saved.peer_fingerprint,
-        sender_displays: saved.local_displays,
-        receiver_displays: saved.peer_displays,
-        layout: saved.layout,
-        left_out,
-    };
-    let bytes = serde_json::to_vec(&shared).map_err(|_| PreferenceError::Invalid)?;
-    if bytes.len() as u64 > MAX_SHARING_PREFERENCES_BYTES {
-        return Err(PreferenceError::Invalid);
-    }
-    Ok(bytes)
-}
-
-/// This computer's record for a shared layout, and whether its sender left something out. Displays
-/// match by identity and the control map names both computers, so either one may have sent it.
-pub(crate) fn shared_setup_for_inspection(
-    fresh: &InspectedPeer,
-    bytes: &[u8],
-) -> Result<(SharingPreferences, bool), PreferenceError> {
-    if bytes.len() as u64 > MAX_SHARING_PREFERENCES_BYTES {
-        return Err(PreferenceError::Invalid);
-    }
-    let shared: SharedSetup =
-        serde_json::from_slice(bytes).map_err(|_| PreferenceError::Invalid)?;
-    if shared.version != SHARED_SETUP_VERSION {
-        return Err(PreferenceError::Invalid);
-    }
-    let local = fresh.local_fingerprint.full_hex();
-    let peer = fresh.peer_fingerprint.full_hex();
-    let (local_displays, peer_displays) =
-        if shared.sender_fingerprint == local && shared.receiver_fingerprint == peer {
-            (&shared.sender_displays, &shared.receiver_displays)
-        } else if shared.sender_fingerprint == peer && shared.receiver_fingerprint == local {
-            (&shared.receiver_displays, &shared.sender_displays)
-        } else {
-            return Err(PreferenceError::InspectionChanged);
-        };
-    validate_displays(local_displays)?;
-    validate_displays(peer_displays)?;
-    if !same_display_geometry(local_displays, &snapshots(&fresh.local_displays))
-        || !same_display_geometry(peer_displays, &snapshots(&fresh.peer_displays))
-    {
-        return Err(PreferenceError::InspectionChanged);
-    }
-    SharingPreferences::from_inspection(fresh, shared.layout)
-        .map(|record| (record, shared.left_out))
 }
 
 /// Both directions allowed: the control map of a pair that has no record yet.
@@ -674,31 +777,6 @@ pub(crate) fn validate_control(
         return Err(PreferenceError::Invalid);
     }
     Ok(())
-}
-
-/// The permissions a session negotiates. The transport orders the two directions by DeviceId,
-/// so the lower computer's entry is `lower_controls_higher` on both computers alike.
-pub(crate) fn wire_control(
-    control: &ControlMap,
-    local_fingerprint: &str,
-    peer_fingerprint: &str,
-) -> Result<ControlPermissions, PreferenceError> {
-    validate_control(control, local_fingerprint, peer_fingerprint)?;
-    let device = |fingerprint: &str| {
-        CertificateFingerprint::parse_full(fingerprint)
-            .map(device_id_from_fingerprint)
-            .map_err(|_| PreferenceError::Invalid)
-    };
-    let (lower, higher) = if device(local_fingerprint)? < device(peer_fingerprint)? {
-        (local_fingerprint, peer_fingerprint)
-    } else {
-        (peer_fingerprint, local_fingerprint)
-    };
-    let allowed = |fingerprint: &str| control.get(&fingerprint_key(fingerprint)) == Some(&true);
-    Ok(ControlPermissions {
-        lower_controls_higher: allowed(lower),
-        higher_controls_lower: allowed(higher),
-    })
 }
 
 /// The computer with the lower DeviceId decides layout changes; both computers agree on which.
@@ -785,15 +863,19 @@ pub struct SavedSetupView {
 }
 
 impl SavedSetupView {
-    /// `inspection` must be the live inspection of the same computer the record belongs to.
-    pub fn from_saved(
-        saved: Option<&SharingPreferences>,
+    /// The card for `peer`: `saved` is the record this computer (`local`) keeps with it, and
+    /// `inspection` must be the live inspection of that same computer.
+    pub fn from_group(
+        saved: Option<&GroupRecord>,
+        local: Option<&str>,
+        peer: &str,
         inspection: Option<&InspectedPeer>,
         revision: &str,
     ) -> Self {
         let layout = saved
             .zip(inspection)
-            .and_then(|(saved, inspection)| saved.layout_for_inspection(inspection).ok());
+            .filter(|(saved, inspection)| saved.fits_link(inspection))
+            .map(|(saved, _)| saved.layout().clone());
         let message = if layout.is_some() {
             "Saved layout fits the connected displays."
         } else if saved.is_some() {
@@ -801,17 +883,20 @@ impl SavedSetupView {
         } else {
             "No layout yet. Arrange the displays to start sharing."
         };
+        let displays = |member: Option<&str>| {
+            saved
+                .zip(member)
+                .and_then(|(saved, member)| saved.member(member))
+                .map(|member| member.displays().to_vec())
+                .unwrap_or_default()
+        };
         Self {
             saved: saved.is_some(),
-            local_displays: saved
-                .map(|saved| saved.local_displays().to_vec())
-                .unwrap_or_default(),
-            peer_displays: saved
-                .map(|saved| saved.peer_displays().to_vec())
-                .unwrap_or_default(),
+            local_displays: displays(local),
+            peer_displays: displays(Some(peer)),
             revision: revision.to_owned(),
             layout,
-            preview_layout: saved.map(|saved| saved.layout.clone()),
+            preview_layout: saved.map(|saved| saved.layout().clone()),
             live: inspection.map(|inspection| LiveDisplays {
                 local_displays: snapshots(&inspection.local_displays),
                 peer_displays: snapshots(&inspection.peer_displays),
@@ -841,50 +926,7 @@ impl std::fmt::Display for PreferenceError {
 impl std::error::Error for PreferenceError {}
 
 impl SharingPreferences {
-    pub fn from_inspection(
-        inspection: &InspectedPeer,
-        layout: LayoutRequest,
-    ) -> Result<Self, PreferenceError> {
-        let preferences = Self {
-            version: SHARING_PREFERENCES_VERSION,
-            interface_id: inspection.interface_id.clone(),
-            local_fingerprint: inspection.local_fingerprint.full_hex(),
-            peer_fingerprint: inspection.peer_fingerprint.full_hex(),
-            local_displays: snapshots(&inspection.local_displays),
-            peer_displays: snapshots(&inspection.peer_displays),
-            layout,
-        };
-        preferences.validate()?;
-        preferences.validate_for_inspection(inspection)?;
-        Ok(preferences)
-    }
-
-    pub fn interface_id(&self) -> &str {
-        &self.interface_id
-    }
-
-    pub(crate) fn layout(&self) -> &LayoutRequest {
-        &self.layout
-    }
-
-    pub(crate) fn peer_fingerprint(&self) -> &str {
-        &self.peer_fingerprint
-    }
-
-    pub(crate) fn local_fingerprint(&self) -> &str {
-        &self.local_fingerprint
-    }
-
-    /// Geometry-only comparison of this computer's displays, read without a live link.
-    pub(crate) fn matches_local_displays(&self, current: &DisplayTopology) -> bool {
-        same_display_geometry(&self.local_displays, &snapshots(current))
-    }
-
-    pub fn local_displays(&self) -> &[DisplaySnapshot] {
-        &self.local_displays
-    }
-
-    /// Whether this computer decides layout changes for the pair, as `local_decides` does live.
+    /// Whether this computer decided layout changes for the pair, as `local_decides` does live.
     pub(crate) fn local_decides(&self) -> bool {
         let device = |fingerprint: &str| {
             CertificateFingerprint::parse_full(fingerprint)
@@ -892,182 +934,6 @@ impl SharingPreferences {
                 .map(device_id_from_fingerprint)
         };
         device(&self.local_fingerprint) < device(&self.peer_fingerprint)
-    }
-
-    /// The record's two sides for a log line: counts and geometry digests only.
-    pub(crate) fn describe(&self) -> String {
-        format!(
-            "this computer {}, other computer {}",
-            describe_displays(&self.local_displays),
-            describe_displays(&self.peer_displays)
-        )
-    }
-
-    /// The record's layout and displays as one short digest, for log lines.
-    pub(crate) fn digest(&self) -> String {
-        let layout = serde_json::to_vec(&self.layout).unwrap_or_default();
-        digest(|hasher| {
-            hasher.write(&layout);
-            hash_displays(&self.local_displays, hasher);
-            hash_displays(&self.peer_displays, hasher);
-        })
-    }
-
-    /// Whether each computer may control the other, keyed by full lowercase fingerprint.
-    pub(crate) fn control(&self) -> &ControlMap {
-        &self.layout.control
-    }
-
-    /// The same record carrying `control` instead of its own; None when `control` is not valid
-    /// for this pair.
-    pub(crate) fn with_control(&self, control: ControlMap) -> Option<Self> {
-        let mut next = self.clone();
-        next.layout.control = control;
-        next.validate().ok()?;
-        Some(next)
-    }
-
-    /// The permissions this record's sessions negotiate.
-    pub(crate) fn wire_control(&self) -> Result<ControlPermissions, PreferenceError> {
-        wire_control(
-            &self.layout.control,
-            &self.local_fingerprint,
-            &self.peer_fingerprint,
-        )
-    }
-
-    pub fn peer_displays(&self) -> &[DisplaySnapshot] {
-        &self.peer_displays
-    }
-
-    /// The same two computers, whatever their displays look like now.
-    pub(crate) fn same_pair(&self, inspection: &InspectedPeer) -> bool {
-        self.local_fingerprint == inspection.local_fingerprint.full_hex()
-            && self.peer_fingerprint == inspection.peer_fingerprint.full_hex()
-    }
-
-    pub(crate) fn same_pair_as(&self, other: &Self) -> bool {
-        self.local_fingerprint == other.local_fingerprint
-            && self.peer_fingerprint == other.peer_fingerprint
-    }
-
-    /// The same monitors on each side, whatever their geometry, order, names, or OS ids.
-    pub(crate) fn same_display_sets(&self, other: &Self) -> bool {
-        same_displays(&self.local_displays, &other.local_displays).is_some()
-            && same_displays(&self.peer_displays, &other.peer_displays).is_some()
-    }
-
-    /// The same monitors both computers show right now, whatever their geometry or OS ids.
-    pub(crate) fn same_displays_as_inspection(&self, inspection: &InspectedPeer) -> bool {
-        self.same_pair(inspection)
-            && same_displays(&self.local_displays, &snapshots(&inspection.local_displays)).is_some()
-            && same_displays(&self.peer_displays, &snapshots(&inspection.peer_displays)).is_some()
-    }
-
-    /// The same two computers showing the same displays at the same geometry.
-    pub(crate) fn fits_displays(&self, inspection: &InspectedPeer) -> bool {
-        self.validate().is_ok()
-            && self.same_pair(inspection)
-            && same_display_geometry(&self.local_displays, &snapshots(&inspection.local_displays))
-            && same_display_geometry(&self.peer_displays, &snapshots(&inspection.peer_displays))
-    }
-
-    /// This record carrying the labels `inspection` shows for its displays. Labels are cosmetic,
-    /// so nothing a layout or a fit depends on changes.
-    pub(crate) fn relabeled(&self, inspection: &InspectedPeer) -> Self {
-        Self {
-            local_displays: relabel(&self.local_displays, &inspection.local_displays),
-            peer_displays: relabel(&self.peer_displays, &inspection.peer_displays),
-            ..self.clone()
-        }
-    }
-
-    /// This record with its display ids rewritten to the ids the same monitors carry now, when
-    /// both computers show exactly the displays it was made with at the same geometry. An OS id
-    /// is a per-connection number (a reconnected Mac display gets a new one), so a monitor keeps
-    /// its layout through its EDID identity instead.
-    pub(crate) fn remap_to_inspection(&self, inspection: &InspectedPeer) -> Option<Self> {
-        if self.validate().is_err() || !self.same_pair(inspection) {
-            return None;
-        }
-        let local = snapshots(&inspection.local_displays);
-        let peer = snapshots(&inspection.peer_displays);
-        let local_pairs = same_displays(&self.local_displays, &local)?;
-        let peer_pairs = same_displays(&self.peer_displays, &peer)?;
-        if !local_pairs
-            .iter()
-            .chain(&peer_pairs)
-            .all(|(remembered, live)| same_geometry(remembered, live))
-        {
-            return None;
-        }
-        let layout = remap_layout(&self.layout, &id_map(local_pairs.iter().chain(&peer_pairs)));
-        Self::from_inspection(inspection, layout).ok()
-    }
-
-    /// The pair as this computer knows it without a link: `local` as read now beside the other
-    /// computer's displays as this record last saw them. A record names no platform and nothing
-    /// that adapts one reads it, so both sides carry this computer's.
-    pub(crate) fn with_local_displays(&self, local: DisplayTopology) -> Option<InspectedPeer> {
-        let local_fingerprint = CertificateFingerprint::parse_full(&self.local_fingerprint).ok()?;
-        let peer_fingerprint = CertificateFingerprint::parse_full(&self.peer_fingerprint).ok()?;
-        Some(InspectedPeer {
-            local_device: device_id_from_fingerprint(local_fingerprint),
-            peer_device: device_id_from_fingerprint(peer_fingerprint),
-            local_fingerprint,
-            peer_fingerprint,
-            local_platform: crate::sharing::local_platform(),
-            peer_platform: crate::sharing::local_platform(),
-            local_displays: local,
-            peer_displays: topology_of(&self.peer_displays)?,
-            interface_id: self.interface_id.clone(),
-        })
-    }
-
-    /// The record as the displays in `now` show it: itself while it fits them, else rebuilt by
-    /// `adapt_to_inspection`, else those displays with no crossing, since none of its own survive.
-    pub(crate) fn preview_for(&self, now: &InspectedPeer) -> Self {
-        if !self.same_pair(now) || self.fits_displays(now) {
-            return self.clone();
-        }
-        adapt_to_inspection(self, now).map_or_else(
-            || Self {
-                local_displays: snapshots(&now.local_displays),
-                peer_displays: snapshots(&now.peer_displays),
-                layout: LayoutRequest {
-                    links: Vec::new(),
-                    arrangement: None,
-                    control: self.layout.control.clone(),
-                },
-                ..self.clone()
-            },
-            |adapted| adapted.record,
-        )
-    }
-
-    pub fn matches_inspection(&self, inspection: &InspectedPeer) -> bool {
-        self.validate().is_ok()
-            && self.interface_id == inspection.interface_id
-            && self.local_fingerprint == inspection.local_fingerprint.full_hex()
-            && self.peer_fingerprint == inspection.peer_fingerprint.full_hex()
-            && same_display_geometry(&self.local_displays, &snapshots(&inspection.local_displays))
-            && same_display_geometry(&self.peer_displays, &snapshots(&inspection.peer_displays))
-    }
-
-    pub fn layout_for_inspection(
-        &self,
-        inspection: &InspectedPeer,
-    ) -> Result<LayoutRequest, PreferenceError> {
-        self.validate_for_inspection(inspection)?;
-        Ok(self.layout.clone())
-    }
-
-    fn validate_for_inspection(&self, inspection: &InspectedPeer) -> Result<(), PreferenceError> {
-        if !self.matches_inspection(inspection) {
-            return Err(PreferenceError::InspectionChanged);
-        }
-        validated_layout(inspection, &self.layout).map_err(|_| PreferenceError::Invalid)?;
-        Ok(())
     }
 
     pub(crate) fn validate(&self) -> Result<(), PreferenceError> {
@@ -1120,104 +986,6 @@ impl DisplayGeometry {
     }
 }
 
-/// A record rebuilt for the displays connected now, and whether the rebuild had to leave anything
-/// out. Only a rebuild that lost something is worth telling the user about; one where a display
-/// merely moved keeps every crossing and needs no banner.
-pub(crate) struct Adapted {
-    pub(crate) record: SharingPreferences,
-    /// A crossing dropped, a position dropped, or a display left unused, against the record this
-    /// was rebuilt from.
-    pub(crate) left_out: bool,
-}
-
-/// The record rebuilt for the displays now: ids follow monitor identity, what names a gone display
-/// drops, blocks keep their place, and a newcomer breaking a crossing is hidden. None if invalid.
-pub(crate) fn adapt_to_inspection(
-    record: &SharingPreferences,
-    inspection: &InspectedPeer,
-) -> Option<Adapted> {
-    if !record.same_pair(inspection) {
-        return None;
-    }
-    let local = snapshots(&inspection.local_displays);
-    let peer = snapshots(&inspection.peer_displays);
-    // Measured on the record's own ids and geometry, before either is rewritten.
-    let translations = record.layout.arrangement.as_ref().map(|arrangement| {
-        [
-            block_translation(arrangement, &record.local_displays),
-            block_translation(arrangement, &record.peer_displays),
-        ]
-    });
-    let pairs: Vec<(&DisplaySnapshot, &DisplaySnapshot)> =
-        pair_displays(&record.local_displays, &local)
-            .into_iter()
-            .chain(pair_displays(&record.peer_displays, &peer))
-            .collect();
-    let kept: BTreeSet<&str> = pairs.iter().map(|(_, live)| live.id.as_str()).collect();
-    let present = |id: &str| kept.contains(id);
-    let mut layout = remap_layout(&record.layout, &id_map(pairs.iter()));
-    let crossings = layout.links.len();
-    layout
-        .links
-        .retain(|link| present(&link.from_display) && present(&link.to_display));
-    let mut left_out = layout.links.len() != crossings;
-    let appeared: Vec<String> = local
-        .iter()
-        .chain(&peer)
-        .filter(|display| !present(&display.id))
-        .map(|display| display.id.clone())
-        .collect();
-    if let (Some(arrangement), Some(translations)) = (layout.arrangement.as_mut(), translations) {
-        let placed = arrangement.positions.len();
-        arrangement
-            .positions
-            .retain(|position| present(&position.display));
-        left_out |= arrangement.positions.len() != placed;
-        arrangement.hidden.retain(|id| present(id));
-        for (side, translation) in [&local, &peer].into_iter().zip(translations) {
-            let Some([dx, dy]) = translation else {
-                continue;
-            };
-            for display in side {
-                if arrangement.hidden.contains(&display.id) {
-                    continue;
-                }
-                arrangement
-                    .positions
-                    .retain(|position| position.display != display.id);
-                arrangement.positions.push(crate::sharing::DisplayPosition {
-                    display: display.id.clone(),
-                    x: display.origin[0] + dx,
-                    y: display.origin[1] + dy,
-                });
-            }
-        }
-    }
-    if let Ok(record) = SharingPreferences::from_inspection(inspection, layout.clone()) {
-        return Some(Adapted { record, left_out });
-    }
-    if appeared.is_empty() {
-        return None;
-    }
-    // A newcomer can share an edge with a kept crossing; leaving it unused is as valid as before.
-    let arrangement = layout
-        .arrangement
-        .get_or_insert_with(|| ArrangementRequest {
-            positions: Vec::new(),
-            hidden: Vec::new(),
-        });
-    arrangement
-        .positions
-        .retain(|position| !appeared.contains(&position.display));
-    arrangement.hidden.extend(appeared);
-    SharingPreferences::from_inspection(inspection, layout)
-        .ok()
-        .map(|record| Adapted {
-            record,
-            left_out: true,
-        })
-}
-
 /// A regular file of at most `limit` bytes, or None when absent; symlinks and oversize fail.
 pub(crate) fn read_bounded(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
     let metadata = match fs::symlink_metadata(path) {
@@ -1251,23 +1019,19 @@ pub(crate) fn load_bounded<T: DeserializeOwned + Default>(
     Ok(value)
 }
 
-/// Like `load_bounded`, but a file another version wrote loads as empty instead of failing.
-pub(crate) fn load_versioned<T: DeserializeOwned + Default>(
-    path: &Path,
-    limit: u64,
-    version: u8,
-    validate: impl FnOnce(&T) -> io::Result<()>,
-) -> io::Result<T> {
-    let Some(bytes) = read_bounded(path, limit)? else {
-        return Ok(T::default());
-    };
-    let versioned: VersionedFile = serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
-    if versioned.version != version {
-        return Ok(T::default());
-    }
-    let value: T = serde_json::from_slice(&bytes).map_err(|_| invalid_data())?;
-    validate(&value)?;
-    Ok(value)
+/// The version a versioned JSON file names, read before anything else in it.
+pub(crate) fn file_version(bytes: &[u8]) -> io::Result<u8> {
+    serde_json::from_slice::<VersionedFile>(bytes)
+        .map(|file| file.version)
+        .map_err(|_| invalid_data())
+}
+
+/// What saving over a file a newer MonHop wrote fails with.
+pub(crate) fn newer_file() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the file was written by a newer MonHop",
+    )
 }
 
 // The setup file, the computer list, and the arrangement library share one bounded atomic write.
@@ -1313,23 +1077,6 @@ pub(crate) fn same_display_geometry(left: &[DisplaySnapshot], right: &[DisplaySn
                     && display.primary == candidate.primary
             })
         })
-}
-
-fn relabel(displays: &[DisplaySnapshot], live: &DisplayTopology) -> Vec<DisplaySnapshot> {
-    displays
-        .iter()
-        .map(|display| {
-            let name = live
-                .displays()
-                .iter()
-                .find(|candidate| candidate.id.0.to_string() == display.id)
-                .map_or_else(|| display.name.clone(), |candidate| candidate.name.clone());
-            DisplaySnapshot {
-                name,
-                ..display.clone()
-            }
-        })
-        .collect()
 }
 
 /// Everything but the id, name, and monitor identity: what a layout's crossings depend on.
@@ -1610,7 +1357,10 @@ fn invalid_data() -> io::Error {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::group_record::{GroupMember, KnownDisplays};
+    use crate::group_record::{
+        AdaptedGroup, GroupMember, KnownDisplays, shared_group_bytes, shared_group_for_link,
+        wire_control,
+    };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -1639,10 +1389,6 @@ pub(crate) mod tests {
     }
 
     impl SharingPreferences {
-        pub(crate) fn set_interface_id_for_test(&mut self, interface_id: &str) {
-            self.interface_id = interface_id.to_owned();
-        }
-
         /// Replaces this computer's displays with one 1920x1080 display per id, stacked so the
         /// side edges the fixture layout crosses on stay free.
         pub(crate) fn set_local_displays_for_test(&mut self, ids: &[&str]) {
@@ -1717,32 +1463,39 @@ pub(crate) mod tests {
         record
     }
 
+    /// The displays `now`'s link shows: both computers of the pair.
+    fn shown(now: &SharingPreferences) -> KnownDisplays {
+        KnownDisplays::of_link(&inspection(now))
+    }
+
+    /// `record`'s pair rebuilt for the displays `now`'s link shows.
+    fn adapted(record: &SharingPreferences, now: &SharingPreferences) -> Option<AdaptedGroup> {
+        group(record).adapt(&shown(now))
+    }
+
     #[test]
     fn a_reconnected_monitor_with_a_new_id_fits_through_its_identity() {
         let record = two_display_record();
+        let saved = group(&record);
         let mut live = record.clone();
         live.set_local_display_id_for_test("3", "7");
         let inspected = inspection(&live);
-        assert!(!record.fits_displays(&inspected));
-        let fitted = record
-            .remap_to_inspection(&inspected)
+        assert!(!saved.fits_link(&inspected));
+        let fitted = saved
+            .remap_to(&shown(&live))
             .expect("the same monitors fit under new ids");
-        assert!(fitted.fits_displays(&inspected));
+        assert!(fitted.fits_link(&inspected));
         assert_eq!(fitted.layout().links[0].to_display, "7");
         assert_eq!(fitted.layout().links[1].from_display, "7");
-        assert!(record.same_display_sets(&fitted));
-        assert!(record.same_displays_as_inspection(&inspected));
+        assert!(saved.same_monitors_as(&fitted));
+        assert!(saved.shows_same_monitors(&shown(&live)));
         // Without identities, only the id can tell displays apart, as before.
         let mut anonymous = record.clone();
         for display in &mut anonymous.local_displays {
             display.monitor = None;
         }
-        assert_eq!(anonymous.remap_to_inspection(&inspected), None);
-        assert!(
-            anonymous
-                .remap_to_inspection(&inspection(&anonymous))
-                .is_some()
-        );
+        assert_eq!(group(&anonymous).remap_to(&shown(&live)), None);
+        assert!(group(&anonymous).remap_to(&shown(&anonymous)).is_some());
     }
 
     #[test]
@@ -1750,21 +1503,21 @@ pub(crate) mod tests {
         let record = two_display_record();
         let mut live = record.clone();
         live.local_displays[1].monitor = Some("04d9-0001-00000000".into());
-        let inspected = inspection(&live);
-        assert_eq!(record.remap_to_inspection(&inspected), None);
-        assert!(!record.same_displays_as_inspection(&inspected));
+        assert_eq!(group(&record).remap_to(&shown(&live)), None);
+        assert!(!group(&record).shows_same_monitors(&shown(&live)));
         // The crossing led to the monitor that left; with none left, nothing can continue.
-        assert!(adapt_to_inspection(&record, &inspected).is_none());
+        live.move_local_display_for_test("3", [0.0, 1440.0]);
+        assert!(adapted(&record, &live).is_none());
     }
 
     #[test]
     fn identical_monitors_without_serials_are_told_apart_by_id() {
         let mut record = two_display_record();
         record.set_local_display_monitors_for_test(&[EXTERNAL, EXTERNAL]);
-        assert!(record.remap_to_inspection(&inspection(&record)).is_some());
+        assert!(group(&record).remap_to(&shown(&record)).is_some());
         let mut renumbered = record.clone();
         renumbered.set_local_display_id_for_test("3", "7");
-        assert_eq!(record.remap_to_inspection(&inspection(&renumbered)), None);
+        assert_eq!(group(&record).remap_to(&shown(&renumbered)), None);
     }
 
     #[test]
@@ -1775,13 +1528,13 @@ pub(crate) mod tests {
         record.set_local_display_monitors_for_test(&[EXTERNAL, EXTERNAL]);
         let mut live = record.clone();
         live.local_displays[1].monitor = Some("04d9-0001-00000000".into());
-        let inspected = inspection(&live);
-        assert_eq!(record.remap_to_inspection(&inspected), None);
-        assert!(adapt_to_inspection(&record, &inspected).is_none());
+        assert_eq!(group(&record).remap_to(&shown(&live)), None);
+        live.move_local_display_for_test("3", [0.0, 1440.0]);
+        assert!(adapted(&record, &live).is_none());
         // The identical monitor that stayed keeps pairing by id.
         let mut still = record.clone();
         still.local_displays[1].monitor = None;
-        assert!(record.remap_to_inspection(&inspection(&still)).is_some());
+        assert!(group(&record).remap_to(&shown(&still)).is_some());
     }
 
     #[test]
@@ -1801,11 +1554,10 @@ pub(crate) mod tests {
             primary: false,
             monitor: None,
         });
-        let Adapted {
+        let AdaptedGroup {
             record: adapted,
             left_out,
-        } = adapt_to_inspection(&record, &inspection(&changed))
-            .expect("newcomers on both computers keep the layout going");
+        } = adapted(&record, &changed).expect("newcomers on both computers keep the layout going");
         assert!(!left_out);
         let (positions, hidden) = arrangement_of(&adapted);
         assert!(hidden.is_empty());
@@ -1823,7 +1575,7 @@ pub(crate) mod tests {
                 ("9", 0.0, 1080.0)
             ]
         );
-        assert!(adapted.fits_displays(&inspection(&changed)));
+        assert!(adapted.fits_link(&inspection(&changed)));
     }
 
     #[test]
@@ -1835,16 +1587,16 @@ pub(crate) mod tests {
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1", "9"]);
         changed.move_local_display_for_test("9", [1920.0, 0.0]);
-        let Adapted {
+        let AdaptedGroup {
             record: adapted,
             left_out,
-        } = adapt_to_inspection(&record, &inspection(&changed))
+        } = adapted(&record, &changed)
             .expect("the layout without the newcomer is as valid as before");
         assert!(left_out);
         let (positions, hidden) = arrangement_of(&adapted);
         assert_eq!(hidden, vec!["9".to_owned()]);
         assert_eq!(positions.len(), 2);
-        assert!(adapted.fits_displays(&inspection(&changed)));
+        assert!(adapted.fits_link(&inspection(&changed)));
     }
 
     #[test]
@@ -1853,20 +1605,25 @@ pub(crate) mod tests {
         let mut live = record.clone();
         live.set_local_display_id_for_test("3", "7");
         live.move_local_display_for_test("7", [1920.0, 0.0]);
-        let inspected = inspection(&live);
-        assert_eq!(record.remap_to_inspection(&inspected), None);
-        assert!(record.same_displays_as_inspection(&inspected));
-        let Adapted {
+        assert_eq!(group(&record).remap_to(&shown(&live)), None);
+        assert!(group(&record).shows_same_monitors(&shown(&live)));
+        let AdaptedGroup {
             record: adapted,
             left_out,
-        } = adapt_to_inspection(&record, &inspected)
-            .expect("a moved monitor keeps the crossings made for it");
+        } = adapted(&record, &live).expect("a moved monitor keeps the crossings made for it");
         // Nothing was lost, so this rebuild is silent: no banner follows it.
         assert!(!left_out);
         assert_eq!(adapted.layout().links.len(), 2);
         assert_eq!(adapted.layout().links[0].to_display, "7");
-        assert_eq!(adapted.local_displays()[1].origin, [1920.0, 0.0]);
-        assert!(adapted.fits_displays(&inspected));
+        assert_eq!(
+            adapted
+                .member(&record.local_fingerprint)
+                .unwrap()
+                .displays()[1]
+                .origin,
+            [1920.0, 0.0]
+        );
+        assert!(adapted.fits_link(&inspection(&live)));
     }
 
     fn link(from: &str, from_edge: &str, to: &str, to_edge: &str) -> crate::sharing::LinkRequest {
@@ -1886,16 +1643,22 @@ pub(crate) mod tests {
         let record = preferences();
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1", "3"]);
-        let Adapted {
+        let AdaptedGroup {
             record: adapted,
             left_out,
-        } = adapt_to_inspection(&record, &inspection(&changed))
-            .expect("a grouped layout survives a display that appeared");
+        } = adapted(&record, &changed).expect("a grouped layout survives a display that appeared");
         // A grouped layout moves each computer's displays as one block, so nothing was dropped.
         assert!(!left_out);
-        assert_eq!(adapted.local_displays().len(), 2);
-        assert_eq!(adapted.layout(), record.layout());
-        assert!(adapted.fits_displays(&inspection(&changed)));
+        assert_eq!(
+            adapted
+                .member(&record.local_fingerprint)
+                .unwrap()
+                .displays()
+                .len(),
+            2
+        );
+        assert_eq!(adapted.layout(), &record.layout);
+        assert!(adapted.fits_link(&inspection(&changed)));
     }
 
     fn placed_record(peer_position: (f64, f64)) -> SharingPreferences {
@@ -1915,12 +1678,12 @@ pub(crate) mod tests {
             ],
             hidden: Vec::new(),
         });
-        assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
+        assert!(adapted(&record, &record).is_some());
         record
     }
 
     fn arrangement_of(
-        adapted: &SharingPreferences,
+        adapted: &GroupRecord,
     ) -> (Vec<crate::sharing::DisplayPosition>, Vec<String>) {
         let arrangement = adapted
             .layout()
@@ -1936,11 +1699,10 @@ pub(crate) mod tests {
         let mut changed = record.clone();
         // The fixture stacks display 3 directly under display 1, as the OS reports it.
         changed.set_local_displays_for_test(&["1", "3"]);
-        let Adapted {
+        let AdaptedGroup {
             record: adapted,
             left_out,
-        } = adapt_to_inspection(&record, &inspection(&changed))
-            .expect("a placed layout survives a display that appeared");
+        } = adapted(&record, &changed).expect("a placed layout survives a display that appeared");
         // The newcomer joined its computer's block, so nothing was left out.
         assert!(!left_out);
         let (positions, hidden) = arrangement_of(&adapted);
@@ -1951,7 +1713,7 @@ pub(crate) mod tests {
             .find(|position| position.display == "3")
             .expect("the newcomer is placed");
         assert_eq!((newcomer.x, newcomer.y), (0.0, 1080.0));
-        assert!(adapted.fits_displays(&inspection(&changed)));
+        assert!(adapted.fits_link(&inspection(&changed)));
     }
 
     #[test]
@@ -1962,10 +1724,10 @@ pub(crate) mod tests {
             link("2", "left", "3", "right"),
             link("3", "right", "2", "left"),
         ];
-        assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
+        assert!(adapted(&record, &record).is_some());
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1"]);
-        assert!(adapt_to_inspection(&record, &inspection(&changed)).is_none());
+        assert!(adapted(&record, &changed).is_none());
     }
 
     #[test]
@@ -1974,38 +1736,56 @@ pub(crate) mod tests {
         let mut moved = record.clone();
         moved.local_displays[0].origin = [0.0, 240.0];
         let inspected = inspection(&moved);
-        assert!(!record.fits_displays(&inspected));
-        let Adapted {
+        assert!(!group(&record).fits_link(&inspected));
+        let AdaptedGroup {
             record: adapted,
             left_out,
-        } = adapt_to_inspection(&record, &inspected)
-            .expect("a display that moved keeps the layout");
+        } = adapted(&record, &moved).expect("a display that moved keeps the layout");
         assert!(!left_out);
-        assert_eq!(adapted.local_displays()[0].origin, [0.0, 240.0]);
-        assert_eq!(adapted.layout(), record.layout());
-        assert!(adapted.fits_displays(&inspected));
+        assert_eq!(
+            adapted
+                .member(&record.local_fingerprint)
+                .unwrap()
+                .displays()[0]
+                .origin,
+            [0.0, 240.0]
+        );
+        assert_eq!(adapted.layout(), &record.layout);
+        assert!(adapted.fits_link(&inspected));
     }
 
     #[test]
     fn a_card_draws_the_displays_there_are_now_through_the_adapted_record() {
         let record = preferences();
+        let saved = group(&record);
         let file = file_with(record.clone());
-        let drawn = |file: &SetupFile, now: &InspectedPeer| {
+        let drawn = |file: &SetupFile, now: &KnownDisplays| {
             let previewed = file.previewed(|saved| saved.preview_for(now));
-            let view = SavedSetupView::from_saved(previewed.active_computer(), None, "0");
+            let peer = "b".repeat(64);
+            let view = SavedSetupView::from_group(
+                previewed.group_with(&peer),
+                previewed.local(),
+                &peer,
+                None,
+                "0",
+            );
             serde_json::to_value(view).unwrap()
         };
         // A record that still fits is drawn exactly as saved.
-        assert_eq!(record.preview_for(&inspection(&record)), record);
+        assert_eq!(
+            saved.preview_for(&KnownDisplays::of_link(&inspection(&record))),
+            saved
+        );
 
         // The link reports this computer's display somewhere else than the record saved it.
         let mut moved = record.clone();
         moved.move_local_display_for_test("1", [0.0, 240.0]);
-        let live = inspection(&moved);
-        let preview = record.preview_for(&live);
+        let live = KnownDisplays::of_link(&inspection(&moved));
+        let preview = saved.preview_for(&live);
         assert_eq!(
             preview,
-            adapt_to_inspection(&record, &live)
+            saved
+                .adapt(&live)
                 .expect("a display that moved adapts")
                 .record
         );
@@ -2016,20 +1796,22 @@ pub(crate) mod tests {
         );
         assert_eq!(
             view["previewLayout"]["links"],
-            serde_json::to_value(&record.layout().links).unwrap()
+            serde_json::to_value(&record.layout.links).unwrap()
         );
         // The saved file itself is untouched.
-        assert_eq!(file.active_computer(), Some(&record));
+        assert_eq!(file.active_group(), Some(&saved));
 
         // Without a link: this computer's displays as read now, the other's as last saved.
-        let now = record
-            .with_local_displays(topology_of(&moved.local_displays).unwrap())
-            .expect("the pair as this computer knows it");
-        assert_eq!(snapshots(&now.peer_displays), record.peer_displays);
-        assert_eq!(
-            record.preview_for(&now).local_displays(),
-            moved.local_displays()
+        let mut now = KnownDisplays::default();
+        now.insert(
+            &record.local_fingerprint,
+            Platform::MacOs,
+            &topology_of(&moved.local_displays).unwrap(),
         );
+        let preview = saved.preview_for(&now);
+        let displays = |owner: &str| preview.member(owner).unwrap().displays().to_vec();
+        assert_eq!(displays(&record.local_fingerprint), moved.local_displays);
+        assert_eq!(displays(&record.peer_fingerprint), record.peer_displays);
 
         // The display every crossing led to went away, so nothing of the record survives: the
         // card draws the displays there are now with no crossing, never the saved ones.
@@ -2041,8 +1823,8 @@ pub(crate) mod tests {
         ];
         let mut unplugged = crossed.clone();
         unplugged.set_local_displays_for_test(&["1"]);
-        let now = inspection(&unplugged);
-        assert!(adapt_to_inspection(&crossed, &now).is_none());
+        let now = KnownDisplays::of_link(&inspection(&unplugged));
+        assert!(group(&crossed).adapt(&now).is_none());
         let view = drawn(&file_with(crossed), &now);
         assert_eq!(view["localDisplays"].as_array().unwrap().len(), 1);
         assert_eq!(view["previewLayout"]["links"], serde_json::json!([]));
@@ -2082,19 +1864,18 @@ pub(crate) mod tests {
             split_link("3", "right", [0.0, 1.0], "2", "left", [0.55, 1.0]),
         ];
         record.validate().expect("the fixture is a valid record");
-        assert!(adapt_to_inspection(&record, &inspection(&record)).is_some());
+        assert!(adapted(&record, &record).is_some());
         let mut changed = record.clone();
         changed.set_local_displays_for_test(&["1"]);
-        let inspected = inspection(&changed);
-        let Adapted {
+        let AdaptedGroup {
             record: adapted,
             left_out,
-        } = adapt_to_inspection(&record, &inspected).expect("the crossings that are left survive");
+        } = adapted(&record, &changed).expect("the crossings that are left survive");
         assert!(left_out);
         // The pair of crossings that named the display that went away is gone; the other pair,
         // and sharing with it, carries on.
         assert_eq!(adapted.layout().links.len(), 2);
-        assert!(adapted.fits_displays(&inspected));
+        assert!(adapted.fits_link(&inspection(&changed)));
     }
 
     /// The same setup made with another paired computer.
@@ -2157,31 +1938,92 @@ pub(crate) mod tests {
         }
     }
 
+    /// The link `saved` was made over: this computer a Mac, the other a PC.
     pub(crate) fn inspection(saved: &SharingPreferences) -> InspectedPeer {
+        let parsed = |fingerprint: &str| CertificateFingerprint::parse_full(fingerprint).unwrap();
+        let (local, peer) = (
+            parsed(&saved.local_fingerprint),
+            parsed(&saved.peer_fingerprint),
+        );
         InspectedPeer {
+            local_device: device_id_from_fingerprint(local),
+            peer_device: device_id_from_fingerprint(peer),
+            local_fingerprint: local,
+            peer_fingerprint: peer,
             local_platform: Platform::MacOs,
             peer_platform: Platform::Windows,
-            ..saved
-                .with_local_displays(topology_of(&saved.local_displays).unwrap())
-                .unwrap()
+            local_displays: topology_of(&saved.local_displays).unwrap(),
+            peer_displays: topology_of(&saved.peer_displays).unwrap(),
+            interface_id: saved.interface_id.clone(),
         }
     }
 
-    /// A file holding exactly `setup`, active.
-    pub(crate) fn file_with(setup: SharingPreferences) -> SetupFile {
-        let mut file = SetupFile::default();
-        file.set_active(Some(
-            &CertificateFingerprint::parse_full(&setup.peer_fingerprint).unwrap(),
-        ));
-        file.insert(setup);
-        file
+    /// The link between two members of `record` as `local` inspects it, showing exactly their
+    /// entries.
+    pub(crate) fn link_of(record: &GroupRecord, local: &str, peer: &str) -> InspectedPeer {
+        let parsed = |fingerprint: &str| CertificateFingerprint::parse_full(fingerprint).unwrap();
+        let entry = |fingerprint: &str| record.member(fingerprint).expect("a member");
+        InspectedPeer {
+            local_device: device_id_from_fingerprint(parsed(local)),
+            peer_device: device_id_from_fingerprint(parsed(peer)),
+            local_fingerprint: parsed(local),
+            peer_fingerprint: parsed(peer),
+            local_platform: entry(local).platform().into(),
+            peer_platform: entry(peer).platform().into(),
+            local_displays: topology_of(entry(local).displays()).unwrap(),
+            peer_displays: topology_of(entry(peer).displays()).unwrap(),
+            interface_id: "en0:4:192.168.1.4".into(),
+        }
     }
 
-    fn saved_computer(path: &Path) -> Option<SharingPreferences> {
-        SetupFile::load(path)
-            .unwrap()
-            .computer(&"B".repeat(64))
-            .cloned()
+    /// `setup` as the two-member group its `inspection` describes.
+    pub(crate) fn group(setup: &SharingPreferences) -> GroupRecord {
+        GroupRecord::from_pairwise(setup, Platform::MacOs, Platform::Windows)
+            .expect("the fixture is a valid pair")
+    }
+
+    fn try_file_with(setup: &SharingPreferences) -> Result<SetupFile, PreferenceError> {
+        let mut file = SetupFile::default();
+        file.set_interface_id(&setup.interface_id);
+        file.store_agreed(
+            &setup.local_fingerprint,
+            GroupRecord::from_pairwise(setup, Platform::MacOs, Platform::Windows)?,
+        )?;
+        Ok(file)
+    }
+
+    /// A file holding exactly `setup`'s group, enabled, on `setup`'s network.
+    pub(crate) fn file_with(setup: SharingPreferences) -> SetupFile {
+        try_file_with(&setup).expect("the fixture is a valid pair")
+    }
+
+    /// Keeps `setup`'s group beside the others, the enabled group left as it is.
+    pub(crate) fn keep_group(file: &mut SetupFile, setup: &SharingPreferences) {
+        let record = group(setup);
+        file.set_local(&setup.local_fingerprint);
+        file.clock = file.clock.max(record.revision());
+        file.store(record);
+    }
+
+    /// Stores `setup`'s group as a new local change, the enabled group left as it is.
+    fn save_group(file: &mut SetupFile, setup: &SharingPreferences) {
+        let record = group(setup)
+            .restamped(file.clock + 1, &setup.local_fingerprint)
+            .unwrap();
+        file.set_local(&setup.local_fingerprint);
+        file.clock = record.revision();
+        file.store(record);
+    }
+
+    /// The pair's own record with that computer.
+    fn pair_of<'a>(file: &'a SetupFile, peer: &str) -> Option<&'a GroupRecord> {
+        file.groups()
+            .iter()
+            .find(|group| group.members().len() == 2 && group.has_member(peer))
+    }
+
+    fn saved_group(path: &Path) -> Option<GroupRecord> {
+        pair_of(&SetupFile::load(path).unwrap(), &"B".repeat(64)).cloned()
     }
 
     #[test]
@@ -2192,12 +2034,16 @@ pub(crate) mod tests {
         saved.peer_displays[0].size[1] = 1600.0 / 1.75;
         saved.peer_displays[0].scale = 1.75;
         let inspected = inspection(&saved);
-        let expected =
-            SharingPreferences::from_inspection(&inspected, saved.layout.clone()).unwrap();
-        file_with(expected.clone()).save(&path).unwrap();
-        let restored = saved_computer(&path).unwrap();
+        let expected = GroupRecord::for_link(&inspected, saved.layout.clone(), 1).unwrap();
+        assert_eq!(expected.members(), group(&saved).members());
+        let mut file = SetupFile::default();
+        file.store_agreed(&saved.local_fingerprint, expected.clone())
+            .unwrap();
+        file.save(&path).unwrap();
+        let restored = saved_group(&path).unwrap();
         assert_eq!(restored, expected);
-        assert_eq!(restored.layout_for_inspection(&inspected), Ok(saved.layout));
+        assert!(restored.fits_link(&inspected));
+        assert_eq!(restored.layout(), &saved.layout);
     }
 
     #[test]
@@ -2205,18 +2051,19 @@ pub(crate) mod tests {
         let directory = TestDirectory::new();
         let path = directory.path("sharing.json");
         let mut file = file_with(preferences());
-        file.insert(preferences_for_peer('C'));
+        keep_group(&mut file, &preferences_for_peer('C'));
         file.save(&path).unwrap();
         let loaded = SetupFile::load(&path).unwrap();
         assert_eq!(loaded, file);
         assert_eq!(loaded.active(), Some("b".repeat(64).as_str()));
+        assert!(loaded.sharing_chosen());
         assert_eq!(loaded.interface_id(), Some("en0:4:192.168.1.4"));
-        assert_eq!(loaded.fingerprints().count(), 2);
+        assert_eq!(loaded.groups().len(), 2);
         assert_eq!(
-            loaded.computer(&"c".repeat(64)),
-            Some(&preferences_for_peer('C'))
+            loaded.group_with(&"c".repeat(64)),
+            Some(&group(&preferences_for_peer('C')))
         );
-        assert_eq!(loaded.active_computer(), Some(&preferences()));
+        assert_eq!(loaded.active_group(), Some(&group(&preferences())));
         let text = String::from_utf8(fs::read(&path).unwrap()).unwrap();
         assert!(text.contains("\"version\":4"));
         assert!(!text.contains("sharingEnabled"));
@@ -2229,11 +2076,12 @@ pub(crate) mod tests {
         assert_eq!(text.matches("interfaceId").count(), 1);
 
         let mut file = loaded;
-        file.remove(&"B".repeat(64));
+        file.forget(&"B".repeat(64));
         assert_eq!(file.active(), None);
-        assert_eq!(file.fingerprints().count(), 1);
-        file.remove(&"c".repeat(64));
-        assert!(file.active_computer().is_none());
+        assert!(!file.sharing_chosen());
+        assert_eq!(file.groups().len(), 1);
+        file.forget(&"c".repeat(64));
+        assert!(file.groups().is_empty());
         file.save(&path).unwrap();
         assert_eq!(SetupFile::load(&path).unwrap(), file);
     }
@@ -2250,7 +2098,7 @@ pub(crate) mod tests {
         file.save(&path).unwrap();
         let loaded = SetupFile::load(&path).unwrap();
         assert_eq!(loaded.active(), Some("d".repeat(64).as_str()));
-        assert!(loaded.active_computer().is_none());
+        assert!(loaded.active_group().is_none());
         assert_eq!(loaded.interface_id(), Some("en0:4:192.168.1.4"));
     }
 
@@ -2269,7 +2117,8 @@ pub(crate) mod tests {
     #[test]
     fn v014_setup_file_loads_as_empty() {
         let directory = TestDirectory::new();
-        let path = directory.path("sharing.json");
+        let path = directory.path(SETUP_FILE);
+        let old_path = directory.path(V3_SETUP_FILE);
         let v014 = serde_json::to_vec(&serde_json::json!({
             "version": 2,
             "interfaceId": "en0:4:192.168.1.4",
@@ -2277,24 +2126,22 @@ pub(crate) mod tests {
             "computers": { "b".repeat(64): v014_record() },
         }))
         .unwrap();
-        write_raw(&path, &v014);
+        write_raw(&old_path, &v014);
         let loaded = SetupFile::load(&path).unwrap();
         assert_eq!(loaded, SetupFile::default());
         assert!(loaded.active().is_none());
-        // Loading never rewrites the old file; the next save replaces it at the current version.
-        assert_eq!(fs::read(&path).unwrap(), v014);
+        // Loading never rewrites the old file, and saving writes this version's beside it.
+        assert_eq!(fs::read(&old_path).unwrap(), v014);
         file_with(preferences()).save(&path).unwrap();
-        assert_eq!(saved_computer(&path), Some(preferences()));
+        assert_eq!(saved_group(&path), Some(group(&preferences())));
+        assert_eq!(fs::read(&old_path).unwrap(), v014);
     }
 
     #[test]
     fn restored_layout_requires_same_identity_network_and_displays() {
         let saved = preferences();
         let current = inspection(&saved);
-        assert_eq!(
-            saved.layout_for_inspection(&current),
-            Ok(saved.layout.clone())
-        );
+        assert!(group(&saved).fits_link(&current));
         let changes: [fn(&mut InspectedPeer); 6] = [
             |peer| {
                 peer.local_fingerprint =
@@ -2320,18 +2167,26 @@ pub(crate) mod tests {
                 peer.peer_displays = inspection(&changed).peer_displays;
             },
         ];
-        for change in changes {
+        let card = |inspection: Option<&InspectedPeer>, revision: &str| {
+            SavedSetupView::from_group(
+                Some(&group(&saved)),
+                Some(&saved.local_fingerprint),
+                &saved.peer_fingerprint,
+                inspection,
+                revision,
+            )
+        };
+        assert_eq!(card(Some(&current), "3").layout, Some(saved.layout.clone()));
+        for (index, change) in changes.iter().enumerate() {
             let mut changed = current.clone();
             change(&mut changed);
-            assert_eq!(
-                saved.layout_for_inspection(&changed),
-                Err(PreferenceError::InspectionChanged)
-            );
-            let view = SavedSetupView::from_saved(Some(&saved), Some(&changed), "4");
+            assert_eq!(group(&saved).fits_link(&changed), index == 2, "{index}");
+            let view = card(Some(&changed), "4");
             assert!(view.saved);
-            assert!(view.layout.is_none());
+            // A group record carries no network, so on another one the saved layout still fits.
+            assert_eq!(view.layout.is_some(), index == 2, "{index}");
         }
-        let without_inspection = SavedSetupView::from_saved(Some(&saved), None, "5");
+        let without_inspection = card(None, "5");
         assert!(without_inspection.layout.is_none());
         assert_eq!(
             without_inspection.preview_layout,
@@ -2346,25 +2201,22 @@ pub(crate) mod tests {
         renamed.local_displays[0].name = "Built-in Retina Display".into();
         renamed.peer_displays[0].name = "U2723QE".into();
         let current = inspection(&renamed);
-        assert!(saved.matches_inspection(&current));
+        assert!(group(&saved).fits_link(&current));
         assert!(inspection(&saved).matches(&current));
-        assert_eq!(
-            saved.layout_for_inspection(&current),
-            Ok(saved.layout.clone())
-        );
     }
 
     #[test]
     fn saving_requires_a_crossing_in_both_directions() {
         let saved = preferences();
         let current = inspection(&saved);
+        assert!(GroupRecord::for_link(&current, saved.layout.clone(), 1).is_ok());
         let mut no_crossing = saved.layout.clone();
         no_crossing.links.clear();
-        assert!(SharingPreferences::from_inspection(&current, no_crossing).is_err());
+        assert!(GroupRecord::for_link(&current, no_crossing, 1).is_err());
         for missing in 0..2 {
             let mut one_way = saved.layout.clone();
             one_way.links.remove(missing);
-            assert!(SharingPreferences::from_inspection(&current, one_way).is_err());
+            assert!(GroupRecord::for_link(&current, one_way, 1).is_err());
         }
     }
 
@@ -2386,7 +2238,7 @@ pub(crate) mod tests {
         ] {
             let mut layout = saved.layout.clone();
             layout.control = accepted;
-            assert!(SharingPreferences::from_inspection(&current, layout).is_ok());
+            assert!(GroupRecord::for_link(&current, layout, 1).is_ok());
         }
         let other = "c".repeat(64);
         let upper = "B".repeat(64);
@@ -2401,10 +2253,12 @@ pub(crate) mod tests {
             let mut layout = saved.layout.clone();
             layout.control = refused.clone();
             assert!(
-                SharingPreferences::from_inspection(&current, layout).is_err(),
+                GroupRecord::for_link(&current, layout, 1).is_err(),
                 "{refused:?}"
             );
-            assert!(wire_control(&refused, &"A".repeat(64), &"B".repeat(64)).is_err());
+            assert!(validate_control(&refused, &"A".repeat(64), &"B".repeat(64)).is_err());
+            // No record carries it, so no session ever negotiates it.
+            assert!(group(&saved).with_control(refused.clone()).is_err());
         }
     }
 
@@ -2441,8 +2295,18 @@ pub(crate) mod tests {
             assert_eq!(here.higher_controls_lower, peer_allowed);
             let mut record = preferences();
             record.layout.control = control;
-            assert_eq!(record.wire_control(), Ok(here));
-            assert_eq!(mirrored(&record).wire_control(), Ok(here));
+            let mine = group(&record);
+            let theirs =
+                GroupRecord::from_pairwise(&mirrored(&record), Platform::Windows, Platform::MacOs)
+                    .unwrap();
+            assert_eq!(
+                wire_control(&mine.layout().control, &local, &peer),
+                Some(here)
+            );
+            assert_eq!(
+                wire_control(&theirs.layout().control, &peer, &local),
+                Some(here)
+            );
         }
         // With the higher computer local, its own entry maps to the other field.
         let control = both_directions(&"C".repeat(64), &peer);
@@ -2467,6 +2331,14 @@ pub(crate) mod tests {
             assert_ne!(local_decides(&here), local_decides(&there), "{peer}");
             assert_eq!(record.local_decides(), local_decides(&here));
             assert_eq!(mirrored(&record).local_decides(), local_decides(&there));
+            assert_eq!(
+                group(&record).decided_by(&record.local_fingerprint),
+                local_decides(&here)
+            );
+            assert_eq!(
+                group(&record).decided_by(&record.peer_fingerprint),
+                local_decides(&there)
+            );
         }
     }
 
@@ -2492,7 +2364,7 @@ pub(crate) mod tests {
         file_with(expected.clone())
             .save(&path)
             .expect("preferences must save");
-        assert_eq!(saved_computer(&path), Some(expected));
+        assert_eq!(saved_group(&path), Some(group(&expected)));
     }
 
     #[test]
@@ -2504,38 +2376,32 @@ pub(crate) mod tests {
         replacement.interface_id = "en1:7:192.168.1.5".into();
         replacement.layout.control.insert("b".repeat(64), false);
         let mut file = file_with(preferences());
-        file.insert(replacement.clone());
+        file.store_agreed(&"A".repeat(64), group(&replacement))
+            .unwrap();
         file.save(&path).unwrap();
         let loaded = SetupFile::load(&path).unwrap();
-        assert_eq!(loaded.fingerprints().count(), 1);
+        assert_eq!(loaded.groups().len(), 1);
         assert_eq!(loaded.interface_id(), Some("en0:4:192.168.1.4"));
-        let on_the_chosen_network = SharingPreferences {
-            interface_id: "en0:4:192.168.1.4".into(),
-            ..replacement.clone()
-        };
-        assert_eq!(
-            loaded.computer(&"b".repeat(64)),
-            Some(&on_the_chosen_network)
-        );
+        assert_eq!(loaded.active_group(), Some(&group(&replacement)));
 
-        // Only an explicit choice moves it, and every record follows it.
+        // Only an explicit choice moves it; the records name none to follow.
         let mut file = loaded;
         file.set_interface_id("en1:7:192.168.1.5");
-        assert_eq!(file.computer(&"b".repeat(64)), Some(&replacement));
+        assert_eq!(file.active_group(), Some(&group(&replacement)));
         // A record a link agreed on leaves it alone as well.
         file.adopt(&"A".repeat(64), trio(9, true)).unwrap();
         assert_eq!(file.interface_id(), Some("en1:7:192.168.1.5"));
 
-        // A file with no network yet takes the first record's, so that record can be used.
+        // A file with no network yet stays without one until the user chooses it.
         let mut fresh = SetupFile::default();
-        fresh.insert(replacement.clone());
-        assert_eq!(fresh.interface_id(), Some("en1:7:192.168.1.5"));
-        fresh.insert(preferences());
-        assert_eq!(fresh.interface_id(), Some("en1:7:192.168.1.5"));
+        fresh
+            .store_agreed(&"A".repeat(64), group(&replacement))
+            .unwrap();
+        assert_eq!(fresh.interface_id(), None);
     }
 
     /// This computer (A, a Mac) with two PCs, B and C, each crossing to A's one display.
-    fn trio(revision: u64, c_controls: bool) -> GroupRecord {
+    pub(crate) fn trio(revision: u64, c_controls: bool) -> GroupRecord {
         let member = |owner: char, platform: Platform, id: &str| {
             let display = DisplaySnapshot {
                 id: id.into(),
@@ -2585,7 +2451,7 @@ pub(crate) mod tests {
         let local = "A".repeat(64);
         let (b, c) = ("b".repeat(64), "c".repeat(64));
         let mut file = file_with(preferences());
-        let pair_before = file.computer(&b).cloned();
+        let pair_before = pair_of(&file, &b).cloned();
         assert!(pair_before.is_some());
 
         // A group of three: its other members become the enabled group.
@@ -2595,7 +2461,10 @@ pub(crate) mod tests {
         assert_eq!(file.clock(), 5);
         // No single computer is active, and the pair keeps its own record.
         assert_eq!(file.active(), None);
-        assert_eq!(file.computer(&b).cloned(), pair_before);
+        assert!(file.sharing_chosen());
+        assert_eq!(pair_of(&file, &b).cloned(), pair_before);
+        // Its card draws the group it shares now.
+        assert_eq!(file.group_with(&b), Some(&trio(5, true)));
 
         // An older copy of the group changes nothing held.
         assert_eq!(file.adopt(&local, trio(4, false)), Ok(false));
@@ -2664,24 +2533,28 @@ pub(crate) mod tests {
             .map(|index| format!("{index:064X}"))
             .collect();
         for peer in &peers {
-            file.insert(record_for(peer));
+            save_group(&mut file, &record_for(peer));
         }
+        let content = |record: Option<&GroupRecord>| record.map(GroupRecord::content_digest);
         assert_eq!(file.groups().len(), MAX_GROUPS);
-        assert_eq!(file.active_computer(), Some(&preferences()));
-        assert_eq!(file.computer(&peers[0]), None);
+        assert_eq!(file.active_group(), Some(&group(&preferences())));
+        assert_eq!(pair_of(&file, &peers[0]), None);
         for peer in &peers[1..] {
-            assert_eq!(file.computer(peer), Some(&record_for(peer)));
+            assert_eq!(
+                content(pair_of(&file, peer)),
+                Some(group(&record_for(peer)).content_digest())
+            );
         }
         file.save(&path).unwrap();
         assert_eq!(SetupFile::load(&path).unwrap(), file);
 
         // Saving a record again makes it the newest, so the next one to go is the oldest left.
-        file.insert(record_for(&peers[1]));
-        file.insert(record_for(&peers[0]));
+        save_group(&mut file, &record_for(&peers[1]));
+        save_group(&mut file, &record_for(&peers[0]));
         assert_eq!(file.groups().len(), MAX_GROUPS);
-        assert_eq!(file.computer(&peers[2]), None);
-        assert!(file.computer(&peers[1]).is_some());
-        assert!(file.computer(&peers[0]).is_some());
+        assert_eq!(pair_of(&file, &peers[2]), None);
+        assert!(pair_of(&file, &peers[1]).is_some());
+        assert!(pair_of(&file, &peers[0]).is_some());
 
         // A file past the bound was not written by this version and is an error.
         let mut groups = file.groups().to_vec();
@@ -2697,7 +2570,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_compatibility_layer_returns_a_pairwise_record_as_inserted() {
+    fn pausing_keeps_the_group_and_choosing_again_resumes() {
         let directory = TestDirectory::new();
         let path = directory.path("sharing.json");
         for record in [
@@ -2712,39 +2585,133 @@ pub(crate) mod tests {
             let mut file = SetupFile::default();
             file.set_interface_id("en7:12:10.1.1.7");
             file.set_active(Some(&peer));
-            file.insert(record.clone());
-            // Exactly the record inserted, on the file's network.
+            file.store_agreed(&record.local_fingerprint, group(&record))
+                .unwrap();
+            file.save(&path).unwrap();
+            let loaded = SetupFile::load(&path).unwrap();
+            assert_eq!(loaded.active(), Some(key.as_str()));
+            assert_eq!(loaded.active_group(), Some(&group(&record)));
+            // The pair reads back exactly as it was made, on the file's network.
             let expected = SharingPreferences {
                 interface_id: "en7:12:10.1.1.7".into(),
                 ..record.clone()
             };
-            assert_eq!(file.computer(&key), Some(&expected));
-            assert_eq!(file.active_computer(), Some(&expected));
-            file.save(&path).unwrap();
-            let loaded = SetupFile::load(&path).unwrap();
-            assert_eq!(loaded.active_computer(), Some(&expected));
-            assert_eq!(loaded.fingerprints().collect::<Vec<_>>(), [key.as_str()]);
+            assert_eq!(
+                loaded
+                    .active_group()
+                    .unwrap()
+                    .to_pairwise(&record.local_fingerprint, "en7:12:10.1.1.7"),
+                Ok(expected)
+            );
 
             // Pause keeps the computer and its record; choosing it again resumes.
             let mut paused = loaded;
             paused.set_active(None);
             assert!(paused.paused());
+            assert!(!paused.sharing_chosen());
             assert_eq!(paused.active(), None);
             assert_eq!(paused.enabled(), std::slice::from_ref(&key));
-            assert_eq!(paused.computer(&key), Some(&expected));
+            assert_eq!(paused.active_group(), Some(&group(&record)));
             paused.set_active(Some(&peer));
             assert!(!paused.paused());
-            assert_eq!(paused.active_computer(), Some(&expected));
+            assert!(paused.sharing_chosen());
+            assert_eq!(paused.active(), Some(key.as_str()));
         }
     }
 
-    const LOCAL: &str = "7C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F8";
-    const WINDOWS_PC: &str = "2B8F0C6D4E1A93572B8F0C6D4E1A93572B8F0C6D4E1A93572B8F0C6D4E1A9357";
+    #[test]
+    fn choosing_another_computer_touches_its_record_once() {
+        let local = "A".repeat(64);
+        let parsed = |owner: &str| CertificateFingerprint::parse_full(&owner.repeat(64)).unwrap();
+        let with_c = record_for(&"C".repeat(64));
+        let mut file = file_with(preferences());
+        keep_group(&mut file, &with_c);
+        assert_eq!(file.clock(), 2);
+        // Switching to C restamps C's record as this computer's newest change, content kept.
+        file.choose(&parsed("C"));
+        let touched = file.active_group().expect("C's pair");
+        assert_eq!((touched.revision(), touched.author()), (3, local.as_str()));
+        assert_eq!(touched.content_digest(), group(&with_c).content_digest());
+        assert_eq!(file.clock(), 3);
+        // Choosing it again changes nothing; resuming after a pause is a choice again.
+        let before = file.clone();
+        file.choose(&parsed("C"));
+        assert_eq!(file, before);
+        file.set_active(None);
+        file.choose(&parsed("C"));
+        assert_eq!(file.active_group().unwrap().revision(), 4);
+        // A computer without a record here has nothing to touch.
+        file.choose(&parsed("D"));
+        assert!(!file.touch_active());
+        assert_eq!(file.clock(), 4);
+        // A revision seen elsewhere is kept, so the next touch is stamped past it.
+        file.observe_clock(9);
+        file.observe_clock(5);
+        file.choose(&parsed("B"));
+        assert_eq!(file.active_group().unwrap().revision(), 10);
+        assert_eq!(file.clock(), 10);
+    }
+
+    #[test]
+    fn forgetting_a_computer_keeps_every_group_without_it() {
+        let local = "A".repeat(64);
+        let (b, c) = ("b".repeat(64), "c".repeat(64));
+        let pair_with_c = || group(&record_for(&c.to_ascii_uppercase()));
+        // Sharing with B and C together; C also has a pair of its own.
+        let mut file = file_with(preferences());
+        keep_group(&mut file, &record_for(&c.to_ascii_uppercase()));
+        file.adopt(&local, trio(5, true)).unwrap();
+        assert_eq!(file.groups().len(), 3);
+        file.forget(&"B".repeat(64));
+        // The pair with B is gone; the group of three gives way to C's own pair, which is now
+        // the one shared and is touched as this computer's change.
+        assert_eq!(file.enabled(), std::slice::from_ref(&c));
+        assert_eq!(file.groups().len(), 1);
+        let kept = file.active_group().expect("C's pair is the active group");
+        assert_eq!(kept.content_digest(), pair_with_c().content_digest());
+        assert_eq!((kept.revision(), kept.author()), (6, local.as_str()));
+        assert_eq!(file.clock(), 6);
+
+        // Without a pair of its own, C's place in the group of three is derived from it.
+        let mut file = file_with(preferences());
+        file.adopt(&local, trio(5, false)).unwrap();
+        file.forget(&b);
+        assert_eq!(file.enabled(), std::slice::from_ref(&c));
+        let derived = file.active_group().expect("the group without B");
+        assert_eq!(
+            derived.member_keys(),
+            [local.to_ascii_lowercase(), c.clone()]
+        );
+        assert_eq!(derived.layout().links.len(), 2);
+        assert_eq!(
+            derived.layout().control,
+            [(local.to_ascii_lowercase(), true), (c.clone(), false)]
+                .into_iter()
+                .collect::<ControlMap>()
+        );
+        assert_eq!((derived.revision(), derived.author()), (6, local.as_str()));
+
+        // Forgetting a computer that is not shared with touches nothing else.
+        let before = file.clone();
+        file.forget(&"D".repeat(64));
+        assert_eq!(file, before);
+        // A pair cannot lose a member and stay a group, so it goes, and nothing is shared.
+        file.forget(&c);
+        assert!(file.groups().is_empty());
+        assert!(file.enabled().is_empty());
+        assert!(!file.sharing_chosen());
+        assert!(file.validate().is_ok());
+    }
+
+    pub(crate) const LOCAL: &str =
+        "7C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F87C1E5A9034B6D2F8";
+    pub(crate) const WINDOWS_PC: &str =
+        "2B8F0C6D4E1A93572B8F0C6D4E1A93572B8F0C6D4E1A93572B8F0C6D4E1A9357";
     const SECOND_PC: &str = "E04A7B3C9D2F1856E04A7B3C9D2F1856E04A7B3C9D2F1856E04A7B3C9D2F1856";
 
     /// A Mac's setup file exactly as version 3 wrote it: a PC with two displays, arranged and
     /// active, and a second PC saved on another network whose input may not control the Mac.
-    const V3_FILE: &str = r#"{
+    pub(crate) const V3_FILE: &str = r#"{
   "version": 3,
   "interfaceId": "en0:4:192.168.1.4",
   "active": "2b8f0c6d4e1a93572b8f0c6d4e1a93572b8f0c6d4e1a93572b8f0c6d4e1a9357",
@@ -2823,7 +2790,7 @@ pub(crate) mod tests {
 }"#;
 
     /// The first PC's own version 3 file: the same pair from its side, on its own network.
-    fn mirrored_v3_file() -> String {
+    pub(crate) fn mirrored_v3_file() -> String {
         let v3: serde_json::Value = serde_json::from_str(V3_FILE).unwrap();
         let mut record = v3["computers"][fingerprint_key(WINDOWS_PC)].clone();
         let fields = record.as_object_mut().unwrap();
@@ -2845,11 +2812,15 @@ pub(crate) mod tests {
         .to_string()
     }
 
-    fn load_as(text: &str, platform: Platform) -> SetupFile {
+    /// `text`, where version 3 kept its setup, as `platform` migrates it with no computer list
+    /// beside it and no identity to read.
+    pub(crate) fn load_as(text: &str, platform: Platform) -> SetupFile {
         let directory = TestDirectory::new();
-        let path = directory.path("sharing.json");
-        write_raw(&path, text.as_bytes());
-        SetupFile::load_as(&path, platform).unwrap()
+        write_raw(&directory.path(V3_SETUP_FILE), text.as_bytes());
+        SetupFile::load_as(&directory.path(SETUP_FILE), platform, BTreeMap::new, || {
+            None
+        })
+        .unwrap()
     }
 
     fn group_of<'a>(file: &'a SetupFile, peer: &str) -> &'a GroupRecord {
@@ -2874,13 +2845,13 @@ pub(crate) mod tests {
             let saved: SharingPreferences =
                 serde_json::from_value(v3["computers"][fingerprint_key(peer)].clone()).unwrap();
             assert_eq!(saved.local_decides(), revision == 2);
-            // Displays, ids, monitors, arrangement and control verbatim; the network is the file's.
+            let group = group_of(&file, peer);
+            // Displays, ids, monitors, arrangement and control verbatim; no network.
             let expected = SharingPreferences {
                 interface_id: "en0:4:192.168.1.4".into(),
-                ..saved
+                ..saved.clone()
             };
-            assert_eq!(file.computer(peer), Some(&expected));
-            let group = group_of(&file, peer);
+            assert_eq!(group.to_pairwise(LOCAL, "en0:4:192.168.1.4"), Ok(expected));
             assert_eq!((group.revision(), group.author()), (revision, author));
             assert!(group.members().iter().all(|member| {
                 member.platform()
@@ -2892,11 +2863,12 @@ pub(crate) mod tests {
             }));
             assert!(group.topology_for(LOCAL).is_some());
             assert_eq!(
-                crate::group_record::wire_control(&group.layout().control, LOCAL, peer),
-                expected.wire_control().ok()
+                wire_control(&group.layout().control, LOCAL, peer),
+                wire_control(&saved.layout.control, LOCAL, peer)
             );
+            assert!(wire_control(&group.layout().control, LOCAL, peer).is_some());
         }
-        assert_eq!(file.active_computer(), file.computer(WINDOWS_PC));
+        assert_eq!(file.active(), Some(fingerprint_key(WINDOWS_PC).as_str()));
         assert_eq!(file.active_group(), Some(group_of(&file, WINDOWS_PC)));
     }
 
@@ -2916,13 +2888,73 @@ pub(crate) mod tests {
         assert_eq!(here.clone().merge(there.clone()), *there);
         // Each computer still reads the pair from its own side.
         let (mine, theirs) = (
-            mac.computer(WINDOWS_PC).unwrap(),
-            pc.computer(LOCAL).unwrap(),
+            here.to_pairwise(LOCAL, "en0:4:192.168.1.4").unwrap(),
+            there
+                .to_pairwise(WINDOWS_PC, "windows-physical-interface")
+                .unwrap(),
         );
-        assert_eq!(theirs.local_fingerprint(), WINDOWS_PC);
-        assert_eq!(theirs.local_displays(), mine.peer_displays());
-        assert_eq!(theirs.layout(), mine.layout());
-        assert_eq!(theirs.wire_control(), mine.wire_control());
+        assert_eq!(theirs.local_fingerprint, WINDOWS_PC);
+        assert_eq!(theirs.local_displays, mine.peer_displays);
+        assert_eq!(theirs.layout, mine.layout);
+        assert_eq!(
+            wire_control(&here.layout().control, LOCAL, WINDOWS_PC),
+            wire_control(&there.layout().control, WINDOWS_PC, LOCAL)
+        );
+    }
+
+    #[test]
+    fn a_migrated_pair_names_each_computer_by_the_platform_the_list_records() {
+        // Two Macs: the list beside each file records the other one as a Mac, so both migrate
+        // the pair to the same content instead of each guessing the other is a PC.
+        let directory = TestDirectory::new();
+        let list_path = directory.path(LIST_FILE);
+        let address: std::net::SocketAddrV4 = "192.168.1.9:24872".parse().unwrap();
+        let listed = |peer: &str| {
+            let mut list = ComputerList::default();
+            list.remember(
+                CertificateFingerprint::parse_full(peer).unwrap(),
+                address,
+                Some(Platform::MacOs),
+            )
+            .unwrap();
+            list.save(&list_path).unwrap();
+        };
+        let load = |text: &str| {
+            let path = directory.path(SETUP_FILE);
+            write_raw(&directory.path(V3_SETUP_FILE), text.as_bytes());
+            SetupFile::load_as(&path, Platform::MacOs, || listed_platforms(&path), || None).unwrap()
+        };
+        listed(WINDOWS_PC);
+        let first = load(V3_FILE);
+        listed(LOCAL);
+        let second = load(&mirrored_v3_file());
+        let (here, there) = (group_of(&first, WINDOWS_PC), group_of(&second, LOCAL));
+        assert!(
+            here.members()
+                .iter()
+                .all(|member| member.platform() == ComputerPlatform::Macos)
+        );
+        assert_eq!(here.members(), there.members());
+        assert_eq!(here.content_digest(), there.content_digest());
+        // A computer the list does not name is taken for the other platform, as before.
+        let second_pc = group_of(&first, SECOND_PC);
+        assert_eq!(
+            second_pc.member(SECOND_PC).unwrap().platform(),
+            ComputerPlatform::Windows
+        );
+        // Without a list, each guesses the other is a PC and the two disagree until they link.
+        let guessed = load_as(&mirrored_v3_file(), Platform::MacOs);
+        assert_ne!(
+            group_of(&guessed, LOCAL).content_digest(),
+            here.content_digest()
+        );
+        // The link between the two Macs finds each record as it is, so sharing starts at once;
+        // the guess would have sent them to arrange again.
+        let mut macs = link_of(here, LOCAL, WINDOWS_PC);
+        (macs.local_platform, macs.peer_platform) = (Platform::MacOs, Platform::MacOs);
+        assert!(here.fits_link(&macs));
+        assert!(there.fits_link(&opposite(&macs)));
+        assert!(!group_of(&guessed, LOCAL).fits_link(&opposite(&macs)));
     }
 
     /// A version 3 file holding `records`, with the computer `active` names chosen.
@@ -2955,14 +2987,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_v3_file_keeps_the_layouts_of_the_stored_identity() {
+        let directory = TestDirectory::new();
+        let path = directory.path(SETUP_FILE);
+        // Two records from an earlier identity D outvote the one this computer, A, saved since.
+        write_raw(
+            &directory.path(V3_SETUP_FILE),
+            &v3_file(
+                Some('B'),
+                &[
+                    record_of('D', 'E'),
+                    record_of('D', 'F'),
+                    record_of('A', 'B'),
+                ],
+            ),
+        );
+        let load = |identity: Option<String>| {
+            SetupFile::load_as(&path, Platform::MacOs, BTreeMap::new, || identity).unwrap()
+        };
+        let file = load(Some("a".repeat(64)));
+        assert_eq!(file.local(), Some("A".repeat(64).as_str()));
+        assert_eq!(file.groups().len(), 1);
+        assert_eq!(file.active(), Some("b".repeat(64).as_str()));
+        assert_eq!(
+            file.active_group().map(GroupRecord::content_digest),
+            Some(group(&record_of('A', 'B')).content_digest())
+        );
+        // An identity no record names leaves nothing of the earlier ones to share with.
+        let file = load(Some("C".repeat(64)));
+        assert_eq!(file.local(), Some("C".repeat(64).as_str()));
+        assert!(file.groups().is_empty());
+        // Only an identity that cannot be read falls back to the records' own majority.
+        let file = load(None);
+        assert_eq!(file.local(), Some("D".repeat(64).as_str()));
+        assert_eq!(file.groups().len(), 2);
+        assert!(file.active_group().is_none());
+    }
+
+    #[test]
     fn a_record_of_an_older_identity_is_dropped() {
         let directory = TestDirectory::new();
-        let path = directory.path("sharing.json");
+        let path = directory.path(SETUP_FILE);
         let load = |active, records: &[SharingPreferences]| {
-            write_raw(&path, &v3_file(active, records));
+            write_raw(&directory.path(V3_SETUP_FILE), &v3_file(active, records));
             SetupFile::load(&path).unwrap()
         };
-        let keys = |file: &SetupFile| file.fingerprints().map(str::to_owned).collect::<Vec<_>>();
+        let keys = |file: &SetupFile| {
+            let local = file.local().map(fingerprint_key);
+            file.groups()
+                .iter()
+                .flat_map(GroupRecord::member_keys)
+                .filter(|member| Some(member) != local.as_ref())
+                .collect::<Vec<_>>()
+        };
+        let active = |file: &SetupFile| {
+            file.active_group()
+                .and_then(|group| group.to_pairwise(file.local()?, "en0:4:192.168.1.4").ok())
+        };
 
         // Two records name this computer A; the one it saved under its earlier identity D goes.
         let file = load(
@@ -2976,14 +3057,14 @@ pub(crate) mod tests {
         assert_eq!(file.local(), Some("A".repeat(64).as_str()));
         assert_eq!(keys(&file), ["b".repeat(64), "c".repeat(64)]);
         assert_eq!(file.groups().len(), 2);
-        assert_eq!(file.computer(&"e".repeat(64)), None);
-        assert_eq!(file.active_computer(), Some(&record_of('A', 'B')));
+        assert_eq!(pair_of(&file, &"e".repeat(64)), None);
+        assert_eq!(active(&file), Some(record_of('A', 'B')));
 
         // On a tie the active record names this computer.
         let file = load(Some('E'), &[record_of('A', 'B'), record_of('D', 'E')]);
         assert_eq!(file.local(), Some("D".repeat(64).as_str()));
         assert_eq!(keys(&file), ["e".repeat(64)]);
-        assert_eq!(file.active_computer(), Some(&record_of('D', 'E')));
+        assert_eq!(active(&file), Some(record_of('D', 'E')));
 
         // Without one, every load settles the tie the same way.
         let file = load(None, &[record_of('A', 'B'), record_of('D', 'E')]);
@@ -2996,13 +3077,17 @@ pub(crate) mod tests {
     #[test]
     fn loading_never_rewrites_and_saving_writes_version_4() {
         let directory = TestDirectory::new();
-        let path = directory.path("sharing.json");
-        write_raw(&path, V3_FILE.as_bytes());
+        let path = directory.path(SETUP_FILE);
+        let old_path = directory.path(V3_SETUP_FILE);
+        write_raw(&old_path, V3_FILE.as_bytes());
         let migrated = SetupFile::load(&path).unwrap();
         assert_eq!(SetupFile::load(&path).unwrap(), migrated);
-        assert_eq!(fs::read(&path).unwrap(), V3_FILE.as_bytes());
+        assert_eq!(fs::read(&old_path).unwrap(), V3_FILE.as_bytes());
+        assert!(!path.exists());
+        assert_eq!(SetupFile::stored_at(&path), old_path);
 
         migrated.save(&path).unwrap();
+        assert_eq!(SetupFile::stored_at(&path), path);
         let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["version"], 4);
         assert_eq!(written["clock"], 2);
@@ -3036,6 +3121,73 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_v4_save_never_touches_the_v3_file() {
+        let directory = TestDirectory::new();
+        let path = directory.path(SETUP_FILE);
+        let old_path = directory.path(V3_SETUP_FILE);
+        write_raw(&old_path, V3_FILE.as_bytes());
+        let mut file = SetupFile::load(&path).unwrap();
+        file.set_active(None);
+        file.save(&path).unwrap();
+        file.forget(WINDOWS_PC);
+        file.save(&path).unwrap();
+        // An older MonHop still finds its own setup exactly as it left it.
+        assert_eq!(fs::read(&old_path).unwrap(), V3_FILE.as_bytes());
+        let saved = SetupFile::load(&path).unwrap();
+        assert_eq!(saved, file);
+        assert!(saved.paused());
+        assert_eq!(saved.groups().len(), 1);
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written["version"], 4);
+    }
+
+    #[test]
+    fn the_v3_file_is_migrated_only_when_the_group_file_is_absent() {
+        let directory = TestDirectory::new();
+        let path = directory.path(SETUP_FILE);
+        let old_path = directory.path(V3_SETUP_FILE);
+        write_raw(&old_path, V3_FILE.as_bytes());
+        // Once this version wrote its own file, the version 3 file is never read again.
+        let mut chosen = SetupFile::default();
+        chosen.set_interface_id("en7:12:10.1.1.7");
+        chosen.save(&path).unwrap();
+        assert_eq!(SetupFile::load(&path).unwrap(), chosen);
+        fs::remove_file(&path).unwrap();
+        let migrated = SetupFile::load(&path).unwrap();
+        assert_eq!(migrated.groups().len(), 2);
+        assert_eq!(migrated.local(), Some(LOCAL));
+        // A build between version 3 and this one wrote version 4 in the old place; it is read too.
+        write_raw(&old_path, &serde_json::to_vec(&chosen).unwrap());
+        assert_eq!(SetupFile::load(&path).unwrap(), chosen);
+        // A version 3 file where this version's belongs is not one this version wrote.
+        write_raw(&path, V3_FILE.as_bytes());
+        assert!(SetupFile::load(&path).is_err());
+    }
+
+    #[test]
+    fn a_newer_version_loads_read_only_and_refuses_to_save() {
+        let directory = TestDirectory::new();
+        let path = directory.path(SETUP_FILE);
+        let mut newer = serde_json::to_value(file_with(preferences())).unwrap();
+        newer["version"] = serde_json::json!(SETUP_FILE_VERSION + 1);
+        newer["members"] = serde_json::json!({ "unknown": "to this version" });
+        let newer = serde_json::to_vec(&newer).unwrap();
+        write_raw(&path, &newer);
+        let mut loaded = SetupFile::load(&path).unwrap();
+        assert!(loaded.written_by_newer());
+        assert!(loaded.groups().is_empty());
+        assert!(!loaded.sharing_chosen());
+        loaded.set_active(Some(
+            &CertificateFingerprint::parse_full(&"B".repeat(64)).unwrap(),
+        ));
+        assert_eq!(
+            loaded.save(&path).map_err(|error| error.kind()),
+            Err(io::ErrorKind::Unsupported)
+        );
+        assert_eq!(fs::read(&path).unwrap(), newer);
+    }
+
+    #[test]
     fn missing_file_is_inert() {
         let directory = TestDirectory::new();
         let loaded = SetupFile::load(&directory.path("missing.json")).unwrap();
@@ -3047,7 +3199,7 @@ pub(crate) mod tests {
     #[test]
     fn corrupt_oversize_and_unknown_records_are_rejected() {
         let directory = TestDirectory::new();
-        let path = directory.path("sharing.json");
+        let path = directory.path(SETUP_FILE);
         write_raw(&path, b"{");
         assert!(SetupFile::load(&path).is_err());
 
@@ -3104,9 +3256,15 @@ pub(crate) mod tests {
         let mut other_version = valid.clone();
         other_version["version"] = serde_json::json!(SETUP_FILE_VERSION + 1);
         write_raw(&path, &serde_json::to_vec(&other_version).unwrap());
-        assert_eq!(SetupFile::load(&path).unwrap(), SetupFile::default());
+        assert!(SetupFile::load(&path).unwrap().written_by_newer());
 
         // A version 3 file is read as strictly as that version read it before it is migrated.
+        fs::remove_file(&path).unwrap();
+        let old_path = directory.path(V3_SETUP_FILE);
+        let rejected = |value: &serde_json::Value| {
+            write_raw(&old_path, &serde_json::to_vec(value).unwrap());
+            SetupFile::load(&path).is_err()
+        };
         let v3: serde_json::Value =
             serde_json::from_slice(&v3_file(Some('B'), &[preferences()])).unwrap();
         assert!(!rejected(&v3));
@@ -3133,8 +3291,10 @@ pub(crate) mod tests {
         let too_many: Vec<SharingPreferences> = (0..=MAX_COMPUTERS)
             .map(|index| record_for(&format!("{index:064X}")))
             .collect();
-        write_raw(&path, &v3_file(None, &too_many));
+        write_raw(&old_path, &v3_file(None, &too_many));
         assert!(SetupFile::load(&path).is_err());
+        // Nothing past a damaged version 3 file was written in its place or beside it.
+        assert!(!path.exists());
     }
 
     #[test]
@@ -3146,13 +3306,19 @@ pub(crate) mod tests {
 
         let mut nonfinite = valid.clone();
         nonfinite.local_displays[0].origin[0] = f64::NAN;
-        assert!(file_with(nonfinite).save(&path).is_err());
+        assert!(try_file_with(&nonfinite).is_err());
 
         let mut invalid_geometry = valid.clone();
         invalid_geometry.peer_displays[0].native_size[0] = 0;
-        assert!(file_with(invalid_geometry).save(&path).is_err());
+        assert!(try_file_with(&invalid_geometry).is_err());
+        // Even a record that reached memory unchecked is never written.
+        let mut record = serde_json::to_value(group(&valid)).unwrap();
+        record["members"][1]["displays"][0]["nativeSize"] = serde_json::json!([0, 1440]);
+        let mut file = file_with(valid.clone());
+        file.groups = vec![serde_json::from_value(record).unwrap()];
+        assert!(file.save(&path).is_err());
 
-        assert_eq!(saved_computer(&path), Some(valid));
+        assert_eq!(saved_group(&path), Some(group(&valid)));
     }
 
     #[test]
@@ -3172,11 +3338,11 @@ pub(crate) mod tests {
                 monitor: None,
             });
         }
-        assert!(file_with(too_many_displays).save(&path).is_err());
+        assert!(try_file_with(&too_many_displays).is_err());
 
         let mut too_many_links = preferences();
         too_many_links.layout.links = vec![too_many_links.layout.links[0].clone(); MAX_LINKS + 1];
-        assert!(file_with(too_many_links).save(&path).is_err());
+        assert!(try_file_with(&too_many_links).is_err());
         assert!(!path.exists());
     }
 
@@ -3200,8 +3366,8 @@ pub(crate) mod tests {
         assert!(SetupFile::load(&link).is_err());
         assert!(file_with(preferences()).save(&link).is_err());
         assert_eq!(
-            SetupFile::load(&target).unwrap().computer(&"b".repeat(64)),
-            Some(&expected)
+            SetupFile::load(&target).unwrap().active_group(),
+            Some(&group(&expected))
         );
     }
 
@@ -3221,57 +3387,64 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn shared_setup_maps_both_perspectives_without_importing_the_network() {
+    fn shared_group_maps_both_perspectives_without_importing_the_network() {
         let saved = preferences();
         let sender = inspection(&saved);
-        let bytes = shared_setup_bytes(&sender, saved.layout.clone(), false).unwrap();
+        let record = group(&saved);
+        let bytes = shared_group_bytes(&sender, &record, false).unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(!text.contains("interfaceId"));
         assert!(!text.contains("enabled"));
         for current in [sender.clone(), opposite(&sender)] {
-            let (restored, left_out) = shared_setup_for_inspection(&current, &bytes).unwrap();
+            let (restored, left_out) = shared_group_for_link(&current, &bytes).unwrap();
             assert!(!left_out);
-            assert_eq!(restored.interface_id, current.interface_id);
-            assert_eq!(
-                restored.local_fingerprint,
-                current.local_fingerprint.full_hex()
-            );
-            assert_eq!(restored.layout, saved.layout);
-            assert!(restored.matches_inspection(&current));
+            assert_eq!(restored, record);
+            assert!(restored.fits_link(&current));
+            // Each computer reads the pair from its own side, on the network it chose.
+            let pairwise = restored
+                .to_pairwise(&current.local_fingerprint.full_hex(), &current.interface_id)
+                .unwrap();
+            assert_eq!(pairwise.layout, saved.layout);
+            assert_eq!(pairwise.interface_id, current.interface_id);
         }
     }
 
     #[test]
-    fn shared_setup_v2_round_trips_control() {
+    fn shared_group_v3_round_trips_control() {
         let saved = preferences();
         let sender = inspection(&saved);
         let receiver = opposite(&sender);
         let mut layout = saved.layout.clone();
         layout.control.insert("b".repeat(64), false);
-        let bytes = shared_setup_bytes(&sender, layout.clone(), true).unwrap();
+        let record = group(&saved).with_control(layout.control.clone()).unwrap();
+        let bytes = shared_group_bytes(&sender, &record, true).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["version"], 2);
+        assert_eq!(value["version"], 3);
         assert_eq!(value["leftOut"], true);
-        assert_eq!(value["layout"]["control"]["a".repeat(64)], true);
-        assert_eq!(value["layout"]["control"]["b".repeat(64)], false);
-        let (here, _) = shared_setup_for_inspection(&sender, &bytes).unwrap();
-        let (there, left_out) = shared_setup_for_inspection(&receiver, &bytes).unwrap();
+        assert_eq!(value["senderFingerprint"], "A".repeat(64));
+        assert_eq!(value["record"]["layout"]["control"]["a".repeat(64)], true);
+        assert_eq!(value["record"]["layout"]["control"]["b".repeat(64)], false);
+        let (here, _) = shared_group_for_link(&sender, &bytes).unwrap();
+        let (there, left_out) = shared_group_for_link(&receiver, &bytes).unwrap();
         assert!(left_out);
-        assert_eq!(here.control(), &layout.control);
-        assert_eq!(there.control(), &layout.control);
-        assert_eq!(here.wire_control(), there.wire_control());
-        assert_eq!(there.local_fingerprint(), "B".repeat(64));
+        assert_eq!(here.layout().control, layout.control);
+        assert_eq!(there.layout().control, layout.control);
+        let (a, b) = ("A".repeat(64), "B".repeat(64));
+        assert_eq!(
+            wire_control(&here.layout().control, &a, &b),
+            wire_control(&there.layout().control, &b, &a)
+        );
     }
 
     #[test]
-    fn shared_setup_rejects_stale_or_untrusted_metadata_before_saving() {
+    fn shared_group_rejects_stale_or_untrusted_metadata_before_saving() {
         let saved = preferences();
         let sender = inspection(&saved);
-        let bytes = shared_setup_bytes(&sender, saved.layout, false).unwrap();
+        let bytes = shared_group_bytes(&sender, &group(&saved), false).unwrap();
         let receiver = opposite(&sender);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         for (field, bad) in [
-            ("version", serde_json::json!(1)),
+            ("version", serde_json::json!(2)),
             ("senderFingerprint", serde_json::json!("00".repeat(32))),
             ("receiverFingerprint", serde_json::json!("00".repeat(32))),
             ("sourcePlatform", serde_json::json!("windows")),
@@ -3281,15 +3454,16 @@ pub(crate) mod tests {
             let mut corrupted = value.clone();
             corrupted[field] = bad;
             assert!(
-                shared_setup_for_inspection(&receiver, &serde_json::to_vec(&corrupted).unwrap())
-                    .is_err(),
+                shared_group_for_link(&receiver, &serde_json::to_vec(&corrupted).unwrap()).is_err(),
                 "{field}"
             );
         }
+        // The sender's entry, as the receiver sees it, no longer matches its displays.
         let mut stale = value.clone();
-        stale["senderDisplays"][0]["origin"][0] = serde_json::json!(100.5);
-        assert!(
-            shared_setup_for_inspection(&receiver, &serde_json::to_vec(&stale).unwrap()).is_err()
+        stale["record"]["members"][0]["displays"][0]["origin"][0] = serde_json::json!(100.5);
+        assert_eq!(
+            shared_group_for_link(&receiver, &serde_json::to_vec(&stale).unwrap()),
+            Err(PreferenceError::InspectionChanged)
         );
         for (field, bad) in [
             ("links", serde_json::json!([])),
@@ -3297,18 +3471,17 @@ pub(crate) mod tests {
             ("sourceDisplay", serde_json::json!("2")),
         ] {
             let mut invalid = value.clone();
-            invalid["layout"][field] = bad;
+            invalid["record"]["layout"][field] = bad;
             assert!(
-                shared_setup_for_inspection(&receiver, &serde_json::to_vec(&invalid).unwrap())
-                    .is_err(),
+                shared_group_for_link(&receiver, &serde_json::to_vec(&invalid).unwrap()).is_err(),
                 "{field}"
             );
         }
         let mut trailing = bytes;
         trailing.extend_from_slice(b"{}");
-        assert!(shared_setup_for_inspection(&receiver, &trailing).is_err());
+        assert!(shared_group_for_link(&receiver, &trailing).is_err());
         assert!(
-            shared_setup_for_inspection(
+            shared_group_for_link(
                 &receiver,
                 &vec![b' '; MAX_SHARING_PREFERENCES_BYTES as usize + 1]
             )

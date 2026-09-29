@@ -1,0 +1,1 @@
+//! Hub core lifecycle scenarios.

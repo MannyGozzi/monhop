@@ -756,7 +756,7 @@ impl Environment for AppEnvironment {
         crate::sharing_setup_path(&self.app)
             .ok()
             .and_then(|path| SetupFile::load(&path).ok())
-            .is_some_and(|file| file.active().is_some())
+            .is_some_and(|file| file.sharing_chosen())
     }
 
     fn announce(&self, view: &UpdatesView) {

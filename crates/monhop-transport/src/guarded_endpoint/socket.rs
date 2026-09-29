@@ -17,7 +17,10 @@ use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
-use tokio::{sync::watch, time::Instant};
+use tokio::{
+    sync::{Notify, watch},
+    time::Instant,
+};
 
 use super::{TokenBucket, native::NativeSocket};
 use crate::{
@@ -75,6 +78,8 @@ fn is_first_packet(datagram: &[u8]) -> bool {
 /// finds its route. Shared by the route checks, the socket and the dialer.
 pub(super) struct Reachability {
     unreachable: Box<[AtomicBool]>,
+    /// Woken by every verdict that leaves a member set aside.
+    set_aside: Notify,
 }
 
 impl Reachability {
@@ -82,6 +87,7 @@ impl Reachability {
     pub(super) fn new(members: usize) -> Arc<Self> {
         Arc::new(Self {
             unreachable: (0..members).map(|_| AtomicBool::new(false)).collect(),
+            set_aside: Notify::new(),
         })
     }
 
@@ -93,6 +99,19 @@ impl Reachability {
         self.unreachable
             .get(member)
             .is_some_and(|unreachable| !unreachable.load(Ordering::Acquire))
+    }
+
+    pub(super) fn reaches_all(&self) -> bool {
+        self.unreachable
+            .iter()
+            .all(|unreachable| !unreachable.load(Ordering::Acquire))
+    }
+
+    /// Resolves once a verdict leaves some member set aside.
+    pub(super) async fn some_set_aside(&self) {
+        while self.reaches_all() {
+            self.set_aside.notified().await;
+        }
     }
 
     /// Takes one route check's verdict, in member order.
@@ -109,6 +128,9 @@ impl Reachability {
                     );
                 }
             }
+        }
+        if !self.reaches_all() {
+            self.set_aside.notify_one();
         }
     }
 }

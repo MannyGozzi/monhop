@@ -190,8 +190,7 @@ impl ReceiverSet {
 }
 
 impl Slot {
-    /// Sequenced as the pairwise actor sequences replies: heartbeats on the control epoch's own
-    /// counter, anything else on the input epoch's, which restarts at 0 when that epoch changes.
+    /// Sequenced as the pairwise actor sequences replies.
     fn respond(
         &mut self,
         response: Option<Message>,
@@ -200,29 +199,11 @@ impl Slot {
         let Some(message) = response else {
             return Ok(None);
         };
-        let control = matches!(message, Message::Ping(_) | Message::Pong(_));
-        let epoch = if control {
-            self.receiver.control_epoch()
-        } else {
-            self.receiver.epoch()
-        };
-        let sequences = &mut self.sequences;
-        if !control && epoch != sequences.epoch {
-            sequences.epoch = epoch;
-            sequences.input = 0;
-        }
-        let sequence = if control {
-            &mut sequences.control
-        } else {
-            &mut sequences.input
-        };
-        let Some(next) = sequence.checked_add(1) else {
+        let Some(frame) = self.sequences.frame(message, &self.receiver) else {
             self.receiver
                 .stop(ReceiverFailure::PeerStopped, destination);
             return Err(SlotFailure::SequenceExhausted);
         };
-        let frame = Frame::new(epoch, *sequence, message);
-        *sequence = next;
         Ok(Some(frame))
     }
 }

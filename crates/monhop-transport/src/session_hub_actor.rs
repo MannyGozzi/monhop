@@ -1,8 +1,4 @@
 //! One destination actor thread shared by every peer link of the share hub.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the share hub shell is its first caller")
-)]
 
 use crate::{
     session_actor::{

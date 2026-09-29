@@ -25,7 +25,8 @@ use monhop_core::{
 };
 use monhop_protocol::{Frame, FrameScope, Message, SessionPurpose};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
-const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// The cadence for reading the OS pointer while every route is local.
+pub(crate) const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const CLEANUP_WAIT: Duration = Duration::from_millis(250);
 const DRAIN_LIMIT: usize = 256;
 

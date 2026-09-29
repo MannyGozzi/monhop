@@ -877,6 +877,7 @@ async fn the_socket_outlives_its_last_handle_until_the_drivers_run() {
 
 use super::super::{
     EndpointHandle, GroupMember, GroupSelection, GuardedEndpoint, MemberHandshakeFailure,
+    native::SharedCheck,
 };
 use crate::{
     crypto::CertificateFingerprint,
@@ -1719,6 +1720,57 @@ async fn a_member_set_aside_by_a_route_check_is_absent_until_one_finds_it() {
     for endpoint in [&hub, &first, &second] {
         endpoint.revoke();
     }
+}
+
+#[tokio::test]
+async fn dropping_the_endpoint_stops_the_timer() {
+    const INTERVAL: Duration = Duration::from_millis(20);
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let [hub_socket, _, _] = two_member_network();
+    let checks = Arc::new(AtomicUsize::new(0));
+    // Finds the member still set aside on every run, so only a stop ends the timer.
+    let check: SharedCheck = {
+        let checks = checks.clone();
+        Arc::new(move || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+    };
+    let held = Arc::downgrade(&check);
+    let hub = GuardedEndpoint::over_socket_rechecking(
+        hub_socket,
+        &group(LOCAL, &[(MEMBERS[0], &ids[0]), (MEMBERS[1], &ids[1])]),
+        &hub_id,
+        Some((check, INTERVAL)),
+    )
+    .unwrap();
+    let signal = hub.revocation_signal();
+    let closed = hub.socket_closed();
+    hub.set_reachable(&[false, true]);
+    tokio::time::timeout(DEADLINE, async {
+        while checks.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the timer rechecks while a member is set aside");
+
+    drop(hub);
+    assert!(signal.is_revoked());
+    tokio::time::timeout(DEADLINE, async {
+        while held.strong_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the timer let go of its check");
+    let stopped = checks.load(Ordering::SeqCst);
+    tokio::time::sleep(INTERVAL * 5).await;
+    assert_eq!(checks.load(Ordering::SeqCst), stopped);
+    tokio::time::timeout(DEADLINE, closed)
+        .await
+        .expect("the timer kept no part of the endpoint open");
 }
 
 #[tokio::test]

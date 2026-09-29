@@ -1,14 +1,19 @@
 //! Explicit sharing actions. Constructing or polling this controller performs no native I/O.
 
 use crate::arrangement_library::{ArrangementLibrary, ArrangementView};
+use crate::group_record::{
+    self, GroupRecord, KnownDisplays, RecordSummary, Stamp, shared_group_bytes,
+    shared_group_for_link,
+};
 use crate::sharing_preferences::{
-    self, ControlMap, DisplayGeometry, PreferenceError, SavedSetupView, SetupFile,
-    SharingPreferences, both_directions, fingerprint_key,
+    self, ControlMap, DisplayGeometry, PreferenceError, SavedSetupView, SetupFile, both_directions,
+    fingerprint_key,
 };
 use monhop_core::{
     DisplayId, Edge, EdgeLink, NativeSessionClaim, NormalizedSpan, Platform, Point,
-    RevocationSignal,
+    RevocationSignal, Topology,
 };
+use monhop_protocol::ControlPermissions;
 use monhop_transport::{
     crypto::CertificateFingerprint,
     session::{
@@ -77,7 +82,11 @@ const PEER_PAUSED: &str = "The other computer paused sharing. Reconnecting when 
 pub(crate) const ARRANGEMENTS_UNREADABLE: &str =
     "The saved arrangements could not be read. Your applied layout is unchanged.";
 /// The arrangement library sits beside the setup file, so every writer of one finds the other.
-pub(crate) const ARRANGEMENTS_FILE: &str = "arrangements.json";
+pub(crate) const ARRANGEMENTS_FILE: &str = "group-arrangements.json";
+const SETUP_FROM_NEWER: &str =
+    "This setup was saved by a newer version of MonHop. Update MonHop to change it.";
+const ARRANGEMENTS_FROM_NEWER: &str =
+    "These arrangements were saved by a newer version of MonHop. Update MonHop to change them.";
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 /// Retrying cannot change the identity the other computer presents; pairing again does.
 const PEER_IDENTITY_BACKOFF: Duration = Duration::from_secs(60);
@@ -85,7 +94,7 @@ const PEER_IDENTITY_BACKOFF: Duration = Duration::from_secs(60);
 /// before it counts as a failure.
 const UNSETTLED_POLL: Duration = Duration::from_millis(250);
 const UNSETTLED_WINDOW: Duration = Duration::from_secs(5);
-/// The decider proposes only once both computers' displays have held still this long; the
+/// A record is proposed for the link's displays only once they have held still this long; the
 /// session they outgrew has already ended.
 const DISPLAYS_SETTLE: Duration = Duration::from_secs(1);
 /// A proposal refused for a passing reason is made again after this long, at most this many
@@ -402,12 +411,80 @@ struct ActiveControl {
 }
 
 impl ActiveControl {
-    fn of(record: &SharingPreferences) -> Self {
-        Self {
-            local: fingerprint_key(record.local_fingerprint()),
-            peer: fingerprint_key(record.peer_fingerprint()),
-            control: record.control().clone(),
+    /// None unless `record` is a pair naming `local`.
+    fn of(record: &GroupRecord, local: &str) -> Option<Self> {
+        let local = fingerprint_key(local);
+        let [first, second] = record.members() else {
+            return None;
+        };
+        let peer = [first, second]
+            .into_iter()
+            .map(|member| fingerprint_key(member.fingerprint()))
+            .find(|member| *member != local)?;
+        record.has_member(&local).then(|| Self {
+            local,
+            peer,
+            control: record.layout().control.clone(),
+        })
+    }
+}
+
+/// A session with the one enabled computer, on the file's network, under the active group's
+/// record.
+#[derive(Clone)]
+pub(crate) struct SessionPlan {
+    interface_id: String,
+    /// This computer's fingerprint as the record names it.
+    local: String,
+    peer: CertificateFingerprint,
+    record: GroupRecord,
+}
+
+impl SessionPlan {
+    /// None while no single computer is chosen, it has no record with this computer yet, or no
+    /// network is chosen.
+    pub(crate) fn of(file: &SetupFile) -> Option<Self> {
+        let peer = CertificateFingerprint::parse_full(file.active()?).ok()?;
+        Some(Self {
+            interface_id: file.interface_id()?.to_owned(),
+            local: file.local()?.to_owned(),
+            peer,
+            record: file.active_group()?.clone(),
+        })
+    }
+
+    pub(crate) fn local(&self) -> &str {
+        &self.local
+    }
+
+    pub(crate) fn record(&self) -> &GroupRecord {
+        &self.record
+    }
+
+    /// Whether this computer still shows the displays the record holds for it.
+    pub(crate) fn fits_local(&self, displays: &session_setup::DisplayTopology) -> bool {
+        self.record.fits_local(&self.local, displays)
+    }
+
+    /// What both computers negotiate; None when neither may control the other.
+    pub(crate) fn control(&self) -> Option<ControlPermissions> {
+        group_record::wire_control(
+            &self.record.layout().control,
+            &self.local,
+            &self.peer.full_hex(),
+        )
+    }
+
+    /// The pointer topology of a session that met the other computer as `inspection` found
+    /// both; None when the record does not fit them, whatever network the session runs on.
+    pub(crate) fn topology(&self, inspection: &InspectedPeer) -> Option<Topology> {
+        if inspection.peer_fingerprint != self.peer
+            || self.record.members().len() != 2
+            || !self.record.fits_link(inspection)
+        {
+            return None;
         }
+        validated_layout(inspection, self.record.layout()).ok()
     }
 }
 
@@ -434,12 +511,26 @@ struct State {
     link_epoch: u64,
     /// Validated by the link but not yet written, with whether its sender left something out; a
     /// Stop before commit drops it.
-    staged: Option<(SharingPreferences, bool)>,
+    staged: Option<(GroupRecord, bool)>,
     /// The computer the running worker is for.
     peer: Option<CertificateFingerprint>,
     /// Mirrors the setup file so the view can show the active computer without a live worker.
     active: Option<String>,
     active_control: Option<ActiveControl>,
+    /// The highest revision the setup file, a commit, or the other computer's summary showed: a
+    /// record made here is stamped past it.
+    clock: u64,
+    /// This computer's identity, the enabled computers and the active group's record, mirrored
+    /// from the setup file for the summary each link carries.
+    local: Option<String>,
+    enabled: Vec<String>,
+    held: Option<GroupRecord>,
+    /// The summary this link last told the other computer; None until it told one.
+    summary_sent: Option<Vec<u8>>,
+    /// The other computer's summary on this connection; None until it arrives.
+    peer_summary: Option<RecordSummary>,
+    /// The setup file as this link's commit left it, for the completion that follows.
+    committed: Option<SetupFile>,
     /// Switch flips made here that both computers have not committed yet, over `active_control`.
     pending_control: Option<ControlMap>,
     editing: bool,
@@ -504,33 +595,77 @@ struct SetupFileLock(Mutex<()>);
 enum SetupFileError {
     Read,
     Write,
+    /// A newer MonHop wrote the file, so this one saves nothing over it.
+    Newer,
+}
+
+impl SetupFileError {
+    const fn message(&self, write: &'static str) -> &'static str {
+        match self {
+            Self::Read => "The saved setup could not be read.",
+            Self::Write => write,
+            Self::Newer => SETUP_FROM_NEWER,
+        }
+    }
 }
 
 impl SetupFileLock {
+    /// `seen` is the highest revision this computer saw, which every write keeps.
     fn update(
         &self,
         path: &Path,
+        seen: u64,
         edit: impl FnOnce(&mut SetupFile),
     ) -> Result<SetupFile, SetupFileError> {
         let _guard = lock(&self.0);
-        update_setup(path, edit)
+        update_setup(path, |file| {
+            file.observe_clock(seen);
+            edit(file);
+        })
     }
 
-    fn write_setup(&self, path: &Path, setup: SharingPreferences) -> Result<(), SetupFileError> {
+    /// Stores the link's two computers and `layout` as a new local change and makes the other
+    /// computer the active one.
+    fn write_setup(
+        &self,
+        path: &Path,
+        seen: u64,
+        inspection: &InspectedPeer,
+        layout: LayoutRequest,
+    ) -> Result<GroupRecord, SetupFileError> {
         let _guard = lock(&self.0);
-        write_setup(path, setup)
+        let mut written = None;
+        try_update_setup(path, |file| {
+            file.observe_clock(seen);
+            let record = GroupRecord::for_link(inspection, layout, file.clock().saturating_add(1))?;
+            file.set_active(Some(&inspection.peer_fingerprint));
+            file.adopt(&inspection.local_fingerprint.full_hex(), record.clone())?;
+            written = Some(record);
+            Ok(())
+        })?;
+        written.ok_or(SetupFileError::Write)
     }
 
-    /// The link's commit. `take_staged` runs under the file lock, so a Use or Pause either
-    /// retired the staged layout before this or waits and then writes over the committed one.
+    /// The link's commit, a max-merge into the file as it is now: a newer record written since
+    /// staging stays. `take_staged` runs under the file lock, so a Use or Pause either retired
+    /// the staged layout before this or waits and then writes over the committed one. Returns
+    /// the file written and whether the staged record is now its members' record.
     fn commit(
         &self,
         path: &Path,
-        take_staged: impl FnOnce() -> Result<SharingPreferences, LinkRejectReason>,
-    ) -> Result<(), LinkRejectReason> {
+        local: &str,
+        take_staged: impl FnOnce() -> Result<(GroupRecord, u64), LinkRejectReason>,
+    ) -> Result<(SetupFile, bool), LinkRejectReason> {
         let _guard = lock(&self.0);
-        let staged = take_staged()?;
-        write_setup(path, staged).map_err(|_| LinkRejectReason::SaveFailed)
+        let (staged, seen) = take_staged()?;
+        let mut adopted = false;
+        try_update_setup(path, |file| {
+            file.observe_clock(seen);
+            adopted = file.adopt(local, staged)?;
+            Ok(())
+        })
+        .map(|file| (file, adopted))
+        .map_err(|_| LinkRejectReason::SaveFailed)
     }
 }
 
@@ -538,20 +673,24 @@ fn update_setup(
     path: &Path,
     edit: impl FnOnce(&mut SetupFile),
 ) -> Result<SetupFile, SetupFileError> {
-    let mut file = SetupFile::load(path).map_err(|_| SetupFileError::Read)?;
-    edit(&mut file);
-    file.save(path).map_err(|_| SetupFileError::Write)?;
-    Ok(file)
+    try_update_setup(path, |file| {
+        edit(file);
+        Ok(())
+    })
 }
 
-/// Stores one computer's record and makes that computer active.
-fn write_setup(path: &Path, setup: SharingPreferences) -> Result<(), SetupFileError> {
-    let peer = setup.peer().map_err(|_| SetupFileError::Write)?;
-    update_setup(path, |file| {
-        file.set_active(Some(&peer));
-        file.insert(setup);
-    })
-    .map(drop)
+/// A refused edit writes nothing.
+fn try_update_setup(
+    path: &Path,
+    edit: impl FnOnce(&mut SetupFile) -> Result<(), PreferenceError>,
+) -> Result<SetupFile, SetupFileError> {
+    let mut file = SetupFile::load(path).map_err(|_| SetupFileError::Read)?;
+    if file.written_by_newer() {
+        return Err(SetupFileError::Newer);
+    }
+    edit(&mut file).map_err(|_| SetupFileError::Write)?;
+    file.save(path).map_err(|_| SetupFileError::Write)?;
+    Ok(file)
 }
 
 #[derive(Clone)]
@@ -560,8 +699,8 @@ enum WorkerKind {
     Link(UnboundedSender<LinkCommand>),
 }
 
-/// What a standing link waits for before the port goes back to a session. Only the decider's
-/// commit, or a commit the other computer sent, ends such a link.
+/// What a standing link waits for before the port goes back to a session. Only a commit ends
+/// such a link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinkReason {
     /// This computer's record no longer fits the displays, or the two records disagree.
@@ -861,7 +1000,10 @@ impl SharingController {
         interface_id: Option<&str>,
     ) -> Result<SharingView, String> {
         self.update_setup_file(path, |file| {
-            file.set_active(fingerprint.as_ref());
+            match fingerprint.as_ref() {
+                Some(fingerprint) => file.choose(fingerprint),
+                None => file.set_active(None),
+            }
             // The supervisor dials only over a recorded network, so choosing a computer records the chosen one.
             if let Some(interface_id) =
                 interface_id.filter(|id| fingerprint.is_some() && !id.is_empty())
@@ -869,16 +1011,7 @@ impl SharingController {
                 file.set_interface_id(interface_id);
             }
         })?;
-        {
-            let mut state = lock(&self.state);
-            publish_arranging(&state, false);
-            state.editing = false;
-            state.link_reason = None;
-            state.pending_control = None;
-            state.last_failure = None;
-            state.last_failure_at = None;
-            state.worker_failed_at = None;
-        }
+        self.clear_choice();
         let live = self.live_peer();
         if live.is_some() && live != fingerprint {
             return Ok(self.stop_with(if fingerprint.is_some() {
@@ -897,6 +1030,19 @@ impl SharingController {
         Ok(self.status())
     }
 
+    /// Drops what was going on for the computers chosen so far: arranging, a reason to hold a
+    /// link, unsynced switch flips, the last drop and its backoff.
+    pub fn clear_choice(&self) {
+        let mut state = lock(&self.state);
+        publish_arranging(&state, false);
+        state.editing = false;
+        state.link_reason = None;
+        state.pending_control = None;
+        state.last_failure = None;
+        state.last_failure_at = None;
+        state.worker_failed_at = None;
+    }
+
     /// Applies one change to the setup file and mirrors the result into the view. Every writer
     /// of that file goes through here or the link's commit, never around them.
     pub fn update_setup_file(
@@ -904,12 +1050,11 @@ impl SharingController {
         path: &Path,
         edit: impl FnOnce(&mut SetupFile),
     ) -> Result<SetupFile, String> {
-        let file = self.setup_file.update(path, edit).map_err(|error| {
-            match error {
-                SetupFileError::Read => "The saved setup could not be read.",
-                SetupFileError::Write => "The saved setup could not be updated.",
-            }
-            .to_owned()
+        let seen = lock(&self.state).clock;
+        let file = self.setup_file.update(path, seen, edit).map_err(|error| {
+            error
+                .message("The saved setup could not be updated.")
+                .to_owned()
         })?;
         self.adopt_saved(&file);
         self.advance_setup_revision();
@@ -1060,11 +1205,25 @@ impl SharingController {
             })
     }
 
-    /// True once the link's displays have held still long enough for the decider to propose.
+    /// True once the link's displays have held still long enough to propose a record for them.
     pub fn displays_settled(&self) -> bool {
         lock(&self.state)
             .displays_changed_at
             .is_some_and(|at| at.elapsed() >= DISPLAYS_SETTLE)
+    }
+
+    /// The stamp of the other computer's record as its summary on this connection gives it,
+    /// None inside when it holds none. None until a summary naming both link ends arrived.
+    pub(crate) fn peer_stamp_for(&self, inspection: &InspectedPeer) -> Option<Option<Stamp>> {
+        let state = lock(&self.state);
+        let summary = state.peer_summary.as_ref()?;
+        let names = |fingerprint: &CertificateFingerprint| {
+            summary
+                .members()
+                .contains(&fingerprint_key(&fingerprint.full_hex()))
+        };
+        (names(&inspection.local_fingerprint) && names(&inspection.peer_fingerprint))
+            .then(|| summary.stamp())
     }
 
     /// A proposal that could not leave: the next pass tries again, as for a passing refusal.
@@ -1117,7 +1276,7 @@ impl SharingController {
     }
 
     /// This computer's displays no longer fit its record, so the next connection is a link on
-    /// which the decider picks the record both computers hold.
+    /// which one computer proposes the record both then hold.
     pub fn note_local_misfit(&self) {
         lock(&self.state)
             .link_reason
@@ -1213,7 +1372,8 @@ impl SharingController {
             .ok_or("Connect both computers first.")?;
         layout.control = control_for(&state, &inspection);
         validated_layout(&inspection, &layout)?;
-        let bytes = sharing_preferences::shared_setup_bytes(&inspection, layout, false)
+        let bytes = GroupRecord::for_link(&inspection, layout, state.clock.saturating_add(1))
+            .and_then(|record| shared_group_bytes(&inspection, &record, false))
             .map_err(|error| error.to_string())?;
         commands
             .send(LinkCommand::Propose { bytes })
@@ -1227,15 +1387,17 @@ impl SharingController {
         Ok(view_of(&state))
     }
 
-    /// The decider's Apply for a display change. `left_out` (a crossing or display dropped) decides
-    /// the banner the commit leaves and whether either computer remembers the layout.
-    pub fn propose_layout(&self, next: &SharingPreferences, left_out: bool) -> Result<(), String> {
+    /// A record rebuilt for the link's displays, stamped as a local change. `left_out` (a crossing
+    /// or display dropped) decides the banner the commit leaves and whether either computer
+    /// remembers the layout.
+    pub fn propose_layout(&self, next: &GroupRecord, left_out: bool) -> Result<(), String> {
         self.send_proposal(next, Some(left_out))
     }
 
-    /// Proposes a record that already fits both computers' displays: the decider's own, or either
-    /// computer's carrying a control change. Nothing changed on screen, so no banner.
-    pub fn propose_record(&self, next: &SharingPreferences) -> Result<(), String> {
+    /// Proposes a record that already fits both computers' displays: this computer's own as it
+    /// is, or carrying a control change as a local change. Nothing changed on screen, so no
+    /// banner.
+    pub fn propose_record(&self, next: &GroupRecord) -> Result<(), String> {
         self.send_proposal(next, None)
     }
 
@@ -1243,7 +1405,7 @@ impl SharingController {
     /// is recorded, and any banner raised, under the same lock that sends it.
     fn send_proposal(
         &self,
-        next: &SharingPreferences,
+        next: &GroupRecord,
         display_change: Option<bool>,
     ) -> Result<(), String> {
         let _operation = lock(&self.operation);
@@ -1262,21 +1424,31 @@ impl SharingController {
             .inspection
             .clone()
             .ok_or("Connect both computers first.")?;
-        let mut layout = next.layout().clone();
-        layout.control = overlaid(next.control(), state.pending_control.as_ref());
+        let local = inspection.local_fingerprint.full_hex();
+        let held = &next.layout().control;
+        let mut control = overlaid(held, state.pending_control.as_ref());
         if sharing_preferences::validate_control(
-            &layout.control,
-            &inspection.local_fingerprint.full_hex(),
+            &control,
+            &local,
             &inspection.peer_fingerprint.full_hex(),
         )
         .is_err()
         {
-            layout.control = next.control().clone();
+            control.clone_from(held);
         }
+        let mut layout = next.layout().clone();
+        layout.control.clone_from(&control);
         validated_layout(&inspection, &layout)?;
+        let next = if display_change.is_some() || control != *held {
+            next.with_control(control)
+                .and_then(|record| record.restamped(state.clock.saturating_add(1), &local))
+                .map_err(|error| error.to_string())?
+        } else {
+            next.clone()
+        };
         let left_out = display_change.unwrap_or(false);
-        let bytes = sharing_preferences::shared_setup_bytes(&inspection, layout, left_out)
-            .map_err(|error| error.to_string())?;
+        let bytes =
+            shared_group_bytes(&inspection, &next, left_out).map_err(|error| error.to_string())?;
         commands
             .send(LinkCommand::Propose { bytes })
             .map_err(|_| "The connection ended. Connect again.".to_owned())?;
@@ -1302,11 +1474,10 @@ impl SharingController {
     }
 
     /// Mirrors the setup file into the view so Home shows the active computer and its switches
-    /// without a live link.
+    /// without a live link, and tells a live link a summary that changed with it.
     pub fn adopt_saved(&self, file: &SetupFile) {
         let mut state = lock(&self.state);
-        state.active = file.active().map(str::to_owned);
-        state.active_control = file.active_computer().map(ActiveControl::of);
+        mirror_file(&mut state, file);
         reconcile_pending_control(&mut state);
     }
 
@@ -1321,11 +1492,11 @@ impl SharingController {
 
     /// Keeps one authenticated sharing session alive with the active computer: connect, run,
     /// reconnect. The pairing itself is checked by the handshake.
-    pub fn start_sharing(&self, saved: SharingPreferences) -> Result<SharingView, String> {
-        let interface_id = saved.interface_id().to_owned();
-        let peer = saved.peer()?;
-        let control = saved.wire_control().map_err(|error| error.to_string())?;
-        let layout = saved.layout().clone();
+    pub fn start_sharing(&self, plan: SessionPlan) -> Result<SharingView, String> {
+        let control = plan
+            .control()
+            .ok_or("Choose which computer can control the other.")?;
+        let (interface_id, peer) = (plan.interface_id.clone(), plan.peer);
         self.launch(
             "starting",
             CONNECTING_FOR_SHARING,
@@ -1340,7 +1511,7 @@ impl SharingController {
                     session_setup::StandingShareEndpoint::new(&interface_id, peer, control);
                 log::info!(
                     "sharing: connecting on {interface_id} with record #{} ({control:?})",
-                    saved.digest()
+                    plan.record.digest()
                 );
                 loop {
                     if cancel.is_revoked() {
@@ -1417,12 +1588,11 @@ impl SharingController {
                     };
                     lock(&state).displays_unreadable_since = None;
                     attempts = AttemptLog::default();
-                    if saved.layout_for_inspection(&paired.inspection).as_ref() != Ok(&layout) {
+                    let Some(topology) = plan.topology(&paired.inspection) else {
                         note_layout_misfit(&mut lock(&state));
                         return Ok(());
-                    }
+                    };
                     log::info!("sharing: attempt {attempt} connected, starting the session");
-                    let topology = validated_layout(&paired.inspection, &layout)?;
                     register_native_cancellation(
                         &mut lock(&state),
                         worker_generation,
@@ -1502,9 +1672,9 @@ impl SharingController {
                         None
                     } else {
                         displays_changed_end(&result, peer_close, || {
-                            current_local_displays(&saved)
+                            current_local_displays(&plan.local)
                                 .ok()
-                                .map(|current| saved.matches_local_displays(&current))
+                                .map(|current| plan.fits_local(&current))
                         })
                     };
                     // The peer's control flip is checked once the displays already ruled
@@ -1585,7 +1755,7 @@ impl SharingController {
         let inspection = lock(&self.state).inspection.clone();
         let library = ArrangementLibrary::load(path).map_err(|_| ARRANGEMENTS_UNREADABLE)?;
         Ok(inspection
-            .map(|inspection| library.views(&inspection))
+            .map(|inspection| library_views(&library, &inspection))
             .unwrap_or_default())
     }
 
@@ -1597,30 +1767,23 @@ impl SharingController {
         name: &str,
         layout: LayoutRequest,
     ) -> Result<Vec<ArrangementView>, String> {
-        let setup = self.connected_setup(revision, layout)?;
-        let inspected = self.inspection_for_library()?;
+        let (record, inspected) = self.connected_record(revision, layout)?;
         let mut library = ArrangementLibrary::load(path).map_err(|_| ARRANGEMENTS_UNREADABLE)?;
         library
-            .upsert(name, setup)
+            .upsert(name, record)
             .map_err(|error| error.message().to_owned())?;
         save_library(path, &library)?;
-        Ok(library.views(&inspected))
+        Ok(library_views(&library, &inspected))
     }
 
-    fn inspection_for_library(&self) -> Result<InspectedPeer, String> {
-        lock(&self.state)
-            .inspection
-            .clone()
-            .ok_or_else(|| "Connect both computers first.".to_owned())
-    }
-
-    /// A setup built from the live inspection, valid for both computers, carrying the control map
-    /// this computer holds for the pair.
-    fn connected_setup(
+    /// The record the live link's two computers would hold for `layout`, valid for both and
+    /// carrying the control map this computer holds for the pair, stamped as the next local
+    /// change; with the inspection it was built from.
+    fn connected_record(
         &self,
         revision: &str,
         mut layout: LayoutRequest,
-    ) -> Result<SharingPreferences, String> {
+    ) -> Result<(GroupRecord, InspectedPeer), String> {
         let state = lock(&self.state);
         if state.shutdown
             || state.view.busy
@@ -1635,7 +1798,9 @@ impl SharingController {
             .ok_or("Connect both computers first.")?;
         layout.control = control_for(&state, &inspected);
         validated_layout(&inspected, &layout)?;
-        SharingPreferences::from_inspection(&inspected, layout).map_err(|error| error.to_string())
+        GroupRecord::for_link(&inspected, layout, state.clock.saturating_add(1))
+            .map(|record| (record, inspected))
+            .map_err(|error| error.to_string())
     }
 
     pub fn save_setup(
@@ -1644,20 +1809,27 @@ impl SharingController {
         revision: &str,
         layout: LayoutRequest,
     ) -> Result<SavedSetupView, String> {
-        let preferences = self.connected_setup(revision, layout)?;
+        let (checked, inspected) = self.connected_record(revision, layout)?;
+        let seen = lock(&self.state).clock;
         // Disk data is inert. Stop may invalidate the inspection while this write completes.
-        self.setup_file
-            .write_setup(path, preferences.clone())
-            .map_err(|_| {
-                "The setup could not be saved. Your previous setup is unchanged.".to_owned()
+        let record = self
+            .setup_file
+            .write_setup(path, seen, &inspected, checked.layout().clone())
+            .map_err(|error| {
+                error
+                    .message("The setup could not be saved. Your previous setup is unchanged.")
+                    .to_owned()
             })?;
         self.clear_display_notice();
-        remember_applied(path, &preferences);
+        remember_applied(path, &record, &inspected.local_fingerprint.full_hex());
         crate::autostart::setup_applied(path);
         let mut state = lock(&self.state);
+        state.clock = state.clock.max(record.revision());
         advance_setup_revision(&mut state);
-        Ok(SavedSetupView::from_saved(
-            Some(&preferences),
+        Ok(SavedSetupView::from_group(
+            Some(&record),
+            Some(&inspected.local_fingerprint.full_hex()),
+            &inspected.peer_fingerprint.full_hex(),
             state.inspection.as_ref(),
             &state.view.revision,
         ))
@@ -1739,6 +1911,9 @@ impl SharingController {
             state.link = Some(commands);
             state.link_since = Some(now);
             state.link_touched = Some(now);
+            state.summary_sent = None;
+            state.peer_summary = None;
+            publish_summary(&mut state);
         }
         let cancel = RevocationSignal::default();
         state.cancel = Some(cancel.clone());
@@ -1803,9 +1978,12 @@ impl SharingController {
                     state.link_touched = None;
                     state.staged = None;
                     state.peer = None;
-                    // Nothing carries the peer's arranging state or a proposal past its link:
-                    // the next link reports the one and re-sends the other.
+                    // Nothing carries the peer's arranging state, its summary or a proposal past
+                    // its link: the next link reports the first two and re-sends the last.
                     state.peer_arranging = false;
+                    state.peer_summary = None;
+                    state.summary_sent = None;
+                    state.committed = None;
                     state.pending_proposal = None;
                     state.displays_changed_at = None;
                     // "Updating" and "the other computer is choosing" both describe an exchange
@@ -2021,7 +2199,7 @@ fn open_link_for_layout(state: &mut State, message: &str) {
 
 /// A dialed session whose displays no longer fit the saved layout. That is the ordinary answer to
 /// a display change, not a failure: the worker ends cleanly, so the supervisor opens the link on
-/// its next pass with no backoff and the decider sends a layout that fits.
+/// its next pass with no backoff and one computer proposes a layout that fits.
 fn note_layout_misfit(state: &mut State) {
     log::info!(
         "sharing: the displays no longer fit the saved layout; opening the link to arrange them"
@@ -2030,7 +2208,7 @@ fn note_layout_misfit(state: &mut State) {
 }
 
 /// The two computers' saved records disagree on who may control whom. Answered on the link like
-/// a misfit, never by dialing again: the decider proposes one record and both then hold it.
+/// a misfit, never by dialing again: the newer record's holder proposes it and both then hold it.
 fn note_record_disagreement(state: &mut State) {
     log::info!("sharing: the two computers hold different layouts; opening the link to agree");
     open_link_for_layout(state, RECORDS_DISAGREE);
@@ -2191,6 +2369,59 @@ fn publish_arranging(state: &State, arranging: bool) {
     }
 }
 
+/// The setup file as the view and the link read it without a disk read. Pending flips are
+/// left for the caller to reconcile.
+fn mirror_file(state: &mut State, file: &SetupFile) {
+    state.active = file.active().map(str::to_owned);
+    state.active_control = file
+        .active()
+        .and(file.active_group())
+        .zip(file.local())
+        .and_then(|(record, local)| ActiveControl::of(record, local));
+    state.clock = state.clock.max(file.clock());
+    state.local = file.local().map(str::to_owned);
+    state.enabled = file.enabled().to_vec();
+    state.held = file.active_group().cloned();
+    publish_summary(state);
+}
+
+/// Tells the live link this computer's summary once it differs from the last one told; the link
+/// itself repeats it on every connection it opens.
+fn publish_summary(state: &mut State) {
+    let Some(link) = state.link.clone() else {
+        return;
+    };
+    let Some(bytes) = own_summary(state) else {
+        return;
+    };
+    if state.summary_sent.as_deref() != Some(bytes.as_slice()) {
+        let _ = link.send(LinkCommand::Summary(bytes.clone()));
+        state.summary_sent = Some(bytes);
+    }
+}
+
+/// This computer's active group and its record's stamp; None while this computer's identity is
+/// unknown. The live link's inspection names that identity first, the setup file after it.
+fn own_summary(state: &State) -> Option<Vec<u8>> {
+    let local = state
+        .inspection
+        .as_ref()
+        .map(|inspection| inspection.local_fingerprint.full_hex())
+        .or_else(|| state.local.clone())?;
+    let mut members = state.enabled.clone();
+    members.push(fingerprint_key(&local));
+    members.sort();
+    members.dedup();
+    let record = state
+        .held
+        .as_ref()
+        .filter(|record| record.member_keys() == members);
+    let members: Vec<&str> = members.iter().map(String::as_str).collect();
+    RecordSummary::new(&members, record)
+        .and_then(|summary| summary.to_bytes())
+        .ok()
+}
+
 /// An applied or promoted layout answers the change, so the next one raises the banner again.
 fn clear_notice(state: &mut State) {
     state.display_notice = None;
@@ -2212,15 +2443,27 @@ fn resolve_notice_on_commit(state: &mut State) {
     }
 }
 
+/// The arrangements made for the link's two computers, each fitting while both show its displays.
+fn library_views(library: &ArrangementLibrary, inspection: &InspectedPeer) -> Vec<ArrangementView> {
+    library.views(
+        &[
+            inspection.local_fingerprint.full_hex(),
+            inspection.peer_fingerprint.full_hex(),
+        ],
+        &KnownDisplays::of_link(inspection),
+    )
+}
+
 /// Remembers an applied record for the displays it was made with; an identical memory is left
-/// alone. `setup` is already validated, and a library problem never fails the Apply behind it.
-fn remember_applied(setup_path: &Path, setup: &SharingPreferences) {
+/// alone. `record` is already validated, `local` is this computer, and a library problem never
+/// fails the Apply behind it.
+fn remember_applied(setup_path: &Path, record: &GroupRecord, local: &str) {
     let path = setup_path.with_file_name(ARRANGEMENTS_FILE);
     let Ok(mut library) = ArrangementLibrary::load(&path) else {
         log::warn!("arrangements: the applied layout was not remembered; the library is damaged");
         return;
     };
-    match library.remember_automatically(setup.clone()) {
+    match library.remember_automatically(record.clone(), local) {
         Ok(true) => {}
         Ok(false) => return,
         Err(error) => {
@@ -2237,6 +2480,9 @@ fn remember_applied(setup_path: &Path, setup: &SharingPreferences) {
 }
 
 pub(crate) fn save_library(path: &Path, library: &ArrangementLibrary) -> Result<(), String> {
+    if library.written_by_newer() {
+        return Err(ARRANGEMENTS_FROM_NEWER.to_owned());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|_| "The setup folder could not be created.".to_owned())?;
@@ -2258,22 +2504,15 @@ async fn await_native_release() -> bool {
     true
 }
 
-/// This computer's displays, read as the record's own computer identity names them.
+/// This computer's displays, read as the identity its records name it by.
 pub(crate) fn current_local_displays(
-    saved: &SharingPreferences,
+    local: &str,
 ) -> Result<session_setup::DisplayTopology, String> {
-    let local_device = CertificateFingerprint::parse_full(saved.local_fingerprint())
+    let local_device = CertificateFingerprint::parse_full(local)
         .map(monhop_transport::session_handshake::device_id_from_fingerprint)
         .map_err(|_| "The saved setup is damaged. Apply a layout again.".to_owned())?;
     session_native::current_displays(local_device)
         .map_err(|_| "Current display information could not be read.".to_owned())
-}
-
-impl SharingPreferences {
-    fn peer(&self) -> Result<CertificateFingerprint, String> {
-        CertificateFingerprint::parse_full(self.peer_fingerprint())
-            .map_err(|_| "The saved setup is damaged. Apply a layout again.".to_owned())
-    }
 }
 
 /// Only arranging has an idle window; a standing link stays up until the supervisor ends it.
@@ -2326,6 +2565,10 @@ fn apply_link_event(shared: &Arc<Mutex<State>>, generation: u64, event: LinkEven
         }
         LinkEvent::Connected { inspection } => {
             adopt_inspection(&mut state, inspection);
+            // The other computer's summary follows on this connection; one heard before it may
+            // be stale.
+            state.peer_summary = None;
+            publish_summary(&mut state);
             state.displays_unreadable_since = None;
             // Both computers are on the link now, so the reason that chose a link over a session
             // is spent and the ordinary decision path runs again.
@@ -2369,12 +2612,15 @@ fn apply_link_event(shared: &Arc<Mutex<State>>, generation: u64, event: LinkEven
             inspection,
             bytes,
             sending,
-        } => match sharing_preferences::shared_setup_for_inspection(&inspection, &bytes) {
+        } => match shared_group_for_link(&inspection, &bytes) {
             Ok((record, _)) => {
                 state.view.local_displays = display_views(&inspection.local_displays);
                 state.view.peer_displays = display_views(&inspection.peer_displays);
                 state.view.synchronized_layout = Some(record.layout().clone());
+                state.clock = state.clock.max(record.revision());
+                let local = inspection.local_fingerprint.full_hex();
                 state.inspection = Some(inspection);
+                let committed = state.committed.take();
                 advance_authorization(&mut state);
                 state.view.phase = "connected";
                 state.view.busy = false;
@@ -2387,14 +2633,25 @@ fn apply_link_event(shared: &Arc<Mutex<State>>, generation: u64, event: LinkEven
                 state.link_reason = None;
                 state.pending_proposal = None;
                 state.proposal_retry = None;
-                // Both computers' switches follow the commit, whichever computer flipped them.
-                if state.active.as_deref()
-                    == Some(fingerprint_key(record.peer_fingerprint()).as_str())
-                {
-                    state.active_control = Some(ActiveControl::of(&record));
-                    if reconcile_pending_control(&mut state) {
-                        state.view.message = CONTROL_SUPERSEDED.into();
+                // Both computers' switches follow the file the commit left, whichever computer
+                // flipped them; a newer record written meanwhile is the one kept there.
+                let mirrored = match committed {
+                    Some(file) => {
+                        mirror_file(&mut state, &file);
+                        true
                     }
+                    None => match ActiveControl::of(&record, &local)
+                        .filter(|control| state.active.as_deref() == Some(control.peer.as_str()))
+                    {
+                        Some(control) => {
+                            state.active_control = Some(control);
+                            true
+                        }
+                        None => false,
+                    },
+                };
+                if mirrored && reconcile_pending_control(&mut state) {
+                    state.view.message = CONTROL_SUPERSEDED.into();
                 }
                 // The sender commits last, so only it may close; the receiver waits for that close.
                 if sending {
@@ -2423,8 +2680,15 @@ fn apply_link_event(shared: &Arc<Mutex<State>>, generation: u64, event: LinkEven
             state.view.sync = SyncView::default();
             state.view.message = "Lost the connection to the other computer. Reconnecting.".into();
         }
-        // Group record summaries are read once the app layer keeps group records.
-        LinkEvent::PeerSummary { .. } => {}
+        // Untrusted: a summary that does not parse is dropped and the last good one stands.
+        LinkEvent::PeerSummary { bytes } => {
+            if let Ok(summary) = RecordSummary::parse(&bytes) {
+                if let Some(stamp) = summary.stamp() {
+                    state.clock = state.clock.max(stamp.revision());
+                }
+                state.peer_summary = Some(summary);
+            }
+        }
         LinkEvent::Closed => {
             let message = state
                 .close_message
@@ -2498,6 +2762,8 @@ fn reject_sync(state: &mut State, reason: LinkRejectReason, sending: bool) {
         !sending && reason == LinkRejectReason::SaveFailed && state.view.sync.state == "applied";
     let message = if disagreed {
         ONLY_THIS_COMPUTER_SAVED
+    } else if !sending && reason == LinkRejectReason::Busy {
+        NEWER_HERE
     } else if flip_pending && state.pending_control.is_none() {
         CONTROL_REFUSED
     } else {
@@ -2533,6 +2799,9 @@ fn connected_message(state: &State) -> &'static str {
 
 const ONLY_THIS_COMPUTER_SAVED: &str =
     "This computer saved the layout, but the other computer could not. Apply again.";
+/// Only this computer's own staging refuses as Busy: it holds a newer, different layout.
+const NEWER_HERE: &str =
+    "This computer holds a newer layout, so the other computer's older one was not applied.";
 
 const fn reject_message(reason: LinkRejectReason) -> &'static str {
     match reason {
@@ -2571,22 +2840,28 @@ fn link_persist(
         commit: Arc::new(move |current, _| {
             // The state lock is released before the write: disk work must never block the UI thread.
             let mut applied = None;
-            setup_file.commit(&commit_path, || {
+            let local = current.local_fingerprint.full_hex();
+            let (file, adopted) = setup_file.commit(&commit_path, &local, || {
                 let mut state = lock(&commit_state);
                 if link_retired(&state, generation, epoch) {
                     return Err(LinkRejectReason::Cancelled);
                 }
                 let (staged, left_out) = state.staged.take().ok_or(LinkRejectReason::SaveFailed)?;
                 // A label that caught up after staging is saved; a display that moved unwound this.
-                let staged = staged.relabeled(current);
+                let staged = staged.relabeled(&KnownDisplays::of_link(current));
                 applied = Some((staged.clone(), left_out));
-                Ok(staged)
+                Ok((staged, state.clock))
             })?;
             if let Some((applied, left_out)) = applied {
-                resolve_notice_on_commit(&mut lock(&commit_state));
-                // A layout that had to leave something out is a stopgap, not an arrangement.
-                if !left_out {
-                    remember_applied(&commit_path, &applied);
+                {
+                    let mut state = lock(&commit_state);
+                    resolve_notice_on_commit(&mut state);
+                    state.committed = Some(file);
+                }
+                // A layout that had to leave something out is a stopgap, not an arrangement, and
+                // one the file kept a newer record over is not what this computer runs.
+                if adopted && !left_out {
+                    remember_applied(&commit_path, &applied, &local);
                 }
                 crate::autostart::setup_applied(&commit_path);
                 // Only now, so a window that reads again finds the remembered layout as well.
@@ -2613,12 +2888,14 @@ fn stage_shared_setup(
     fresh: &InspectedPeer,
     bytes: &[u8],
 ) -> Result<(), LinkRejectReason> {
-    let staged = sharing_preferences::shared_setup_for_inspection(fresh, bytes).map_err(
-        |error| match error {
-            PreferenceError::InspectionChanged => LinkRejectReason::InspectionChanged,
-            PreferenceError::Invalid => LinkRejectReason::Invalid,
-        },
-    )?;
+    let staged = shared_group_for_link(fresh, bytes).map_err(|error| match error {
+        PreferenceError::InspectionChanged => LinkRejectReason::InspectionChanged,
+        PreferenceError::Invalid => LinkRejectReason::Invalid,
+    })?;
+    // Sessions run with one computer at a time, so only the link's own pair is staged.
+    if staged.0.members().len() != 2 {
+        return Err(LinkRejectReason::Invalid);
+    }
     {
         let state = lock(shared);
         if link_retired(&state, generation, epoch) {
@@ -2632,8 +2909,20 @@ fn stage_shared_setup(
             return Err(LinkRejectReason::InspectionChanged);
         }
     }
-    // The file must be readable now: a damaged file would fail the commit after the peer saved.
-    SetupFile::load(path).map_err(|_| LinkRejectReason::SaveFailed)?;
+    // The file must be writable now: a damaged file, or one a newer MonHop wrote, would fail the
+    // commit after the peer saved.
+    let file = SetupFile::load(path).map_err(|_| LinkRejectReason::SaveFailed)?;
+    if file.written_by_newer() {
+        return Err(LinkRejectReason::SaveFailed);
+    }
+    // Monotone: a record older than the active one, with other content, would undo a newer
+    // choice; its sender learns of the newer one from this computer's summary.
+    if let Some(held) = file.active_group().map(GroupRecord::stamp) {
+        let proposed = staged.0.stamp();
+        if held > proposed && !held.same_content(&proposed) {
+            return Err(LinkRejectReason::Busy);
+        }
+    }
     let mut state = lock(shared);
     if link_retired(&state, generation, epoch) {
         return Err(LinkRejectReason::Cancelled);
@@ -3310,6 +3599,7 @@ pub(crate) mod tests {
     }
 
     use super::*;
+    use crate::sharing_preferences::tests::group;
     use monhop_core::DeviceId;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -3326,6 +3616,8 @@ pub(crate) mod tests {
         pub(crate) proposals: std::sync::mpsc::Receiver<Vec<u8>>,
         /// Every arranging state the controller told the link to publish, in order.
         arranging: std::sync::mpsc::Receiver<bool>,
+        /// Every summary the controller told the link to publish, in order.
+        pub(crate) summaries: std::sync::mpsc::Receiver<Vec<u8>>,
         /// What the real link calls to stage and commit an agreed layout on this computer.
         pub(crate) persist: LinkPersist,
     }
@@ -3341,11 +3633,13 @@ pub(crate) mod tests {
             } = run;
             let (proposed, proposals) = std::sync::mpsc::channel();
             let (arranged, arranging) = std::sync::mpsc::channel();
+            let (summarized, summaries) = std::sync::mpsc::channel();
             if let Some(sender) = lock(&LINK_FIXTURES).as_ref() {
                 let _ = sender.send(LinkFixture {
                     events: events.clone(),
                     proposals,
                     arranging,
+                    summaries,
                     persist,
                 });
             }
@@ -3358,7 +3652,9 @@ pub(crate) mod tests {
                         Some(LinkCommand::Arranging(value)) => {
                             let _ = arranged.send(value);
                         }
-                        Some(LinkCommand::Summary(_)) => {}
+                        Some(LinkCommand::Summary(bytes)) => {
+                            let _ = summarized.send(bytes);
+                        }
                         Some(LinkCommand::Close) | None => {
                             let _ = events.send(LinkEvent::Closed);
                             return Ok(());
@@ -3486,8 +3782,7 @@ pub(crate) mod tests {
     fn sync_payload() -> (InspectedPeer, Vec<u8>) {
         let preferences = crate::sharing_preferences::tests::preferences();
         let inspection = crate::sharing_preferences::tests::inspection(&preferences);
-        let layout = preferences.layout_for_inspection(&inspection).unwrap();
-        let bytes = sharing_preferences::shared_setup_bytes(&inspection, layout, false).unwrap();
+        let bytes = shared_group_bytes(&inspection, &group(&preferences), false).unwrap();
         (inspection, bytes)
     }
 
@@ -3585,7 +3880,7 @@ pub(crate) mod tests {
         let controller = SharingController::default();
         let saved = crate::sharing_preferences::tests::preferences();
         let inspected = crate::sharing_preferences::tests::inspection(&saved);
-        let layout = saved.layout_for_inspection(&inspected).unwrap();
+        let layout = saved.layout.clone();
         connected_revision(&controller, 4);
         lock(&controller.state).inspection = Some(inspected);
         let before = controller.save_setup(&path, "4", layout.clone()).unwrap();
@@ -3594,7 +3889,7 @@ pub(crate) mod tests {
         let file = SetupFile::load(&path).unwrap();
         assert_eq!(file.active(), Some("b".repeat(64).as_str()));
         assert_eq!(
-            file.active_computer().map(|saved| saved.layout()),
+            file.active_group().map(|saved| saved.layout()),
             Some(&layout)
         );
         controller.stop_with(NOT_CONNECTED);
@@ -3616,12 +3911,12 @@ pub(crate) mod tests {
     fn named_arrangements_save_replace_and_list_for_the_connected_pair() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let (directory, path) = sync_test_path();
-        let path = path.with_file_name("arrangements.json");
+        let path = path.with_file_name(ARRANGEMENTS_FILE);
         let controller = SharingController::default();
         assert!(controller.arrangements(&path).unwrap().is_empty());
         let saved = crate::sharing_preferences::tests::preferences();
         let inspected = crate::sharing_preferences::tests::inspection(&saved);
-        let mut layout = saved.layout_for_inspection(&inspected).unwrap();
+        let mut layout = saved.layout.clone();
         connected_revision(&controller, 4);
         lock(&controller.state).inspection = Some(inspected);
         assert!(
@@ -3668,7 +3963,8 @@ pub(crate) mod tests {
         // The saved library never carries an enabled switch.
         let file: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(file["arrangements"][0]["setup"]["sharingEnabled"].is_null());
+        assert!(file["arrangements"][0]["record"]["sharingEnabled"].is_null());
+        assert_eq!(file["version"], 3);
         controller.stop_with(NOT_CONNECTED);
         assert!(controller.arrangements(&path).unwrap().is_empty());
         drop(directory);
@@ -3830,7 +4126,7 @@ pub(crate) mod tests {
     fn the_supervisor_proposes_a_layout_over_the_link_without_a_window_revision() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let idle = SharingController::default();
-        let next = crate::sharing_preferences::tests::preferences();
+        let next = group(&crate::sharing_preferences::tests::preferences());
         assert!(idle.propose_layout(&next, false).is_err());
 
         let (controller, fixture, inspection) = connected_link(Duration::from_secs(600));
@@ -3842,11 +4138,16 @@ pub(crate) mod tests {
             .proposals
             .recv_timeout(Duration::from_secs(1))
             .expect("the link must carry the supervisor's proposal");
-        // The bytes are the shared setup an Apply sends: the other computer stages them the
-        // same way, and they name the same layout and the same control map.
-        let (staged, left_out) =
-            sharing_preferences::shared_setup_for_inspection(&inspection, &proposed).unwrap();
+        // The bytes are the shared group an Apply sends: the other computer stages them the
+        // same way, and they name the same layout and the same control map, stamped as this
+        // computer's change past its clock.
+        let (staged, left_out) = shared_group_for_link(&inspection, &proposed).unwrap();
         assert_eq!(staged.layout(), next.layout());
+        assert_eq!(staged.content_digest(), next.content_digest());
+        assert_eq!(
+            (staged.revision(), staged.author()),
+            (1, "A".repeat(64).as_str())
+        );
         assert!(!left_out);
         assert_eq!(
             controller.propose_layout(&next, false).err(),
@@ -3869,7 +4170,7 @@ pub(crate) mod tests {
     fn a_sent_layout_that_dropped_something_is_what_home_reports_after_the_commit() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let (controller, _fixture, _) = connected_link(Duration::from_secs(600));
-        let next = crate::sharing_preferences::tests::preferences();
+        let next = group(&crate::sharing_preferences::tests::preferences());
         controller.propose_layout(&next, true).unwrap();
         assert_eq!(
             controller.status().display_notice,
@@ -3888,7 +4189,7 @@ pub(crate) mod tests {
     fn a_proposal_lost_with_its_link_is_made_again_while_a_commit_settles_it() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let (controller, _fixture, inspection) = connected_link(Duration::from_secs(600));
-        let next = crate::sharing_preferences::tests::preferences();
+        let next = group(&crate::sharing_preferences::tests::preferences());
         let (controller, fixture, inspection) = (controller, _fixture, inspection);
         controller.propose_layout(&next, false).unwrap();
         assert!(controller.proposal_pending_for(&inspection));
@@ -4161,25 +4462,34 @@ pub(crate) mod tests {
         let controller = SharingController::default();
         let saved = crate::sharing_preferences::tests::preferences();
         let inspected = crate::sharing_preferences::tests::inspection(&saved);
-        let layout = saved.layout_for_inspection(&inspected).unwrap();
+        let layout = saved.layout.clone();
         connected_revision(&controller, 4);
         lock(&controller.state).inspection = Some(inspected.clone());
         assert!(controller.raise_display_notice(DisplayNotice::Waiting, &inspected));
         controller.save_setup(&path, "4", layout).unwrap();
         assert!(controller.status().display_notice.is_none());
         let library = ArrangementLibrary::load(&path.with_file_name(ARRANGEMENTS_FILE)).unwrap();
-        let listed = library.views(&inspected);
+        let listed = library_views(&library, &inspected);
         assert_eq!(listed.len(), 1);
         assert!(listed[0].automatic);
         assert_eq!(
             serde_json::to_value(&listed[0]).unwrap()["automatic"],
             serde_json::json!(true)
         );
-        assert!(library.automatic_fit(&inspected).is_some());
-        assert_eq!(
-            SetupFile::load(&path).unwrap().active_computer(),
-            Some(&saved)
+        assert!(
+            library
+                .automatic_fit(&group(&saved), &KnownDisplays::of_link(&inspected))
+                .is_some()
         );
+        let file = SetupFile::load(&path).unwrap();
+        let applied = file.active_group().unwrap();
+        assert_eq!(applied.content_digest(), group(&saved).content_digest());
+        // A new local change, past the clock of a file that had none.
+        assert_eq!(
+            (applied.revision(), applied.author()),
+            (1, "A".repeat(64).as_str())
+        );
+        assert!(applied.fits_link(&inspected));
         drop(directory);
     }
 
@@ -4973,7 +5283,12 @@ pub(crate) mod tests {
         assert_eq!(temporary_count(&directory.0), 0);
         let file = SetupFile::load(&path).unwrap();
         assert_eq!(file.active(), Some("b".repeat(64).as_str()));
-        assert!(file.active_computer().is_some());
+        assert_eq!(file.local(), Some("A".repeat(64).as_str()));
+        // Both computers store exactly the agreed record.
+        assert_eq!(
+            file.active_group(),
+            Some(&shared_group_for_link(&fresh, &bytes).unwrap().0)
+        );
 
         (persist.stage)(&fresh, &bytes).unwrap();
         assert!(lock(&controller.state).staged.is_some());
@@ -5013,13 +5328,274 @@ pub(crate) mod tests {
         .unwrap();
         (persist.commit)(&named, &bytes).unwrap();
         let file = SetupFile::load(&path).unwrap();
-        let saved = file.active_computer().unwrap();
+        let saved = file.active_group().unwrap();
         assert!(
             saved
-                .peer_displays()
+                .member(&"B".repeat(64))
+                .unwrap()
+                .displays()
                 .iter()
                 .all(|display| display.name() == "Studio Display")
         );
+    }
+
+    #[test]
+    fn only_the_links_own_pair_is_staged() {
+        let controller = SharingController::default();
+        let (_directory, path) = sync_test_path();
+        let trio = crate::sharing_preferences::tests::trio(3, true);
+        let link =
+            crate::sharing_preferences::tests::link_of(&trio, &"A".repeat(64), &"B".repeat(64));
+        let bytes = shared_group_bytes(&link, &trio, false).unwrap();
+        assert_eq!(
+            stage_shared_setup(&controller.state, 0, 0, &path, &link, &bytes),
+            Err(LinkRejectReason::Invalid)
+        );
+        assert!(lock(&controller.state).staged.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_older_proposal_is_refused_at_stage() {
+        let controller = SharingController::default();
+        let (_directory, path) = sync_test_path();
+        let saved = crate::sharing_preferences::tests::preferences();
+        let fresh = crate::sharing_preferences::tests::inspection(&saved);
+        let local = "A".repeat(64);
+        // This computer holds a newer record, with other content, than the one about to arrive.
+        let older = group(&saved);
+        let newer = older
+            .with_control(control(true, false))
+            .and_then(|record| record.restamped(5, &"B".repeat(64)))
+            .unwrap();
+        let mut file = SetupFile::default();
+        file.set_interface_id(&saved.interface_id);
+        file.adopt(&local, newer.clone()).unwrap();
+        file.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let persist = link_persist(
+            Arc::clone(&controller.state),
+            0,
+            path.clone(),
+            Arc::clone(&controller.setup_file),
+        );
+        let bytes = |record: &GroupRecord| shared_group_bytes(&fresh, record, false).unwrap();
+        assert_eq!(
+            (persist.stage)(&fresh, &bytes(&older)),
+            Err(LinkRejectReason::Busy)
+        );
+        assert!(lock(&controller.state).staged.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Refusing it here says this computer's layout is the newer one.
+        let mut refused = State::default();
+        reject_sync(&mut refused, LinkRejectReason::Busy, false);
+        assert_eq!(refused.view.message, NEWER_HERE);
+        // The same content under an older stamp only confirms what is held, which stays.
+        let same = newer.restamped(1, &local).unwrap();
+        (persist.stage)(&fresh, &bytes(&same)).unwrap();
+        (persist.commit)(&fresh, &bytes(&same)).unwrap();
+        assert_eq!(SetupFile::load(&path).unwrap().active_group(), Some(&newer));
+        // A newer record is taken.
+        let newest = older.restamped(6, &local).unwrap();
+        (persist.stage)(&fresh, &bytes(&newest)).unwrap();
+        (persist.commit)(&fresh, &bytes(&newest)).unwrap();
+        assert_eq!(
+            SetupFile::load(&path).unwrap().active_group(),
+            Some(&newest)
+        );
+    }
+
+    #[test]
+    fn concurrent_commits_leave_the_newest_on_disk() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let saved = crate::sharing_preferences::tests::preferences();
+        let fresh = crate::sharing_preferences::tests::inspection(&saved);
+        let stamped = |control: ControlMap, revision| {
+            group(&saved)
+                .with_control(control)
+                .and_then(|record| record.restamped(revision, &"B".repeat(64)))
+                .unwrap()
+        };
+        let (newer, newest) = (
+            stamped(control(true, false), 3),
+            stamped(control(false, true), 4),
+        );
+        for order in [[&newest, &newer], [&newer, &newest]] {
+            let (directory, path) = sync_test_path();
+            crate::sharing_preferences::tests::file_with(saved.clone())
+                .save(&path)
+                .unwrap();
+            let links: Vec<(SharingController, LinkFixture)> = order
+                .iter()
+                .map(|_| {
+                    let controller = controller_with(fake_link, Duration::from_secs(600));
+                    controller.adopt_saved(&SetupFile::load(&path).unwrap());
+                    let fixture = open_fake_link(&controller, path.clone(), fixture_peer());
+                    fixture
+                        .events
+                        .send(LinkEvent::Connected {
+                            inspection: fresh.clone(),
+                        })
+                        .unwrap();
+                    wait_for(&controller, |view| view.phase == "connected");
+                    (controller, fixture)
+                })
+                .collect();
+            // Both links stage against the same file before either commits.
+            for ((_, fixture), record) in links.iter().zip(order) {
+                let bytes = shared_group_bytes(&fresh, record, false).unwrap();
+                (fixture.persist.stage)(&fresh, &bytes).unwrap();
+            }
+            for ((controller, fixture), record) in links.iter().zip(order) {
+                let bytes = shared_group_bytes(&fresh, record, false).unwrap();
+                (fixture.persist.commit)(&fresh, &bytes).unwrap();
+                fixture
+                    .events
+                    .send(LinkEvent::SyncCompleted {
+                        inspection: fresh.clone(),
+                        bytes,
+                        sending: false,
+                    })
+                    .unwrap();
+                wait_for(controller, |view| view.sync.state == "applied");
+            }
+            // Whichever commit came last, the newest record stays on disk, and the last computer
+            // to commit shows the switches the file holds rather than the ones it was sent.
+            assert_eq!(
+                SetupFile::load(&path).unwrap().active_group(),
+                Some(&newest)
+            );
+            let (last, _) = links.last().unwrap();
+            assert_eq!(last.status().control, switches(false, true, false));
+            for (controller, _) in &links {
+                controller.stop_with(NOT_CONNECTED);
+                join_finished_worker(controller);
+            }
+            drop(directory);
+        }
+    }
+
+    #[test]
+    fn summaries_are_sent_at_link_start_and_on_change() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let (directory, path) = sync_test_path();
+        let saved = crate::sharing_preferences::tests::preferences();
+        let fresh = crate::sharing_preferences::tests::inspection(&saved);
+        crate::sharing_preferences::tests::file_with(saved.clone())
+            .save(&path)
+            .unwrap();
+        let controller = controller_with(fake_link, Duration::from_secs(600));
+        controller.adopt_saved(&SetupFile::load(&path).unwrap());
+        let told = |fixture: &LinkFixture| {
+            let bytes = fixture
+                .summaries
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the link is told a summary");
+            RecordSummary::parse(&bytes).unwrap()
+        };
+        // The link starts with this computer's group and its record's stamp, never a layout.
+        let fixture = open_fake_link(&controller, path.clone(), fixture_peer());
+        let first = told(&fixture);
+        assert_eq!(first.members(), ["a".repeat(64), "b".repeat(64)]);
+        assert_eq!(first.stamp(), Some(group(&saved).stamp()));
+        // Connecting, and each supervisor pass mirroring the same file, repeat nothing.
+        fixture
+            .events
+            .send(LinkEvent::Connected {
+                inspection: fresh.clone(),
+            })
+            .unwrap();
+        wait_for(&controller, |view| view.phase == "connected");
+        controller.adopt_saved(&SetupFile::load(&path).unwrap());
+        assert!(
+            fixture
+                .summaries
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+        // A change to the held record is told at once.
+        controller
+            .update_setup_file(&path, |file| assert!(file.touch_active()))
+            .unwrap();
+        let touched = told(&fixture);
+        assert_eq!(touched.stamp().map(|stamp| stamp.revision()), Some(3));
+
+        // The other computer's summary raises the clock; one that does not parse is dropped.
+        let theirs = group(&saved).restamped(9, &"B".repeat(64)).unwrap();
+        for bytes in [
+            b"not a summary".to_vec(),
+            RecordSummary::new(&[&"B".repeat(64), &"A".repeat(64)], Some(&theirs))
+                .and_then(|summary| summary.to_bytes())
+                .unwrap(),
+        ] {
+            fixture
+                .events
+                .send(LinkEvent::PeerSummary { bytes })
+                .unwrap();
+        }
+        for _ in 0..400 {
+            if controller.peer_stamp_for(&fresh).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            controller.peer_stamp_for(&fresh),
+            Some(Some(theirs.stamp()))
+        );
+        // So the next change made here is stamped past it.
+        controller
+            .update_setup_file(&path, |file| assert!(file.touch_active()))
+            .unwrap();
+        assert_eq!(
+            told(&fixture).stamp().map(|stamp| stamp.revision()),
+            Some(10)
+        );
+        // A link opened again starts with the summary afresh.
+        controller.stop_with(NOT_CONNECTED);
+        join_finished_worker(&controller);
+        assert!(controller.peer_stamp_for(&fresh).is_none());
+        let again = open_fake_link(&controller, path.clone(), fixture_peer());
+        assert_eq!(told(&again).stamp().map(|stamp| stamp.revision()), Some(10));
+        controller.stop_with(NOT_CONNECTED);
+        join_finished_worker(&controller);
+        drop(directory);
+    }
+
+    #[test]
+    fn a_network_change_no_longer_misfits_the_record() {
+        let saved = crate::sharing_preferences::tests::preferences();
+        let mut file = crate::sharing_preferences::tests::file_with(saved.clone());
+        // The user picks another network; the record made on the old one stays as it is.
+        file.set_interface_id("en1:7:192.168.1.5");
+        let plan = SessionPlan::of(&file).expect("the active computer has a record");
+        assert_eq!(plan.interface_id, "en1:7:192.168.1.5");
+        let mut there = crate::sharing_preferences::tests::inspection(&saved);
+        there.interface_id = "en1:7:192.168.1.5".into();
+        // A session on the new network finds the same displays, so it runs instead of opening a
+        // link, where the pairwise record would have misfit.
+        assert!(plan.fits_local(&there.local_displays));
+        assert!(plan.topology(&there).is_some());
+        assert!(file.active_group().unwrap().fits_link(&there));
+        let card = SavedSetupView::from_group(
+            file.active_group(),
+            file.local(),
+            &"b".repeat(64),
+            Some(&there),
+            "1",
+        );
+        assert!(serde_json::to_value(card).unwrap()["layout"].is_object());
+        // Displays that moved still misfit, whatever the network.
+        let mut moved = saved.clone();
+        moved.move_local_display_for_test("1", [0.0, 240.0]);
+        let moved = crate::sharing_preferences::tests::inspection(&moved);
+        assert!(!plan.fits_local(&moved.local_displays));
+        assert!(plan.topology(&moved).is_none());
+        // A session with another computer than the chosen one never runs under this record.
+        let other = crate::sharing_preferences::tests::inspection(
+            &crate::sharing_preferences::tests::preferences_for_peer('C'),
+        );
+        assert!(plan.topology(&other).is_none());
     }
 
     #[test]
@@ -5053,13 +5629,54 @@ pub(crate) mod tests {
         assert_ne!(committed, written);
         // By then the layout is remembered as well, so a window reading again lists it.
         let library = ArrangementLibrary::load(&path.with_file_name(ARRANGEMENTS_FILE)).unwrap();
-        assert_eq!(library.views(&fresh).len(), 1);
+        assert_eq!(library_views(&library, &fresh).len(), 1);
         // A commit with nothing staged writes nothing, so nothing moves.
         assert_eq!(
             (persist.commit)(&fresh, &bytes),
             Err(LinkRejectReason::SaveFailed)
         );
         assert_eq!(revision(), committed);
+        drop(directory);
+    }
+
+    #[test]
+    fn a_setup_from_a_newer_version_is_never_saved_over() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let controller = SharingController::default();
+        let (directory, path) = sync_test_path();
+        let newer = br#"{"version":5,"groups":{"future":true}}"#;
+        std::fs::write(&path, newer).unwrap();
+        assert_eq!(
+            controller
+                .update_setup_file(&path, |file| file.set_interface_id("en0:4:192.168.1.4"))
+                .err()
+                .as_deref(),
+            Some(SETUP_FROM_NEWER)
+        );
+        let saved = crate::sharing_preferences::tests::preferences();
+        let inspected = crate::sharing_preferences::tests::inspection(&saved);
+        connected_revision(&controller, 4);
+        lock(&controller.state).inspection = Some(inspected);
+        assert_eq!(
+            controller
+                .save_setup(&path, "4", saved.layout.clone())
+                .err()
+                .as_deref(),
+            Some(SETUP_FROM_NEWER)
+        );
+        // A layout the other computer sends is refused before either computer commits it.
+        let (fresh, bytes) = sync_payload();
+        let persist = link_persist(
+            Arc::clone(&controller.state),
+            0,
+            path.clone(),
+            Arc::clone(&controller.setup_file),
+        );
+        assert_eq!(
+            (persist.stage)(&fresh, &bytes),
+            Err(LinkRejectReason::SaveFailed)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), newer);
         drop(directory);
     }
 
@@ -5187,7 +5804,7 @@ pub(crate) mod tests {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let idle = SharingController::default();
         let saved = crate::sharing_preferences::tests::preferences();
-        let layout = saved.layout().clone();
+        let layout = saved.layout.clone();
         assert!(idle.apply_setup("0", layout.clone()).is_err());
 
         let (controller, fixture, _) = connected_link(Duration::from_secs(600));
@@ -5222,7 +5839,7 @@ pub(crate) mod tests {
         controller.adopt_saved(&crate::sharing_preferences::tests::file_with(saved.clone()));
         let before = controller.status().control;
         let sending = controller
-            .apply_setup(&controller.status().revision, saved.layout().clone())
+            .apply_setup(&controller.status().revision, saved.layout.clone())
             .unwrap();
         assert_eq!(sending.sync.state, "sending");
         fixture
@@ -5485,14 +6102,13 @@ pub(crate) mod tests {
     }
 
     /// Saves the fixture pair's record, carrying `control`, as the active one.
-    fn active_file(path: &Path, control: ControlMap) -> SharingPreferences {
-        let record = crate::sharing_preferences::tests::preferences()
-            .with_control(control)
-            .expect("a valid control map");
+    fn active_file(path: &Path, control: ControlMap) -> GroupRecord {
+        let mut record = crate::sharing_preferences::tests::preferences();
+        record.layout.control = control;
         crate::sharing_preferences::tests::file_with(record.clone())
             .save(path)
             .unwrap();
-        record
+        group(&record)
     }
 
     fn switches(local_to_peer: bool, peer_to_local: bool, syncing: bool) -> Option<ControlView> {
@@ -5572,9 +6188,7 @@ pub(crate) mod tests {
     #[test]
     fn new_layout_defaults_to_both() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
-        let mut layout = crate::sharing_preferences::tests::preferences()
-            .layout()
-            .clone();
+        let mut layout = crate::sharing_preferences::tests::preferences().layout;
         // The window never chooses the switches: whatever it sends is replaced.
         layout.control = control(false, false);
         let proposed = |controller: &SharingController, fixture: &LinkFixture| {
@@ -5586,10 +6200,11 @@ pub(crate) mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("one proposal");
             let inspection = lock(&controller.state).inspection.clone().unwrap();
-            sharing_preferences::shared_setup_for_inspection(&inspection, &bytes)
+            shared_group_for_link(&inspection, &bytes)
                 .unwrap()
                 .0
-                .control()
+                .layout()
+                .control
                 .clone()
         };
         let (controller, fixture, _) = connected_link(Duration::from_secs(600));
@@ -5625,7 +6240,9 @@ pub(crate) mod tests {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let (directory, path) = sync_test_path();
         let saved = active_file(&path, control(true, true));
-        let inspection = crate::sharing_preferences::tests::inspection(&saved);
+        let inspection = crate::sharing_preferences::tests::inspection(
+            &crate::sharing_preferences::tests::preferences(),
+        );
         let controller = controller_with(fake_link, Duration::from_secs(600));
         controller.adopt_saved(&SetupFile::load(&path).unwrap());
         // A running session: busy, no link, and it ends only when asked to.
@@ -5676,9 +6293,13 @@ pub(crate) mod tests {
             .proposals
             .recv_timeout(Duration::from_secs(1))
             .expect("the flip travels as one proposal");
-        let (agreed, _) =
-            sharing_preferences::shared_setup_for_inspection(&inspection, &bytes).unwrap();
-        assert_eq!(agreed.control(), &control(true, false));
+        let (agreed, _) = shared_group_for_link(&inspection, &bytes).unwrap();
+        assert_eq!(agreed.layout().control, control(true, false));
+        // The flip is this computer's change, stamped past the clock it read from the file.
+        assert_eq!(
+            (agreed.revision(), agreed.author()),
+            (saved.revision() + 1, "A".repeat(64).as_str())
+        );
         assert!(controller.propose_record(&saved).is_err());
         (fixture.persist.stage)(&inspection, &bytes).unwrap();
         (fixture.persist.commit)(&inspection, &bytes).unwrap();
@@ -5698,11 +6319,15 @@ pub(crate) mod tests {
         assert!(controller.link_is_off());
         join_finished_worker(&controller);
         let committed = SetupFile::load(&path).unwrap();
-        let committed = committed.active_computer().unwrap();
-        assert_eq!(committed.control(), &control(true, false));
+        let committed = committed.active_group().unwrap();
+        assert_eq!(committed.layout().control, control(true, false));
         assert_eq!(
-            committed.wire_control(),
-            Ok(monhop_protocol::ControlPermissions {
+            group_record::wire_control(
+                &committed.layout().control,
+                &"A".repeat(64),
+                &"B".repeat(64)
+            ),
+            Some(ControlPermissions {
                 lower_controls_higher: true,
                 higher_controls_lower: false,
             })
@@ -5775,7 +6400,7 @@ pub(crate) mod tests {
         settle_displays(&controller);
         assert!(controller.displays_settled());
         let next = crate::sharing_preferences::tests::preferences();
-        controller.propose_layout(&next, false).unwrap();
+        controller.propose_layout(&group(&next), false).unwrap();
         fixture
             .events
             .send(LinkEvent::SyncRejected {
@@ -5831,9 +6456,7 @@ pub(crate) mod tests {
             let (directory, path) = sync_test_path();
             let saved = crate::sharing_preferences::tests::preferences();
             let fresh = crate::sharing_preferences::tests::inspection(&saved);
-            let bytes =
-                sharing_preferences::shared_setup_bytes(&fresh, saved.layout().clone(), left_out)
-                    .unwrap();
+            let bytes = shared_group_bytes(&fresh, &group(&saved), left_out).unwrap();
             let persist = link_persist(
                 Arc::clone(&controller.state),
                 0,
@@ -5843,10 +6466,15 @@ pub(crate) mod tests {
             (persist.stage)(&fresh, &bytes).unwrap();
             (persist.commit)(&fresh, &bytes).unwrap();
             // Both computers still hold the stopgap, so sharing continues on it.
-            assert!(SetupFile::load(&path).unwrap().active_computer().is_some());
+            assert!(SetupFile::load(&path).unwrap().active_group().is_some());
             let library =
                 ArrangementLibrary::load(&path.with_file_name(ARRANGEMENTS_FILE)).unwrap();
-            assert_eq!(library.automatic_fit(&fresh).is_some(), !left_out);
+            assert_eq!(
+                library
+                    .automatic_fit(&group(&saved), &KnownDisplays::of_link(&fresh))
+                    .is_some(),
+                !left_out
+            );
             drop(directory);
         }
     }

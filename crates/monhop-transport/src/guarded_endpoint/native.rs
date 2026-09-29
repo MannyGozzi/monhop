@@ -3,11 +3,14 @@
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use monhop_core::RevocationSignal;
+use tokio::{runtime::Handle, task::AbortHandle};
 
 use crate::policy::{
     InterfaceKind, InterfaceSnapshot, NetworkLock, PeerRoute, PolicyError, RouteSnapshot,
@@ -80,6 +83,7 @@ pub(super) struct PreparedNetwork {
     pub reachability: Arc<Reachability>,
     pub signal: RevocationSignal,
     pub watch: Watch,
+    pub readmission: Option<Readmission>,
 }
 
 struct PreparedSelection {
@@ -88,15 +92,18 @@ struct PreparedSelection {
     reachability: Arc<Reachability>,
     signal: RevocationSignal,
     watch: Watch,
+    check: SharedCheck,
 }
 
-pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
+/// `network` is the runtime that will drive the endpoint; it hosts the readmission timer.
+pub(super) fn prepare(pinned: &PinnedNetwork, network: &Handle) -> io::Result<PreparedNetwork> {
     let PreparedSelection {
         initial,
         mut lock,
         reachability,
         signal,
         watch,
+        check,
     } = prepare_selection(pinned, None)?;
 
     require_active(&signal, None)?;
@@ -122,6 +129,7 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
 
     revalidate_selection(&initial, pinned, &mut lock, &signal, None)?;
     reachability.set(lock.reachable());
+    let readmission = Readmission::for_group(network, check, &signal, &reachability);
 
     Ok(PreparedNetwork {
         socket,
@@ -129,6 +137,7 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
         reachability,
         signal,
         watch,
+        readmission,
     })
 }
 
@@ -186,7 +195,8 @@ fn prepare_selection(
         lock: Mutex::new(None),
         reachability: reachability.clone(),
     });
-    let watch = start_watch(&initial, pinned, &watched)?;
+    let check = pinned_check(&initial, pinned, &watched);
+    let watch = start_watch(&initial, &check)?;
     let signal = watch.revocation_signal();
     require_active(&signal, cancel)?;
 
@@ -208,6 +218,7 @@ fn prepare_selection(
         reachability,
         signal,
         watch,
+        check,
     })
 }
 
@@ -323,60 +334,167 @@ struct Watched {
 
 type PinnedLock = Arc<Watched>;
 
+/// The one check both the change watch and the readmission timer run; `false` revokes.
+pub(super) type SharedCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
 #[cfg(target_os = "macos")]
-fn start_watch(
-    adapter: &Adapter,
-    pinned: &PinnedNetwork,
-    watched: &PinnedLock,
-) -> io::Result<Watch> {
-    Watch::start_after_local_enable(
-        &adapter.name,
-        adapter.index,
-        pinned_check(adapter, pinned, watched),
-    )
-    .map_err(io::Error::other)
+fn start_watch(adapter: &Adapter, check: &SharedCheck) -> io::Result<Watch> {
+    Watch::start_after_local_enable(&adapter.name, adapter.index, notice_check(check))
+        .map_err(io::Error::other)
 }
 
 #[cfg(windows)]
-fn start_watch(
-    adapter: &Adapter,
-    pinned: &PinnedNetwork,
-    watched: &PinnedLock,
-) -> io::Result<Watch> {
-    Watch::start(adapter, pinned_check(adapter, pinned, watched)).map_err(native_category)
+fn start_watch(adapter: &Adapter, check: &SharedCheck) -> io::Result<Watch> {
+    Watch::start(adapter, notice_check(check)).map_err(native_category)
 }
 
-/// Runs on the native change-notice thread: the same adapter, attachment, peer, and on-link route
-/// revalidation the session performs, for every pinned peer. Anything unreadable, or a notice
-/// before the first snapshot, reads as a change. A check that keeps the lock sets each member's
-/// reachability, so a member set aside earlier is admitted again once its route is back.
-fn pinned_check(
-    initial: &Adapter,
-    pinned: &PinnedNetwork,
-    watched: &PinnedLock,
-) -> network_watch::PinnedCheck {
+fn notice_check(check: &SharedCheck) -> network_watch::PinnedCheck {
+    let check = Arc::clone(check);
+    Box::new(move || check())
+}
+
+/// What one check reads: the selected adapter, and each pinned peer's route through it.
+type Observation = (Option<InterfaceSnapshot>, Option<io::Result<PeerRoutes>>);
+
+/// The same adapter, attachment, peer, and on-link route revalidation the session performs, for
+/// every pinned peer. Anything unreadable, or a check before the first snapshot, reads as a
+/// change. A check that keeps the lock sets each member's reachability, so a member set aside
+/// earlier is admitted again once its route is back.
+fn pinned_check(initial: &Adapter, pinned: &PinnedNetwork, watched: &PinnedLock) -> SharedCheck {
     let initial = initial.clone();
     let pinned = pinned.clone();
-    let watched = Arc::clone(watched);
-    Box::new(move || {
-        let current = observe_selected_adapter(&initial, &pinned)
-            .and_then(|observed| interface_snapshot(&observed))
-            .inspect_err(|error| {
-                log::warn!(
-                    "network recheck: the selected adapter did not read back ({:?})",
-                    error.kind()
-                );
-            });
-        let sole = pinned.peers.len() == 1;
-        let routes = current.as_ref().ok().map(|current| {
-            pinned
-                .peers
-                .iter()
-                .map(|peer| peer_route(current, *peer.ip(), sole))
-                .collect::<io::Result<PeerRoutes>>()
+    checking(watched, move || observe_pinned(&initial, &pinned))
+}
+
+fn observe_pinned(initial: &Adapter, pinned: &PinnedNetwork) -> Observation {
+    let current = observe_selected_adapter(initial, pinned)
+        .and_then(|observed| interface_snapshot(&observed))
+        .inspect_err(|error| {
+            log::warn!(
+                "network recheck: the selected adapter did not read back ({:?})",
+                error.kind()
+            );
         });
-        recheck(&watched, current.ok().as_ref(), routes)
+    let sole = pinned.peers.len() == 1;
+    let routes = current.as_ref().ok().map(|current| {
+        pinned
+            .peers
+            .iter()
+            .map(|peer| peer_route(current, *peer.ip(), sole))
+            .collect::<io::Result<PeerRoutes>>()
+    });
+    (current.ok(), routes)
+}
+
+/// A check that applies what `observe` reads to the watched lock.
+fn checking(
+    watched: &PinnedLock,
+    observe: impl Fn() -> Observation + Send + Sync + 'static,
+) -> SharedCheck {
+    let watched = Arc::clone(watched);
+    Arc::new(move || {
+        let (current, routes) = observe();
+        recheck(&watched, current.as_ref(), routes)
     })
+}
+
+/// How long after a member is set aside, and then how often, the timer reruns the check.
+const READMIT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Reruns the change watch's check while any member is set aside, because nothing may announce
+/// that member's route coming back: macOS reports no neighbor-entry change, for one. Dropping it
+/// stops the timer.
+pub(super) struct Readmission(AbortHandle);
+
+impl Readmission {
+    /// None for a lone member: it is never set aside, so there is nothing to readmit.
+    fn for_group(
+        network: &Handle,
+        check: SharedCheck,
+        signal: &RevocationSignal,
+        reachability: &Arc<Reachability>,
+    ) -> Option<Self> {
+        (reachability.len() > 1).then(|| {
+            Self::start(
+                network,
+                check,
+                signal.clone(),
+                Arc::clone(reachability),
+                READMIT_INTERVAL,
+            )
+        })
+    }
+
+    /// The first check runs `interval` after a member is set aside, then one every `interval`
+    /// until every member is back or `signal` is revoked. Checks run on `network`'s blocking
+    /// pool, never on the workers driving the endpoint.
+    pub(super) fn start(
+        network: &Handle,
+        check: SharedCheck,
+        signal: RevocationSignal,
+        reachability: Arc<Reachability>,
+        interval: Duration,
+    ) -> Self {
+        Self(
+            network
+                .spawn(readmit(check, signal, reachability, interval))
+                .abort_handle(),
+        )
+    }
+}
+
+impl Drop for Readmission {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn readmit(
+    check: SharedCheck,
+    signal: RevocationSignal,
+    reachability: Arc<Reachability>,
+    interval: Duration,
+) {
+    loop {
+        reachability.some_set_aside().await;
+        tokio::time::sleep(interval).await;
+        if signal.is_revoked() {
+            return;
+        }
+        if reachability.reaches_all() {
+            continue;
+        }
+        let timed = {
+            let (check, signal) = (check.clone(), signal.clone());
+            move || timed_recheck(&check, &signal)
+        };
+        match tokio::task::spawn_blocking(timed).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(_) => {
+                log::warn!("network watch: a timed recheck could not run; revoked");
+                signal.revoke();
+                return;
+            }
+        }
+    }
+}
+
+/// Runs `check` as the change watch runs it on a notice: never once revoked, and a check that
+/// fails or panics revokes.
+fn timed_recheck(check: &SharedCheck, signal: &RevocationSignal) -> bool {
+    if signal.is_revoked() {
+        return false;
+    }
+    let holds = catch_unwind(AssertUnwindSafe(|| check())).unwrap_or_else(|payload| {
+        std::mem::forget(payload);
+        false
+    });
+    if !holds {
+        log::warn!("network watch: a timed recheck found the pinned network changed; revoked");
+        signal.revoke();
+    }
+    holds
 }
 
 fn recheck(
@@ -549,6 +667,8 @@ fn policy_category(error: PolicyError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[test]
@@ -915,6 +1035,224 @@ mod tests {
         let watched = watching(&selected, &peer_routes(route()));
         assert!(!recheck(&watched, Some(&selected), Some(Ok(alone))));
         assert!(revoked(&watched));
+    }
+
+    /// Stands in for the two seconds, so the timer's cadence runs in real time.
+    const INTERVAL: Duration = Duration::from_millis(20);
+    const SETTLE: Duration = Duration::from_secs(5);
+
+    /// What the next check reads in place of the native adapter and route lookups, and when each
+    /// check read it.
+    struct Network {
+        current: Mutex<(Option<InterfaceSnapshot>, PeerRoutes)>,
+        reads: Mutex<Vec<Instant>>,
+    }
+
+    impl Network {
+        fn observe(&self) -> Observation {
+            self.reads.lock().unwrap().push(Instant::now());
+            let (current, routes) = self.current.lock().unwrap().clone();
+            let routes = current.is_some().then_some(Ok(routes));
+            (current, routes)
+        }
+
+        fn set(&self, current: Option<&InterfaceSnapshot>, routes: &PeerRoutes) {
+            *self.current.lock().unwrap() = (current.cloned(), routes.clone());
+        }
+
+        fn reads(&self) -> Vec<Instant> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    /// A group bound with `routes`, the check its watch and timer share, and the running timer.
+    struct Readmitting {
+        watched: PinnedLock,
+        network: Arc<Network>,
+        check: SharedCheck,
+        signal: RevocationSignal,
+        _timer: Readmission,
+    }
+
+    impl Readmitting {
+        fn bound(selected: &InterfaceSnapshot, routes: &PeerRoutes) -> Self {
+            let watched = Arc::new(watching(selected, routes));
+            let network = Arc::new(Network {
+                current: Mutex::new((Some(selected.clone()), routes.clone())),
+                reads: Mutex::default(),
+            });
+            let reading = Arc::clone(&network);
+            let check = checking(&watched, move || reading.observe());
+            let signal = RevocationSignal::default();
+            let timer = Readmission::start(
+                &Handle::current(),
+                Arc::clone(&check),
+                signal.clone(),
+                Arc::clone(&watched.reachability),
+                INTERVAL,
+            );
+            Self {
+                watched,
+                network,
+                check,
+                signal,
+                _timer: timer,
+            }
+        }
+
+        /// A change notice that reads `routes`: the watch runs the shared check once.
+        fn notice(&self, selected: &InterfaceSnapshot, routes: &PeerRoutes) {
+            self.network.set(Some(selected), routes);
+            assert!((self.check)());
+        }
+
+        fn checks(&self) -> usize {
+            self.network.reads().len()
+        }
+    }
+
+    fn with_down(members: &PeerRoutes, down: &[usize]) -> PeerRoutes {
+        let mut routes = members.clone();
+        for &member in down {
+            routes[member].1 = PeerRoute::Unreachable;
+        }
+        routes
+    }
+
+    async fn until(what: &str, condition: impl Fn() -> bool) {
+        tokio::time::timeout(SETTLE, async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
+    #[tokio::test]
+    async fn a_member_marked_unreachable_is_readmitted_on_the_next_timed_recheck_without_a_notice()
+    {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let members = member_routes();
+        let group = Readmitting::bound(&selected, &members);
+        let marked = Instant::now();
+        group.notice(&selected, &with_down(&members, &[1]));
+        assert_eq!(reaches(&group.watched), [true, false, true]);
+
+        // Its route resolves again, and no notice says so.
+        group.network.set(Some(&selected), &members);
+        until("the timer readmits the member", || {
+            reaches(&group.watched) == [true, true, true]
+        })
+        .await;
+        let reads = group.network.reads();
+        assert!(reads[1] >= marked + INTERVAL, "the first timed check waits");
+        assert!(!group.signal.is_revoked());
+        assert!(!revoked(&group.watched));
+    }
+
+    #[tokio::test]
+    async fn the_timer_stops_once_every_member_is_reachable() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let members = member_routes();
+        let group = Readmitting::bound(&selected, &members);
+        group.notice(&selected, &with_down(&members, &[2]));
+        group.network.set(Some(&selected), &members);
+        until("the timer readmits the member", || {
+            reaches(&group.watched) == [true, true, true]
+        })
+        .await;
+        let settled = group.checks();
+        tokio::time::sleep(INTERVAL * 10).await;
+        assert_eq!(group.checks(), settled);
+
+        // A later member set aside starts it again.
+        group.notice(&selected, &with_down(&members, &[0]));
+        until("the timer rechecks", || group.checks() > settled + 1).await;
+        assert_eq!(reaches(&group.watched), [false, true, true]);
+        group.network.set(Some(&selected), &members);
+        until("the timer readmits the member", || {
+            reaches(&group.watched) == [true, true, true]
+        })
+        .await;
+        assert!(!group.signal.is_revoked());
+    }
+
+    #[tokio::test]
+    async fn a_timed_recheck_that_finds_an_interface_change_revokes() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let members = member_routes();
+        let mut other_network = selected.clone();
+        other_network.network_signature = vec![2; 32];
+        let mut renumbered = selected.clone();
+        renumbered.index = 9;
+        let mut readdressed = selected.clone();
+        readdressed.address = Ipv4Addr::new(192, 168, 50, 20);
+        let mut resubnetted = selected.clone();
+        resubnetted.prefix_len = 16;
+        let unreadable = None;
+        for current in [
+            Some(other_network),
+            Some(renumbered),
+            Some(readdressed),
+            Some(resubnetted),
+            unreadable,
+        ] {
+            let group = Readmitting::bound(&selected, &members);
+            group.notice(&selected, &with_down(&members, &[1]));
+            // Every route is back, on an adapter that no longer reads back as selected.
+            group.network.set(current.as_ref(), &members);
+            until("the timed check revokes", || group.signal.is_revoked()).await;
+            assert_eq!(reaches(&group.watched), [true, false, true]);
+            assert_eq!(revoked(&group.watched), current.is_some());
+            let stopped = group.checks();
+            tokio::time::sleep(INTERVAL * 5).await;
+            assert_eq!(group.checks(), stopped);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_still_unreachable_member_stays_set_aside() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let members = member_routes();
+        let down = with_down(&members, &[1]);
+        let group = Readmitting::bound(&selected, &members);
+        group.notice(&selected, &down);
+        until("the timer rechecks three times", || group.checks() >= 4).await;
+        assert_eq!(reaches(&group.watched), [true, false, true]);
+        assert!(!group.signal.is_revoked());
+        assert!(!revoked(&group.watched));
+
+        // A route that comes back off-link or elsewhere readmits no one: it revokes everything.
+        let elsewhere = PeerRoute::Found(RouteSnapshot {
+            interface_index: 9,
+            ..route()
+        });
+        let other_source = PeerRoute::Found(RouteSnapshot {
+            source: Ipv4Addr::new(192, 168, 50, 20),
+            ..route()
+        });
+        for found in [gateway(), elsewhere, other_source] {
+            let group = Readmitting::bound(&selected, &members);
+            group.notice(&selected, &down);
+            let mut back = members.clone();
+            back[1].1 = found;
+            group.network.set(Some(&selected), &back);
+            until("the timed check revokes", || group.signal.is_revoked()).await;
+            assert_eq!(reaches(&group.watched), [true, false, true]);
+            assert!(revoked(&group.watched));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_group_of_one_has_nothing_to_readmit() {
+        let check: SharedCheck = Arc::new(|| true);
+        let signal = RevocationSignal::default();
+        let network = Handle::current();
+        let alone = Reachability::new(1);
+        assert!(Readmission::for_group(&network, check.clone(), &signal, &alone).is_none());
+        let group = Reachability::new(2);
+        assert!(Readmission::for_group(&network, check, &signal, &group).is_some());
     }
 
     #[test]

@@ -22,10 +22,10 @@ use crate::sharing::{
     validate_arrangement,
 };
 use crate::sharing_preferences::{
-    ComputerPlatform, ControlMap, DisplaySnapshot, MAX_LINKS, PreferenceError,
-    SHARING_PREFERENCES_VERSION, SharingPreferences, block_translation, fingerprint_key, id_map,
-    pair_displays, remap_layout, same_display_geometry, same_displays, same_geometry, snapshots,
-    topology_of, validate_displays, validate_fingerprint,
+    ComputerPlatform, ControlMap, DisplaySnapshot, MAX_LINKS, PreferenceError, SharingPreferences,
+    block_translation, describe_displays, fingerprint_key, id_map, pair_displays, remap_layout,
+    same_display_geometry, same_displays, same_geometry, snapshots, topology_of, validate_displays,
+    validate_fingerprint,
 };
 
 pub(crate) const GROUP_RECORD_VERSION: u8 = 1;
@@ -90,15 +90,18 @@ impl PartialOrd for Stamp {
 }
 
 impl Stamp {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Whether both stamps name the same layout, whoever made it and when.
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        self.content == other.content
     }
 }
 
 /// The displays each computer shows as this computer knows them now: its own as read now and
 /// each live peer's as that link reports them.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct KnownDisplays {
     /// Keyed by lowercase fingerprint.
@@ -112,7 +115,6 @@ struct KnownMember {
 }
 
 impl KnownDisplays {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn insert(
         &mut self,
         fingerprint: &str,
@@ -129,7 +131,6 @@ impl KnownDisplays {
     }
 
     /// Both ends of one link.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn of_link(inspection: &InspectedPeer) -> Self {
         let mut known = Self::default();
         known.insert(
@@ -145,6 +146,22 @@ impl KnownDisplays {
         known
     }
 
+    /// These displays, and `record`'s own entry for each of its members not known here: a member
+    /// that is not live counts as showing what that record last saw.
+    pub(crate) fn with_entries_of(&self, record: &GroupRecord) -> Self {
+        let mut known = self.clone();
+        for member in &record.members {
+            known
+                .members
+                .entry(fingerprint_key(&member.fingerprint))
+                .or_insert_with(|| KnownMember {
+                    platform: member.platform,
+                    displays: member.displays.clone(),
+                });
+        }
+        known
+    }
+
     fn get(&self, member: &GroupMember) -> Option<&KnownMember> {
         self.members.get(&fingerprint_key(&member.fingerprint))
     }
@@ -152,7 +169,6 @@ impl KnownDisplays {
 
 /// A record rebuilt for the displays known now, and whether the rebuild left a crossing, a
 /// position, or a display out against the record it was rebuilt from.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AdaptedGroup {
     pub(crate) record: GroupRecord,
     pub(crate) left_out: bool,
@@ -168,7 +184,6 @@ struct Content {
 
 impl GroupMember {
     /// `fingerprint` in any case.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         fingerprint: &str,
         platform: Platform,
@@ -181,7 +196,6 @@ impl GroupMember {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
@@ -191,7 +205,6 @@ impl GroupMember {
         self.platform
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn displays(&self) -> &[DisplaySnapshot] {
         &self.displays
     }
@@ -257,7 +270,35 @@ impl GroupRecord {
         )
     }
 
-    /// The pairwise record `local` keeps for a two-member group; the network is the file's.
+    /// The two computers of a link and `layout`, stamped as a local change of the link's local
+    /// end at `revision`.
+    pub(crate) fn for_link(
+        inspection: &InspectedPeer,
+        layout: LayoutRequest,
+        revision: u64,
+    ) -> Result<Self, PreferenceError> {
+        let local = inspection.local_fingerprint.full_hex();
+        Self::new(
+            revision,
+            &local,
+            vec![
+                GroupMember::new(
+                    &local,
+                    inspection.local_platform,
+                    &inspection.local_displays,
+                )?,
+                GroupMember::new(
+                    &inspection.peer_fingerprint.full_hex(),
+                    inspection.peer_platform,
+                    &inspection.peer_displays,
+                )?,
+            ],
+            layout,
+        )
+    }
+
+    /// The pairwise record `local` would have kept for a two-member group, on `interface_id`.
+    #[cfg(test)]
     pub(crate) fn to_pairwise(
         &self,
         local: &str,
@@ -269,7 +310,7 @@ impl GroupRecord {
         }
         let (local, peer) = (&self.members[index], &self.members[1 - index]);
         let record = SharingPreferences {
-            version: SHARING_PREFERENCES_VERSION,
+            version: crate::sharing_preferences::SHARING_PREFERENCES_VERSION,
             interface_id: interface_id.to_owned(),
             local_fingerprint: local.fingerprint.clone(),
             peer_fingerprint: peer.fingerprint.clone(),
@@ -290,12 +331,10 @@ impl GroupRecord {
         &self.author
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn members(&self) -> &[GroupMember] {
         &self.members
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn layout(&self) -> &LayoutRequest {
         &self.layout
     }
@@ -303,6 +342,62 @@ impl GroupRecord {
     /// `fingerprint` in any case.
     pub(crate) fn has_member(&self, fingerprint: &str) -> bool {
         self.index_of(fingerprint).is_some()
+    }
+
+    /// `fingerprint`'s entry, in any case.
+    pub(crate) fn member(&self, fingerprint: &str) -> Option<&GroupMember> {
+        self.index_of(fingerprint).map(|index| &self.members[index])
+    }
+
+    /// The same record carrying `control` instead of its own, stamped as it is.
+    pub(crate) fn with_control(&self, control: ControlMap) -> Result<Self, PreferenceError> {
+        let mut record = self.clone();
+        record.layout.control = control;
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Whether `local` still shows the displays its entry holds, at the same geometry: what a
+    /// computer can check of a record without a link.
+    pub(crate) fn fits_local(&self, local: &str, displays: &DisplayTopology) -> bool {
+        self.member(local)
+            .is_some_and(|member| same_display_geometry(&member.displays, &snapshots(displays)))
+    }
+
+    /// Whether `local` has the lowest DeviceId of the members, the one that decides layout
+    /// changes for a pair.
+    pub(crate) fn decided_by(&self, local: &str) -> bool {
+        let lowest = self
+            .members
+            .iter()
+            .filter_map(|member| device_of(&member.fingerprint))
+            .min();
+        lowest.is_some() && device_of(local) == lowest
+    }
+
+    /// `local`'s side and every other member's, for a log line: display counts and geometry
+    /// digests only.
+    pub(crate) fn describe_for(&self, local: &str) -> String {
+        let key = fingerprint_key(local);
+        let mut sides = vec![format!(
+            "this computer {}",
+            self.member(local).map_or_else(
+                || "unknown".to_owned(),
+                |member| describe_displays(&member.displays)
+            )
+        )];
+        sides.extend(
+            self.members
+                .iter()
+                .filter(|member| fingerprint_key(&member.fingerprint) != key)
+                .map(|member| format!("other computer {}", describe_displays(&member.displays))),
+        );
+        sides.join(", ")
+    }
+
+    /// The first bytes of the content digest, for log lines.
+    pub(crate) fn digest(&self) -> String {
+        hex(&self.content_digest())[..8].to_owned()
     }
 
     /// The members' lowercase fingerprints in member order, sorted once validated: the key of
@@ -581,7 +676,6 @@ impl GroupRecord {
 
     /// Both link ends are members showing exactly the displays and platform their entries hold;
     /// other members are not this link's to judge.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn fits_link(&self, inspection: &InspectedPeer) -> bool {
         let known = KnownDisplays::of_link(inspection);
         self.validate().is_ok()
@@ -605,10 +699,43 @@ impl GroupRecord {
             .collect()
     }
 
+    /// `remap_to` for a record whose every member `known` shows: the record as it loads now.
+    pub(crate) fn remap_to_all(&self, known: &KnownDisplays) -> Option<Self> {
+        self.members
+            .iter()
+            .all(|member| known.get(member).is_some())
+            .then(|| self.remap_to(known))
+            .flatten()
+    }
+
+    /// Every member shows exactly the monitors its entry was made with, whatever their geometry,
+    /// order, names or OS ids.
+    pub(crate) fn shows_same_monitors(&self, known: &KnownDisplays) -> bool {
+        self.members.iter().all(|member| {
+            known
+                .get(member)
+                .is_some_and(|live| same_displays(&member.displays, &live.displays).is_some())
+        })
+    }
+
+    /// The same member set, each member with the same monitors, whatever their geometry.
+    pub(crate) fn same_monitors_as(&self, other: &Self) -> bool {
+        self.member_keys() == other.member_keys()
+            && self.members.iter().all(|member| {
+                other.member(&member.fingerprint).is_some_and(|theirs| {
+                    same_displays(&member.displays, &theirs.displays).is_some()
+                })
+            })
+    }
+
+    /// The same members, displays, labels and layout, whatever the stamp.
+    pub(crate) fn same_content_as(&self, other: &Self) -> bool {
+        self.members == other.members && self.layout == other.layout
+    }
+
     /// This record with the ids of every known member's displays rewritten to the ids the same
     /// monitors carry now, when each known member shows exactly the displays its entry was made
     /// with at the same geometry. Members `known` does not show are left as they are.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn remap_to(&self, known: &KnownDisplays) -> Option<Self> {
         self.validate().ok()?;
         let mut members = self.members.clone();
@@ -640,7 +767,6 @@ impl GroupRecord {
     /// displays changed: ids follow monitor identity, what names a gone display drops, each changed
     /// block keeps its place, and a newcomer breaking a crossing is hidden. Two links that know the
     /// same change to one member rebuild the same content. None if nothing valid survives.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn adapt(&self, known: &KnownDisplays) -> Option<AdaptedGroup> {
         let changed = self.changed_members(known);
         if changed.is_empty() {
@@ -749,7 +875,6 @@ impl GroupRecord {
     /// The record as the displays in `known` show it, to draw and never save: itself while it
     /// fits them, else `adapt`'s rebuild, else those displays with what named a changed member's
     /// old displays dropped.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn preview_for(&self, known: &KnownDisplays) -> Self {
         let changed = self.changed_members(known);
         if changed.is_empty() {
@@ -782,7 +907,6 @@ impl GroupRecord {
 
     /// This record carrying the labels `known` shows for its displays. Labels are cosmetic, so
     /// the content and every fit stay as they are.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn relabeled(&self, known: &KnownDisplays) -> Self {
         let mut record = self.clone();
         for member in &mut record.members {
@@ -801,7 +925,6 @@ impl GroupRecord {
     /// The group without `member`: its displays, the crossings and positions that name them, and
     /// its control entry go, stamped as `author`'s local change at `revision`. None when what is
     /// left is not a valid record (one member, no crossing, or nobody left who may control).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn without_member(&self, member: &str, revision: u64, author: &str) -> Option<Self> {
         let index = self.index_of(member)?;
         let mut record = self.clone();
@@ -828,7 +951,6 @@ impl GroupRecord {
 /// The permissions a Share session between members `a` and `b` negotiates, keyed as today: the
 /// lower DeviceId's entry is `lower_controls_higher` on both computers alike. None when neither
 /// may control the other, since such a pair gets no Share connection.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn wire_control(control: &ControlMap, a: &str, b: &str) -> Option<ControlPermissions> {
     if fingerprint_key(a) == fingerprint_key(b) {
         return None;
@@ -858,7 +980,6 @@ struct SharedGroup {
 }
 
 /// The payload proposing `record` over the link `inspection` describes, sent by its local end.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn shared_group_bytes(
     inspection: &InspectedPeer,
     record: &GroupRecord,
@@ -885,7 +1006,6 @@ pub(crate) fn shared_group_bytes(
 /// The record a link peer proposed, and whether its sender left something out. Either end may have
 /// sent it; both ends must be members whose entries match the displays and platforms the link
 /// shows now, while other members' entries are only checked against the record's own bounds.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn shared_group_for_link(
     fresh: &InspectedPeer,
     bytes: &[u8],
@@ -916,7 +1036,6 @@ pub(crate) fn shared_group_for_link(
 
 /// What one computer tells each link peer about its active group: the members, and the stamp of
 /// its record for them when it has one. Never a layout.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RecordSummary {
@@ -938,7 +1057,6 @@ struct SummaryStamp {
 
 impl RecordSummary {
     /// `members` in any case and order; `record`, when present, is the record for exactly them.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         members: &[&str],
         record: Option<&GroupRecord>,
@@ -970,7 +1088,6 @@ impl RecordSummary {
         Ok(summary)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, PreferenceError> {
         self.validate()?;
         let bytes = serde_json::to_vec(self).map_err(|_| PreferenceError::Invalid)?;
@@ -980,7 +1097,6 @@ impl RecordSummary {
         Ok(bytes)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, PreferenceError> {
         if bytes.is_empty() || bytes.len() > MAX_SUMMARY_PAYLOAD_BYTES {
             return Err(PreferenceError::Invalid);
@@ -990,13 +1106,11 @@ impl RecordSummary {
         Ok(summary)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn members(&self) -> &[String] {
         &self.members
     }
 
     /// None when the sender has no record for its group yet.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stamp(&self) -> Option<Stamp> {
         let record = self.record.as_ref()?;
         Some(Stamp {
@@ -1750,9 +1864,13 @@ mod tests {
         ];
         let mut accepted = 0;
         for (case, layout) in &cases {
-            let pairwise = SharingPreferences::from_inspection(&inspection(&base), layout.clone());
             let mut record = base.clone();
             record.layout = layout.clone();
+            // Today's pairwise rules: the record's own, then the layout's against the link.
+            let pairwise = record
+                .validate()
+                .map_err(|error| error.to_string())
+                .and_then(|()| validated_layout(&inspection(&base), layout).map(drop));
             let group = GroupRecord::from_pairwise(&record, Platform::MacOs, Platform::Windows);
             assert_eq!(group.is_ok(), pairwise.is_ok(), "{case}");
             accepted += usize::from(pairwise.is_ok());
@@ -1823,7 +1941,8 @@ mod tests {
         assert_eq!(wire_control(&control, &a, &a), None);
         assert_eq!(wire_control(&control, &a, &fingerprint('D')), None);
 
-        // A two-member map gives exactly today's permissions, from either side.
+        // A two-member map gives exactly today's permissions, from either side: the lower
+        // DeviceId's entry is `lower_controls_higher`.
         for (a_allowed, b_allowed) in [(true, true), (true, false), (false, true)] {
             let pair: ControlMap = [(key('A'), a_allowed), (key('B'), b_allowed)]
                 .into_iter()
@@ -1831,7 +1950,10 @@ mod tests {
             for (local, peer) in [(&a, &b), (&b, &a)] {
                 assert_eq!(
                     wire_control(&pair, local, peer),
-                    Some(crate::sharing_preferences::wire_control(&pair, local, peer).unwrap())
+                    Some(ControlPermissions {
+                        lower_controls_higher: a_allowed,
+                        higher_controls_lower: b_allowed,
+                    })
                 );
             }
         }
@@ -2266,13 +2388,13 @@ mod tests {
             assert_eq!(theirs.clone().merge(mine.clone()), *decider);
             // Both computers get today's pairwise record back, and today's permissions.
             assert_eq!(
-                mine.to_pairwise(&record.local_fingerprint, record.interface_id()),
+                mine.to_pairwise(&record.local_fingerprint, &record.interface_id),
                 Ok(record.clone())
             );
             assert_eq!(
                 theirs.to_pairwise(
                     &record.peer_fingerprint.to_ascii_lowercase(),
-                    record.interface_id()
+                    &record.interface_id
                 ),
                 Ok(mirrored(&record))
             );
@@ -2282,10 +2404,10 @@ mod tests {
                     &record.local_fingerprint,
                     &record.peer_fingerprint
                 ),
-                record.wire_control().ok()
+                Some(ControlPermissions::BOTH)
             );
             assert_eq!(
-                mine.to_pairwise(&fingerprint('D'), record.interface_id()),
+                mine.to_pairwise(&fingerprint('D'), &record.interface_id),
                 Err(PreferenceError::Invalid)
             );
         }

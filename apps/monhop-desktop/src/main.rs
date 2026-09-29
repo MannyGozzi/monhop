@@ -277,12 +277,12 @@ async fn reveal_logs() -> Result<(), String> {
 fn sharing_setup_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     app.path()
         .app_local_data_dir()
-        .map(|path| path.join("sharing-setup.json"))
+        .map(|path| path.join(sharing_preferences::SETUP_FILE))
         .map_err(|_| "The setup folder could not be located.".to_owned())
 }
 
 fn arrangements_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    sharing_setup_path(app).map(|path| path.with_file_name("arrangements.json"))
+    sharing_setup_path(app).map(|path| path.with_file_name(sharing::ARRANGEMENTS_FILE))
 }
 
 #[tauri::command]

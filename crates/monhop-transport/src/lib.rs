@@ -13,6 +13,7 @@ pub mod session;
 pub mod session_actor;
 pub mod session_clipboard;
 pub(crate) mod session_clock;
+#[cfg(any(windows, target_os = "macos"))]
 pub mod session_group;
 pub mod session_handshake;
 pub mod session_health;

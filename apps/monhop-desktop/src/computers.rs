@@ -1,7 +1,12 @@
 //! The paired-computer list: names and addresses for presentation only. These records never
 //! authenticate or authorize input; trust lives in OS-protected storage.
 
-use std::{collections::BTreeSet, fs, io, net::SocketAddrV4, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
+    net::SocketAddrV4,
+    path::Path,
+};
 
 use monhop_core::Platform;
 use monhop_transport::{crypto::CertificateFingerprint, session_setup::InspectedPeer};
@@ -15,6 +20,8 @@ use crate::{
     },
 };
 
+/// The list sits beside the setup file.
+pub(crate) const LIST_FILE: &str = "dashboard.json";
 const MAX_BYTES: u64 = 16 * 1024;
 const MAX_NAME_CHARS: usize = 48;
 
@@ -99,7 +106,15 @@ impl ComputersView {
                 peer.platform,
             );
         }
-        for fingerprint in setup.fingerprints() {
+        let local = setup.local().map(fingerprint_key);
+        let recorded: BTreeSet<String> = setup
+            .groups()
+            .iter()
+            .flat_map(|group| group.members())
+            .map(|member| fingerprint_key(member.fingerprint()))
+            .filter(|member| Some(member) != local.as_ref())
+            .collect();
+        for fingerprint in recorded {
             seed(fingerprint.to_ascii_uppercase(), None, None);
         }
         let computers = computers
@@ -111,8 +126,10 @@ impl ComputersView {
                     .filter(|live| live.fingerprint == fingerprint)
                     .map(|live| live.inspection);
                 ComputerView {
-                    setup: SavedSetupView::from_saved(
-                        setup.computer(&fingerprint),
+                    setup: SavedSetupView::from_group(
+                        setup.group_with(&fingerprint),
+                        setup.local(),
+                        &fingerprint,
                         inspection,
                         revision,
                     ),
@@ -152,6 +169,19 @@ impl ComputerList {
                 "Computer history could not be saved. Your pairing and display setup are unchanged."
                     .to_owned()
             })
+    }
+
+    /// Each listed computer's platform, keyed by lowercase fingerprint.
+    pub(crate) fn platforms(&self) -> BTreeMap<String, Platform> {
+        self.computers
+            .iter()
+            .map(|computer| {
+                (
+                    fingerprint_key(&computer.fingerprint),
+                    computer.platform.into(),
+                )
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -347,7 +377,10 @@ mod tests {
         let saved = crate::sharing_preferences::tests::preferences();
         let inspection = crate::sharing_preferences::tests::inspection(&saved);
         let mut setup = crate::sharing_preferences::tests::file_with(saved);
-        setup.insert(crate::sharing_preferences::tests::preferences_for_peer('C'));
+        crate::sharing_preferences::tests::keep_group(
+            &mut setup,
+            &crate::sharing_preferences::tests::preferences_for_peer('C'),
+        );
         let mut list = ComputerList::default();
         list.remember(fingerprint('C'), endpoint(), Some(Platform::MacOs))
             .unwrap();

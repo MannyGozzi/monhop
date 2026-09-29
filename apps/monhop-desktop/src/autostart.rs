@@ -135,7 +135,7 @@ impl Autostart {
     fn paired(setup_path: Option<&Path>) -> bool {
         setup_path
             .and_then(|path| SetupFile::load(path).ok())
-            .is_some_and(|file| file.active().is_some())
+            .is_some_and(|file| file.sharing_chosen())
     }
 
     fn pending_view(enabled: bool) -> AutostartView {
