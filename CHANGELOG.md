@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-29
+
 Several computers, and clipboard sharing. **Update every computer together:** this version cannot connect to 0.2.2 or earlier. Pairings and saved layouts carry over, and an older MonHop started later still finds its own settings untouched.
 
 ### Added
@@ -165,7 +167,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.3
 [0.2.2]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.2
 [0.2.1]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.1
 [0.2.0]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.0
