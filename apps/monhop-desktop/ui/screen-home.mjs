@@ -18,6 +18,7 @@ import {
   clipboardAccessNotice,
   clipboardNoticeText,
   clipboardPeerLines,
+  clipboardPill,
   clipboardStatusText,
   lastTransferText,
   normalizeClipboardView,
@@ -31,6 +32,7 @@ import {
   note,
   rows,
   sliderRow,
+  statusChip,
   swap,
   switchRow,
 } from "./dom.mjs";
@@ -192,7 +194,15 @@ function clipboardCard(ctx) {
   if (skipNotice) children.push(note(skipNotice));
   const lastText = lastTransferText(view);
   if (lastText) children.push(note(lastText));
-  return card({ id: "home-clipboard", title: "Clipboard", children });
+  const pill = clipboardPill(view);
+  const headingActions = [
+    swap(
+      "home-clipboard-pill",
+      pill ? statusChip(pill) : el("span", { className: "chip-slot" }),
+      pill ? pill.tone : "none",
+    ),
+  ];
+  return card({ id: "home-clipboard", title: "Clipboard", headingActions, children });
 }
 
 // The card works without a paired computer: dimming is this computer's own feature.

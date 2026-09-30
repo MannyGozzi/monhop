@@ -6,6 +6,7 @@ import {
   clipboardAccessNotice,
   clipboardNoticeText,
   clipboardPeerLines,
+  clipboardPill,
   clipboardStatusText,
   lastTransferText,
   normalizeClipboardView,
@@ -160,7 +161,17 @@ test("the status only speaks up while on with nobody to share with; the switch s
   );
 });
 
-test("peer lines name each attached computer and say whether it needs turning on there too", () => {
+test("the pill is green once a peer shares back, amber while none does, and absent when off", () => {
+  const peers = (...states) =>
+    states.map((peerEnabled, i) => ({ fingerprint: [FP_A, FP_B, FP_C][i], peerEnabled }));
+  const pill = (enabled, list) => clipboardPill(normalizeClipboardView({ enabled, peers: list }));
+  assert.equal(pill(false, peers(true)), null);
+  assert.deepEqual(pill(true, []), { tone: "checking", label: "Waiting" });
+  assert.deepEqual(pill(true, peers(false, null)), { tone: "checking", label: "Waiting" });
+  assert.deepEqual(pill(true, peers(false, true)), { tone: "active", label: "Sharing" });
+});
+
+test("peer lines only ask for the computers not sharing back, by name", () => {
   const view = normalizeClipboardView({
     enabled: true,
     peers: [
@@ -170,19 +181,19 @@ test("peer lines name each attached computer and say whether it needs turning on
     ],
   });
   assert.deepEqual(clipboardPeerLines(view, computers), [
-    "Studio: on",
-    "Windows PC: off. Turn it on there too",
-    "Windows PC: off. Turn it on there too",
+    "Turn on clipboard sharing on Windows PC too.",
+    "Turn on clipboard sharing on Windows PC too.",
   ]);
 });
 
 test("peer lines never throw when the computers list is missing or empty", () => {
   const view = normalizeClipboardView({
     enabled: true,
-    peers: [{ fingerprint: FP_A, peerEnabled: true }],
+    peers: [{ fingerprint: FP_A, peerEnabled: false }],
   });
-  assert.deepEqual(clipboardPeerLines(view, undefined), ["Windows PC: on"]);
-  assert.deepEqual(clipboardPeerLines(view, { items: [] }), ["Windows PC: on"]);
+  const line = ["Turn on clipboard sharing on Windows PC too."];
+  assert.deepEqual(clipboardPeerLines(view, undefined), line);
+  assert.deepEqual(clipboardPeerLines(view, { items: [] }), line);
 });
 
 test("the macOS access notice covers ask and denied, and is silent otherwise", () => {

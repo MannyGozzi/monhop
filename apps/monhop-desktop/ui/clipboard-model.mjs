@@ -80,13 +80,24 @@ export function clipboardStatusText(view) {
     : null;
 }
 
-// One line per attached peer, named from the paired-computers list so it reads "<name>: on"
-// rather than a bare fingerprint.
+// The header pill: green once a computer on the other end shares too, amber while none does,
+// and absent while the switch is off, which already says so.
+export function clipboardPill(view) {
+  if (!view.enabled) return null;
+  return view.peers.some((peer) => peer.peerEnabled === true)
+    ? { tone: "active", label: "Sharing" }
+    : { tone: "checking", label: "Waiting" };
+}
+
+// Only the attached computers that are not sharing back need a line, named from the
+// paired-computers list rather than a bare fingerprint. Unreported reads the same as off.
 export function clipboardPeerLines(view, computers) {
-  return view.peers.map((peer) => {
-    const name = displayName(findComputer(computers ?? { items: [] }, peer.fingerprint));
-    return peer.peerEnabled === true ? `${name}: on` : `${name}: off. Turn it on there too`;
-  });
+  return view.peers
+    .filter((peer) => peer.peerEnabled !== true)
+    .map((peer) => {
+      const name = displayName(findComputer(computers ?? { items: [] }, peer.fingerprint));
+      return `Turn on clipboard sharing on ${name} too.`;
+    });
 }
 
 const ACCESS_NOTICE = {
