@@ -8153,6 +8153,8 @@ pub(crate) mod tests {
 
     #[test]
     fn sharing_set_enabled_touches_or_derives_a_record() {
+        // The idle view reads the process-wide native claim that lifecycle tests hold.
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let (directory, path) = sync_test_path();
         let controller = SharingController::default();
         let (a, b, c) = ("A".repeat(64), "B".repeat(64), "C".repeat(64));
