@@ -220,6 +220,8 @@ pub trait WatchedDestination: InputDestination {
     type Environment: WatchedEnvironment;
     /// Taken once, before startup: the checks run on their own thread and never touch injection.
     fn environment(&mut self) -> Self::Environment;
+    /// On the injection thread at least every `TICK` while a receiver runs; must never block.
+    fn tick(&mut self) {}
 }
 
 pub trait WatchedEnvironment: Send + 'static {
@@ -552,6 +554,12 @@ pub(crate) struct DestinationGuard<D: WatchedDestination> {
     pub(crate) armed: bool,
 }
 
+impl<D: WatchedDestination> DestinationGuard<D> {
+    pub(crate) fn tick(&mut self) {
+        self.destination.tick();
+    }
+}
+
 impl<D: WatchedDestination> InputDestination for DestinationGuard<D> {
     fn apply(&mut self, action: DestinationAction) -> Result<(), DestinationFailure> {
         match catch_unwind(AssertUnwindSafe(|| self.destination.apply(action))) {
@@ -708,6 +716,7 @@ fn run_receiver<D: WatchedDestination>(
                     break;
                 }
             }
+            destination.tick();
             note_hold(&status, receiver, now);
             if status.failure().is_some() {
                 break;

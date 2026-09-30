@@ -9,6 +9,7 @@ mod dimming;
 #[cfg(target_os = "macos")]
 mod display_labels;
 mod group_record;
+mod key_names;
 mod launch;
 mod lifecycle;
 mod links;

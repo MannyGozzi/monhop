@@ -13,6 +13,7 @@ use crate::{
 use monhop_core::{
     Platform, Point, PointerGesture,
     capture::{CaptureEvent, CapturedEvent, MAX_SUPPRESSION_TTL, StopReason},
+    capture_physical::HeldInput,
 };
 #[cfg(target_os = "macos")]
 pub(crate) use monhop_platform_macos::native_capture::{NativeCapture, NativeCaptureError};
@@ -100,8 +101,19 @@ pub(crate) trait CaptureControl {
     /// `None` once native control failed.
     fn completed_control_revision(&self) -> Option<u64>;
     fn is_ready_for_suppression(&self) -> bool;
+    /// The presses held since capture started that keep suppression refused.
+    fn blocking_presses(&self) -> Vec<HeldInput>;
     fn stop_reason(&self) -> Option<StopReason>;
     fn request_stop(&self);
+}
+
+/// Asks the capture only while suppression is refused, so a ready capture's tick allocates nothing.
+pub(crate) fn blocking_presses(capture: &impl CaptureControl) -> Vec<HeldInput> {
+    if capture.is_ready_for_suppression() {
+        Vec::new()
+    } else {
+        capture.blocking_presses()
+    }
 }
 
 /// The authenticated link to one controller's peer.
@@ -129,6 +141,9 @@ impl CaptureControl for NativeCapture {
     }
     fn is_ready_for_suppression(&self) -> bool {
         NativeCapture::is_ready_for_suppression(self)
+    }
+    fn blocking_presses(&self) -> Vec<HeldInput> {
+        NativeCapture::blocking_presses(self)
     }
     fn stop_reason(&self) -> Option<StopReason> {
         NativeCapture::stop_reason(self)
@@ -721,6 +736,9 @@ mod tests {
         }
         fn is_ready_for_suppression(&self) -> bool {
             true
+        }
+        fn blocking_presses(&self) -> Vec<HeldInput> {
+            Vec::new()
         }
         fn stop_reason(&self) -> Option<StopReason> {
             self.stopped.get().then_some(StopReason::Requested)

@@ -143,6 +143,8 @@ pub(super) struct FakeCapture {
     renewals: u32,
     /// The OS pointer, which local absolute motion and restores move.
     pub(super) pointer: Point,
+    /// Presses held since capture started; suppression is refused until none are.
+    pub(super) blocking: Vec<HeldInput>,
 }
 
 impl FakeCapture {
@@ -154,6 +156,7 @@ impl FakeCapture {
             commands: Vec::new(),
             renewals: 0,
             pointer: Point::new(50.0, 50.0),
+            blocking: Vec::new(),
         }
     }
 
@@ -202,7 +205,10 @@ impl CaptureControl for FakeCapture {
         Some(self.route.1)
     }
     fn is_ready_for_suppression(&self) -> bool {
-        true
+        self.blocking.is_empty()
+    }
+    fn blocking_presses(&self) -> Vec<HeldInput> {
+        self.blocking.clone()
     }
     fn stop_reason(&self) -> Option<StopReason> {
         None
@@ -1338,4 +1344,31 @@ fn a_single_peer_hub_behaves_like_run_session() {
         assert!(core.orphan.is_none() && core.pending.is_none() && core.submitted.is_none());
         assert!(core.slots.iter().all(|slot| matches!(slot, Slot::Empty)));
     }
+}
+
+#[test]
+fn presses_held_since_capture_started_are_named_until_released_or_native_input_stops() {
+    let mut mesh = Mesh::start(pair());
+    let held = [
+        HeldInput::Key(HidUsage(0x50)),
+        HeldInput::Button(MouseButton::Middle),
+    ];
+    mesh.computer(1).capture.blocking = held.to_vec();
+    mesh.tick();
+    assert_eq!(mesh.at(1).core.blocking_presses(), held);
+    assert!(mesh.at(2).core.blocking_presses().is_empty());
+
+    mesh.computer(1).capture.blocking.truncate(1);
+    mesh.tick();
+    assert_eq!(mesh.at(1).core.blocking_presses(), &held[..1]);
+    mesh.computer(1).capture.blocking.clear();
+    mesh.tick();
+    assert!(mesh.at(1).core.blocking_presses().is_empty());
+
+    mesh.computer(1).capture.blocking = held.to_vec();
+    mesh.tick();
+    mesh.drop_link(1, 2);
+    mesh.pump();
+    assert!(!mesh.at(1).native);
+    assert!(mesh.at(1).core.blocking_presses().is_empty());
 }

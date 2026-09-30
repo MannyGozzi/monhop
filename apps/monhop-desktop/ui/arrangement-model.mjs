@@ -517,7 +517,7 @@ function disconnectedMessage(order, unreachable) {
     : `${names} are not connected to the rest.`;
 }
 
-function joinNames(list) {
+export function joinNames(list) {
   return list.length <= 1 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
 }
 

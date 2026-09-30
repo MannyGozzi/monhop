@@ -403,6 +403,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .card-actions .note { margin-right: auto; }
 .note { color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); }
 .note[data-tone="danger"] { color: var(--destructive); }
+.note[data-tone="warning"] { color: var(--warning-text); }
 .note[data-tone="success"] { color: var(--success); }
 .recovery-steps { margin: 0; padding-left: var(--gap-4); }
 .home-layout-heading { color: var(--subtle-foreground); font-size: var(--text-xs); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-label); text-transform: uppercase; }

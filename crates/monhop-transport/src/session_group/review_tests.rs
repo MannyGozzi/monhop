@@ -43,6 +43,9 @@ impl CaptureControl for Control<'_> {
     fn is_ready_for_suppression(&self) -> bool {
         self.capture.is_ready_for_suppression()
     }
+    fn blocking_presses(&self) -> Vec<HeldInput> {
+        self.capture.blocking_presses()
+    }
     fn stop_reason(&self) -> Option<StopReason> {
         match self.state {
             ControlState::Busy => None,

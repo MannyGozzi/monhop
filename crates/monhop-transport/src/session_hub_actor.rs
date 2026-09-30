@@ -421,6 +421,7 @@ impl<D: WatchedDestination> Worker<D> {
             for index in 0..MAX_GROUP_PEERS {
                 self.tick(index);
             }
+            self.destination.tick();
             if self.status.failure().is_some() {
                 break;
             }
@@ -761,6 +762,7 @@ mod tests {
         actions: SyncSender<(DestinationAction, FloorSnapshot)>,
         refuse_release: Arc<AtomicBool>,
         environment: Option<Environment>,
+        ticks: Arc<AtomicUsize>,
     }
 
     impl InputDestination for Probe {
@@ -778,6 +780,9 @@ mod tests {
         fn environment(&mut self) -> Environment {
             self.environment.take().expect("taken once")
         }
+        fn tick(&mut self) {
+            self.ticks.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     struct Hub {
@@ -787,6 +792,7 @@ mod tests {
         refuse_release: Arc<AtomicBool>,
         environment_fails: Arc<AtomicBool>,
         wakes: Arc<AtomicUsize>,
+        ticks: Arc<AtomicUsize>,
     }
 
     impl Hub {
@@ -798,6 +804,8 @@ mod tests {
             let floor = gate.floor().clone();
             let refused = refuse_release.clone();
             let failing = environment_fails.clone();
+            let ticks = Arc::new(AtomicUsize::new(0));
+            let ticked = ticks.clone();
             let ownership = monhop_core::NativeSessionClaim::claim()
                 .expect("test owns native input")
                 .split()
@@ -814,6 +822,7 @@ mod tests {
                         actions,
                         refuse_release: refused,
                         environment: Some(Environment { failing }),
+                        ticks: ticked,
                     })
                 },
             )
@@ -832,6 +841,7 @@ mod tests {
                 refuse_release,
                 environment_fails,
                 wakes,
+                ticks,
             }
         }
 
@@ -1040,6 +1050,16 @@ mod tests {
         assert_eq!(hub.actor.peer_failure(slot(2)), None);
         assert!(hub.wakes.load(Ordering::Acquire) > 0);
         assert_eq!(actions(&hub.finish()), [ReleaseAll]);
+    }
+
+    #[test]
+    fn the_destination_is_ticked_while_no_input_arrives() {
+        let _test = lock_test();
+        let mut hub = Hub::start();
+        hub.join(slot(1));
+        let before = hub.ticks.load(Ordering::Acquire);
+        wait_until(|| hub.ticks.load(Ordering::Acquire) >= before + 5);
+        hub.finish();
     }
 
     #[test]

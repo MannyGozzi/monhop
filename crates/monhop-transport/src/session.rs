@@ -8,7 +8,9 @@ use crate::{
     session_handshake::NegotiatedSession,
     session_wire::{FrameReader, FrameWriter, decode_datagram, is_heartbeat},
 };
-use monhop_core::{DeviceId, DisplayId, RevocationSignal, capture::StopReason};
+use monhop_core::{
+    DeviceId, DisplayId, RevocationSignal, capture::StopReason, capture_physical::HeldInput,
+};
 use monhop_protocol::{Frame, FrameScope, Message};
 use std::{
     net::SocketAddr,
@@ -36,6 +38,8 @@ struct ProgressState {
     half: AtomicU64,
     /// The peer went silent past the deadline; input is local until the link proves itself.
     held: AtomicBool,
+    /// Presses held since capture started, which keep the pointer from crossing until released.
+    blocking: std::sync::Mutex<Vec<HeldInput>>,
     /// The user ended this session (pause, switch, quit): its close tells the peer it was no failure.
     deliberate: AtomicBool,
     receiver: std::sync::Mutex<Option<crate::session_actor::ReceiverStats>>,
@@ -116,6 +120,22 @@ impl SessionProgress {
     }
     pub(crate) fn hold(&self, held: bool) {
         self.0.held.store(held, Ordering::Release);
+    }
+    /// Empty while nothing keeps the pointer from crossing to another computer.
+    pub fn blocking_presses(&self) -> Vec<HeldInput> {
+        self.0
+            .blocking
+            .lock()
+            .map(|presses| presses.clone())
+            .unwrap_or_default()
+    }
+    pub(crate) fn block(&self, presses: &[HeldInput]) {
+        if let Ok(mut blocking) = self.0.blocking.lock()
+            && blocking.as_slice() != presses
+        {
+            blocking.clear();
+            blocking.extend_from_slice(presses);
+        }
     }
     pub(crate) fn record_receiver(&self, stats: crate::session_actor::ReceiverStats) {
         if let Ok(mut slot) = self.0.receiver.lock() {

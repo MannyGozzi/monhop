@@ -6,6 +6,7 @@ import {
   groupedPlacement,
   hiddenDisplaysAcross,
   isPlacement,
+  joinNames,
   layoutArrangement,
   matchesCrossings,
   monitorKey,
@@ -26,6 +27,7 @@ const MAX_ARRANGEMENTS = 32;
 export const MAX_ARRANGEMENT_NAME = 64;
 const MAX_MEMBERS = 8;
 const MAX_DISPLAYS_TOTAL = 32;
+const MAX_BLOCKING_PRESSES = 16;
 
 const PLATFORMS = new Set(["macos", "windows"]);
 const DISPLAY_NOTICE_KINDS = new Set(["continued", "waiting", "updating", "peerDeciding"]);
@@ -1198,6 +1200,7 @@ export function normalizeSharingView(value) {
       peers: [],
       enabled: [],
       paused: false,
+      blockingPresses: [],
       message: "The connection state was not recognized. Stop, then connect again.",
     };
   }
@@ -1233,7 +1236,21 @@ export function normalizeSharingView(value) {
     peers: normalizePeers(source.peers),
     enabled: normalizeFingerprintList(source.enabled),
     paused: source.paused === true,
+    blockingPresses: normalizeBlockingPresses(source.blockingPresses),
   };
+}
+
+// Key and button names from Rust; a damaged entry is dropped rather than drawn.
+function normalizeBlockingPresses(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((name) => boundedText(name, 64)).slice(0, MAX_BLOCKING_PRESSES);
+}
+
+// Home's line while presses held since sharing started keep the pointer home; "" once none do.
+export function releaseToShareCopy(names) {
+  return Array.isArray(names) && names.length
+    ? `Release ${joinNames(names)} on this computer to share.`
+    : "";
 }
 
 // At least one direction must stay on; a reply claiming neither is damaged, not a real state.

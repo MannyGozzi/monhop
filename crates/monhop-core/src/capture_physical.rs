@@ -60,6 +60,23 @@ impl std::fmt::Debug for LocalTransfer {
     }
 }
 
+/// Escape, the last key of the local emergency chord.
+const ESCAPE: u16 = 0x29;
+/// Left Ctrl, right Ctrl and Escape held together: the local emergency escape.
+const ESCAPE_CHORD: [usize; 3] = [0xe0, 0xe4, ESCAPE as usize];
+
+/// A key or button held since capture started; each keeps suppression refused until released.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HeldInput {
+    Key(HidUsage),
+    Button(MouseButton),
+}
+impl std::fmt::Debug for HeldInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HeldInput([redacted])")
+    }
+}
+
 pub struct TransferPlan {
     entries: [Option<LocalTransfer>; 261],
     len: usize,
@@ -214,6 +231,44 @@ impl PhysicalCapture {
         !self.any_press(|press| press.initially_held)
     }
 
+    /// The presses keeping suppression refused: keys in usage order, then buttons in slot order.
+    pub fn initially_held(&self) -> impl Iterator<Item = HeldInput> + '_ {
+        let keys = self
+            .keys
+            .iter()
+            .enumerate()
+            .filter(|(_, press)| press.initially_held)
+            .map(|(index, _)| HeldInput::Key(HidUsage(index as u16)));
+        let buttons = MouseButton::ALL
+            .into_iter()
+            .filter(|button| self.buttons[button.index()].initially_held)
+            .map(HeldInput::Button);
+        keys.chain(buttons)
+    }
+
+    /// Drops a press held since capture start that the OS now reads as up although no release
+    /// reached the hook (an injected or lost key-up). Returns whether it was still refusing.
+    pub fn forget_initially_held(&mut self, held: HeldInput) -> bool {
+        let press = match held {
+            HeldInput::Key(usage) if usage.is_valid() => &mut self.keys[usize::from(usage.0)],
+            HeldInput::Button(button) => &mut self.buttons[button.index()],
+            HeldInput::Key(_) => return false,
+        };
+        if !press.initially_held {
+            return false;
+        }
+        *press = Press::default();
+        // A forgotten key is up, so a chord it completed is no longer held and cannot fire; a
+        // forgotten Escape's release never comes to lift its reservation.
+        if !ESCAPE_CHORD.iter().all(|index| self.keys[*index].physical) {
+            self.chord_since = None;
+        }
+        if held == HeldInput::Key(HidUsage(ESCAPE)) {
+            self.reserved_escape = false;
+        }
+        true
+    }
+
     /// Whether a held press still owes local apps a withheld release.
     pub fn has_suppressed_presses(&self) -> bool {
         self.any_press(|press| press.suppressed_down || press.withheld)
@@ -276,7 +331,7 @@ impl PhysicalCapture {
                 let index = usize::from(usage.0);
                 let previous = self.keys[index];
                 self.keys[index].physical = pressed;
-                let complete_chord = [0xe0, 0xe4, 0x29].iter().all(|i| self.keys[*i].physical);
+                let complete_chord = ESCAPE_CHORD.iter().all(|i| self.keys[*i].physical);
                 if complete_chord {
                     if self.chord_since.is_none() {
                         self.chord_since = Some(now);
@@ -285,9 +340,9 @@ impl PhysicalCapture {
                 } else {
                     self.chord_since = None;
                 }
-                let reserved = self.intercepts_escape && usage.0 == 0x29 && self.reserved_escape;
+                let reserved = self.intercepts_escape && usage.0 == ESCAPE && self.reserved_escape;
                 let chord_repeat = self.intercepts_escape && complete_chord && pressed;
-                if usage.0 == 0x29 && !pressed {
+                if usage.0 == ESCAPE && !pressed {
                     self.reserved_escape = false;
                 }
                 if let Some(suppress) =
@@ -569,6 +624,73 @@ mod tests {
         assert!(!input.process(key(0xe0, false), true, Duration::ZERO, &mut tx, &stop));
         assert!(input.is_ready_for_suppression());
         assert!(rx.try_pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn initially_held_lists_each_refusing_press_until_it_is_released_or_forgotten() {
+        let stop = CaptureStop::default();
+        let (mut tx, mut rx) = capture_channel(stop.clone());
+        let mut input = PhysicalCapture::new(Duration::ZERO);
+        input.seed_locally_held_key(HidUsage(0x50));
+        input.seed_locally_held_key(HidUsage(0xe1));
+        input.seed_locally_held_button(MouseButton::Middle);
+        assert_eq!(
+            input.initially_held().collect::<Vec<_>>(),
+            [
+                HeldInput::Key(HidUsage(0x50)),
+                HeldInput::Key(HidUsage(0xe1)),
+                HeldInput::Button(MouseButton::Middle),
+            ]
+        );
+        // A physical release still clears its press as before.
+        assert!(!input.process(key(0xe1, false), false, Duration::ZERO, &mut tx, &stop));
+        // A press the OS reads up without a release reaching the hook is forgotten once.
+        assert!(input.forget_initially_held(HeldInput::Key(HidUsage(0x50))));
+        assert!(!input.forget_initially_held(HeldInput::Key(HidUsage(0x50))));
+        assert!(!input.is_ready_for_suppression());
+        assert!(input.forget_initially_held(HeldInput::Button(MouseButton::Middle)));
+        assert!(input.is_ready_for_suppression());
+        assert_eq!(input.initially_held().count(), 0);
+        assert!(rx.try_pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn forgetting_never_touches_a_press_made_after_capture_started() {
+        let stop = CaptureStop::default();
+        let (mut tx, mut rx) = capture_channel(stop.clone());
+        let mut input = PhysicalCapture::new(Duration::ZERO);
+        route_remote(&mut input, &mut tx);
+        rx.try_pop().unwrap();
+        assert!(input.process(key(0x50, true), true, Duration::ZERO, &mut tx, &stop));
+        assert!(!input.forget_initially_held(HeldInput::Key(HidUsage(0x50))));
+        assert!(!input.forget_initially_held(HeldInput::Key(HidUsage(0x1000))));
+        assert!(!input.forget_initially_held(HeldInput::Button(MouseButton::Left)));
+        // The queued press keeps its owed release.
+        assert!(rx.try_pop().unwrap().is_some());
+        assert!(input.process(key(0x50, false), true, Duration::ZERO, &mut tx, &stop));
+        assert!(rx.try_pop().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_forgotten_press_whose_release_arrives_late_passes_locally() {
+        let stop = CaptureStop::default();
+        let (mut tx, mut rx) = capture_channel(stop.clone());
+        let mut input = PhysicalCapture::new(Duration::ZERO);
+        input.seed_locally_held_key(HidUsage(0x50));
+        assert!(input.forget_initially_held(HeldInput::Key(HidUsage(0x50))));
+        route_remote(&mut input, &mut tx);
+        rx.try_pop().unwrap();
+        assert!(!input.process(key(0x50, false), true, Duration::ZERO, &mut tx, &stop));
+        assert!(rx.try_pop().unwrap().is_none());
+        assert!(!input.has_suppressed_presses());
+    }
+
+    #[test]
+    fn held_input_debug_never_names_the_key() {
+        assert_eq!(
+            format!("{:?}", HeldInput::Key(HidUsage(0x50))),
+            "HeldInput([redacted])"
+        );
     }
 
     #[test]
@@ -1192,6 +1314,51 @@ mod tests {
         input.process(key(0x29, true), false, ms(0), &mut tx, &stop);
         input.tick(ms(2000), &stop);
         assert_eq!(stop.reason(), Some(StopReason::EmergencyEscape));
+    }
+
+    #[test]
+    fn forgetting_a_startup_held_ctrl_disarms_the_emergency_chord_it_completed() {
+        let stop = CaptureStop::default();
+        let (mut tx, _rx) = capture_channel(stop.clone());
+        let mut input = PhysicalCapture::new(Duration::ZERO);
+        input.seed_locally_held_key(HidUsage(0xe0));
+        input.process(key(0xe4, true), false, ms(0), &mut tx, &stop);
+        input.process(key(0x29, true), false, ms(0), &mut tx, &stop);
+        // The OS reads the startup Ctrl up: the chord is no longer held.
+        assert!(input.forget_initially_held(HeldInput::Key(HidUsage(0xe0))));
+        input.tick(ms(2000), &stop);
+        assert_eq!(stop.reason(), None);
+    }
+
+    #[test]
+    fn forgetting_keys_outside_a_held_chord_keeps_it_armed() {
+        let stop = CaptureStop::default();
+        let (mut tx, _rx) = capture_channel(stop.clone());
+        let mut input = PhysicalCapture::new(Duration::ZERO);
+        input.seed_locally_held_key(HidUsage(0x50));
+        for usage in [0xe0, 0xe4, 0x29] {
+            input.process(key(usage, true), false, ms(0), &mut tx, &stop);
+        }
+        assert!(input.forget_initially_held(HeldInput::Key(HidUsage(0x50))));
+        input.tick(ms(2000), &stop);
+        assert_eq!(stop.reason(), Some(StopReason::EmergencyEscape));
+    }
+
+    #[test]
+    fn a_forgotten_startup_held_escape_leaves_no_reservation_on_the_next_escape() {
+        let stop = CaptureStop::default();
+        let (mut tx, mut rx) = capture_channel(stop.clone());
+        let mut input = PhysicalCapture::new(Duration::ZERO);
+        input.seed_locally_held_key(HidUsage(0x29));
+        input.process(key(0xe0, true), false, ms(0), &mut tx, &stop);
+        input.process(key(0xe4, true), false, ms(0), &mut tx, &stop);
+        assert!(input.forget_initially_held(HeldInput::Key(HidUsage(0x29))));
+        input.process(key(0xe0, false), false, ms(1), &mut tx, &stop);
+        input.process(key(0xe4, false), false, ms(1), &mut tx, &stop);
+        while rx.try_pop().unwrap().is_some() {}
+        // A later Escape is an ordinary key again: queued, not reserved.
+        input.process(key(0x29, true), false, ms(2), &mut tx, &stop);
+        assert!(rx.try_pop().unwrap().is_some());
     }
 
     fn located(x: i32) -> CaptureEvent {

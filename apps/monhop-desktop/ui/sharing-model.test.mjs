@@ -34,6 +34,7 @@ import {
   normalizeDisplayNotice,
   normalizeSharingView,
   normalizeStoredLayout,
+  releaseToShareCopy,
   resetArrangement,
   sameSharingView,
   setDisplayInUse,
@@ -280,6 +281,50 @@ test("a display change the user must settle gets the banner; one MonHop is settl
   assert.equal(peerDeciding.primaryLabel, null);
 
   assert.equal(displayNoticeCopy("bogus", "Office Windows PC"), null);
+});
+
+test("a press held since sharing started is named so the user knows what to release", () => {
+  assert.equal(releaseToShareCopy([]), "");
+  assert.equal(releaseToShareCopy(undefined), "");
+  assert.equal(releaseToShareCopy(["Left Arrow"]), "Release Left Arrow on this computer to share.");
+  assert.equal(
+    releaseToShareCopy(["Left Arrow", "Left Shift"]),
+    "Release Left Arrow and Left Shift on this computer to share.",
+  );
+  assert.equal(
+    releaseToShareCopy(["the middle mouse button"]),
+    "Release the middle mouse button on this computer to share.",
+  );
+  assert.equal(
+    releaseToShareCopy(["Left Shift", "A", "the left mouse button"]),
+    "Release Left Shift, A and the left mouse button on this computer to share.",
+  );
+});
+
+test("the view carries the held names it was sent and drops damaged ones", () => {
+  const sharing = { ...offView, phase: "sharing", sharingActive: true };
+  assert.deepEqual(normalizeSharingView(sharing).blockingPresses, []);
+  assert.deepEqual(
+    normalizeSharingView({ ...sharing, blockingPresses: ["Left Arrow", 7, "", "x".repeat(65)] })
+      .blockingPresses,
+    ["Left Arrow"],
+  );
+  assert.deepEqual(
+    normalizeSharingView({ ...sharing, blockingPresses: "Left Arrow" }).blockingPresses,
+    [],
+  );
+  assert.deepEqual(
+    normalizeSharingView({ garbage: true, blockingPresses: ["Left Arrow"] }).blockingPresses,
+    [],
+  );
+  // A press released since the last poll is a change worth drawing.
+  assert.equal(
+    sameSharingView(
+      normalizeSharingView({ ...sharing, blockingPresses: ["Left Arrow"] }),
+      normalizeSharingView(sharing),
+    ),
+    false,
+  );
 });
 
 test("the link phases decide what the user can do", () => {

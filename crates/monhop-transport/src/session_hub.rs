@@ -1160,7 +1160,8 @@ impl<N: NativeInput> HubLoop<N> {
         Ok(())
     }
 
-    /// Each link's route, active half and hold, as a pairwise session reports its own.
+    /// Each link's route, active half, hold and blocking presses, as a pairwise session reports
+    /// its own.
     fn report(&mut self) {
         let floor = self.core.floor();
         if self.last_floor != Some((floor.state, floor.peer)) {
@@ -1200,6 +1201,7 @@ impl<N: NativeInput> HubLoop<N> {
                 source.is_some_and(|source| source.held_since().is_some())
                     || actor.is_some_and(|actor| actor.is_held(slot)),
             );
+            link.progress.block(self.core.blocking_presses());
         }
     }
 
@@ -1589,8 +1591,8 @@ mod tests {
         session_source_runtime::CaptureRefusal,
     };
     use monhop_core::{
-        Display, Edge, EdgeLink, HidUsage, LogicalSize, Machine, ModifierState, NativeSize,
-        NormalizedSpan, Platform, capture::CaptureEvent,
+        Display, Edge, EdgeLink, HidUsage, LogicalSize, Machine, ModifierState, MouseButton,
+        NativeSize, NormalizedSpan, Platform, capture::CaptureEvent, capture_physical::HeldInput,
     };
     use monhop_protocol::{Capabilities, ControlPermissions, DisplayDescription};
     use std::{
@@ -1604,6 +1606,7 @@ mod tests {
     const LETTER_A: u16 = 0x04;
     const LETTER_B: u16 = 0x05;
     const SHIFT: u16 = 0xe1;
+    const LEFT_ARROW: u16 = 0x50;
     /// Far longer than any loopback exchange: what has not happened by then never will.
     const PATIENCE: Duration = Duration::from_secs(5);
     /// Long enough for anything the hub owes to be reported.
@@ -1848,6 +1851,9 @@ mod tests {
         fn is_ready_for_suppression(&self) -> bool {
             true
         }
+        fn blocking_presses(&self) -> Vec<HeldInput> {
+            Vec::new()
+        }
         fn stop_reason(&self) -> Option<StopReason> {
             None
         }
@@ -1866,6 +1872,8 @@ mod tests {
         starts: AtomicU32,
         /// While set, a stopped capture has not finished.
         finish_held: AtomicBool,
+        /// Presses held since capture started; suppression is refused until none are.
+        blocking: Mutex<Vec<HeldInput>>,
     }
 
     impl FakeInput {
@@ -1890,6 +1898,10 @@ mod tests {
 
         fn hold_finish(&self, held: bool) {
             self.0.finish_held.store(held, Ordering::Release);
+        }
+
+        fn hold_since_start(&self, presses: &[HeldInput]) {
+            *lock(&self.0.blocking) = presses.to_vec();
         }
     }
 
@@ -1938,7 +1950,10 @@ mod tests {
                 .completed_control_revision()
         }
         fn is_ready_for_suppression(&self) -> bool {
-            true
+            lock(&self.input.0.blocking).is_empty()
+        }
+        fn blocking_presses(&self) -> Vec<HeldInput> {
+            lock(&self.input.0.blocking).clone()
         }
         fn stop_reason(&self) -> Option<StopReason> {
             self.stopped
@@ -2281,6 +2296,8 @@ mod tests {
         /// The hub loop's passes so far.
         passes: Rc<Cell<u32>>,
         peers: Vec<Option<Rc<RefCell<Peer>>>>,
+        /// The hub's progress for each member's link, as the app reads it.
+        progress: Vec<Option<SessionProgress>>,
         endpoints: Vec<[quinn::Endpoint; 2]>,
     }
 
@@ -2299,6 +2316,7 @@ mod tests {
                 passes: run.passes.clone(),
                 run: tokio::task::spawn_local(run.run()),
                 peers: (0..count).map(|_| None).collect(),
+                progress: (0..count).map(|_| None).collect(),
                 endpoints: Vec::new(),
                 computers,
                 topology,
@@ -2335,14 +2353,19 @@ mod tests {
             tokio::task::spawn_local(drive(peer.clone(), io, wait));
             self.peers[id] = Some(peer);
             self.endpoints.push(endpoints);
+            let progress = SessionProgress::default();
+            self.progress[id] = Some(progress.clone());
             self.hub
-                .add_peer(
-                    ours,
-                    SessionProgress::default(),
-                    RevocationSignal::default(),
-                )
+                .add_peer(ours, progress, RevocationSignal::default())
                 .expect("the hub runs");
             go
+        }
+
+        fn blocking(&self, id: usize) -> Vec<HeldInput> {
+            self.progress[id]
+                .as_ref()
+                .expect("a linked member")
+                .blocking_presses()
         }
 
         async fn join(&mut self, id: usize) {
@@ -2577,6 +2600,32 @@ mod tests {
                 .await;
             assert_eq!(group.peer(1).keys(), [(SHIFT, true)]);
             group.quiet().await;
+            group.finish().await;
+        });
+    }
+
+    #[test]
+    fn every_link_names_the_presses_that_keep_the_pointer_home_until_they_are_released() {
+        scenario(async {
+            let mut group = Group::start(3);
+            group.join(1).await;
+            group.join(2).await;
+            let held = [
+                HeldInput::Key(HidUsage(LEFT_ARROW)),
+                HeldInput::Button(MouseButton::Middle),
+            ];
+            group.input.hold_since_start(&held);
+            group
+                .until("both links name the held presses", |group| {
+                    [1, 2].into_iter().all(|id| group.blocking(id) == held)
+                })
+                .await;
+            group.input.hold_since_start(&[]);
+            group
+                .until("the release clears them from both links", |group| {
+                    [1, 2].into_iter().all(|id| group.blocking(id).is_empty())
+                })
+                .await;
             group.finish().await;
         });
     }

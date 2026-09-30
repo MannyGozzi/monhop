@@ -249,6 +249,11 @@ impl PhysicalModifierLedger {
         set_modifier(&mut self.held, usage, true);
     }
 
+    /// Undoes `seed_held` for a modifier HID state reads as up although its release never arrived.
+    pub fn forget_seeded(&mut self, usage: HidUsage) {
+        set_modifier(&mut self.held, usage, false);
+    }
+
     /// Records a local transfer the capture posted, whose copy HID state then also counts.
     pub fn record_posted(&mut self, transfer: LocalTransfer) {
         if let LocalTransfer::Key { usage, pressed } = transfer {
@@ -1053,6 +1058,36 @@ mod tests {
                 "the healed ledger toggles correctly under injection"
             );
         }
+    }
+
+    #[test]
+    fn a_forgotten_seed_toggles_as_released_and_leaves_other_seeds_held() {
+        let left_shift = HidUsage(0xe1);
+        let left_control = HidUsage(0xe0);
+        let mut ledger = PhysicalModifierLedger::default();
+        ledger.seed_held(left_shift);
+        ledger.seed_held(left_control);
+        ledger.forget_seeded(left_shift);
+        assert_eq!(
+            key(flags_changed(
+                &mut ledger,
+                LEFT_SHIFT,
+                physical(),
+                while_injected(true)
+            )),
+            (left_shift, true),
+            "the next toggle is a press, not the release of a seed already forgotten"
+        );
+        assert_eq!(
+            key(flags_changed(
+                &mut ledger,
+                LEFT_CONTROL,
+                physical(),
+                while_injected(true)
+            )),
+            (left_control, false),
+            "the other seed still toggles to its release"
+        );
     }
 
     #[test]

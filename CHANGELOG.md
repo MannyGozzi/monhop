@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- A key or mouse button held down when sharing started no longer silently stops the pointer from crossing to another computer: Home names what to release.
+
 ## [0.2.3] - 2026-09-29
 
 Several computers, and clipboard sharing. **Update every computer together:** this version cannot connect to 0.2.2 or earlier. Pairings and saved layouts carry over, and an older MonHop started later still finds its own settings untouched.

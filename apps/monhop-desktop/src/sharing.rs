@@ -6,6 +6,7 @@ use crate::group_record::{
     self, GroupMember, GroupRecord, KnownDisplays, RecordSummary, Stamp, shared_group_bytes,
     shared_group_for_link,
 };
+use crate::key_names;
 use crate::sharing_hub::{
     ClipboardSlot, GroupPlan, SetupLinkRequest, ShareEnd, ShareFailure, ShareRequest, ShareUp,
     SharingNetwork,
@@ -173,6 +174,9 @@ pub struct SharingView {
     last_failure: String,
     /// The session is up but the other computer stopped answering; input stays local until it does.
     held: bool,
+    /// While sharing, each key or button held since capture started that keeps the pointer from
+    /// crossing, by name; empty otherwise. Names identify keys, so they never reach a log.
+    blocking_presses: Vec<String>,
     /// Every computer switched on for sharing, lowercase.
     enabled: Vec<String>,
     /// Sharing is paused; the enabled computers stay chosen.
@@ -302,6 +306,7 @@ impl Default for SharingView {
             control: None,
             last_failure: String::new(),
             held: false,
+            blocking_presses: Vec::new(),
             enabled: Vec::new(),
             paused: false,
             peers: Vec::new(),
@@ -4260,6 +4265,14 @@ fn shown_view(state: &State, peer: &PeerState, live: bool) -> SharingView {
         view.message = SHARING_ENABLED.into();
     }
     view.held = held && view.phase == "sharing";
+    view.blocking_presses = match progress.filter(|_| view.phase == "sharing") {
+        Some(progress) => progress
+            .blocking_presses()
+            .into_iter()
+            .map(key_names::name)
+            .collect(),
+        None => Vec::new(),
+    };
     view
 }
 
@@ -8085,6 +8098,7 @@ pub(crate) mod tests {
             sorted_keys(&view),
             [
                 "active",
+                "blockingPresses",
                 "busy",
                 "control",
                 "diagnostics",

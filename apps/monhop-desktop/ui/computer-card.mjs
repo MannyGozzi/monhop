@@ -2,7 +2,12 @@ import { ACCORDION_TOGGLE, createAccordion, presence } from "./accordion.mjs";
 import { computerStatus } from "./computer-status.mjs";
 import { computerArrangements, displayName } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
-import { displayNoticeCopy, isConnected, noticePresentation } from "./sharing-model.mjs";
+import {
+  displayNoticeCopy,
+  isConnected,
+  noticePresentation,
+  releaseToShareCopy,
+} from "./sharing-model.mjs";
 import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
 import {
   computerTone,
@@ -68,6 +73,8 @@ export function computerCard(
   const pending = renamePending === fingerprint;
   const editing = renaming === fingerprint || pending;
   const key = `${scope}-${fingerprint}`;
+  const sharingHome = scope === "home" && enabled && status.key === "sharing";
+  const release = sharingHome ? releaseToShareCopy(ctx.sharing.view?.blockingPresses) : "";
 
   const children = [
     el("div", {
@@ -115,10 +122,8 @@ export function computerCard(
         }),
       ],
     }),
-    presence(
-      `${key}-detail`,
-      scope === "home" && enabled && status.key === "sharing" ? note(status.detail) : null,
-    ),
+    presence(`${key}-detail`, sharingHome ? note(status.detail) : null),
+    presence(`${key}-release`, release ? note(release, "warning") : null),
     presence(
       `${key}-control`,
       scope === "home" && enabled ? controlSwitches(ctx, computer, name, local) : null,

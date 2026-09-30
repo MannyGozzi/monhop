@@ -13,7 +13,7 @@ use crate::{
     },
     session_source::{SourceController, SourceEffect, SourceMode},
     session_source_runtime::{
-        CaptureControl, NativeCapture, NativeCaptureError, apply_outcome,
+        CaptureControl, NativeCapture, NativeCaptureError, apply_outcome, blocking_presses,
         native_capture_start_failure, normalize, renew_lease, retry_pending, settle_submitted,
     },
     session_startup::{StartupControl, startup_failure},
@@ -537,6 +537,7 @@ pub async fn run_session(
                                 .as_ref()
                                 .is_some_and(DestinationActor::is_held),
                     );
+                    progress.block(&blocking_presses(&*capture));
                 }
             }
         }

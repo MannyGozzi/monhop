@@ -24,8 +24,8 @@ use crate::{
         SourceFailure, SourceMode, SourceOutcome, TaggedInput,
     },
     session_source_runtime::{
-        CaptureControl, CaptureRefusal, OutboundFrames, apply_effects, normalize, renew_lease,
-        retry_pending, settle_submitted,
+        CaptureControl, CaptureRefusal, OutboundFrames, apply_effects, blocking_presses, normalize,
+        renew_lease, retry_pending, settle_submitted,
     },
     session_startup::{ReadyControl, StartupControl, StartupError, startup_failure},
     session_wire::is_heartbeat,
@@ -34,6 +34,7 @@ use monhop_core::{
     DeviceId, DisplayId, FloorOwner, FloorPeer, FloorSnapshot, FloorState, HidUsage,
     MAX_GROUP_PEERS, MouseButton, Point, SharedFloor, TakeBackGate, Topology,
     capture::{CapturedEvent, MAX_SUPPRESSION_TTL},
+    capture_physical::HeldInput,
 };
 use monhop_protocol::{DisplayTopology, Frame, FrameScope, Message, SessionEpoch};
 use std::{cell::RefCell, collections::VecDeque, fmt, time::Duration};
@@ -327,6 +328,8 @@ pub(crate) struct HubCore {
     gate: TakeBackGate,
     native: Native,
     capture_ready: bool,
+    /// What keeps `capture_ready` false, as of the last tick.
+    blocking: Vec<HeldInput>,
     slots: [Slot; MAX_GROUP_PEERS],
     /// The last route barrier dispatched to the controllers.
     route: (bool, u64),
@@ -390,6 +393,7 @@ impl HubCore {
             floor,
             native: Native::Idle,
             capture_ready: false,
+            blocking: Vec::new(),
             slots: std::array::from_fn(|_| Slot::Empty),
             route: (false, 0),
             issuer: None,
@@ -427,6 +431,11 @@ impl HubCore {
 
     pub(crate) fn is_ready(&self, slot: FloorPeer) -> bool {
         self.link(slot).is_some_and(PeerLink::is_ready)
+    }
+
+    /// The presses keeping every seam a wall; empty once capture can suppress.
+    pub(crate) fn blocking_presses(&self) -> &[HeldInput] {
+        &self.blocking
     }
 
     /// What the last calls produced, for the shell to execute in order.
@@ -633,6 +642,7 @@ impl HubCore {
     ) -> Result<(), SessionFailure> {
         if let Some(capture) = capture.as_deref() {
             self.capture_ready = capture.is_ready_for_suppression();
+            self.blocking = blocking_presses(capture);
         }
         for index in 0..MAX_GROUP_PEERS {
             let now = self.now();
@@ -710,6 +720,7 @@ impl HubCore {
         self.floor.reset();
         self.native = Native::Idle;
         self.capture_ready = false;
+        self.blocking.clear();
         self.route = (false, 0);
         self.issuer = None;
         self.pending = None;
@@ -1405,6 +1416,9 @@ impl<C: CaptureControl> CaptureControl for Issuing<'_, C> {
     }
     fn is_ready_for_suppression(&self) -> bool {
         self.capture.is_ready_for_suppression()
+    }
+    fn blocking_presses(&self) -> Vec<HeldInput> {
+        self.capture.blocking_presses()
     }
     fn stop_reason(&self) -> Option<monhop_core::capture::StopReason> {
         self.capture.stop_reason()

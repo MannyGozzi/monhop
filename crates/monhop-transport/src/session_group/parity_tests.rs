@@ -72,6 +72,9 @@ impl CaptureControl for StubCapture {
     fn is_ready_for_suppression(&self) -> bool {
         self.ready
     }
+    fn blocking_presses(&self) -> Vec<HeldInput> {
+        Vec::new()
+    }
     fn stop_reason(&self) -> Option<StopReason> {
         None
     }

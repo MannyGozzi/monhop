@@ -6,7 +6,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -49,7 +49,7 @@ use crate::{
         control_channel,
     },
     capture_decode::{DecodedInput, decode_keyboard, decode_mouse},
-    capture_physical::{LocalTransfer, PhysicalCapture},
+    capture_physical::{HeldInput, LocalTransfer, PhysicalCapture},
     desktop_state::ordinary_desktop_is_active,
     input::{
         MONHOP_INJECTED_MARKER, RawCaptureOwnership, VirtualDesktop,
@@ -98,11 +98,25 @@ pub fn double_click_interval() -> Option<Duration> {
     (millis != 0).then_some(Duration::from_millis(u64::from(millis)))
 }
 
+/// How often the hook thread asks Windows whether a press held since capture start is still down.
+const HELD_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Mouse buttons by the virtual key `GetAsyncKeyState` reads them under.
+const BUTTON_VIRTUAL_KEYS: [(u32, MouseButton); 5] = [
+    (1, MouseButton::Left),
+    (2, MouseButton::Right),
+    (4, MouseButton::Middle),
+    (5, MouseButton::Back),
+    (6, MouseButton::Forward),
+];
+
 struct Shared {
     origin: Instant,
     generation: u64,
     stop: CaptureStop,
     ready: AtomicBool,
+    /// What keeps `ready` false, as the hook thread last published it.
+    blocking: Mutex<Vec<HeldInput>>,
     progress_ms: AtomicU64,
     allows_suppression: bool,
     device_removed: AtomicBool,
@@ -206,6 +220,7 @@ impl NativeCapture {
             generation,
             stop,
             ready: AtomicBool::new(false),
+            blocking: Mutex::new(Vec::new()),
             progress_ms: AtomicU64::new(0),
             allows_suppression: duration.is_none(),
             device_removed: AtomicBool::new(false),
@@ -290,6 +305,19 @@ impl NativeCapture {
     /// False while a key or button held at capture start keeps suppression refused.
     pub fn is_ready_for_suppression(&self) -> bool {
         self.shared.allows_suppression && self.shared.ready.load(Ordering::Acquire)
+    }
+
+    /// The presses held since capture start that still refuse suppression; empty once allowed.
+    /// Up to one recheck interval stale after a physical release.
+    pub fn blocking_presses(&self) -> Vec<HeldInput> {
+        if !self.shared.allows_suppression || self.shared.ready.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.shared
+            .blocking
+            .lock()
+            .map(|blocking| blocking.clone())
+            .unwrap_or_default()
     }
 
     /// Runs `waker` on the hook thread after every queued event; see `CaptureConsumer::set_waker`.
@@ -442,6 +470,8 @@ struct CallbackState {
     ignored: IgnoredInputCounts,
     held_virtual_keys: [Option<u32>; 256],
     unsupported_presses_seen: [bool; 256],
+    /// Presses held since capture start that the previous recheck trusted as up.
+    read_up_last_time: Vec<HeldInput>,
 }
 
 #[derive(Default)]
@@ -658,6 +688,15 @@ impl CallbackState {
     }
 
     fn event_with_travel(&mut self, event: CaptureEvent, travel: Option<(f64, f64)>) -> bool {
+        match event {
+            CaptureEvent::Key { usage, pressed, .. } => {
+                crate::physical_presses::note_key(usage, pressed);
+            }
+            CaptureEvent::Button {
+                button, pressed, ..
+            } => crate::physical_presses::note_button(button, pressed),
+            _ => {}
+        }
         if matches!(
             event,
             CaptureEvent::Key { .. } | CaptureEvent::Button { .. }
@@ -821,6 +860,100 @@ impl CallbackState {
             self.mark_unsupported_press(virtual_key);
         }
     }
+
+    /// Seeds every key and button `is_down` reads as held at capture start, then publishes.
+    fn seed_from(&mut self, is_down: impl Fn(u32) -> bool) {
+        // The generic Shift, Ctrl and Alt keys alias their left and right keys, seeded instead.
+        for virtual_key in (8..=254).filter(|key| !matches!(key, 0x10..=0x12)) {
+            if is_down(virtual_key) {
+                // SAFETY: MAPVK_VK_TO_VSC_EX preserves the extended scan-code prefix.
+                let scan = unsafe { MapVirtualKeyW(virtual_key, MAPVK_VK_TO_VSC_EX) };
+                self.seed_held_key(virtual_key, scan);
+            }
+        }
+        for (virtual_key, button) in BUTTON_VIRTUAL_KEYS {
+            if is_down(virtual_key) {
+                self.physical.seed_locally_held_button(button);
+            }
+        }
+        self.publish_blocking();
+    }
+
+    /// Forgets each press held since capture start that `read` reported up on two consecutive
+    /// rechecks: its release was injected or lost, so no physical release will reach the hook to
+    /// clear it. A press read down or unknown in between stays, so a key held through capture
+    /// start is never suppressed half-way.
+    fn recheck_initially_held(&mut self, read: impl Fn(u32) -> KeyRead) -> usize {
+        let held: Vec<HeldInput> = self.physical.initially_held().collect();
+        let mut up_now = Vec::new();
+        let mut forgotten = 0;
+        for press in held {
+            let virtual_key = match press {
+                HeldInput::Key(usage) => self.held_virtual_keys[usize::from(usage.0)],
+                HeldInput::Button(button) => BUTTON_VIRTUAL_KEYS
+                    .iter()
+                    .find(|(_, candidate)| *candidate == button)
+                    .map(|(key, _)| *key),
+            };
+            let Some(virtual_key) = virtual_key else {
+                continue;
+            };
+            match read(virtual_key) {
+                KeyRead::Up if self.read_up_last_time.contains(&press) => {
+                    if self.physical.forget_initially_held(press) {
+                        if let HeldInput::Key(usage) = press {
+                            self.held_virtual_keys[usize::from(usage.0)] = None;
+                        }
+                        forgotten += 1;
+                    }
+                }
+                KeyRead::Up => up_now.push(press),
+                KeyRead::Down | KeyRead::Unknown => {}
+            }
+        }
+        self.read_up_last_time = up_now;
+        self.publish_blocking();
+        forgotten
+    }
+
+    fn publish_blocking(&self) {
+        if let Ok(mut blocking) = self.shared.blocking.lock() {
+            blocking.clear();
+            blocking.extend(self.physical.initially_held());
+        }
+        self.shared
+            .ready
+            .store(self.physical.is_ready_for_suppression(), Ordering::Release);
+    }
+}
+
+/// One key-state read for a recheck. Windows reads every key up while another desktop has the
+/// input (UAC, the lock screen), so a read is only trusted on the ordinary desktop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyRead {
+    Down,
+    Up,
+    Unknown,
+}
+
+/// `virtual_key`'s state, trusted only if the ordinary desktop had the input before and after the
+/// read: OpenInputDesktop names another desktop, or fails, while a secure desktop has it.
+fn trusted_key_state(virtual_key: u32) -> KeyRead {
+    if !ordinary_desktop_is_active() {
+        return KeyRead::Unknown;
+    }
+    let down = key_state_down(virtual_key);
+    if !ordinary_desktop_is_active() {
+        return KeyRead::Unknown;
+    }
+    if down { KeyRead::Down } else { KeyRead::Up }
+}
+
+/// Whether Windows' key state reads `virtual_key` down.
+fn key_state_down(virtual_key: u32) -> bool {
+    // SAFETY: reads the current key state without input effects.
+    let state = unsafe { GetAsyncKeyState(virtual_key as i32) };
+    state < 0
 }
 
 fn control_state<T>(
@@ -1249,6 +1382,7 @@ fn run(
             ignored: IgnoredInputCounts::default(),
             held_virtual_keys: [None; 256],
             unsupported_presses_seen: [false; 256],
+            read_up_last_time: Vec::new(),
             press_revision: 0,
         })
     });
@@ -1269,6 +1403,7 @@ fn run(
             return Err(error);
         }
     };
+    crate::physical_presses::forget_held();
     seed_initial_state();
     if let Some(error) = startup_completion_error(
         shared.stop.reason(),
@@ -1296,6 +1431,7 @@ fn run(
     let _ = started.send(Ok(()));
     let mut source_loss_at = None;
     let mut last_ownership_check = Duration::ZERO;
+    let mut last_held_recheck = Duration::ZERO;
     let mut revocation_wake_attempted = false;
     loop {
         shared.progress_ms.store(
@@ -1340,6 +1476,17 @@ fn run(
             state.physical.tick(now, &shared.stop);
             state.remote();
             draining = state.physical.has_suppressed_presses();
+            if now.saturating_sub(last_held_recheck) >= HELD_RECHECK_INTERVAL {
+                last_held_recheck = now;
+                if !state.physical.is_ready_for_suppression() {
+                    let forgotten = state.recheck_initially_held(trusted_key_state);
+                    if forgotten > 0 {
+                        log::info!(
+                            "native capture: {forgotten} press(es) held at capture start now read up without a release; no longer blocking"
+                        );
+                    }
+                }
+            }
             false
         });
         if shared.stop.is_stopped() {
@@ -1427,35 +1574,7 @@ fn release_injected_until_complete(state: &mut CallbackState, stop: &CaptureStop
 
 fn seed_initial_state() {
     with_callback(|state| {
-        for vk in 8..=254 {
-            if matches!(vk, 0x10..=0x12) {
-                continue;
-            }
-            // SAFETY: these APIs read current keyboard state and map a virtual key without input effects.
-            let held = unsafe { GetAsyncKeyState(vk) } < 0;
-            if !held {
-                continue;
-            }
-            // SAFETY: MAPVK_VK_TO_VSC_EX preserves the extended scan-code prefix.
-            let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) };
-            state.seed_held_key(vk as u32, scan);
-        }
-        for (vk, button) in [
-            (1, MouseButton::Left),
-            (2, MouseButton::Right),
-            (4, MouseButton::Middle),
-            (5, MouseButton::Back),
-            (6, MouseButton::Forward),
-        ] {
-            // SAFETY: reads each mouse button's current held state without synthesizing input.
-            if unsafe { GetAsyncKeyState(vk) } < 0 {
-                state.physical.seed_locally_held_button(button);
-            }
-        }
-        state
-            .shared
-            .ready
-            .store(state.physical.is_ready_for_suppression(), Ordering::Release);
+        state.seed_from(key_state_down);
         false
     });
 }
@@ -1725,6 +1844,7 @@ mod tests {
             generation: 1,
             stop: stop.clone(),
             ready: AtomicBool::new(true),
+            blocking: Mutex::new(Vec::new()),
             progress_ms: AtomicU64::new(0),
             allows_suppression: true,
             device_removed: AtomicBool::new(false),
@@ -1745,6 +1865,7 @@ mod tests {
                 ignored: IgnoredInputCounts::default(),
                 held_virtual_keys: [None; 256],
                 unsupported_presses_seen: [false; 256],
+                read_up_last_time: Vec::new(),
                 press_revision: 0,
             },
             consumer,
@@ -1842,6 +1963,126 @@ mod tests {
         assert_eq!(state.ignored.unsourced_motion_samples, 0);
         assert_eq!(state.shared.stop.reason(), None);
         assert!(consumer.try_pop().unwrap().is_none());
+    }
+
+    fn published_blocking(state: &CallbackState) -> Vec<HeldInput> {
+        state.shared.blocking.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_press_held_at_start_that_reads_up_without_a_release_stops_blocking_on_recheck() {
+        const LEFT_ARROW: u32 = 0x25;
+        const MIDDLE: u32 = 4;
+        let (mut state, mut consumer) = callback_fixture();
+        state.seed_from(|key| key == LEFT_ARROW || key == MIDDLE);
+        let middle = HeldInput::Button(MouseButton::Middle);
+        assert!(!state.shared.ready.load(Ordering::Acquire));
+        let seeded = published_blocking(&state);
+        let [left_arrow @ HeldInput::Key(_), held_button] = seeded[..] else {
+            panic!(
+                "expected one key and one button, got {} presses",
+                seeded.len()
+            );
+        };
+        assert_eq!(held_button, middle);
+
+        let arrow_up = |key| {
+            if key == MIDDLE {
+                KeyRead::Down
+            } else {
+                KeyRead::Up
+            }
+        };
+        // Still down: nothing is forgotten, so a key held through capture start keeps refusing.
+        assert_eq!(state.recheck_initially_held(|_| KeyRead::Down), 0);
+        assert_eq!(published_blocking(&state), [left_arrow, middle]);
+
+        // Windows let go of the arrow without the hook seeing a release: one up read is not
+        // enough, a second one a recheck later forgets it.
+        assert_eq!(state.recheck_initially_held(arrow_up), 0);
+        assert_eq!(published_blocking(&state), [left_arrow, middle]);
+        assert_eq!(state.recheck_initially_held(arrow_up), 1);
+        assert!(!state.shared.ready.load(Ordering::Acquire));
+        assert_eq!(published_blocking(&state), [middle]);
+
+        assert_eq!(state.recheck_initially_held(|_| KeyRead::Up), 0);
+        assert_eq!(state.recheck_initially_held(|_| KeyRead::Up), 1);
+        assert!(state.shared.ready.load(Ordering::Acquire));
+        assert!(published_blocking(&state).is_empty());
+
+        // A late physical release of the forgotten arrow passes locally and queues nothing.
+        assert!(!state.decoded(decode_keyboard(WM_KEYUP, LEFT_ARROW, 0x4b, 0x81, 0)));
+        assert!(consumer.try_pop().unwrap().is_none());
+        assert_eq!(state.shared.stop.reason(), None);
+    }
+
+    #[test]
+    fn an_unknown_or_down_read_between_two_up_reads_keeps_the_press_blocking() {
+        const LEFT_ARROW: u32 = 0x25;
+        let (mut state, _consumer) = callback_fixture();
+        state.seed_from(|key| key == LEFT_ARROW);
+        // A secure desktop had the input: an unknown read neither forgets nor counts as up.
+        for _ in 0..3 {
+            assert_eq!(state.recheck_initially_held(|_| KeyRead::Unknown), 0);
+        }
+        for between in [KeyRead::Unknown, KeyRead::Down] {
+            assert_eq!(state.recheck_initially_held(|_| KeyRead::Up), 0);
+            assert_eq!(state.recheck_initially_held(|_| between), 0);
+            assert_eq!(state.recheck_initially_held(|_| KeyRead::Up), 0);
+            assert_eq!(published_blocking(&state).len(), 1);
+            assert!(!state.shared.ready.load(Ordering::Acquire));
+            // Reset the streak for the next case.
+            assert_eq!(state.recheck_initially_held(|_| KeyRead::Down), 0);
+        }
+    }
+
+    #[test]
+    fn physical_downs_repeats_and_ups_update_what_the_injector_reads_as_held() {
+        // F13, which no other test presses, keeps the process-wide counts apart.
+        const F13: u32 = 0x7c;
+        let usage = monhop_core::HidUsage(0x68);
+        let (mut state, _consumer) = callback_fixture();
+        let before = crate::physical_presses::key_presses(usage);
+        state.decoded(decode_keyboard(WM_KEYDOWN, F13, 0x64, 0, 0));
+        assert!(crate::physical_presses::key_held(usage));
+        // Auto-repeat only comes from a finger on the key: it counts, and the key stays held.
+        state.decoded(decode_keyboard(WM_KEYDOWN, F13, 0x64, 0, 0));
+        assert!(crate::physical_presses::key_held(usage));
+        assert_eq!(crate::physical_presses::key_presses(usage), before + 2);
+        state.decoded(decode_keyboard(WM_KEYUP, F13, 0x64, 0x80, 0));
+        assert!(!crate::physical_presses::key_held(usage));
+        assert_eq!(crate::physical_presses::key_presses(usage), before + 2);
+        // Injected input never reaches the ledger.
+        state.decoded(decode_keyboard(
+            WM_KEYDOWN,
+            F13,
+            0x64,
+            0,
+            MONHOP_INJECTED_MARKER,
+        ));
+        assert!(!crate::physical_presses::key_held(usage));
+    }
+
+    #[test]
+    fn a_physical_release_still_clears_a_press_held_at_start_before_any_recheck() {
+        let (mut state, mut consumer) = callback_fixture();
+        state.seed_from(|key| key == 0xa3);
+        assert!(!state.shared.ready.load(Ordering::Acquire));
+        assert!(!state.decoded(decode_keyboard(WM_KEYUP, 0xa3, 0x1d, 0x81, 0)));
+        assert!(state.physical.is_ready_for_suppression());
+        assert_eq!(state.recheck_initially_held(|_| KeyRead::Down), 0);
+        assert!(state.shared.ready.load(Ordering::Acquire));
+        assert!(published_blocking(&state).is_empty());
+        assert!(consumer.try_pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn nothing_held_at_start_publishes_ready_with_nothing_blocking() {
+        let (mut state, _consumer) = callback_fixture();
+        state.shared.ready.store(false, Ordering::Release);
+        state.seed_from(|_| false);
+        assert!(state.shared.ready.load(Ordering::Acquire));
+        assert!(published_blocking(&state).is_empty());
     }
 
     #[test]

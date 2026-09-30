@@ -25,7 +25,7 @@ use core_foundation::{
     string::{CFString, CFStringRef},
 };
 use monhop_core::{
-    MouseButton, Point, RevocationSignal, TakeBackGate,
+    HidUsage, MouseButton, Point, RevocationSignal, TakeBackGate,
     capture::{
         CaptureConsumer, CaptureEvent, CapturePermit, CaptureProducer, CaptureStop, CapturedEvent,
         MAX_SUPPRESSION_TTL, NativeSessionClaim, OwnerWake, StopReason, SuppressionLease,
@@ -35,7 +35,7 @@ use monhop_core::{
         CaptureCommand, ControlCompletion, ControlError, ControlReader, ControlWriter,
         control_channel,
     },
-    capture_physical::{LocalTransfer, PhysicalCapture},
+    capture_physical::{HeldInput, LocalTransfer, PhysicalCapture},
     gesture_latch::{GestureLatch, TouchRecord},
 };
 
@@ -103,6 +103,8 @@ const CG_EVENT_SOURCE_STATE_HID_SYSTEM: CGEventSourceStateID = 1;
 const RUN_LOOP_SLICE: Duration = Duration::from_millis(10);
 const MAX_OWNER_THREAD_GAP: Duration = Duration::from_secs(5);
 const OWNED_RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+/// How often HID state is re-read for presses held since capture start while any still refuses.
+const HELD_PRESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 // SAFETY: These declarations match the current ApplicationServices SDK declarations. They are
 // kept here because this adapter owns its separate active tap and does not alter native.rs. The
@@ -177,6 +179,8 @@ struct Shared {
     stop: CaptureStop,
     revocation: RevocationSignal,
     ready: AtomicBool,
+    /// Published with `ready`, before it.
+    held: HeldSnapshot,
     remote_active: AtomicBool,
     interception_failed: AtomicBool,
     progress_ms: AtomicU64,
@@ -184,6 +188,43 @@ struct Shared {
     owner_wake: OwnerWake,
     /// Read by the owner thread in place of a TCC probe; see `PermissionWatch`.
     permissions: PermissionCell,
+}
+
+/// The presses refusing suppression as one bit each: key usages 0..256, then button slots.
+/// Presses are only ever forgotten, so a torn read still lies between two publications.
+#[derive(Default)]
+struct HeldSnapshot([AtomicU64; 5]);
+
+impl HeldSnapshot {
+    const BUTTON_BASE: usize = 256;
+
+    fn store(&self, physical: &PhysicalCapture) {
+        let mut words = [0_u64; 5];
+        for held in physical.initially_held() {
+            let bit = match held {
+                HeldInput::Key(usage) => usize::from(usage.0),
+                HeldInput::Button(button) => Self::BUTTON_BASE + button.index(),
+            };
+            words[bit / 64] |= 1 << (bit % 64);
+        }
+        for (slot, word) in self.0.iter().zip(words) {
+            slot.store(word, Ordering::Release);
+        }
+    }
+
+    /// Keys in usage order, then buttons in slot order, as `PhysicalCapture::initially_held`.
+    fn load(&self) -> Vec<HeldInput> {
+        let words = self.0.each_ref().map(|slot| slot.load(Ordering::Acquire));
+        let is_set = |bit: usize| words[bit / 64] & (1 << (bit % 64)) != 0;
+        let keys = (0..Self::BUTTON_BASE)
+            .filter(|bit| is_set(*bit))
+            .map(|bit| HeldInput::Key(HidUsage(bit as u16)));
+        let buttons = MouseButton::ALL
+            .into_iter()
+            .filter(|button| is_set(Self::BUTTON_BASE + button.index()))
+            .map(HeldInput::Button);
+        keys.chain(buttons).collect()
+    }
 }
 
 /// The caller must establish the paired peer and topology before starting a session capture.
@@ -263,6 +304,7 @@ impl NativeCapture {
             stop,
             revocation,
             ready: AtomicBool::new(false),
+            held: HeldSnapshot::default(),
             remote_active: AtomicBool::new(false),
             interception_failed: AtomicBool::new(false),
             progress_ms: AtomicU64::new(0),
@@ -332,6 +374,11 @@ impl NativeCapture {
     /// False while a key or button held at capture start keeps suppression refused.
     pub fn is_ready_for_suppression(&self) -> bool {
         self.shared.allows_suppression && self.shared.ready.load(Ordering::Acquire)
+    }
+
+    /// The presses held since capture start that keep suppression refused; empty once ready.
+    pub fn blocking_presses(&self) -> Vec<HeldInput> {
+        self.shared.held.load()
     }
 
     /// Runs `waker` on the tap thread after every queued event; see `CaptureConsumer::set_waker`.
@@ -1202,11 +1249,67 @@ impl CallbackState {
         {
             self.local_modifiers.record_local_key(usage, pressed);
         }
-        self.shared
-            .ready
-            .store(self.physical.is_ready_for_suppression(), Ordering::Release);
+        self.publish_readiness();
         self.mark_stopped();
         suppress
+    }
+
+    /// The snapshot goes first, so whoever sees `ready` also sees the presses it cleared. It is
+    /// rebuilt only while some press refuses, or once more as the last one clears.
+    fn publish_readiness(&self) {
+        let ready = self.physical.is_ready_for_suppression();
+        if !ready || !self.shared.ready.load(Ordering::Relaxed) {
+            self.shared.held.store(&self.physical);
+        }
+        self.shared.ready.store(ready, Ordering::Release);
+    }
+
+    /// Capture start only: a key the HID system reads as down before the tap saw its press.
+    fn seed_held_key(&mut self, usage: HidUsage) {
+        self.physical.seed_locally_held_key(usage);
+        self.local_modifiers.record_local_key(usage, true);
+        self.physical_modifiers.seed_held(usage);
+    }
+
+    /// Re-reads held presses once `due` passes. Returns the next deadline, or none once ready.
+    fn poll_held_presses(
+        &mut self,
+        due: Option<Duration>,
+        now: Duration,
+        reads_down: impl Fn(HeldInput) -> bool,
+    ) -> Option<Duration> {
+        match due {
+            Some(at) if now >= at => self
+                .forget_released_holds(reads_down)
+                .then_some(now + HELD_PRESS_POLL_INTERVAL),
+            due => due,
+        }
+    }
+
+    /// Owner thread only. Forgets each press held since capture start that `reads_down` now
+    /// reports up, as its release never reached the tap. Returns whether any still refuses.
+    fn forget_released_holds(&mut self, reads_down: impl Fn(HeldInput) -> bool) -> bool {
+        let released: Vec<_> = self
+            .physical
+            .initially_held()
+            .filter(|held| !reads_down(*held))
+            .collect();
+        for held in &released {
+            if self.physical.forget_initially_held(*held)
+                && let HeldInput::Key(usage) = *held
+            {
+                self.local_modifiers.record_local_key(usage, false);
+                self.physical_modifiers.forget_seeded(usage);
+            }
+        }
+        if !released.is_empty() {
+            log::info!(
+                "forgot {} presses held since capture start that now read as released",
+                released.len()
+            );
+        }
+        self.publish_readiness();
+        !self.physical.is_ready_for_suppression()
     }
 
     fn decoded(&mut self, decoded: DecodedInput) -> bool {
@@ -1551,6 +1654,9 @@ fn run(
     let _ = started.send(Ok(()));
 
     let mut previous_tick = shared.origin.elapsed();
+    // The run-loop slice bounds each pass, so this deadline is met even with no input arriving.
+    let mut held_poll_at =
+        (!shared.ready.load(Ordering::Acquire)).then_some(previous_tick + HELD_PRESS_POLL_INTERVAL);
     loop {
         let now = shared.origin.elapsed();
         let mut pass = LoopPass::start(now);
@@ -1590,6 +1696,7 @@ fn run(
         let mut draining = false;
         with_callback(|state| {
             state.physical.tick(shared.origin.elapsed(), &shared.stop);
+            held_poll_at = state.poll_held_presses(held_poll_at, now, hid_reads_down);
             state.log_finished_gestures();
             if !state.remote() {
                 state.return_cursor_to_pin();
@@ -1698,33 +1805,47 @@ fn seed_initial_state() {
                 // SAFETY: the state query reads the current HID key state and has no callback or
                 // ownership side effect.
                 if unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, key) } {
-                    state.physical.seed_locally_held_key(usage);
-                    state.local_modifiers.record_local_key(usage, true);
-                    state.physical_modifiers.seed_held(usage);
+                    state.seed_held_key(usage);
                 }
             }
         }
-        for (button, quartz_button) in [
-            (MouseButton::Left, 0),
-            (MouseButton::Right, 1),
-            (MouseButton::Middle, 2),
-            (MouseButton::Back, 3),
-            (MouseButton::Forward, 4),
-        ] {
-            // SAFETY: Quartz mouse-button identifiers are the fixed values used by the decoder.
-            if unsafe { CGEventSourceButtonState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, quartz_button) }
-            {
+        for button in MouseButton::ALL {
+            if hid_button_down(button) {
                 state.physical.seed_locally_held_button(button);
             }
         }
         state.pointer_position =
             current_pointer_position().filter(|point| state.active_display_bounds.contains(*point));
-        state
-            .shared
-            .ready
-            .store(state.physical.is_ready_for_suppression(), Ordering::Release);
+        state.publish_readiness();
         false
     });
+}
+
+fn hid_button_down(button: MouseButton) -> bool {
+    let quartz_button: CGMouseButton = match button {
+        MouseButton::Left => 0,
+        MouseButton::Right => 1,
+        MouseButton::Middle => 2,
+        MouseButton::Back => 3,
+        MouseButton::Forward => 4,
+    };
+    // SAFETY: Quartz mouse-button identifiers are the fixed values used by the decoder; the state
+    // query has no callback or ownership side effect.
+    unsafe { CGEventSourceButtonState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, quartz_button) }
+}
+
+/// The HID system's current state of a press held since capture start.
+fn hid_reads_down(held: HeldInput) -> bool {
+    match held {
+        HeldInput::Key(usage) => match hid_to_mac_virtual_key(usage) {
+            // SAFETY: the key came from the fixed HID mapping and the state query has no callback
+            // or ownership side effect.
+            Ok(key) => unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_STATE_HID_SYSTEM, key.0) },
+            // Seeding recorded only mapped keys; one never read stays refusing.
+            Err(_) => true,
+        },
+        HeldInput::Button(button) => hid_button_down(button),
+    }
 }
 
 fn clear_callback() {
@@ -2079,6 +2200,7 @@ mod callback_tests {
             stop: stop.clone(),
             revocation,
             ready: AtomicBool::new(true),
+            held: HeldSnapshot::default(),
             remote_active: AtomicBool::new(false),
             interception_failed: AtomicBool::new(false),
             progress_ms: AtomicU64::new(0),
@@ -3008,6 +3130,133 @@ mod callback_tests {
             assert!(!is_pointer_record(gesture));
         }
         assert!(is_pointer_record(CG_EVENT_MOUSE_MOVED));
+    }
+
+    const LEFT_ARROW: HidUsage = HidUsage(0x50);
+    const LEFT_SHIFT: HidUsage = HidUsage(0xe1);
+
+    /// Seeds as capture start does and publishes the result.
+    fn seed_holds(state: &mut CallbackState, keys: &[HidUsage], buttons: &[MouseButton]) {
+        for usage in keys {
+            state.seed_held_key(*usage);
+        }
+        for button in buttons {
+            state.physical.seed_locally_held_button(*button);
+        }
+        state.publish_readiness();
+    }
+
+    /// What `NativeCapture::blocking_presses` and the owner's readiness check read.
+    fn published(state: &CallbackState) -> (bool, Vec<HeldInput>) {
+        (
+            state.shared.ready.load(Ordering::Acquire),
+            state.shared.held.load(),
+        )
+    }
+
+    #[test]
+    fn presses_that_read_up_are_forgotten_and_readiness_flips() {
+        let (mut state, _consumer) = callback_fixture();
+        // 0x3f and 0x40 straddle a snapshot word.
+        let keys = [
+            HidUsage(0x04),
+            HidUsage(0x3f),
+            HidUsage(0x40),
+            LEFT_ARROW,
+            LEFT_SHIFT,
+        ];
+        seed_holds(&mut state, &keys, &[MouseButton::Middle]);
+        let mut expected: Vec<_> = keys.into_iter().map(HeldInput::Key).collect();
+        expected.push(HeldInput::Button(MouseButton::Middle));
+        assert_eq!(published(&state), (false, expected));
+        assert_ne!(
+            state.local_modifiers.flags(),
+            LocalModifierState::default().flags()
+        );
+
+        assert!(!state.forget_released_holds(|_| false));
+        assert!(state.physical.is_ready_for_suppression());
+        assert_eq!(published(&state), (true, Vec::new()));
+        assert_eq!(
+            state.local_modifiers.flags(),
+            LocalModifierState::default().flags(),
+            "a forgotten modifier no longer sets transfer flags"
+        );
+        let next_shift_toggle = decode_keyboard(
+            CG_EVENT_FLAGS_CHANGED,
+            0x38,
+            &mut state.physical_modifiers,
+            HidKeyState {
+                down: true,
+                injection_held: true,
+            },
+            physical_source(),
+            SYNTHETIC_EVENT_MARKER,
+        );
+        assert!(
+            matches!(
+                next_shift_toggle,
+                DecodedInput::Event(CaptureEvent::Key { pressed: true, .. })
+            ),
+            "the physical ledger no longer counts the forgotten modifier as down"
+        );
+    }
+
+    #[test]
+    fn presses_that_still_read_down_keep_refusing() {
+        let (mut state, _consumer) = callback_fixture();
+        seed_holds(
+            &mut state,
+            &[LEFT_ARROW, LEFT_SHIFT],
+            &[MouseButton::Left, MouseButton::Back],
+        );
+        let still_down = [
+            HeldInput::Key(LEFT_SHIFT),
+            HeldInput::Button(MouseButton::Back),
+        ];
+        assert!(state.forget_released_holds(|held| still_down.contains(&held)));
+        assert!(!state.physical.is_ready_for_suppression());
+        assert_eq!(published(&state), (false, still_down.to_vec()));
+        assert_ne!(
+            state.local_modifiers.flags(),
+            LocalModifierState::default().flags(),
+            "the shift still down keeps its flag"
+        );
+    }
+
+    #[test]
+    fn a_release_reaching_the_tap_clears_the_published_press() {
+        let (mut state, _consumer) = callback_fixture();
+        seed_holds(&mut state, &[LEFT_ARROW], &[]);
+        assert!(!deliver_key(&mut state, CG_EVENT_KEY_UP, 0x7b, false));
+        assert_eq!(published(&state), (true, Vec::new()));
+    }
+
+    #[test]
+    fn held_presses_are_polled_only_when_due_and_never_once_ready() {
+        let (mut state, _consumer) = callback_fixture();
+        seed_holds(&mut state, &[LEFT_ARROW], &[]);
+        let reads = Cell::new(0);
+        let down = |_: HeldInput| {
+            reads.set(reads.get() + 1);
+            true
+        };
+        let due = Duration::from_secs(5);
+        let next = due + HELD_PRESS_POLL_INTERVAL;
+        assert_eq!(
+            state.poll_held_presses(Some(due), due - Duration::from_millis(1), down),
+            Some(due)
+        );
+        assert_eq!(reads.get(), 0, "nothing is read before the deadline");
+        assert_eq!(state.poll_held_presses(Some(due), due, down), Some(next));
+        assert_eq!(reads.get(), 1);
+
+        assert_eq!(state.poll_held_presses(Some(next), next, |_| false), None);
+        assert!(published(&state).0);
+        for due in [None, Some(next)] {
+            assert_eq!(state.poll_held_presses(due, next * 2, down), None);
+        }
+        assert_eq!(reads.get(), 1, "once ready no press is read again");
     }
 }
 

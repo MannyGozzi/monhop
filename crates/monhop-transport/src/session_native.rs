@@ -205,6 +205,11 @@ impl WatchedDestination for NativeDestination {
             permission_checked: None,
         }
     }
+    /// Releases again any key or button whose release Windows silently dropped.
+    #[cfg(windows)]
+    fn tick(&mut self) {
+        self.native.injector.tick(std::time::Instant::now());
+    }
 }
 
 impl WatchedEnvironment for NativeEnvironment {

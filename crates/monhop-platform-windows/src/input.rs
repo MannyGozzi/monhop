@@ -340,6 +340,8 @@ impl Injector {
         Err(InputError::UnsupportedPlatform)
     }
 
+    pub fn tick(&mut self, _now: std::time::Instant) {}
+
     pub const fn is_key_held(&self, _usage: HidUsage) -> bool {
         false
     }
@@ -427,12 +429,13 @@ mod windows {
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::KeyboardAndMouse::{
-                INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-                KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-                MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-                MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-                MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
-                MOUSEINPUT, SendInput,
+                GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+                KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VSC_TO_VK_EX,
+                MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+                MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+                MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+                MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW,
+                SendInput,
             },
             Input::{
                 GetRawInputData, GetRegisteredRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
@@ -793,6 +796,22 @@ mod windows {
         }
     }
 
+    /// A release is read back once, this long after SendInput reported it delivered.
+    const READBACK_DELAY: Duration = Duration::from_millis(50);
+
+    /// A release SendInput reported delivered that Windows has not confirmed yet: UIPI drops
+    /// input bound for an elevated foreground window without any error, which leaves Windows'
+    /// own key state down. Detection only: an injector that released on its own could lift a key
+    /// under a finger, so a key still down is reported and the user sees what to release.
+    #[derive(Clone, Copy)]
+    struct Unconfirmed {
+        release: HeldInput,
+        virtual_key: u32,
+        due: Instant,
+        /// The capture's physical press count at release; a later press settles the key.
+        physical_presses: u32,
+    }
+
     #[derive(Default)]
     pub struct Injector {
         held_keys: BTreeSet<HidUsage>,
@@ -800,6 +819,7 @@ mod windows {
         synthetic: Synthetic,
         /// Wheel units an open pinch has not posted yet; `None` while no pinch is open.
         pinch_residual: Option<f64>,
+        unconfirmed: Vec<Unconfirmed>,
     }
 
     impl Injector {
@@ -809,6 +829,7 @@ mod windows {
                 held_buttons: BTreeSet::new(),
                 synthetic: Synthetic::new(),
                 pinch_residual: None,
+                unconfirmed: Vec::new(),
             }
         }
 
@@ -821,8 +842,10 @@ mod windows {
                     self.post(Operation::Wire(Stroke::Key { usage, pressed }))?;
                     if pressed {
                         self.held_keys.insert(usage);
+                        self.forget_unconfirmed(HeldInput::Key(usage));
                     } else {
                         self.held_keys.remove(&usage);
+                        self.await_confirmation(HeldInput::Key(usage), Instant::now());
                     }
                 }
                 InjectionOperation::Button { button, pressed } => {
@@ -832,8 +855,10 @@ mod windows {
                     self.post(Operation::Wire(Stroke::Button { button, pressed }))?;
                     if pressed {
                         self.held_buttons.insert(button);
+                        self.forget_unconfirmed(HeldInput::Button(button));
                     } else {
                         self.held_buttons.remove(&button);
+                        self.await_confirmation(HeldInput::Button(button), Instant::now());
                     }
                 }
                 InjectionOperation::RelativeMove { dx, dy } => {
@@ -950,10 +975,14 @@ mod windows {
                 return Ok(());
             }
 
+            let now = Instant::now();
             match dispatch_inputs(&inputs) {
                 Ok(()) => {
                     self.held_keys.clear();
                     self.held_buttons.clear();
+                    for release in releases {
+                        self.await_confirmation(release, now);
+                    }
                     Ok(())
                 }
                 Err(InputError::PartialSendInput {
@@ -963,6 +992,7 @@ mod windows {
                 }) => {
                     for release in releases.into_iter().take(sent) {
                         self.mark_released(release);
+                        self.await_confirmation(release, now);
                     }
                     Err(InputError::PartialSendInput {
                         sent,
@@ -992,11 +1022,128 @@ mod windows {
                 }
             }
         }
+
+        /// Reads back the releases Windows has not confirmed and reports, as a count, any it still
+        /// reads down. Call on the injection thread's tick; it never waits and never injects.
+        pub fn tick(&mut self, now: Instant) {
+            if self.unconfirmed.is_empty() {
+                return;
+            }
+            let still_down = self.read_back(now, key_state_down, physical_presses, physically_held);
+            if still_down > 0 {
+                log::warn!(
+                    "input: {still_down} released key(s) or button(s) still read down {} ms after their release; Windows may have dropped the release",
+                    READBACK_DELAY.as_millis()
+                );
+            }
+        }
+
+        fn await_confirmation(&mut self, release: HeldInput, now: Instant) {
+            let Some(virtual_key) = virtual_key_of(release) else {
+                return;
+            };
+            self.forget_unconfirmed(release);
+            self.unconfirmed.push(Unconfirmed {
+                release,
+                virtual_key,
+                due: now + READBACK_DELAY,
+                physical_presses: physical_presses(release),
+            });
+        }
+
+        fn forget_unconfirmed(&mut self, release: HeldInput) {
+            self.unconfirmed
+                .retain(|entry| !same_input(entry.release, release));
+        }
+
+        fn holds(&self, input: HeldInput) -> bool {
+            match input {
+                HeldInput::Key(usage) => self.held_keys.contains(&usage),
+                HeldInput::Button(button) => self.held_buttons.contains(&button),
+            }
+        }
+
+        /// Reads back each due release once and returns how many Windows still reads down. Held or
+        /// pressed physically since, or held again by the wire, is no evidence of a drop.
+        fn read_back(
+            &mut self,
+            now: Instant,
+            is_down: impl Fn(u32) -> bool,
+            presses: impl Fn(HeldInput) -> u32,
+            held: impl Fn(HeldInput) -> bool,
+        ) -> usize {
+            let mut still_down = 0;
+            let mut index = 0;
+            while index < self.unconfirmed.len() {
+                let entry = self.unconfirmed[index];
+                if entry.due > now {
+                    index += 1;
+                    continue;
+                }
+                let settled = self.holds(entry.release)
+                    || held(entry.release)
+                    || presses(entry.release) != entry.physical_presses
+                    || !is_down(entry.virtual_key);
+                if !settled {
+                    still_down += 1;
+                }
+                self.unconfirmed.swap_remove(index);
+            }
+            still_down
+        }
     }
 
     impl Drop for Injector {
         fn drop(&mut self) {
             let _ = self.release_all();
+        }
+    }
+
+    fn same_input(a: HeldInput, b: HeldInput) -> bool {
+        match (a, b) {
+            (HeldInput::Key(a), HeldInput::Key(b)) => a == b,
+            (HeldInput::Button(a), HeldInput::Button(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// The virtual key Windows files `release`'s key state under, from the scan code it was sent as.
+    fn virtual_key_of(release: HeldInput) -> Option<u32> {
+        match release {
+            HeldInput::Key(usage) => {
+                let scan = set1_from_hid_usage(usage).ok()?;
+                let code = u32::from(scan.make_code) | if scan.is_extended() { 0xe000 } else { 0 };
+                // SAFETY: maps a scan code to a virtual key without input effects.
+                let virtual_key = unsafe { MapVirtualKeyW(code, MAPVK_VSC_TO_VK_EX) };
+                (virtual_key != 0).then_some(virtual_key)
+            }
+            HeldInput::Button(button) => Some(match button {
+                MouseButton::Left => 1,
+                MouseButton::Right => 2,
+                MouseButton::Middle => 4,
+                MouseButton::Back => 5,
+                MouseButton::Forward => 6,
+            }),
+        }
+    }
+
+    fn key_state_down(virtual_key: u32) -> bool {
+        // SAFETY: reads the current key state without input effects.
+        let state = unsafe { GetAsyncKeyState(virtual_key as i32) };
+        state < 0
+    }
+
+    fn physical_presses(input: HeldInput) -> u32 {
+        match input {
+            HeldInput::Key(usage) => crate::physical_presses::key_presses(usage),
+            HeldInput::Button(button) => crate::physical_presses::button_presses(button),
+        }
+    }
+
+    fn physically_held(input: HeldInput) -> bool {
+        match input {
+            HeldInput::Key(usage) => crate::physical_presses::key_held(usage),
+            HeldInput::Button(button) => crate::physical_presses::button_held(button),
         }
     }
 
@@ -1109,5 +1256,99 @@ mod windows {
         // SAFETY: GetLastError has no preconditions and only reads this thread's error state.
         let code = unsafe { GetLastError() };
         InputError::WindowsApi { operation, code }
+    }
+
+    #[cfg(test)]
+    mod readback_tests {
+        use super::*;
+
+        const LEFT_ARROW: HidUsage = HidUsage(0x50);
+
+        fn ms(millis: u64) -> Duration {
+            Duration::from_millis(millis)
+        }
+
+        /// An injector owing a readback of `release`, released at `at` after `presses` physical
+        /// presses.
+        fn owing(release: HeldInput, at: Instant, presses: u32) -> Injector {
+            let mut injector = Injector::new();
+            injector.await_confirmation(release, at);
+            injector.unconfirmed[0].physical_presses = presses;
+            injector
+        }
+
+        #[test]
+        fn a_release_windows_still_reads_down_is_reported_once_after_the_delay() {
+            let start = Instant::now();
+            let mut injector = owing(HeldInput::Key(LEFT_ARROW), start, 0);
+            assert_eq!(
+                injector.read_back(start + ms(10), |_| true, |_| 0, |_| false),
+                0
+            );
+            assert_eq!(injector.unconfirmed.len(), 1);
+            assert_eq!(
+                injector.read_back(start + READBACK_DELAY, |_| true, |_| 0, |_| false),
+                1
+            );
+            // Reported once, then dropped: nothing is ever released again.
+            assert!(injector.unconfirmed.is_empty());
+            assert_eq!(
+                injector.read_back(start + ms(5000), |_| true, |_| 0, |_| false),
+                0
+            );
+        }
+
+        #[test]
+        fn a_release_windows_reads_up_is_settled_silently() {
+            let start = Instant::now();
+            let mut injector = owing(HeldInput::Button(MouseButton::Middle), start, 0);
+            assert_eq!(
+                injector.read_back(start + READBACK_DELAY, |_| false, |_| 0, |_| false),
+                0
+            );
+            assert!(injector.unconfirmed.is_empty());
+        }
+
+        #[test]
+        fn a_key_held_or_pressed_physically_or_pressed_again_by_the_wire_is_no_alarm() {
+            let start = Instant::now();
+            let due = start + READBACK_DELAY;
+            // Take-back by a physical Left while the wire held Left: the press was counted before
+            // the release, and the finger is still on the key.
+            let mut injector = owing(HeldInput::Key(LEFT_ARROW), start, 1);
+            assert_eq!(injector.read_back(due, |_| true, |_| 1, |_| true), 0);
+            // Pressed and released physically since.
+            let mut injector = owing(HeldInput::Key(LEFT_ARROW), start, 1);
+            assert_eq!(injector.read_back(due, |_| true, |_| 2, |_| false), 0);
+            // Held again by the wire; dropping an injector releases what it holds, so tests must
+            // leave nothing held.
+            let mut injector = owing(HeldInput::Button(MouseButton::Middle), start, 0);
+            injector.held_buttons.insert(MouseButton::Middle);
+            assert_eq!(injector.read_back(due, |_| true, |_| 0, |_| false), 0);
+            injector.held_buttons.clear();
+            // Finger lifted and no new press, yet Windows reads it down: that is the alarm.
+            let mut injector = owing(HeldInput::Key(LEFT_ARROW), start, 1);
+            assert_eq!(injector.read_back(due, |_| true, |_| 1, |_| false), 1);
+        }
+
+        #[test]
+        fn pressing_the_key_again_drops_only_its_pending_readback() {
+            let start = Instant::now();
+            let mut injector = owing(HeldInput::Key(LEFT_ARROW), start, 0);
+            injector.forget_unconfirmed(HeldInput::Key(HidUsage(0x4f)));
+            assert_eq!(injector.unconfirmed.len(), 1);
+            injector.forget_unconfirmed(HeldInput::Key(LEFT_ARROW));
+            assert!(injector.unconfirmed.is_empty());
+        }
+
+        #[test]
+        fn keys_and_buttons_map_to_the_virtual_keys_windows_reads_them_under() {
+            assert_eq!(virtual_key_of(HeldInput::Key(LEFT_ARROW)), Some(0x25));
+            assert_eq!(virtual_key_of(HeldInput::Key(HidUsage(0x04))), Some(0x41));
+            assert_eq!(
+                virtual_key_of(HeldInput::Button(MouseButton::Middle)),
+                Some(4)
+            );
+        }
     }
 }

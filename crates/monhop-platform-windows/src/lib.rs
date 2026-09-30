@@ -22,6 +22,8 @@ pub mod identity_storage;
 pub mod network;
 #[cfg(any(windows, test))]
 pub mod network_watch;
+#[cfg(windows)]
+mod physical_presses;
 #[cfg(any(windows, test))]
 mod power_watch;
 pub mod threads;
