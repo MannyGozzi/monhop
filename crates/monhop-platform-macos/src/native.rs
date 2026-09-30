@@ -81,6 +81,10 @@ struct CGRect {
 const CG_ERROR_SUCCESS: CGError = 0;
 const CG_SCROLL_EVENT_UNIT_PIXEL: CGScrollEventUnit = 0;
 const CG_MOUSE_EVENT_BUTTON_NUMBER: CGEventField = 3;
+/// Core Graphics `kCGMouseEventDeltaX`/`DeltaY`, the motion apps that pan or look read. Whole
+/// points only: Core Graphics truncates a fraction written through the double setter.
+const CG_MOUSE_EVENT_DELTA_X: CGEventField = 4;
+const CG_MOUSE_EVENT_DELTA_Y: CGEventField = 5;
 /// Core Graphics `kCGMouseEventClickState`, the count macOS apps read to recognize a multi-click.
 const CG_MOUSE_EVENT_CLICK_STATE: CGEventField = 1;
 
@@ -434,12 +438,22 @@ pub fn post_scroll(
 pub fn post_motion(
     destination: PostingDestination,
     point: Point,
+    delta: (i64, i64),
     marker: i64,
     flags: u64,
     drag_button: Option<MouseButton>,
 ) -> Result<(), MacError> {
     ensure_injection_permission()?;
-    let location = point_to_cg(point)?;
+    let event = motion_event(point_to_cg(point)?, delta, drag_button)?;
+    post_marked_event(destination, event, marker, flags)
+}
+
+/// Returns an owned event that the caller posts or releases.
+fn motion_event(
+    location: CGPoint,
+    (delta_x, delta_y): (i64, i64),
+    drag_button: Option<MouseButton>,
+) -> Result<CGEventRef, MacError> {
     let (event_type, button_number) = drag_button
         .map(mouse_drag_event)
         .unwrap_or((CG_EVENT_MOUSE_MOVED, 0));
@@ -450,17 +464,19 @@ pub fn post_motion(
     if event.is_null() {
         return Err(MacError::NativeEventCreationFailed);
     }
-    if drag_button.is_some() {
-        // SAFETY: event is non-null and owned until post_marked_event releases it.
-        unsafe {
+    // SAFETY: event is a non-null Core Graphics event owned by the caller.
+    unsafe {
+        if drag_button.is_some() {
             CGEventSetIntegerValueField(
                 event,
                 CG_MOUSE_EVENT_BUTTON_NUMBER,
                 i64::from(button_number),
             );
         }
+        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X, delta_x);
+        CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y, delta_y);
     }
-    post_marked_event(destination, event, marker, flags)
+    Ok(event)
 }
 
 /// The user's system-gesture hotkey bindings, read without changing them; unreadable means default.
@@ -766,12 +782,38 @@ mod tests {
     use super::{
         CFRelease, CG_EVENT_KEY_DOWN, CG_EVENT_MOUSE_MOVED, CG_EVENT_SCROLL_WHEEL,
         CG_EVENT_SOURCE_USER_DATA, CG_MOUSE_EVENT_BUTTON_NUMBER, CG_MOUSE_EVENT_CLICK_STATE,
-        CGEventCreateKeyboardEvent, CGEventGetIntegerValueField, CGEventSetIntegerValueField,
-        CGPoint, DiagnosticState, MouseButton, PassiveDiagnosticCounts, button_event,
-        diagnostic_callback, record_diagnostic_event,
+        CG_MOUSE_EVENT_DELTA_X, CG_MOUSE_EVENT_DELTA_Y, CGEventCreateKeyboardEvent,
+        CGEventGetIntegerValueField, CGEventSetIntegerValueField, CGPoint, DiagnosticState,
+        MouseButton, PassiveDiagnosticCounts, button_event, diagnostic_callback, motion_event,
+        record_diagnostic_event,
     };
 
     const SYNTHETIC_MARKER: i64 = 42;
+
+    #[test]
+    fn moved_and_dragged_events_carry_the_motion_delta() {
+        for (drag_button, number) in [
+            (None, 0),
+            (Some(MouseButton::Left), 0),
+            (Some(MouseButton::Right), 1),
+            (Some(MouseButton::Middle), 2),
+            (Some(MouseButton::Forward), 4),
+        ] {
+            let event = motion_event(CGPoint { x: 1.0, y: 2.0 }, (7, -3), drag_button)
+                .expect("a fixed motion event is created");
+            // SAFETY: event is owned here, read, then released; it is never posted.
+            let fields = unsafe {
+                let fields = (
+                    CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X),
+                    CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y),
+                    CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER),
+                );
+                CFRelease(event);
+                fields
+            };
+            assert_eq!(fields, (7, -3, number), "{drag_button:?}");
+        }
+    }
 
     #[test]
     fn a_posted_press_and_release_carry_the_wire_click_count() {

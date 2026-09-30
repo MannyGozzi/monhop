@@ -79,6 +79,7 @@ pub fn post_scroll(
 pub fn post_motion(
     _: PostingDestination,
     _: Point,
+    _: (i64, i64),
     _: i64,
     _: u64,
     _: Option<MouseButton>,

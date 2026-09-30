@@ -400,15 +400,17 @@ impl MacInjector {
     }
 
     /// Submits an absolute point and anchors pointer state only after submission.
+    /// The event's delta is the clamped move from the last submitted point, none without one.
     /// Submission is not a downstream delivery acknowledgement.
     pub fn move_to(&mut self, point: Point) -> Result<(), MacError> {
         let destination = self.destination;
         let flags = self.modifier_flags();
         let drag_button = self.drag_button();
-        self.cursor.post_absolute(point, |point| {
+        self.cursor.post_absolute(point, |point, delta| {
             backend::post_motion(
                 destination,
                 point,
+                delta,
                 SYNTHETIC_EVENT_MARKER,
                 flags,
                 drag_button,
@@ -418,15 +420,17 @@ impl MacInjector {
 
     /// Submits a bounded delta from the last successful pointer anchor.
     /// It returns CursorPositionUnknown until an absolute move creates that anchor.
+    /// The event's delta is `delta` unclamped, so motion into an edge reports as hardware's does.
     /// Submission is not a downstream delivery acknowledgement.
     pub fn move_by(&mut self, delta: Point) -> Result<(), MacError> {
         let destination = self.destination;
         let flags = self.modifier_flags();
         let drag_button = self.drag_button();
-        self.cursor.post_relative(delta, |point| {
+        self.cursor.post_relative(delta, |point, delta| {
             backend::post_motion(
                 destination,
                 point,
+                delta,
                 SYNTHETIC_EVENT_MARKER,
                 flags,
                 drag_button,
@@ -564,6 +568,8 @@ impl MacInjector {
 struct CursorState {
     bounds: CursorBounds,
     submitted: Option<Point>,
+    /// Motion the whole-point event deltas have not reported yet, always under half a point.
+    unreported_delta: Point,
 }
 
 impl CursorState {
@@ -571,33 +577,52 @@ impl CursorState {
         Ok(Self {
             bounds: CursorBounds::new(bounds)?,
             submitted: None,
+            unreported_delta: Point::default(),
         })
     }
 
     fn post_absolute(
         &mut self,
         point: Point,
-        post: impl FnOnce(Point) -> Result<(), MacError>,
+        post: impl FnOnce(Point, (i64, i64)) -> Result<(), MacError>,
     ) -> Result<(), MacError> {
         validate_absolute_point(point)?;
         let point = self.bounds.clamp(point)?;
-        post(point)?;
-        self.submitted = Some(point);
-        Ok(())
+        let delta = self.submitted.map_or(Point::default(), |previous| {
+            Point::new(point.x - previous.x, point.y - previous.y)
+        });
+        self.post_motion(point, delta, post)
     }
 
     fn post_relative(
         &mut self,
         delta: Point,
-        post: impl FnOnce(Point) -> Result<(), MacError>,
+        post: impl FnOnce(Point, (i64, i64)) -> Result<(), MacError>,
     ) -> Result<(), MacError> {
         validate_relative_delta(delta)?;
         let point = self.submitted.ok_or(MacError::CursorPositionUnknown)?;
         let point = self
             .bounds
             .clamp(Point::new(point.x + delta.x, point.y + delta.y))?;
-        post(point)?;
+        self.post_motion(point, delta, post)
+    }
+
+    /// Rounds the event delta to whole points and carries the rest, so a Retina Mac's half-point
+    /// steps sum to the true motion. The carry and anchor advance only after a successful post.
+    fn post_motion(
+        &mut self,
+        point: Point,
+        delta: Point,
+        post: impl FnOnce(Point, (i64, i64)) -> Result<(), MacError>,
+    ) -> Result<(), MacError> {
+        let total = Point::new(
+            self.unreported_delta.x + delta.x,
+            self.unreported_delta.y + delta.y,
+        );
+        let whole = Point::new(total.x.round(), total.y.round());
+        post(point, (whole.x as i64, whole.y as i64))?;
         self.submitted = Some(point);
+        self.unreported_delta = Point::new(total.x - whole.x, total.y - whole.y);
         Ok(())
     }
 
@@ -614,6 +639,7 @@ impl CursorState {
 
     fn clear(&mut self) {
         self.submitted = None;
+        self.unreported_delta = Point::default();
     }
 }
 
@@ -911,16 +937,16 @@ mod tests {
     fn relative_motion_accumulates_without_reading_the_os_cursor() {
         let mut cursor = standard_cursor();
         cursor
-            .post_absolute(Point::new(100.0, 200.0), |_| Ok(()))
+            .post_absolute(Point::new(100.0, 200.0), |_, _| Ok(()))
             .unwrap();
         cursor
-            .post_relative(Point::new(3.0, -4.0), |point| {
+            .post_relative(Point::new(3.0, -4.0), |point, _| {
                 assert_eq!(point, Point::new(103.0, 196.0));
                 Ok(())
             })
             .unwrap();
         cursor
-            .post_relative(Point::new(-1.0, 2.0), |point| {
+            .post_relative(Point::new(-1.0, 2.0), |point, _| {
                 assert_eq!(point, Point::new(102.0, 198.0));
                 Ok(())
             })
@@ -931,13 +957,13 @@ mod tests {
     fn absolute_moves_reanchor_and_buttons_use_the_last_submitted_point() {
         let mut cursor = standard_cursor();
         cursor
-            .post_absolute(Point::new(10.0, 20.0), |_| Ok(()))
+            .post_absolute(Point::new(10.0, 20.0), |_, _| Ok(()))
             .unwrap();
         cursor
-            .post_absolute(Point::new(30.0, 40.0), |_| Ok(()))
+            .post_absolute(Point::new(30.0, 40.0), |_, _| Ok(()))
             .unwrap();
         cursor
-            .post_relative(Point::new(2.0, 3.0), |point| {
+            .post_relative(Point::new(2.0, 3.0), |point, _| {
                 assert_eq!(point, Point::new(32.0, 43.0));
                 Ok(())
             })
@@ -969,15 +995,15 @@ mod tests {
 
         let mut cursor = standard_cursor();
         assert_eq!(
-            cursor.post_relative(Point::new(1.0, 1.0), |_| Ok(())),
+            cursor.post_relative(Point::new(1.0, 1.0), |_, _| Ok(())),
             Err(MacError::CursorPositionUnknown)
         );
         assert_eq!(
-            cursor.post_absolute(Point::new(f64::NAN, 0.0), |_| Ok(())),
+            cursor.post_absolute(Point::new(f64::NAN, 0.0), |_, _| Ok(())),
             Err(MacError::InvalidPoint)
         );
         assert_eq!(
-            cursor.post_absolute(Point::new(1_000_000_001.0, 0.0), |_| Ok(())),
+            cursor.post_absolute(Point::new(1_000_000_001.0, 0.0), |_, _| Ok(())),
             Err(MacError::PointOutOfRange)
         );
         assert_eq!(
@@ -991,7 +1017,7 @@ mod tests {
         let mut cursor = standard_cursor();
         assert_eq!(cursor.anchor(), Err(MacError::CursorPositionUnknown));
         let point = Point::new(20.0, 30.0);
-        cursor.post_absolute(point, |_| Ok(())).unwrap();
+        cursor.post_absolute(point, |_, _| Ok(())).unwrap();
         assert_eq!(cursor.anchor(), Ok(point));
         cursor.clear();
         assert_eq!(cursor.anchor(), Err(MacError::CursorPositionUnknown));
@@ -1003,13 +1029,13 @@ mod tests {
         let upper_x = 100.0_f64.next_down();
         let upper_y = 100.0_f64.next_down();
         cursor
-            .post_absolute(Point::new(200.0, 150.0), |point| {
+            .post_absolute(Point::new(200.0, 150.0), |point, _| {
                 assert_eq!(point, Point::new(upper_x, upper_y));
                 Ok(())
             })
             .unwrap();
         cursor
-            .post_relative(Point::new(-1.0, -1.0), |point| {
+            .post_relative(Point::new(-1.0, -1.0), |point, _| {
                 assert_eq!(point, Point::new(upper_x - 1.0, upper_y - 1.0));
                 Ok(())
             })
@@ -1021,16 +1047,16 @@ mod tests {
         let mut cursor = cursor(&[rect(0.0, 0.0, 100.0, 100.0)]);
         let upper_x = 100.0_f64.next_down();
         cursor
-            .post_absolute(Point::new(99.0, 50.0), |_| Ok(()))
+            .post_absolute(Point::new(99.0, 50.0), |_, _| Ok(()))
             .unwrap();
         cursor
-            .post_relative(Point::new(2.0, 0.0), |point| {
+            .post_relative(Point::new(2.0, 0.0), |point, _| {
                 assert_eq!(point, Point::new(upper_x, 50.0));
                 Ok(())
             })
             .unwrap();
         cursor
-            .post_relative(Point::new(-1.0, 0.0), |point| {
+            .post_relative(Point::new(-1.0, 0.0), |point, _| {
                 assert_eq!(point, Point::new(upper_x - 1.0, 50.0));
                 Ok(())
             })
@@ -1041,10 +1067,10 @@ mod tests {
     fn negative_origin_bounds_are_preserved() {
         let mut cursor = cursor(&[rect(-100.0, -100.0, 100.0, 100.0)]);
         cursor
-            .post_absolute(Point::new(-50.0, -50.0), |_| Ok(()))
+            .post_absolute(Point::new(-50.0, -50.0), |_, _| Ok(()))
             .unwrap();
         cursor
-            .post_relative(Point::new(-75.0, -75.0), |point| {
+            .post_relative(Point::new(-75.0, -75.0), |point, _| {
                 assert_eq!(point, Point::new(-100.0, -100.0));
                 Ok(())
             })
@@ -1055,13 +1081,13 @@ mod tests {
     fn display_gaps_clamp_to_a_member_rectangle_not_a_bounding_box() {
         let mut cursor = cursor(&[rect(0.0, 0.0, 100.0, 100.0), rect(200.0, 0.0, 100.0, 100.0)]);
         cursor
-            .post_absolute(Point::new(125.0, 50.0), |point| {
+            .post_absolute(Point::new(125.0, 50.0), |point, _| {
                 assert_eq!(point, Point::new(100.0_f64.next_down(), 50.0));
                 Ok(())
             })
             .unwrap();
         cursor
-            .post_absolute(Point::new(175.0, 50.0), |point| {
+            .post_absolute(Point::new(175.0, 50.0), |point, _| {
                 assert_eq!(point, Point::new(200.0, 50.0));
                 Ok(())
             })
@@ -1072,16 +1098,16 @@ mod tests {
     fn failed_posts_leave_the_previous_anchor_for_retry() {
         let mut cursor = standard_cursor();
         cursor
-            .post_absolute(Point::new(10.0, 20.0), |_| Ok(()))
+            .post_absolute(Point::new(10.0, 20.0), |_, _| Ok(()))
             .unwrap();
         assert_eq!(
-            cursor.post_absolute(Point::new(30.0, 40.0), |_| Err(
+            cursor.post_absolute(Point::new(30.0, 40.0), |_, _| Err(
                 MacError::NativeEventCreationFailed
             )),
             Err(MacError::NativeEventCreationFailed)
         );
         assert_eq!(
-            cursor.post_relative(Point::new(1.0, 2.0), |_| Err(
+            cursor.post_relative(Point::new(1.0, 2.0), |_, _| Err(
                 MacError::NativeEventCreationFailed
             )),
             Err(MacError::NativeEventCreationFailed)
@@ -1093,7 +1119,7 @@ mod tests {
             })
             .unwrap();
         cursor
-            .post_relative(Point::new(1.0, 2.0), |point| {
+            .post_relative(Point::new(1.0, 2.0), |point, _| {
                 assert_eq!(point, Point::new(11.0, 22.0));
                 Ok(())
             })
@@ -1104,7 +1130,7 @@ mod tests {
     fn recovery_clears_the_anchor_only_after_button_cleanup_completes() {
         let mut cursor = standard_cursor();
         cursor
-            .post_absolute(Point::new(10.0, 20.0), |_| Ok(()))
+            .post_absolute(Point::new(10.0, 20.0), |_, _| Ok(()))
             .unwrap();
         let mut buttons = BTreeMap::from([(MouseButton::Left, 2)]);
         clear_cursor_after_button_recovery(&buttons, &mut cursor);
@@ -1113,5 +1139,99 @@ mod tests {
         buttons.clear();
         clear_cursor_after_button_recovery(&buttons, &mut cursor);
         assert_eq!(cursor.submitted, None);
+    }
+
+    /// The point and whole-point event delta one successful absolute move submits.
+    fn moved_to(cursor: &mut CursorState, point: Point) -> (Point, (i64, i64)) {
+        let mut posted = None;
+        cursor
+            .post_absolute(point, |point, delta| {
+                posted = Some((point, delta));
+                Ok(())
+            })
+            .unwrap();
+        posted.unwrap()
+    }
+
+    /// The point and whole-point event delta one successful relative move submits.
+    fn moved_by(cursor: &mut CursorState, delta: Point) -> (Point, (i64, i64)) {
+        let mut posted = None;
+        cursor
+            .post_relative(delta, |point, delta| {
+                posted = Some((point, delta));
+                Ok(())
+            })
+            .unwrap();
+        posted.unwrap()
+    }
+
+    #[test]
+    fn a_relative_move_reports_its_unclamped_delta_at_a_display_edge() {
+        let mut cursor = cursor(&[rect(0.0, 0.0, 100.0, 100.0)]);
+        let upper_x = 100.0_f64.next_down();
+        moved_to(&mut cursor, Point::new(99.0, 50.0));
+        assert_eq!(
+            moved_by(&mut cursor, Point::new(5.0, 0.0)),
+            (Point::new(upper_x, 50.0), (5, 0))
+        );
+        assert_eq!(
+            moved_by(&mut cursor, Point::new(3.0, -2.0)),
+            (Point::new(upper_x, 48.0), (3, -2)),
+            "a pointer pinned at the edge still reports the motion"
+        );
+    }
+
+    #[test]
+    fn an_absolute_move_reports_the_clamped_point_minus_the_previous_one() {
+        let mut cursor = cursor(&[rect(0.0, 0.0, 100.0, 100.0)]);
+        moved_to(&mut cursor, Point::new(10.0, 20.0));
+        assert_eq!(
+            moved_to(&mut cursor, Point::new(13.0, 16.0)),
+            (Point::new(13.0, 16.0), (3, -4))
+        );
+        assert_eq!(
+            moved_to(&mut cursor, Point::new(250.0, 16.0)),
+            (Point::new(100.0_f64.next_down(), 16.0), (87, 0)),
+            "the delta ends at the clamped point, not the requested one"
+        );
+    }
+
+    #[test]
+    fn the_first_absolute_move_reports_no_delta_even_after_recovery() {
+        let mut cursor = standard_cursor();
+        assert_eq!(
+            moved_to(&mut cursor, Point::new(500.0, 400.0)),
+            (Point::new(500.0, 400.0), (0, 0))
+        );
+        assert_eq!(moved_by(&mut cursor, Point::new(0.5, 0.5)).1, (1, 1));
+        cursor.clear();
+        assert_eq!(
+            moved_to(&mut cursor, Point::new(20.0, 30.0)).1,
+            (0, 0),
+            "recovery drops both the anchor and the carried half point"
+        );
+    }
+
+    #[test]
+    fn half_point_steps_carry_so_whole_event_deltas_sum_to_the_motion() {
+        let mut cursor = standard_cursor();
+        moved_to(&mut cursor, Point::new(500.0, 500.0));
+        let deltas: Vec<_> = (0..4)
+            .map(|_| moved_by(&mut cursor, Point::new(0.5, -0.5)).1)
+            .collect();
+        assert_eq!(deltas, [(1, -1), (0, 0), (1, -1), (0, 0)]);
+
+        assert_eq!(moved_by(&mut cursor, Point::new(0.25, 0.0)).1, (0, 0));
+        assert_eq!(
+            cursor.post_relative(Point::new(0.25, 0.0), |_, _| Err(
+                MacError::NativeEventCreationFailed
+            )),
+            Err(MacError::NativeEventCreationFailed)
+        );
+        assert_eq!(
+            moved_by(&mut cursor, Point::new(0.25, 0.0)).1,
+            (1, 0),
+            "a failed post leaves the carry for its retry"
+        );
     }
 }
