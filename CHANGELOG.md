@@ -4,22 +4,27 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
-Several computers, and clipboard sharing. **Update every computer together:** this version cannot connect to 0.2.x. Pairings and saved layouts carry over, and an older MonHop started later still finds its own settings untouched.
+Several computers, and clipboard sharing. **Update every computer together:** this version cannot connect to 0.2.2 or earlier. Pairings and saved layouts carry over, and an older MonHop started later still finds its own settings untouched.
 
 ### Added
 
-- Share with more than one computer at once. Switch on each paired computer you want on Home; every switched-on computer stays connected, all their displays form one arrangement, and any computer's keyboard and mouse can move across all of them, including straight from one controlled computer to another. Each computer's card shows its own status and displays, and the tray says how many computers are connected. A computer shares with another only after you switch it on there too.
-- Clipboard sharing, off until you turn it on in Settings. Text and images you copy go to connected computers that also have it on. Files are never sent, items that password managers mark as private are skipped, and what arrives stays on that computer. On a Mac, macOS asks once whether MonHop may read the clipboard.
+- Share with up to eight computers at once. Switch on each paired computer you want on Home; every switched-on computer stays connected, all their displays form one arrangement, and any computer's keyboard and mouse can move across all of them, including straight from one controlled computer to another. Each computer's card shows its own status, displays and control switches, and the top bar says how many computers you are sharing with. A computer shares with another only after you switch it on there too.
+- Clipboard sharing, off until you turn it on in the Clipboard card on Home. Text up to 1 MB and images up to 32 MB that you copy go to connected computers that also have it on, over the same encrypted connection as your keyboard and mouse. A green Sharing pill shows when a computer on the other end shares back. Files are never sent, items that password managers mark as private are skipped, and what arrives stays on that computer. On a Mac, macOS asks once whether MonHop may read the clipboard.
 
 ### Changed
 
-- Arranging displays works for any number of computers: drag each computer's block, and the pointer crosses wherever two blocks touch. Each computer gets its own color.
+- Arranging displays works for any number of computers: drag each computer's block, and the pointer crosses wherever two blocks touch. Each computer is drawn in its own color.
 - When two computers hold different saved layouts, the newer one wins on both, whichever computer made it.
 - A paired computer that is switched off or out of range no longer interrupts sharing with the others, and MonHop reconnects to it by itself when it comes back.
 
 ### Fixed
 
-- The saved network is kept when Windows renumbers the Wi-Fi adapter.
+- Dragging with the middle button, and apps that follow mouse movement rather than the pointer position, now work on a Mac controlled from another computer.
+- Sharing stays connected, and the saved network is kept, when Windows renumbers the network adapter.
+
+### Security
+
+- Every incoming connection proves its address before any encryption work, each paired computer gets a limited number of connection attempts per second, and an attempt that does not finish within 3 seconds is dropped, so a flood of attempts cannot stall sharing.
 
 ## [0.2.2] - 2026-09-24
 

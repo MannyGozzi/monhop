@@ -161,10 +161,11 @@ test("the status only speaks up while on with nobody to share with; the switch s
   );
 });
 
+const peers = (...states) =>
+  states.map((peerEnabled, i) => ({ fingerprint: [FP_A, FP_B, FP_C][i], peerEnabled }));
+const pill = (enabled, list) => clipboardPill(normalizeClipboardView({ enabled, peers: list }));
+
 test("the pill is green once a peer shares back, amber while none does, and absent when off", () => {
-  const peers = (...states) =>
-    states.map((peerEnabled, i) => ({ fingerprint: [FP_A, FP_B, FP_C][i], peerEnabled }));
-  const pill = (enabled, list) => clipboardPill(normalizeClipboardView({ enabled, peers: list }));
   assert.equal(pill(false, peers(true)), null);
   assert.deepEqual(pill(true, []), { tone: "checking", label: "Waiting" });
   assert.deepEqual(pill(true, peers(false, null)), { tone: "checking", label: "Waiting" });

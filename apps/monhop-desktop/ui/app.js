@@ -169,7 +169,7 @@ let dropCopyFeedback = emptyCopyFeedback();
 let dropCopyRequest = 0;
 let dimming = initialDimming();
 // Undefined until clipboard_status succeeds or a "clipboard" event arrives, so a backend built
-// before clipboard sharing landed leaves the Settings card hidden rather than showing a broken one.
+// before clipboard sharing landed leaves the Home card hidden rather than showing a broken one.
 let clipboardView;
 let clipboardPending = false;
 let theme = "system";
