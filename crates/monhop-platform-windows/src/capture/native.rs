@@ -904,6 +904,9 @@ impl CallbackState {
                         if let HeldInput::Key(usage) = press {
                             self.held_virtual_keys[usize::from(usage.0)] = None;
                         }
+                        // A hold the hook saw but whose release it missed would otherwise hide a
+                        // later dropped release of this key from the injector's readback.
+                        crate::physical_presses::clear(press);
                         forgotten += 1;
                     }
                 }
@@ -939,14 +942,24 @@ enum KeyRead {
 /// `virtual_key`'s state, trusted only if the ordinary desktop had the input before and after the
 /// read: OpenInputDesktop names another desktop, or fails, while a secure desktop has it.
 fn trusted_key_state(virtual_key: u32) -> KeyRead {
-    if !ordinary_desktop_is_active() {
-        return KeyRead::Unknown;
-    }
+    let before = read_is_trustworthy();
     let down = key_state_down(virtual_key);
-    if !ordinary_desktop_is_active() {
-        return KeyRead::Unknown;
+    classify_read(before, down, read_is_trustworthy())
+}
+
+/// A key-state read reflects the keyboard only on the ordinary desktop with a foreground this
+/// process may read; an elevated foreground also reads every key up.
+fn read_is_trustworthy() -> bool {
+    ordinary_desktop_is_active() && crate::desktop_state::foreground_is_readable()
+}
+
+/// A read counts only if it was trustworthy both before and after it was taken.
+fn classify_read(trusted_before: bool, down: bool, trusted_after: bool) -> KeyRead {
+    match (trusted_before && trusted_after, down) {
+        (false, _) => KeyRead::Unknown,
+        (true, true) => KeyRead::Down,
+        (true, false) => KeyRead::Up,
     }
-    if down { KeyRead::Down } else { KeyRead::Up }
 }
 
 /// Whether Windows' key state reads `virtual_key` down.
@@ -2034,6 +2047,52 @@ mod tests {
             // Reset the streak for the next case.
             assert_eq!(state.recheck_initially_held(|_| KeyRead::Down), 0);
         }
+    }
+
+    #[test]
+    fn a_read_is_trusted_only_when_trustworthy_before_and_after() {
+        assert_eq!(classify_read(true, false, true), KeyRead::Up);
+        assert_eq!(classify_read(true, true, true), KeyRead::Down);
+        for (before, after) in [(false, true), (true, false), (false, false)] {
+            for down in [false, true] {
+                assert_eq!(classify_read(before, down, after), KeyRead::Unknown);
+            }
+        }
+    }
+
+    #[test]
+    fn reads_under_an_elevated_foreground_never_forget_a_held_key() {
+        const LEFT_ARROW: u32 = 0x25;
+        let (mut state, _consumer) = callback_fixture();
+        state.seed_from(|key| key == LEFT_ARROW);
+        // An elevated foreground makes GetAsyncKeyState read zero on the ordinary desktop; the
+        // read is untrustworthy, so the zero is never taken for a release.
+        let elevated = |_| classify_read(false, false, false);
+        for _ in 0..5 {
+            assert_eq!(state.recheck_initially_held(elevated), 0);
+        }
+        // Nor does one such read complete a streak between two trusted up reads.
+        let trusted_up = |_| classify_read(true, false, true);
+        assert_eq!(state.recheck_initially_held(trusted_up), 0);
+        assert_eq!(state.recheck_initially_held(elevated), 0);
+        assert_eq!(state.recheck_initially_held(trusted_up), 0);
+        assert_eq!(published_blocking(&state).len(), 1);
+        assert!(!state.shared.ready.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn forgetting_a_startup_press_clears_the_hold_the_injector_would_read() {
+        // F14, which no other test presses, keeps the process-wide flags apart.
+        const F14: u32 = 0x7d;
+        let usage = monhop_core::HidUsage(0x69);
+        let (mut state, _consumer) = callback_fixture();
+        state.seed_from(|key| key == F14);
+        // The hook saw the key down (a repeat) but missed its release.
+        crate::physical_presses::note_key(usage, true);
+        assert!(crate::physical_presses::key_held(usage));
+        assert_eq!(state.recheck_initially_held(|_| KeyRead::Up), 0);
+        assert_eq!(state.recheck_initially_held(|_| KeyRead::Up), 1);
+        assert!(!crate::physical_presses::key_held(usage));
     }
 
     #[test]

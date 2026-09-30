@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use monhop_core::{HidUsage, MouseButton};
+use monhop_core::{HidUsage, MouseButton, capture_physical::HeldInput};
 
 static KEY_PRESSES: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
 static BUTTON_PRESSES: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
@@ -26,6 +26,18 @@ pub(crate) fn note_button(button: MouseButton, pressed: bool) {
         BUTTON_PRESSES[button.index()].fetch_add(1, Ordering::Relaxed);
     }
     BUTTONS_HELD[button.index()].store(pressed, Ordering::Relaxed);
+}
+
+/// The capture forgot `input` as released although no release reached the hook.
+pub(crate) fn clear(input: HeldInput) {
+    match input {
+        HeldInput::Key(usage) => {
+            if let Some(held) = KEYS_HELD.get(usize::from(usage.0)) {
+                held.store(false, Ordering::Relaxed);
+            }
+        }
+        HeldInput::Button(button) => BUTTONS_HELD[button.index()].store(false, Ordering::Relaxed),
+    }
 }
 
 /// A new capture has seen nothing yet: a release that happened while none ran leaves no hold.
