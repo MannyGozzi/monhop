@@ -14,6 +14,15 @@ import {
 } from "./dimming-model.mjs";
 import { canInstall, installHint } from "./updates-model.mjs";
 import {
+  CLIPBOARD_PRIVACY,
+  clipboardAccessNotice,
+  clipboardNoticeText,
+  clipboardPeerLines,
+  clipboardStatusText,
+  lastTransferText,
+  normalizeClipboardView,
+} from "./clipboard-model.mjs";
+import {
   button,
   card,
   clear,
@@ -87,6 +96,8 @@ export function renderHome(nodes, ctx) {
   // The hero stays first. Updates and machine preferences are secondary to the computer in use.
   const ready = presence("home-updates-ready", updatesReadyCard(ctx));
   if (ready) nodes.homeContent.append(ready);
+  const clipboard = presence("home-clipboard", clipboardCard(ctx));
+  if (clipboard) nodes.homeContent.append(clipboard);
   nodes.homeContent.append(dimmingCard(ctx));
 
   const logPath = state.snapshot?.logPath;
@@ -151,6 +162,37 @@ function displayNoticeCard(ctx) {
       }),
     ],
   });
+}
+
+// Hidden until app.js wires `state.clipboard = { view, pending }` from clipboard_status / the
+// "clipboard" event, so an app.js that predates this card keeps rendering exactly as it did.
+function clipboardCard(ctx) {
+  const { clipboard, computers, actions } = ctx;
+  if (!clipboard) return null;
+  const view = normalizeClipboardView(clipboard.view);
+  const canToggle = typeof actions.setClipboardEnabled === "function";
+  const children = [
+    rows([
+      switchRow("Share the clipboard", {
+        checked: view.enabled,
+        description: CLIPBOARD_PRIVACY,
+        disabled: clipboard.pending || !ctx.core || !canToggle,
+        focusKey: "home-clipboard-enable",
+        onChange: actions.setClipboardEnabled,
+      }),
+    ]),
+  ];
+  const status = clipboardStatusText(view);
+  const waiting = presence("home-clipboard-status", status ? note(status) : null);
+  if (waiting) children.push(waiting);
+  for (const line of clipboardPeerLines(view, computers)) children.push(note(line));
+  const accessNotice = clipboardAccessNotice(view);
+  if (accessNotice) children.push(note(accessNotice, "danger"));
+  const skipNotice = clipboardNoticeText(view);
+  if (skipNotice) children.push(note(skipNotice));
+  const lastText = lastTransferText(view);
+  if (lastText) children.push(note(lastText));
+  return card({ id: "home-clipboard", title: "Clipboard", children });
 }
 
 // The card works without a paired computer: dimming is this computer's own feature.

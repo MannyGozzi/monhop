@@ -1,6 +1,6 @@
 // Clipboard sharing as the window shows it: normalize Rust's view (kinds, sizes and fingerprints,
 // never clipboard content — the wire shape from settings.rs::ClipboardView does not carry any),
-// then derive the status text the settings card renders.
+// then derive the status text the Home card renders.
 
 import { displayName, findComputer } from "./computers-model.mjs";
 
@@ -11,9 +11,10 @@ const KINDS = new Set(["text", "image"]);
 const FINGERPRINT = /^[a-f0-9]{64}$/i;
 const MAX_PEERS = 8;
 
-export const CLIPBOARD_NEEDS_CONNECTION =
-  "Clipboard sharing needs a computer you're actively sharing input with. A computer that " +
-  "can't control this one, or be controlled by it, doesn't share its clipboard.";
+export const CLIPBOARD_PRIVACY =
+  "Copied text and images go only to computers you're sharing with, encrypted over the same " +
+  "verified connection as your keyboard and mouse. Nothing leaves your network, and files and " +
+  "password-manager items are never sent.";
 
 function cleanFingerprint(value) {
   return typeof value === "string" && FINGERPRINT.test(value) ? value.toLowerCase() : null;
@@ -72,9 +73,11 @@ export function normalizeClipboardView(value) {
   };
 }
 
+// The switch shows on and off; this only says what it cannot: on, with nobody to share with yet.
 export function clipboardStatusText(view) {
-  if (!view.enabled) return "Off.";
-  return view.peers.length ? "On." : "On. Waiting for a connected computer.";
+  return view.enabled && !view.peers.length
+    ? "Waiting for a computer you're sharing input with."
+    : null;
 }
 
 // One line per attached peer, named from the paired-computers list so it reads "<name>: on"

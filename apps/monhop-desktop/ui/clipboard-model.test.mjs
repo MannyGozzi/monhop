@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  CLIPBOARD_NEEDS_CONNECTION,
+  CLIPBOARD_PRIVACY,
   clipboardAccessNotice,
   clipboardNoticeText,
   clipboardPeerLines,
@@ -146,17 +146,17 @@ test("a malicious payload can never smuggle clipboard content through the normal
 
 // ---------- status text ----------
 
-test("the headline status reads off, waiting, or on depending on enabled and attached peers", () => {
-  assert.equal(clipboardStatusText(normalizeClipboardView({ enabled: false })), "Off.");
+test("the status only speaks up while on with nobody to share with; the switch shows on and off", () => {
+  assert.equal(clipboardStatusText(normalizeClipboardView({ enabled: false })), null);
   assert.equal(
     clipboardStatusText(normalizeClipboardView({ enabled: true })),
-    "On. Waiting for a connected computer.",
+    "Waiting for a computer you're sharing input with.",
   );
   assert.equal(
     clipboardStatusText(
       normalizeClipboardView({ enabled: true, peers: [{ fingerprint: FP_A, peerEnabled: true }] }),
     ),
-    "On.",
+    null,
   );
 });
 
@@ -211,9 +211,11 @@ test("the last-copy notice covers every skip reason and is silent when there is 
   assert.equal(clipboardNoticeText(normalizeClipboardView({})), null);
 });
 
-test("the connection note explains that clipboard sharing rides on a control connection", () => {
-  assert.match(CLIPBOARD_NEEDS_CONNECTION, /control/);
-  assert.match(CLIPBOARD_NEEDS_CONNECTION, /clipboard/);
+test("the blurb says the clipboard stays encrypted on your network and skips files and passwords", () => {
+  assert.match(CLIPBOARD_PRIVACY, /encrypted/);
+  assert.match(CLIPBOARD_PRIVACY, /network/);
+  assert.match(CLIPBOARD_PRIVACY, /files/);
+  assert.match(CLIPBOARD_PRIVACY, /password-manager/);
 });
 
 // ---------- last transfer text and size formatting ----------
