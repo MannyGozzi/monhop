@@ -44,6 +44,9 @@ pub const MAX_COMPUTERS: usize = 16;
 const MAX_GROUPS: usize = 16;
 /// Migrated records are revision 1 or 2, so the first change after migration is newer than both.
 const MIGRATED_CLOCK: u64 = 2;
+/// The furthest one revision from another computer may move the clock: far past any real run of
+/// changes, and small enough that no peer can walk the clock to its end.
+const MAX_CLOCK_STEP: u64 = 1 << 20;
 
 const MAX_INTERFACE_ID_BYTES: usize = 512;
 pub(crate) const MAX_LINKS: usize = 64;
@@ -797,6 +800,11 @@ fn stored_identity() -> Option<String> {
 }
 
 /// The lowercase form every view and file key uses; the input must already be a valid fingerprint.
+/// Whether a revision another computer sent is near enough to `clock` to be taken.
+pub(crate) fn within_clock_step(clock: u64, revision: u64) -> bool {
+    revision <= clock.saturating_add(MAX_CLOCK_STEP)
+}
+
 pub(crate) fn fingerprint_key(fingerprint: &str) -> String {
     fingerprint.to_ascii_lowercase()
 }

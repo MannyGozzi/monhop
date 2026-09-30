@@ -907,9 +907,9 @@ impl SetupFileLock {
         let mut refused = None;
         try_update_setup(path, |file| {
             file.observe_clock(seen);
-            // Staging checked the group against the computers switched on then; one switched off
-            // since must stay off.
-            if staged.members().len() > 2 && staged.member_keys() != active_members(file, local) {
+            // Staging checked against the computers switched on then; the user may have changed
+            // them since.
+            if !keeps_enabled(&staged, file, local) {
                 refused = Some(LinkRejectReason::Invalid);
                 return Err(PreferenceError::Invalid);
             }
@@ -3805,9 +3805,14 @@ fn apply_link_event(
                 view.message = "Lost the connection to the other computer. Reconnecting.".into();
             });
         }
-        // Untrusted: a summary that does not parse is dropped and the last good one stands.
+        // Untrusted: a summary that does not parse, or whose stamp runs far past this computer's
+        // clock, is dropped and the last good one stands.
         LinkEvent::PeerSummary { bytes } => {
-            if let Ok(summary) = RecordSummary::parse(&bytes) {
+            if let Ok(summary) = RecordSummary::parse(&bytes)
+                && summary.stamp().is_none_or(|stamp| {
+                    sharing_preferences::within_clock_step(state.clock, stamp.revision())
+                })
+            {
                 if let Some(stamp) = summary.stamp() {
                     state.clock = state.clock.max(stamp.revision());
                 }
@@ -4052,7 +4057,6 @@ fn stage_shared_setup(
         PreferenceError::InspectionChanged => LinkRejectReason::InspectionChanged,
         PreferenceError::Invalid => LinkRejectReason::Invalid,
     })?;
-    let pair = staged.0.members().len() == 2;
     {
         let state = lock(shared);
         if link_retired(&state, key, generation, epoch) {
@@ -4066,6 +4070,10 @@ fn stage_shared_setup(
         {
             return Err(LinkRejectReason::InspectionChanged);
         }
+        // Taken, a revision that far ahead would leave later changes here no newer stamp.
+        if !sharing_preferences::within_clock_step(state.clock, staged.0.revision()) {
+            return Err(LinkRejectReason::Invalid);
+        }
     }
     // The file must be writable now: a damaged file, or one a newer MonHop wrote, would fail the
     // commit after the peer saved.
@@ -4073,10 +4081,7 @@ fn stage_shared_setup(
     if file.written_by_newer() {
         return Err(LinkRejectReason::SaveFailed);
     }
-    // Beyond the link's own pair, only the group this computer has switched on is staged: a
-    // record never adds a computer here that the user did not enable.
-    if !pair && staged.0.member_keys() != active_members(&file, &fresh.local_fingerprint.full_hex())
-    {
+    if !keeps_enabled(&staged.0, &file, &fresh.local_fingerprint.full_hex()) {
         return Err(LinkRejectReason::Invalid);
     }
     // Monotone: a record older than the active one, with other content, would undo a newer
@@ -4093,6 +4098,18 @@ fn stage_shared_setup(
     }
     peer_entry(&mut state.peers, key).staged = Some(staged);
     Ok(())
+}
+
+/// Whether taking `staged` leaves the computers switched on here as the user set them: a group
+/// must be exactly them, and a pair may switch on its own computer but never switch another off.
+fn keeps_enabled(staged: &GroupRecord, file: &SetupFile, local: &str) -> bool {
+    let members = staged.member_keys();
+    let active = active_members(file, local);
+    if members.len() > 2 {
+        members == active
+    } else {
+        active.iter().all(|member| members.contains(member))
+    }
 }
 
 /// Sorted lowercase fingerprints of `local` and every enabled computer.
@@ -6967,6 +6984,108 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_pair_never_switches_off_another_computer_switched_on_here() {
+        let controller = SharingController::default();
+        let (_directory, path) = sync_test_path();
+        let mut file = SetupFile::default();
+        file.adopt(
+            &"A".repeat(64),
+            crate::sharing_preferences::tests::trio(3, true),
+        )
+        .unwrap();
+        file.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // B's own pair record, newer than the group of three A holds.
+        let preferences = crate::sharing_preferences::tests::preferences();
+        let fresh = crate::sharing_preferences::tests::inspection(&preferences);
+        let pair = group(&preferences).restamped(9, &"B".repeat(64)).unwrap();
+        let bytes = shared_group_bytes(&fresh, &pair, false).unwrap();
+        assert_eq!(
+            stage_shared_setup(
+                &controller.state,
+                &fixture_key(),
+                0,
+                0,
+                &path,
+                &fresh,
+                &bytes
+            ),
+            Err(LinkRejectReason::Invalid)
+        );
+        assert!(fixture_entry(&mut lock(&controller.state)).staged.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_pair_commit_after_another_computer_is_switched_on_writes_nothing() {
+        let controller = SharingController::default();
+        let (_directory, path) = sync_test_path();
+        let (fresh, bytes) = sync_payload();
+        let persist = claimed_link_persist(
+            Arc::clone(&controller.state),
+            fixture_key(),
+            0,
+            path.clone(),
+            Arc::clone(&controller.setup_file),
+        );
+        (persist.stage)(&fresh, &bytes).unwrap();
+        // C is switched on here, with B, while the pair was staged.
+        let mut file = SetupFile::default();
+        file.adopt(
+            &"A".repeat(64),
+            crate::sharing_preferences::tests::trio(3, true),
+        )
+        .unwrap();
+        file.save(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            (persist.commit)(&fresh, &bytes),
+            Err(LinkRejectReason::Invalid)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_record_stamped_far_past_the_clock_is_refused() {
+        let controller = SharingController::default();
+        let (_directory, path) = sync_test_path();
+        let preferences = crate::sharing_preferences::tests::preferences();
+        let fresh = crate::sharing_preferences::tests::inspection(&preferences);
+        let runaway = group(&preferences)
+            .restamped(u64::MAX, &"B".repeat(64))
+            .unwrap();
+        let bytes = shared_group_bytes(&fresh, &runaway, false).unwrap();
+        assert_eq!(
+            stage_shared_setup(
+                &controller.state,
+                &fixture_key(),
+                0,
+                0,
+                &path,
+                &fresh,
+                &bytes
+            ),
+            Err(LinkRejectReason::Invalid)
+        );
+        assert!(fixture_entry(&mut lock(&controller.state)).staged.is_none());
+        // One a real run of changes ahead is taken.
+        let ahead = group(&preferences)
+            .restamped(5_000, &"B".repeat(64))
+            .unwrap();
+        let bytes = shared_group_bytes(&fresh, &ahead, false).unwrap();
+        stage_shared_setup(
+            &controller.state,
+            &fixture_key(),
+            0,
+            0,
+            &path,
+            &fresh,
+            &bytes,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn a_computer_switched_off_after_staging_stays_off_at_commit() {
         let controller = SharingController::default();
         let (_directory, path) = sync_test_path();
@@ -7250,13 +7369,19 @@ pub(crate) mod tests {
         let touched = told(&fixture);
         assert_eq!(touched.stamp().map(|stamp| stamp.revision()), Some(3));
 
-        // The other computer's summary raises the clock; one that does not parse is dropped.
+        // The other computer's summary raises the clock; one that does not parse, or that would
+        // run the clock to its end, is dropped.
         let theirs = group(&saved).restamped(9, &"B".repeat(64)).unwrap();
+        let runaway = group(&saved).restamped(u64::MAX, &"B".repeat(64)).unwrap();
+        let summary_of = |record: &GroupRecord| {
+            RecordSummary::new(&[&"B".repeat(64), &"A".repeat(64)], Some(record))
+                .and_then(|summary| summary.to_bytes())
+                .unwrap()
+        };
         for bytes in [
             b"not a summary".to_vec(),
-            RecordSummary::new(&[&"B".repeat(64), &"A".repeat(64)], Some(&theirs))
-                .and_then(|summary| summary.to_bytes())
-                .unwrap(),
+            summary_of(&runaway),
+            summary_of(&theirs),
         ] {
             fixture
                 .events
@@ -7480,11 +7605,16 @@ pub(crate) mod tests {
     #[test]
     fn stop_between_staging_and_commit_leaves_the_applied_setup_untouched() {
         let (directory, path) = sync_test_path();
-        crate::sharing_preferences::tests::file_with(
+        // C's setup, with C switched off, so B's pair may be staged.
+        let mut file = crate::sharing_preferences::tests::file_with(
             crate::sharing_preferences::tests::preferences_for_peer('C'),
+        );
+        file.set_enabled(
+            &CertificateFingerprint::parse_full(&"C".repeat(64)).unwrap(),
+            false,
         )
-        .save(&path)
         .unwrap();
+        file.save(&path).unwrap();
         let original = std::fs::read(&path).unwrap();
         let controller = SharingController::default();
         let (fresh, bytes) = sync_payload();
