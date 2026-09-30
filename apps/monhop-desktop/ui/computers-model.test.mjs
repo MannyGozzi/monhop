@@ -348,6 +348,24 @@ test("each computer carries its own enabled and member flags", () => {
   assert.equal(mac.member, true);
 });
 
+test("group members sent as { fingerprint, displays } set the member flag", () => {
+  const view = normalizeComputers({
+    computers: [
+      { fingerprint: WINDOWS, platform: "windows" },
+      { fingerprint: MAC, platform: "macos" },
+    ],
+    enabled: [WINDOWS],
+    group: {
+      members: [
+        { fingerprint: WINDOWS, displays: [] },
+        { fingerprint: MAC, displays: [] },
+      ],
+    },
+  });
+  assert.equal(findComputer(view, WINDOWS).member, true);
+  assert.equal(findComputer(view, MAC).member, true);
+});
+
 test("without a group record, member falls back to enabled", () => {
   const view = normalizeComputers({
     computers: [

@@ -149,7 +149,10 @@ function normalizeMemberSet(group, seen) {
     return null;
   const members = new Set();
   for (const raw of group.members) {
-    const fingerprint = cleanFingerprint(raw);
+    // The backend names members as { fingerprint, displays }; a bare fingerprint is still accepted.
+    const fingerprint = cleanFingerprint(
+      raw && typeof raw === "object" && !Array.isArray(raw) ? raw.fingerprint : raw,
+    );
     if (fingerprint && seen.has(fingerprint)) members.add(fingerprint);
   }
   return members;

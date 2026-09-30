@@ -96,6 +96,8 @@ pub trait ClipboardSink: Send + Sync {
     /// The peer's switch, reported when it changes; the first report is the peer's attach State.
     fn peer_state(&self, peer: CertificateFingerprint, enabled: bool);
     fn note(&self, peer: CertificateFingerprint, note: ClipboardNote);
+    /// The connection closed: nothing more arrives or leaves, even while the link is still held.
+    fn closed(&self, peer: CertificateFingerprint);
 }
 
 /// A locally copied item, validated so a peer never counts it as a violation. Publish it in an
@@ -688,6 +690,7 @@ impl Receiver {
                 }
             }
         }
+        self.sink.closed(self.peer);
     }
 
     fn admit(&mut self, mut stream: RecvStream) {
@@ -876,6 +879,9 @@ impl Receiver {
         log::warn!(
             "clipboard from {peer} disabled on this connection after {MAX_VIOLATIONS} violations"
         );
+        if self.reported_peer.replace(false) == Some(true) {
+            self.sink.peer_state(self.peer, false);
+        }
         self.sink.note(self.peer, ClipboardNote::Disabled);
     }
 }
@@ -986,6 +992,7 @@ mod tests {
         Received(InboundClipboard),
         PeerState(bool),
         Note(ClipboardNote),
+        Closed,
     }
 
     struct Channel(mpsc::UnboundedSender<Seen>);
@@ -1001,6 +1008,10 @@ mod tests {
 
         fn note(&self, _: CertificateFingerprint, note: ClipboardNote) {
             let _ = self.0.send(Seen::Note(note));
+        }
+
+        fn closed(&self, _: CertificateFingerprint) {
+            let _ = self.0.send(Seen::Closed);
         }
     }
 
@@ -1207,7 +1218,7 @@ mod tests {
             .next(|seen| match seen {
                 Seen::Received(item) => Some(item),
                 Seen::Note(note) => panic!("the image had its longer deadline: {note:?}"),
-                Seen::PeerState(_) => None,
+                Seen::PeerState(_) | Seen::Closed => None,
             })
             .await;
         assert_eq!(
@@ -1229,6 +1240,20 @@ mod tests {
             }
         );
         assert!(started.elapsed() >= limits.png_body);
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_is_reported_while_the_link_is_held() {
+        let pair = connection_pair().await;
+        let mut local = attach_scaled(&pair.server, pair.client_id, Limits::PRODUCTION);
+        let _remote = attach_scaled(&pair.client, pair.server_id, Limits::PRODUCTION);
+        local
+            .next(|seen| matches!(seen, Seen::PeerState(true)).then_some(()))
+            .await;
+        pair.client.close(VarInt::from_u32(0), b"");
+        local
+            .next(|seen| matches!(seen, Seen::Closed).then_some(()))
+            .await;
     }
 
     #[tokio::test]
@@ -1255,7 +1280,7 @@ mod tests {
                 .next(|seen| match seen {
                     Seen::Received(item) => Some(item),
                     Seen::Note(note) => panic!("the receiver refused a paced stream: {note:?}"),
-                    Seen::PeerState(_) => None,
+                    Seen::PeerState(_) | Seen::Closed => None,
                 })
                 .await;
             assert_eq!(received.bytes, text);

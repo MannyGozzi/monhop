@@ -37,6 +37,7 @@ pub fn accept_incoming(bytes: Vec<u8>) -> Result<String, ClipboardTextError> {
 }
 
 /// Windows paste side: every LF without a CR before it gains one, so a second pass changes nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn windows_line_ends(text: &str) -> Cow<'_, str> {
     let lone_lf = text
         .split('\n')

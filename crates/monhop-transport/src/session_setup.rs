@@ -430,8 +430,7 @@ impl PreparedEndpoint {
         connection: quinn::Connection,
         purpose: SessionPurpose,
     ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
-        let local_displays =
-            current_displays(self.local_device).map_err(|_| SetupFailure::Displays)?;
+        let local_displays = read_native_displays(self.local_device).await?;
         let pair = PairFacts {
             identity: &self.identity,
             peer: &self.peer,
@@ -969,8 +968,8 @@ struct LiveLink {
 
 /// Close reasons for member connections the group endpoint ends itself.
 const MEMBER_FORGOTTEN_REASON: &[u8] = b"pairing removed";
-const MEMBER_SUPERSEDED_REASON: &[u8] = b"replaced by a newer connection";
-const MEMBER_RELEASED_REASON: &[u8] = b"connection released";
+pub(crate) const MEMBER_SUPERSEDED_REASON: &[u8] = b"replaced by a newer connection";
+pub(crate) const MEMBER_RELEASED_REASON: &[u8] = b"connection released";
 const MEMBER_UNCLAIMED_REASON: &[u8] = b"no session is waiting for this computer";
 
 /// What a group endpoint fixed at bind about one admitted computer.
@@ -1005,54 +1004,113 @@ fn native_displays(device: DeviceId) -> Result<DisplayTopology, SetupFailure> {
     current_displays(device).map_err(|_| SetupFailure::Displays)
 }
 
+/// Enumeration can stall, and the runtime awaiting it may be the network thread that serves the
+/// hub and every connection, so `reader` runs on the blocking pool.
+async fn read_displays(
+    reader: DisplayReader,
+    device: DeviceId,
+) -> Result<DisplayTopology, SetupFailure> {
+    match tokio::task::spawn_blocking(move || reader(device)).await {
+        Ok(displays) => displays,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => Err(SetupFailure::Displays),
+    }
+}
+
+/// This computer's displays, read off the calling runtime's thread.
+pub(crate) async fn read_native_displays(
+    device: DeviceId,
+) -> Result<DisplayTopology, SetupFailure> {
+    read_displays(native_displays, device).await
+}
+
+/// Why a bind left a paired computer out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exclusion {
+    /// Its recorded address is off the selected subnet.
+    OffSubnet,
+    /// A computer admitted before it holds its recorded address.
+    AddressTaken,
+    /// The network already admits `MAX_PINNED_PEERS`.
+    Full,
+}
+
+/// Who a bind admits, and each other paired computer with why it was left out.
+struct Admission {
+    admitted: Vec<(GroupPeer, SocketAddrV4)>,
+    excluded: Vec<(CertificateFingerprint, Exclusion)>,
+}
+
 /// O-1: every paired computer the selected network reaches directly, whatever group it is in.
-/// Group members come first; one computer per address, and no more than one socket pins.
+/// Group members come first, so they win an address and the cap over any other paired record;
+/// one computer per address, and no more than one socket pins.
 fn admitted_peers(
     selected: &InterfaceSnapshot,
     local: CertificateFingerprint,
     local_platform: Platform,
     records: &[ConfirmedPeerRecord],
     members: &[GroupMemberRecord],
-) -> Vec<(GroupPeer, SocketAddrV4)> {
+) -> Admission {
     let (grouped, others): (Vec<_>, Vec<_>) = records.iter().partition(|record| {
         members
             .iter()
             .any(|member| member.fingerprint == record.peer().fingerprint())
     });
-    let mut admitted: Vec<(GroupPeer, SocketAddrV4)> = Vec::new();
+    let mut admission = Admission {
+        admitted: Vec::new(),
+        excluded: Vec::new(),
+    };
     for record in grouped.into_iter().chain(others) {
         let offer = record.peer();
         let fingerprint = offer.fingerprint();
         let address = offer.endpoint();
-        let pin = match offer.verified_peer() {
-            Ok(pin)
-                if fingerprint != local
-                    && validate_peer(selected, *address.ip()).is_ok()
-                    && !admitted.iter().any(|(peer, earlier)| {
-                        peer.fingerprint == fingerprint || earlier.ip() == address.ip()
-                    }) =>
-            {
-                pin
-            }
-            _ => {
-                log::info!(
-                    "group endpoint: paired computer {} is off the selected subnet or at an \
-                     address already admitted; not admitted",
-                    fingerprint.short_hex()
-                );
-                continue;
-            }
-        };
-        if admitted.len() == MAX_PINNED_PEERS {
-            log::warn!(
-                "group endpoint: paired computer {} not admitted: one network admits at most \
-                 {MAX_PINNED_PEERS}",
+        let admitted = &admission.admitted;
+        if fingerprint == local
+            || admitted
+                .iter()
+                .any(|(peer, _)| peer.fingerprint == fingerprint)
+        {
+            continue;
+        }
+        let Ok(pin) = offer.verified_peer() else {
+            log::info!(
+                "group endpoint: paired computer {} has an unreadable certificate; not admitted",
                 fingerprint.short_hex()
             );
             continue;
+        };
+        let exclusion = if validate_peer(selected, *address.ip()).is_err() {
+            Some(Exclusion::OffSubnet)
+        } else if admitted
+            .iter()
+            .any(|(_, earlier)| earlier.ip() == address.ip())
+        {
+            Some(Exclusion::AddressTaken)
+        } else if admitted.len() == MAX_PINNED_PEERS {
+            Some(Exclusion::Full)
+        } else {
+            None
+        };
+        if let Some(exclusion) = exclusion {
+            let short = fingerprint.short_hex();
+            match exclusion {
+                Exclusion::OffSubnet => log::info!(
+                    "group endpoint: paired computer {short} is off the selected subnet; not admitted"
+                ),
+                Exclusion::AddressTaken => log::info!(
+                    "group endpoint: paired computer {short} is at an address already admitted; \
+                     not admitted"
+                ),
+                Exclusion::Full => log::warn!(
+                    "group endpoint: paired computer {short} not admitted: one network admits at \
+                     most {MAX_PINNED_PEERS}"
+                ),
+            }
+            admission.excluded.push((fingerprint, exclusion));
+            continue;
         }
         let platform = offer.platform();
-        admitted.push((
+        admission.admitted.push((
             GroupPeer {
                 fingerprint,
                 pin,
@@ -1063,7 +1121,7 @@ fn admitted_peers(
             address,
         ));
     }
-    admitted
+    admission
 }
 
 type Delivery = Result<quinn::Connection, MemberHandshakeFailure>;
@@ -1208,6 +1266,8 @@ pub struct GroupEndpoint {
     live: RefCell<Box<[Option<LiveLink>]>>,
     controls: RefCell<Vec<GroupMemberRecord>>,
     peers: Box<[GroupPeer]>,
+    /// Paired computers the bind left out and not forgotten since.
+    excluded: RefCell<Vec<(CertificateFingerprint, Exclusion)>>,
     local: LocalFacts,
     displays: DisplayReader,
     interface_id: String,
@@ -1219,8 +1279,10 @@ pub struct GroupEndpoint {
 impl GroupEndpoint {
     /// Binds the selected interface for every paired computer whose recorded address is on its
     /// subnet, in the current group or not; `members` gives the group's share control, and an
-    /// admitted computer without one can open only setup links. Must run on the network runtime,
-    /// which then hosts the one accept router.
+    /// admitted computer without one can open only setup links. A paired computer left out, off
+    /// the subnet, at an address a group member or an earlier record holds, or past the cap,
+    /// fails every connect as `NetworkRoute`; only one with no pairing is `PairingRequired`.
+    /// Must run on the network runtime, which then hosts the one accept router.
     pub fn bind(
         interface_id: &str,
         members: &[GroupMemberRecord],
@@ -1233,7 +1295,7 @@ impl GroupEndpoint {
         check_cancel(cancel)?;
         let (selection, selected) = selected_adapter(interface_id)?;
         let local_platform = this_platform();
-        let admitted = admitted_peers(
+        let Admission { admitted, excluded } = admitted_peers(
             &selected,
             identity.fingerprint(),
             local_platform,
@@ -1268,6 +1330,7 @@ impl GroupEndpoint {
             endpoint,
             LocalFacts::new(identity, local_platform),
             admitted.into_iter().map(|(peer, _)| peer).collect(),
+            excluded,
             members,
             interface_id,
             cancel,
@@ -1276,10 +1339,12 @@ impl GroupEndpoint {
     }
 
     /// `peers` must be in the endpoint's member order.
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         endpoint: GuardedEndpoint,
         local: LocalFacts,
         peers: Box<[GroupPeer]>,
+        excluded: Vec<(CertificateFingerprint, Exclusion)>,
         members: &[GroupMemberRecord],
         interface_id: &str,
         cancel: &RevocationSignal,
@@ -1304,6 +1369,7 @@ impl GroupEndpoint {
             live: RefCell::new(peers.iter().map(|_| None).collect()),
             controls: RefCell::new(members.to_vec()),
             peers,
+            excluded: RefCell::new(excluded),
             local,
             displays,
             interface_id: interface_id.to_owned(),
@@ -1343,7 +1409,7 @@ impl GroupEndpoint {
         agreement: [u8; 32],
         cancel: &RevocationSignal,
     ) -> Result<PairedMember, SetupFailure> {
-        let index = self.index(member).ok_or(SetupFailure::PairingRequired)?;
+        let index = self.admitted(member)?;
         self.check(index, Some(cancel))?;
         let control = if purpose == SessionPurpose::Setup {
             ControlPermissions::BOTH
@@ -1365,11 +1431,7 @@ impl GroupEndpoint {
                     .dial_until_negotiated(index, control, purpose, agreement, cancel)
                     .await;
             }
-            let connection = if dials {
-                self.dial(index, cancel).await?
-            } else {
-                self.wait_for(index, cancel).await?
-            };
+            let connection = self.connection(index, cancel).await?;
             self.negotiate_while_admitted(index, connection, control, purpose, agreement, cancel)
                 .await
         })
@@ -1379,6 +1441,81 @@ impl GroupEndpoint {
             return Err(SetupFailure::Connection);
         };
         let (session, inspection) = established?;
+        self.hand_out(index, session, inspection, cancel)
+    }
+
+    /// Whether this computer dials `member` under the pair's dial rule.
+    pub(crate) fn dials(&self, member: CertificateFingerprint) -> Result<bool, SetupFailure> {
+        self.admitted(member).map(|index| self.peers[index].dials)
+    }
+
+    /// Why no connection to `member` may start now: it was forgotten, or the endpoint revoked.
+    pub(crate) fn check_member(&self, member: CertificateFingerprint) -> Result<(), SetupFailure> {
+        let index = self.admitted(member)?;
+        self.check(index, None)
+    }
+
+    /// The connection step of a setup `connect` alone: a dial to the member's recorded address or
+    /// its next incoming connection, as the pair's dial rule says. A setup link bounds and retries
+    /// it as on an endpoint of its own, then hands the connection to `negotiate_setup`.
+    pub(crate) async fn setup_connection(
+        &self,
+        member: CertificateFingerprint,
+        cancel: &RevocationSignal,
+    ) -> Result<quinn::Connection, SetupFailure> {
+        let index = self.admitted(member)?;
+        self.check(index, Some(cancel))?;
+        self.connection(index, cancel).await
+    }
+
+    /// Negotiates a setup link on a connection from `setup_connection` and hands it out as
+    /// `connect` does, closing the member's previous connection.
+    pub(crate) async fn negotiate_setup(
+        &self,
+        member: CertificateFingerprint,
+        connection: quinn::Connection,
+        cancel: &RevocationSignal,
+    ) -> Result<PairedMember, SetupFailure> {
+        let index = self.admitted(member)?;
+        let (session, inspection) = self
+            .negotiate_while_admitted(
+                index,
+                connection,
+                ControlPermissions::BOTH,
+                SessionPurpose::Setup,
+                [0; 32],
+                cancel,
+            )
+            .await?;
+        self.hand_out(index, session, inspection, cancel)
+    }
+
+    /// This computer's displays as a connect reads them.
+    pub(crate) async fn local_displays(&self) -> Result<DisplayTopology, SetupFailure> {
+        read_displays(self.displays, self.local.device).await
+    }
+
+    async fn connection(
+        &self,
+        index: usize,
+        cancel: &RevocationSignal,
+    ) -> Result<quinn::Connection, SetupFailure> {
+        if self.peers[index].dials {
+            self.dial(index, cancel).await
+        } else {
+            self.wait_for(index, cancel).await
+        }
+    }
+
+    /// Records a negotiated session as the member's live connection with a fresh link cancel,
+    /// stopping and closing the one it replaces.
+    fn hand_out(
+        &self,
+        index: usize,
+        session: NegotiatedSession,
+        inspection: InspectedPeer,
+        cancel: &RevocationSignal,
+    ) -> Result<PairedMember, SetupFailure> {
         // Forget runs on this thread, so nothing is handed out for a member it already removed.
         if let Err(error) = self.check(index, Some(cancel)) {
             session
@@ -1418,6 +1555,9 @@ impl GroupEndpoint {
     /// Stops admitting `member` without a rebind: its waiting connect ends, its incoming is
     /// ignored and its connection closed. Only a new bind admits it again.
     pub fn forget(&self, member: CertificateFingerprint) {
+        self.excluded
+            .borrow_mut()
+            .retain(|(excluded, _)| *excluded != member);
         let Some(index) = self.index(member) else {
             return;
         };
@@ -1458,6 +1598,24 @@ impl GroupEndpoint {
         self.peers
             .iter()
             .position(|peer| peer.fingerprint == member)
+    }
+
+    /// `member`'s index. A paired computer the bind left out is a route failure, as an endpoint
+    /// of its own reports a recorded address off the selected network; only a computer with no
+    /// pairing needs pairing.
+    fn admitted(&self, member: CertificateFingerprint) -> Result<usize, SetupFailure> {
+        if let Some(index) = self.index(member) {
+            return Ok(index);
+        }
+        let excluded = self.excluded.borrow();
+        let Some((_, exclusion)) = excluded.iter().find(|(excluded, _)| *excluded == member) else {
+            return Err(SetupFailure::PairingRequired);
+        };
+        note_attempt_failure(format!(
+            "group endpoint: paired computer {} is not admitted on this network ({exclusion:?})",
+            member.short_hex()
+        ));
+        Err(SetupFailure::NetworkRoute)
     }
 
     fn check(&self, index: usize, cancel: Option<&RevocationSignal>) -> Result<(), SetupFailure> {
@@ -1594,7 +1752,7 @@ impl GroupEndpoint {
         agreement: [u8; 32],
     ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
         let peer = &self.peers[index];
-        let local_displays = (self.displays)(self.local.device)?;
+        let local_displays = self.local_displays().await?;
         let pair = PairFacts {
             identity: &self.local.identity,
             peer: &peer.pin,
@@ -1646,8 +1804,52 @@ impl GroupEndpoint {
     }
 
     #[cfg(test)]
-    fn waiting(&self, member: CertificateFingerprint) -> bool {
+    pub(crate) fn waiting(&self, member: CertificateFingerprint) -> bool {
         routes(&self.routes).claimed(member)
+    }
+
+    /// A group endpoint on a loopback `socket` for `identity` on `platform`, admitting each
+    /// `(identity, address, this computer dials it)` member in order, on the other platform.
+    #[cfg(test)]
+    pub(crate) fn over_loopback(
+        socket: std::net::UdpSocket,
+        identity: DeviceIdentity,
+        platform: Platform,
+        members: &[(&DeviceIdentity, SocketAddrV4, bool)],
+        controls: &[GroupMemberRecord],
+        cancel: &RevocationSignal,
+        displays: DisplayReader,
+    ) -> Rc<Self> {
+        use crate::guarded_endpoint::loopback::pin;
+        let group: Vec<_> = members
+            .iter()
+            .map(|(member, address, _)| GroupMember {
+                address: *address,
+                pin: pin(member),
+            })
+            .collect();
+        let endpoint = GuardedEndpoint::over_loopback(socket, &identity, &group).unwrap();
+        let peers = members
+            .iter()
+            .map(|(member, _, dials)| GroupPeer {
+                fingerprint: member.fingerprint(),
+                pin: pin(member),
+                device: device_id_from_fingerprint(member.fingerprint()),
+                platform: opposite_platform(platform),
+                dials: *dials,
+            })
+            .collect();
+        Self::assemble(
+            endpoint,
+            LocalFacts::new(identity, platform),
+            peers,
+            Vec::new(),
+            controls,
+            "loopback-test",
+            cancel,
+            displays,
+        )
+        .unwrap()
     }
 }
 
@@ -2425,7 +2627,10 @@ mod capture_stop_close_tests {
 
 #[cfg(test)]
 mod group_tests {
-    use std::net::{SocketAddr, UdpSocket};
+    use std::{
+        net::{SocketAddr, UdpSocket},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
     use crate::{
@@ -2515,39 +2720,28 @@ mod group_tests {
     /// A group endpoint on loopback admitting `members`: it dials them all when `dials`, else it
     /// waits for each.
     fn hub(members: &[&Computer], dials: bool, controls: &[GroupMemberRecord]) -> Hub {
+        hub_reading(members, dials, controls, fixture_displays)
+    }
+
+    /// `hub`, reading this computer's displays with `displays`.
+    fn hub_reading(
+        members: &[&Computer],
+        dials: bool,
+        controls: &[GroupMemberRecord],
+        displays: DisplayReader,
+    ) -> Hub {
         let identity = DeviceIdentity::generate().unwrap();
         let socket = loopback::bind();
         let address = socket.local_addr().unwrap();
-        let group: Vec<_> = members
+        let members: Vec<_> = members
             .iter()
-            .map(|member| GroupMember {
-                address: member.address,
-                pin: pin(&member.identity),
-            })
-            .collect();
-        let endpoint = GuardedEndpoint::over_loopback(socket, &identity, &group).unwrap();
-        let peers = members
-            .iter()
-            .map(|member| GroupPeer {
-                fingerprint: member.identity.fingerprint(),
-                pin: pin(&member.identity),
-                device: device_id_from_fingerprint(member.identity.fingerprint()),
-                platform: MEMBER,
-                dials,
-            })
+            .map(|member| (&member.identity, member.address, dials))
             .collect();
         let hub_pin = pin(&identity);
         let cancel = RevocationSignal::default();
-        let group = GroupEndpoint::assemble(
-            endpoint,
-            LocalFacts::new(identity, HUB),
-            peers,
-            controls,
-            "loopback-test",
-            &cancel,
-            fixture_displays,
-        )
-        .unwrap();
+        let group = GroupEndpoint::over_loopback(
+            socket, identity, HUB, &members, controls, &cancel, displays,
+        );
         Hub {
             group,
             pin: hub_pin,
@@ -3093,13 +3287,9 @@ mod group_tests {
         assert!(!hub.group.revocation().is_stopping());
     }
 
-    #[test]
-    fn the_admitted_set_is_every_paired_computer_on_the_selected_subnet() {
-        let local = DeviceIdentity::generate().unwrap();
-        let ids: Vec<_> = (0..9)
-            .map(|_| DeviceIdentity::generate().unwrap())
-            .collect();
-        let selected = InterfaceSnapshot {
+    /// The selected network: 192.168.50.0/24.
+    fn subnet() -> InterfaceSnapshot {
+        InterfaceSnapshot {
             stable_id: "adapter".into(),
             name: "ethernet".into(),
             index: 7,
@@ -3109,39 +3299,66 @@ mod group_tests {
             is_hardware: true,
             is_up: true,
             network_signature: vec![1; 32],
-        };
-        let record = |host: [u8; 4], identity: &DeviceIdentity| {
-            let offer = PairingOffer::new(
-                SocketAddrV4::new(host.into(), PAIRING_PORT),
-                identity.certificate_der(),
-            )
-            .unwrap()
-            .with_platform(MEMBER);
-            ConfirmedPeerRecord::new(local.fingerprint(), offer).unwrap()
-        };
-        let in_group = |identity: &DeviceIdentity| GroupMemberRecord {
+        }
+    }
+
+    /// `local`'s pairing with `identity`, recorded at `host`.
+    fn record(
+        local: &DeviceIdentity,
+        host: [u8; 4],
+        identity: &DeviceIdentity,
+    ) -> ConfirmedPeerRecord {
+        let offer = PairingOffer::new(
+            SocketAddrV4::new(host.into(), PAIRING_PORT),
+            identity.certificate_der(),
+        )
+        .unwrap()
+        .with_platform(MEMBER);
+        ConfirmedPeerRecord::new(local.fingerprint(), offer).unwrap()
+    }
+
+    fn in_group(identity: &DeviceIdentity) -> GroupMemberRecord {
+        GroupMemberRecord {
             fingerprint: identity.fingerprint(),
             control: ControlPermissions::BOTH,
-        };
+        }
+    }
+
+    fn admission(
+        local: &DeviceIdentity,
+        records: &[ConfirmedPeerRecord],
+        members: &[GroupMemberRecord],
+    ) -> Admission {
+        admitted_peers(&subnet(), local.fingerprint(), HUB, records, members)
+    }
+
+    fn admitted_fingerprints(admission: &Admission) -> Vec<CertificateFingerprint> {
+        admission
+            .admitted
+            .iter()
+            .map(|(peer, _)| peer.fingerprint)
+            .collect()
+    }
+
+    #[test]
+    fn the_admitted_set_is_every_paired_computer_on_the_selected_subnet() {
+        let local = DeviceIdentity::generate().unwrap();
+        let ids: Vec<_> = (0..9)
+            .map(|_| DeviceIdentity::generate().unwrap())
+            .collect();
         let records = [
-            record([192, 168, 50, 20], &ids[0]),
-            record([192, 168, 50, 21], &ids[1]),
-            record([10, 0, 0, 5], &ids[2]),
-            record([192, 168, 50, 20], &ids[3]),
+            record(&local, [192, 168, 50, 20], &ids[0]),
+            record(&local, [192, 168, 50, 21], &ids[1]),
+            record(&local, [10, 0, 0, 5], &ids[2]),
+            record(&local, [192, 168, 50, 20], &ids[3]),
         ];
-        let admitted = admitted_peers(
-            &selected,
-            local.fingerprint(),
-            HUB,
-            &records,
-            &[in_group(&ids[1])],
-        );
+        let Admission { admitted, excluded } = admission(&local, &records, &[in_group(&ids[1])]);
         let admitted: Vec<_> = admitted
             .iter()
             .map(|(peer, address)| (peer.fingerprint, *address, peer.dials))
             .collect();
         // The group member first, then any paired computer on the subnet; another subnet and a
-        // second computer at a taken address are left out.
+        // second computer at a taken address are left out, and remembered with why.
         assert!(
             admitted
                 == [
@@ -3149,18 +3366,193 @@ mod group_tests {
                     (ids[0].fingerprint(), records[0].peer().endpoint(), true),
                 ]
         );
+        assert!(
+            excluded
+                == [
+                    (ids[2].fingerprint(), Exclusion::OffSubnet),
+                    (ids[3].fingerprint(), Exclusion::AddressTaken),
+                ]
+        );
 
         let crowded: Vec<_> = (0..9_u8)
-            .map(|host| record([192, 168, 50, 30 + host], &ids[usize::from(host)]))
+            .map(|host| record(&local, [192, 168, 50, 30 + host], &ids[usize::from(host)]))
             .collect();
-        let admitted = admitted_peers(
-            &selected,
-            local.fingerprint(),
-            HUB,
-            &crowded,
-            &[in_group(&ids[8])],
+        let crowded = admission(&local, &crowded, &[in_group(&ids[8])]);
+        assert_eq!(crowded.admitted.len(), MAX_PINNED_PEERS);
+        assert!(crowded.admitted[0].0.fingerprint == ids[8].fingerprint());
+        assert!(
+            crowded.excluded
+                == [
+                    (ids[6].fingerprint(), Exclusion::Full),
+                    (ids[7].fingerprint(), Exclusion::Full),
+                ]
         );
-        assert_eq!(admitted.len(), MAX_PINNED_PEERS);
-        assert!(admitted[0].0.fingerprint == ids[8].fingerprint());
+    }
+
+    /// A loopback hub admitting one computer, which bind left `excluded` beside.
+    fn hub_excluding(excluded: Vec<(CertificateFingerprint, Exclusion)>) -> (Hub, Computer) {
+        let computer = Computer::new();
+        let hub = hub(&[&computer], false, &[]);
+        *hub.group.excluded.borrow_mut() = excluded;
+        (hub, computer)
+    }
+
+    async fn setup_connect(hub: &Hub, member: CertificateFingerprint) -> Option<SetupFailure> {
+        tokio::time::timeout(
+            DEADLINE,
+            hub.group
+                .connect(member, SessionPurpose::Setup, NO_AGREEMENT, &hub.cancel),
+        )
+        .await
+        .expect("the connect settles at once")
+        .err()
+    }
+
+    #[tokio::test]
+    async fn a_paired_computer_off_the_subnet_is_a_network_route_failure() {
+        let local = DeviceIdentity::generate().unwrap();
+        let away = DeviceIdentity::generate().unwrap();
+        let records = [record(&local, [10, 0, 0, 5], &away)];
+        let admission = admission(&local, &records, &[in_group(&away)]);
+        assert!(admission.admitted.is_empty());
+        let (hub, _computer) = hub_excluding(admission.excluded);
+        let member = away.fingerprint();
+
+        // As an endpoint of its own reports it, and retried as a route failure, never as pairing.
+        assert_eq!(
+            setup_connect(&hub, member).await,
+            Some(SetupFailure::NetworkRoute)
+        );
+        let share = hub
+            .group
+            .connect(member, SessionPurpose::Share, NO_AGREEMENT, &hub.cancel)
+            .await;
+        assert_eq!(share.err(), Some(SetupFailure::NetworkRoute));
+        assert_eq!(hub.group.dials(member), Err(SetupFailure::NetworkRoute));
+        assert_eq!(
+            hub.group.check_member(member),
+            Err(SetupFailure::NetworkRoute)
+        );
+        assert!(!hub.group.admits(member));
+
+        // Removing the pairing leaves no trust record at all.
+        hub.group.forget(member);
+        assert_eq!(
+            setup_connect(&hub, member).await,
+            Some(SetupFailure::PairingRequired)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_record_sharing_an_address_never_displaces_an_enabled_member() {
+        let local = DeviceIdentity::generate().unwrap();
+        let [stale, enabled] = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+        let at_stale = record(&local, [192, 168, 50, 20], &stale);
+        let at_enabled = record(&local, [192, 168, 50, 20], &enabled);
+        for records in [
+            [at_stale.clone(), at_enabled.clone()],
+            [at_enabled.clone(), at_stale.clone()],
+        ] {
+            let admission = admission(&local, &records, &[in_group(&enabled)]);
+            assert!(admitted_fingerprints(&admission) == [enabled.fingerprint()]);
+            assert!(admission.excluded == [(stale.fingerprint(), Exclusion::AddressTaken)]);
+        }
+
+        // The stale record's connects are a route failure, not a pairing to redo.
+        let (hub, _computer) = hub_excluding(
+            admission(&local, &[at_stale, at_enabled], &[in_group(&enabled)]).excluded,
+        );
+        assert_eq!(
+            setup_connect(&hub, stale.fingerprint()).await,
+            Some(SetupFailure::NetworkRoute)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_computer_is_still_pairing_required() {
+        let local = DeviceIdentity::generate().unwrap();
+        let [away, stranger] = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+        let records = [record(&local, [10, 0, 0, 5], &away)];
+        let (hub, computer) = hub_excluding(admission(&local, &records, &[]).excluded);
+        let member = stranger.fingerprint();
+        assert_eq!(
+            setup_connect(&hub, member).await,
+            Some(SetupFailure::PairingRequired)
+        );
+        assert_eq!(hub.group.dials(member), Err(SetupFailure::PairingRequired));
+        assert_eq!(
+            hub.group.check_member(member),
+            Err(SetupFailure::PairingRequired)
+        );
+        // The admitted computer is untouched by either.
+        assert!(hub.group.admits(computer.identity.fingerprint()));
+        assert_eq!(
+            hub.group.check_member(computer.identity.fingerprint()),
+            Ok(())
+        );
+    }
+
+    /// Ticks of a task running beside the display reads.
+    static TICKS: AtomicUsize = AtomicUsize::new(0);
+    /// How many of them landed during each read.
+    static TICKS_DURING_READS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    /// Well inside the other computer's handshake deadline, which runs while the hub reads.
+    fn slow_displays(_: DeviceId) -> Result<DisplayTopology, SetupFailure> {
+        let before = TICKS.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(200));
+        let during = TICKS.load(Ordering::Acquire) - before;
+        TICKS_DURING_READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(during);
+        Ok(topology())
+    }
+
+    /// The test runtime has one thread, as the network thread does.
+    #[tokio::test]
+    async fn a_slow_display_read_does_not_block_the_network_runtime() {
+        let ticker = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                TICKS.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        let computer = Computer::new();
+        let hub = hub_reading(&[&computer], false, &[], slow_displays);
+        let remote = computer.dialing(&hub);
+        let fingerprint = remote.fingerprint();
+
+        // A setup link's topology poll, then a negotiation.
+        let polled = hub.group.local_displays().await.unwrap();
+        assert!(polled.same_geometry(&topology()));
+        let (paired, _dialed) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub.group.connect(
+                    fingerprint,
+                    SessionPurpose::Setup,
+                    NO_AGREEMENT,
+                    &hub.cancel
+                ),
+                async {
+                    until(|| hub.group.waiting(fingerprint)).await;
+                    remote_dials(&remote, &hub).await
+                }
+            )
+        })
+        .await
+        .expect("the computer connects");
+        assert!(paired.unwrap().inspection.peer_fingerprint == fingerprint);
+        ticker.abort();
+
+        let reads = TICKS_DURING_READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(reads.len(), 2);
+        assert!(
+            reads.iter().all(|&ticks| ticks >= 3),
+            "the runtime stalled while displays were read: {reads:?}"
+        );
     }
 }

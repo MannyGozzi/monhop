@@ -17,7 +17,9 @@ use super::image::{MAX_DIB_BYTES, Rgba};
 #[serde(rename_all = "lowercase")]
 pub enum Access {
     Allowed,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Ask,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Denied,
     Unknown,
 }
@@ -65,6 +67,7 @@ pub enum Content {
     /// The platform's own PNG flavor, unmodified.
     Png(Vec<u8>),
     /// A packed DIB: BITMAPINFOHEADER or a later header, then optional masks and pixels.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Dib(Vec<u8>),
     Skipped(Skip),
     Empty,
@@ -94,6 +97,7 @@ pub struct Snapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeError {
     /// Another process held the clipboard through every retry.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Busy,
     /// The change marker moved after the caller approved the write, so nothing was written: the
     /// newer local copy wins.

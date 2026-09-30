@@ -86,6 +86,8 @@ pub struct ArrangementView {
     /// Loadable right now: every computer it was made for shows the displays it was made with.
     /// Always false while one of them is not connected.
     pub fits: bool,
+    /// The computers it was made for, this one included: lowercase and sorted.
+    pub members: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,9 +112,9 @@ impl LibraryError {
 impl ArrangementLibrary {
     /// `path` is this version's file. While it is absent, the version 2 file beside it is
     /// migrated in memory; that file is never written, so an older MonHop keeps its own
-    /// arrangements, and the next save writes `path`. A file a newer MonHop wrote loads empty and
-    /// read-only, one another older version wrote is empty, and a damaged one is an error rather
-    /// than a silent reset.
+    /// arrangements, and the next save writes `path`. A file a newer MonHop wrote, in either
+    /// place, loads empty and read-only, so no save hides it; one another older version wrote is
+    /// empty, and a damaged one is an error rather than a silent reset.
     pub fn load(path: &Path) -> io::Result<Self> {
         Self::load_as(path, crate::sharing::local_platform(), || {
             listed_platforms(path)
@@ -133,15 +135,7 @@ impl ArrangementLibrary {
                     library.validate()?;
                     Ok(library)
                 }
-                version if version > LIBRARY_VERSION => {
-                    log::warn!(
-                        "arrangements: the saved arrangements are version {version}, from a newer MonHop; they are kept as they are and nothing is saved over them"
-                    );
-                    Ok(Self {
-                        newer: true,
-                        ..Self::default()
-                    })
-                }
+                version if version > LIBRARY_VERSION => Ok(Self::from_newer(version)),
                 _ => Err(invalid()),
             };
         }
@@ -149,12 +143,28 @@ impl ArrangementLibrary {
         else {
             return Ok(Self::default());
         };
-        if file_version(&bytes)? != LIBRARY_V2_VERSION {
-            return Ok(Self::default());
+        match file_version(&bytes)? {
+            LIBRARY_V2_VERSION => {
+                let old: LibraryV2 = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+                old.validate()?;
+                Ok(old.migrate(platform, &listed()))
+            }
+            // No MonHop up to this one writes past version 2 here; version 3 goes only to `path`.
+            version if version > LIBRARY_V2_VERSION => Ok(Self::from_newer(version)),
+            _ => Ok(Self::default()),
         }
-        let old: LibraryV2 = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        old.validate()?;
-        Ok(old.migrate(platform, &listed()))
+    }
+
+    /// Empty and never saved: a save would overwrite the newer file, or, when it sits in the
+    /// version 2 place, hide it behind a `path` that is read instead from then on.
+    fn from_newer(version: u8) -> Self {
+        log::warn!(
+            "arrangements: the saved arrangements are version {version}, from a newer MonHop; they are kept as they are and nothing is saved over them"
+        );
+        Self {
+            newer: true,
+            ..Self::default()
+        }
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -454,6 +464,7 @@ fn view(entry: &SavedArrangement, known: &KnownDisplays) -> ArrangementView {
         fits: fitted.is_some(),
         layout: fitted,
         automatic: entry.automatic,
+        members: entry.record.member_keys(),
     }
 }
 
@@ -745,8 +756,22 @@ mod tests {
         assert!(listed.iter().all(|entry| entry.layout.is_none()));
         // The exact names the window reads, so a change here is a change the window sees.
         let json = serde_json::to_value(&listed[0]).unwrap();
+        assert_eq!(
+            json.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "automatic",
+                "crossings",
+                "fits",
+                "layout",
+                "members",
+                "name"
+            ]
+        );
         assert_eq!(json["name"], "Desk");
-        assert_eq!(json.as_object().unwrap().len(), 5);
+        assert_eq!(
+            json["members"],
+            serde_json::json!(["a".repeat(64), "b".repeat(64)])
+        );
         assert_eq!(json["crossings"], 1);
         assert_eq!(json["automatic"], false);
         assert_eq!(json["fits"], false);
@@ -1460,6 +1485,38 @@ mod tests {
         assert!(refused.contains("newer version of MonHop"), "{refused}");
         assert_eq!(std::fs::read(&path).unwrap(), newer);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_newer_legacy_library_loads_read_only() {
+        for version in [LIBRARY_VERSION, LIBRARY_VERSION + 1] {
+            let directory = directory();
+            let path = directory.join(crate::sharing::ARRANGEMENTS_FILE);
+            let old_path = directory.join(V2_LIBRARY_FILE);
+            let mut newer: serde_json::Value = serde_json::from_str(V2_LIBRARY).unwrap();
+            newer["version"] = serde_json::json!(version);
+            newer["more"] = serde_json::json!(1);
+            let newer = serde_json::to_vec(&newer).unwrap();
+            std::fs::write(&old_path, &newer).unwrap();
+            let mut library = ArrangementLibrary::load(&path).unwrap();
+            assert!(library.written_by_newer(), "version {version}");
+            assert!(library.arrangements.is_empty());
+
+            // The first save is refused, so the newer file is never hidden behind one written here.
+            library.upsert("Desk", group(&preferences())).unwrap();
+            assert_eq!(
+                library.save(&path).map_err(|error| error.kind()),
+                Err(io::ErrorKind::Unsupported)
+            );
+            let names: Vec<_> = std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [V2_LIBRARY_FILE], "no file was created");
+            assert_eq!(std::fs::read(&old_path).unwrap(), newer);
+            assert!(ArrangementLibrary::load(&path).unwrap().written_by_newer());
+            let _ = std::fs::remove_dir_all(directory);
+        }
     }
 
     #[test]

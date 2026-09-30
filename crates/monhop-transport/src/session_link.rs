@@ -4,6 +4,7 @@
 //! changes pairing trust, or binds anything but the one selected interface and pinned peer.
 
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     future::Future,
     sync::Arc,
@@ -18,9 +19,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::{
     crypto::CertificateFingerprint,
     session_handshake::{ControlStreams, NegotiatedSession, SessionPurpose},
-    session_native::current_displays,
     session_setup::{
-        InspectedPeer, PreparedEndpoint, SetupFailure, is_transient, prepare_endpoint,
+        GroupEndpoint, InspectedPeer, MEMBER_RELEASED_REASON, PairedMember, PreparedEndpoint,
+        SetupFailure, is_transient, prepare_endpoint, read_native_displays,
     },
 };
 
@@ -153,7 +154,33 @@ pub async fn run_setup_link(
     run_link(&connector, cancel, &persist, &events, &mut commands).await
 }
 
-/// Supplies one connection at a time. The production implementation owns a bound, pinned endpoint.
+/// Runs the setup link to `member` on the process's one group endpoint, beside every other
+/// member's links and sessions, with `run_setup_link`'s dial rule, attempt bounds and retry
+/// cadence. The link only ever closes `member`'s own connection, never the endpoint.
+///
+/// Per member, Share and Setup are exclusive and the newest connection wins: a connection handed
+/// out for `member` by another connect ends this link with `Cancelled` instead of being replaced
+/// by its next attempt, and `member` forgotten ends it with `PairingRequired`. The future is not
+/// `Send`; it runs on the group endpoint's network runtime.
+pub async fn run_setup_link_on(
+    group: &GroupEndpoint,
+    member: CertificateFingerprint,
+    cancel: &RevocationSignal,
+    persist: LinkPersist,
+    events: UnboundedSender<LinkEvent>,
+    mut commands: UnboundedReceiver<LinkCommand>,
+) -> Result<(), SetupFailure> {
+    let connector = GroupConnector {
+        dials: group.dials(member)?,
+        group,
+        member,
+        claim: RefCell::new(None),
+    };
+    run_link(&connector, cancel, &persist, &events, &mut commands).await
+}
+
+/// Supplies one connection at a time. The production implementations own a bound, pinned
+/// endpoint, or take one member's connections from the shared group endpoint.
 trait LinkConnector {
     /// Windows dials the pinned peer; macOS binds once and accepts.
     fn dials(&self) -> bool;
@@ -166,10 +193,25 @@ trait LinkConnector {
     fn negotiate(
         &self,
         connection: quinn::Connection,
+        cancel: &RevocationSignal,
     ) -> impl Future<Output = Result<(NegotiatedSession, InspectedPeer), SetupFailure>>;
 
-    /// `None` reports a transient enumeration failure, which must not drop a healthy link.
-    fn local_displays(&self, inspection: &InspectedPeer) -> Option<DisplayTopology>;
+    /// `None` reports a transient enumeration failure, which must not drop a healthy link. The
+    /// read runs off the link's runtime thread, which may also serve the hub.
+    fn local_displays(
+        &self,
+        inspection: &InspectedPeer,
+    ) -> impl Future<Output = Option<DisplayTopology>>;
+
+    /// Why the link must end instead of connecting again, once something outside it took its
+    /// connection. An endpoint of the link's own is never taken.
+    fn taken(&self) -> Option<SetupFailure> {
+        None
+    }
+
+    /// Closes the connection the link just stopped using before it waits to connect again.
+    /// Dropping the link's handles already closes a connection nothing else holds.
+    fn release(&self) {}
 
     fn close(&self) -> impl Future<Output = ()>;
 }
@@ -201,18 +243,109 @@ impl LinkConnector for EndpointConnector {
     async fn negotiate(
         &self,
         connection: quinn::Connection,
+        _cancel: &RevocationSignal,
     ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
         self.prepared
             .negotiate_session(connection, SessionPurpose::Setup)
             .await
     }
 
-    fn local_displays(&self, inspection: &InspectedPeer) -> Option<DisplayTopology> {
-        current_displays(inspection.local_device).ok()
+    async fn local_displays(&self, inspection: &InspectedPeer) -> Option<DisplayTopology> {
+        read_native_displays(inspection.local_device).await.ok()
     }
 
     async fn close(&self) {
         let _ = self.prepared.endpoint().close_and_wait_idle().await;
+    }
+}
+
+/// Takes one member's connections from the group endpoint. The last one handed out stays this
+/// link's claim after the link lets it go, so a newer connection for the member, which stops
+/// that claim, ends the link rather than being replaced by the link's next attempt.
+struct GroupConnector<'a> {
+    group: &'a GroupEndpoint,
+    member: CertificateFingerprint,
+    dials: bool,
+    /// The link cancel and connection of the member's last connection handed to this link.
+    claim: RefCell<Option<(RevocationSignal, quinn::Connection)>>,
+}
+
+impl LinkConnector for GroupConnector<'_> {
+    fn dials(&self) -> bool {
+        self.dials
+    }
+
+    async fn next_connection(
+        &self,
+        cancel: &RevocationSignal,
+    ) -> Result<quinn::Connection, SetupFailure> {
+        self.group.setup_connection(self.member, cancel).await
+    }
+
+    async fn negotiate(
+        &self,
+        connection: quinn::Connection,
+        cancel: &RevocationSignal,
+    ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
+        // A connection handed out while this one was dialed or awaited must not be replaced.
+        if let Some(failure) = self.taken() {
+            connection.close(0_u32.into(), MEMBER_RELEASED_REASON);
+            return Err(failure);
+        }
+        let PairedMember {
+            session,
+            inspection,
+            cancel: claim,
+        } = self
+            .group
+            .negotiate_setup(self.member, connection, cancel)
+            .await?;
+        *self.claim.borrow_mut() = Some((claim, session.connection.clone()));
+        Ok((session, inspection))
+    }
+
+    async fn local_displays(&self, _inspection: &InspectedPeer) -> Option<DisplayTopology> {
+        self.group.local_displays().await.ok()
+    }
+
+    fn taken(&self) -> Option<SetupFailure> {
+        if let Err(failure) = self.group.check_member(self.member) {
+            return Some(failure);
+        }
+        self.claim
+            .borrow()
+            .as_ref()
+            .filter(|(claim, _)| claim.is_stopping())
+            .map(|_| SetupFailure::Cancelled)
+    }
+
+    /// The endpoint keeps a handle to the connection, so the link closes it itself.
+    fn release(&self) {
+        if let Some((_, connection)) = self.claim.borrow().as_ref() {
+            connection.close(0_u32.into(), MEMBER_RELEASED_REASON);
+        }
+    }
+
+    async fn close(&self) {
+        self.let_go();
+    }
+}
+
+impl GroupConnector<'_> {
+    /// Ends the member's connection through the endpoint, unless another connection took it.
+    fn let_go(&self) {
+        if let Some((claim, _)) = self.claim.take()
+            && !claim.is_stopping()
+        {
+            self.group.close_member(self.member);
+        }
+    }
+}
+
+/// Every way out of the link, a cancel or a dropped future included, lets go of the connection.
+impl Drop for GroupConnector<'_> {
+    fn drop(&mut self) {
+        self.let_go();
     }
 }
 
@@ -246,6 +379,9 @@ async fn run_link<C: LinkConnector>(
     loop {
         if cancel.is_revoked() {
             return Err(SetupFailure::Cancelled);
+        }
+        if let Some(failure) = connector.taken() {
+            return Err(failure);
         }
         attempt = attempt.saturating_add(1);
         log::debug!("setup link: connecting, attempt {attempt}");
@@ -291,6 +427,7 @@ async fn run_link<C: LinkConnector>(
         if session.purpose() != SessionPurpose::Setup
             || session.control.next_sequence() != LINK_START_SEQUENCE
         {
+            connector.release();
             emit(
                 events,
                 LinkEvent::Disconnected {
@@ -329,8 +466,14 @@ async fn run_link<C: LinkConnector>(
         drop(link);
         match exit {
             LinkExit::Closed => return closed(connector, events).await,
-            LinkExit::Cancelled => return Err(SetupFailure::Cancelled),
+            LinkExit::Cancelled => {
+                return Err(connector.taken().unwrap_or(SetupFailure::Cancelled));
+            }
             LinkExit::Disconnected(reason) => {
+                if let Some(failure) = connector.taken() {
+                    return Err(failure);
+                }
+                connector.release();
                 log::warn!("setup link: disconnected ({reason:?})");
                 emit(events, LinkEvent::Disconnected { reason })?;
                 if matches!(
@@ -353,15 +496,18 @@ async fn connect_once<C: LinkConnector>(
         // One attempt covers connect plus negotiate, so a peer that never answers frees the dialer.
         return tokio::time::timeout(LINK_ATTEMPT_DEADLINE, async {
             let connection = connector.next_connection(cancel).await?;
-            connector.negotiate(connection).await
+            connector.negotiate(connection, cancel).await
         })
         .await
         .unwrap_or(Err(SetupFailure::Connection));
     }
     let connection = connector.next_connection(cancel).await?;
-    tokio::time::timeout(LINK_ATTEMPT_DEADLINE, connector.negotiate(connection))
-        .await
-        .unwrap_or(Err(SetupFailure::Handshake))
+    tokio::time::timeout(
+        LINK_ATTEMPT_DEADLINE,
+        connector.negotiate(connection, cancel),
+    )
+    .await
+    .unwrap_or(Err(SetupFailure::Handshake))
 }
 
 async fn closed<C: LinkConnector>(
@@ -982,7 +1128,9 @@ impl<'a> Link<'a> {
                 }
             }
             // Peer frames are served first. A peer that floods them cannot outlast cancellation:
-            // the endpoint watch closes the socket, which ends the read with a transport failure.
+            // an endpoint of the link's own has its watch close the socket, and on the group
+            // endpoint's one-thread runtime the read waits for the connection driver once the
+            // received data runs out, which lets the guard run.
             let wake = {
                 let Self { reader, recv, .. } = &mut *self;
                 tokio::select! {
@@ -1028,13 +1176,13 @@ impl<'a> Link<'a> {
                         .await?;
                 }
                 Wake::Topology => self.publish_local_topology(connector).await?,
-                Wake::Guard => self.guard()?,
+                Wake::Guard => self.guard(connector)?,
             }
         }
     }
 
-    fn guard(&mut self) -> Result<(), LinkExit> {
-        if self.cancel.is_revoked() {
+    fn guard<C: LinkConnector>(&mut self, connector: &C) -> Result<(), LinkExit> {
+        if self.cancel.is_revoked() || connector.taken().is_some() {
             self.close_transaction(LinkRejectReason::Cancelled)?;
             return Err(LinkExit::Cancelled);
         }
@@ -1412,7 +1560,7 @@ impl<'a> Link<'a> {
         &mut self,
         connector: &C,
     ) -> Result<(), LinkExit> {
-        let Some(current) = connector.local_displays(&self.inspection) else {
+        let Some(current) = connector.local_displays(&self.inspection).await else {
             return Ok(());
         };
         let moved = !current.same_geometry(&self.inspection.local_displays);
@@ -1555,7 +1703,8 @@ async fn run_persist(
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
+        rc::Rc,
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -1563,14 +1712,15 @@ mod tests {
     };
 
     use monhop_core::{DisplayId, Platform, Point};
-    use monhop_protocol::{Capabilities, DisplayDescription};
+    use monhop_protocol::{Capabilities, ControlPermissions, DisplayDescription};
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::{
         crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig, VerifiedPeer},
+        guarded_endpoint::loopback,
         session_handshake::{HandshakeConfig, device_id_from_fingerprint, negotiate},
-        session_setup::handshake_failure,
+        session_setup::{GroupMemberRecord, MEMBER_SUPERSEDED_REASON, handshake_failure},
     };
 
     const TEST_DEADLINE: Duration = Duration::from_secs(30);
@@ -1622,6 +1772,7 @@ mod tests {
         async fn negotiate(
             &self,
             connection: quinn::Connection,
+            _cancel: &RevocationSignal,
         ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
             let local_displays = self.displays.lock().unwrap().clone();
             let capabilities =
@@ -1656,7 +1807,7 @@ mod tests {
             Ok((session, inspection))
         }
 
-        fn local_displays(&self, _inspection: &InspectedPeer) -> Option<DisplayTopology> {
+        async fn local_displays(&self, _inspection: &InspectedPeer) -> Option<DisplayTopology> {
             Some(self.displays.lock().unwrap().clone())
         }
 
@@ -2655,5 +2806,606 @@ mod tests {
             .await;
         assert_eq!(dialer, Ok(()));
         assert_eq!(listener, Ok(()));
+    }
+
+    const AGREEMENT: [u8; 32] = [7; 32];
+
+    /// The hub's displays on every group endpoint below.
+    fn hub_displays(_: DeviceId) -> Result<DisplayTopology, SetupFailure> {
+        Ok(topology(1, 100))
+    }
+
+    /// A paired computer before it answers the hub, and which of the two dials.
+    struct Computer {
+        identity: DeviceIdentity,
+        socket: UdpSocket,
+        address: SocketAddrV4,
+        hub_dials: bool,
+    }
+
+    impl Computer {
+        fn new(hub_dials: bool) -> Self {
+            let socket = loopback::bind();
+            Self {
+                identity: DeviceIdentity::generate().unwrap(),
+                address: loopback::address(&socket),
+                socket,
+                hub_dials,
+            }
+        }
+
+        /// This computer on its own plain endpoint, running its side of the link with the hub.
+        fn remote(self, hub: &GroupHub) -> Loopback {
+            let endpoint = if self.hub_dials {
+                loopback::listener(self.socket, &self.identity, &hub.pin)
+            } else {
+                loopback::dialer(self.socket, &self.identity, &hub.pin)
+            };
+            Loopback {
+                endpoint,
+                peer_address: (!self.hub_dials).then_some(hub.address),
+                identity: self.identity,
+                peer: hub.pin.clone(),
+                local_platform: Platform::MacOs,
+                peer_platform: Platform::Windows,
+                displays: Arc::new(Mutex::new(topology(2, 200))),
+                connection: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    /// The Windows computer whose one group endpoint admits every computer above.
+    struct GroupHub {
+        group: Rc<GroupEndpoint>,
+        pin: VerifiedPeer,
+        address: SocketAddr,
+        /// The endpoint's bind cancel, which the share connects below also run under.
+        cancel: RevocationSignal,
+    }
+
+    fn group_hub(computers: &[&Computer], controls: &[GroupMemberRecord]) -> GroupHub {
+        let identity = DeviceIdentity::generate().unwrap();
+        let socket = loopback::bind();
+        let address = socket.local_addr().unwrap();
+        let hub_pin = pin(&identity);
+        let members: Vec<_> = computers
+            .iter()
+            .map(|computer| (&computer.identity, computer.address, computer.hub_dials))
+            .collect();
+        let cancel = RevocationSignal::default();
+        let group = GroupEndpoint::over_loopback(
+            socket,
+            identity,
+            Platform::Windows,
+            &members,
+            controls,
+            &cancel,
+            hub_displays,
+        );
+        GroupHub {
+            group,
+            pin: hub_pin,
+            address,
+            cancel,
+        }
+    }
+
+    fn sharing(computer: &Computer) -> GroupMemberRecord {
+        GroupMemberRecord {
+            fingerprint: computer.identity.fingerprint(),
+            control: ControlPermissions::BOTH,
+        }
+    }
+
+    /// What a test drives on one side of a link.
+    struct Party {
+        inbox: UnboundedReceiver<LinkEvent>,
+        commands: UnboundedSender<LinkCommand>,
+        recorder: Arc<Recorder>,
+        cancel: RevocationSignal,
+    }
+
+    /// What that side's link runs with.
+    struct Run {
+        persist: LinkPersist,
+        events: UnboundedSender<LinkEvent>,
+        orders: UnboundedReceiver<LinkCommand>,
+        cancel: RevocationSignal,
+    }
+
+    fn party(order: &Arc<AtomicUsize>) -> (Party, Run) {
+        let recorder = Arc::new(Recorder::new(order));
+        let (events, inbox) = unbounded_channel();
+        let (commands, orders) = unbounded_channel();
+        let cancel = RevocationSignal::default();
+        (
+            Party {
+                inbox,
+                commands,
+                recorder: Arc::clone(&recorder),
+                cancel: cancel.clone(),
+            },
+            Run {
+                persist: persist_for(&recorder),
+                events,
+                orders,
+                cancel,
+            },
+        )
+    }
+
+    async fn hub_link(
+        hub: &GroupHub,
+        member: CertificateFingerprint,
+        run: Run,
+    ) -> Result<(), SetupFailure> {
+        let Run {
+            persist,
+            events,
+            orders,
+            cancel,
+        } = run;
+        run_setup_link_on(&hub.group, member, &cancel, persist, events, orders).await
+    }
+
+    /// A computer that dials waits for the hub's link to claim it first, so no dial is refused.
+    async fn remote_link(remote: &Loopback, hub: &GroupHub, run: Run) -> Result<(), SetupFailure> {
+        let Run {
+            persist,
+            events,
+            mut orders,
+            cancel,
+        } = run;
+        if remote.dials() {
+            let member = remote.identity.fingerprint();
+            until(|| hub.group.waiting(member)).await;
+        }
+        run_link(remote, &cancel, &persist, &events, &mut orders).await
+    }
+
+    async fn until(condition: impl Fn() -> bool) {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// `from` proposes `bytes` and both computers commit them.
+    async fn applies(from: &mut Party, to: &mut Party, bytes: &[u8]) {
+        from.commands
+            .send(LinkCommand::Propose {
+                bytes: bytes.to_vec(),
+            })
+            .unwrap();
+        assert!(matches!(
+            settled(&mut from.inbox).await,
+            LinkEvent::SyncCompleted { sending: true, .. }
+        ));
+        assert!(matches!(
+            settled(&mut to.inbox).await,
+            LinkEvent::SyncCompleted { sending: false, .. }
+        ));
+        assert_eq!(*to.recorder.saved.lock().unwrap(), bytes);
+    }
+
+    async fn closes(party: &mut Party) {
+        party.commands.send(LinkCommand::Close).unwrap();
+        wait_for(&mut party.inbox, |event| matches!(event, LinkEvent::Closed)).await;
+    }
+
+    async fn wait_peer_closed(inbox: &mut UnboundedReceiver<LinkEvent>) {
+        wait_for(inbox, |event| {
+            matches!(
+                event,
+                LinkEvent::Disconnected {
+                    reason: LinkDisconnect::PeerClosed
+                }
+            )
+        })
+        .await;
+    }
+
+    /// Waits for the hub's link to connect and reports the computer it names.
+    async fn connected_to(inbox: &mut UnboundedReceiver<LinkEvent>) -> CertificateFingerprint {
+        let LinkEvent::Connected { inspection } =
+            wait_for(inbox, |event| matches!(event, LinkEvent::Connected { .. })).await
+        else {
+            unreachable!("filtered above");
+        };
+        inspection.peer_fingerprint
+    }
+
+    /// Drains a link's events until the link has ended, refusing any new attempt among them.
+    async fn ends_without_another_attempt(inbox: &mut UnboundedReceiver<LinkEvent>) {
+        while let Some(event) = tokio::time::timeout(TEST_DEADLINE, inbox.recv())
+            .await
+            .expect("the link ended")
+        {
+            assert!(
+                !matches!(event, LinkEvent::Connecting { .. }),
+                "the link tried to connect again"
+            );
+        }
+    }
+
+    /// The other computer's side of a share session with the hub, on the pair's dial rule.
+    async fn remote_share(remote: &Loopback, hub: &GroupHub) -> NegotiatedSession {
+        let connection = match remote.peer_address {
+            Some(address) => {
+                let member = remote.identity.fingerprint();
+                until(|| hub.group.waiting(member)).await;
+                remote
+                    .endpoint
+                    .connect(address, LOCAL_TLS_SERVER_NAME)
+                    .unwrap()
+                    .await
+                    .unwrap()
+            }
+            None => remote.endpoint.accept().await.unwrap().await.unwrap(),
+        };
+        let displays = remote.displays.lock().unwrap().clone();
+        let capabilities =
+            Capabilities::new(Capabilities::RELATIVE_MOTION | Capabilities::DISPLAY_TOPOLOGY)
+                .unwrap();
+        let config = HandshakeConfig::new(
+            &remote.identity,
+            &remote.peer,
+            remote.local_platform,
+            remote.peer_platform,
+            capabilities,
+            capabilities,
+            &displays,
+            ControlPermissions::BOTH,
+            SessionPurpose::Share,
+        )
+        .unwrap()
+        .with_agreement(AGREEMENT);
+        negotiate(connection, config).await.unwrap()
+    }
+
+    /// A share session between the hub and `remote`, from both ends.
+    async fn share(hub: &GroupHub, remote: &Loopback) -> (PairedMember, NegotiatedSession) {
+        let member = remote.identity.fingerprint();
+        let (paired, answered) = tokio::join!(
+            hub.group
+                .connect(member, SessionPurpose::Share, AGREEMENT, &hub.cancel),
+            remote_share(remote, hub)
+        );
+        let paired = paired.unwrap();
+        assert!(paired.inspection.peer_fingerprint == member);
+        (paired, answered)
+    }
+
+    async fn still_carries(ours: &quinn::Connection, theirs: &quinn::Connection) {
+        for (from, to) in [(ours, theirs), (theirs, ours)] {
+            from.send_datagram(b"still connected".to_vec().into())
+                .unwrap();
+            let received = tokio::time::timeout(TEST_DEADLINE, to.read_datagram())
+                .await
+                .expect("the datagram crossed")
+                .unwrap();
+            assert_eq!(received.as_ref(), b"still connected");
+        }
+    }
+
+    async fn closed_with(connection: &quinn::Connection, reason: &[u8]) {
+        let closed = tokio::time::timeout(TEST_DEADLINE, connection.closed())
+            .await
+            .expect("the connection closed");
+        assert!(
+            matches!(
+                &closed,
+                quinn::ConnectionError::ApplicationClosed(close) if close.reason.as_ref() == reason
+            ),
+            "{closed}"
+        );
+    }
+
+    /// The connection the other computer's link last made or accepted.
+    fn remote_connection(remote: &Loopback) -> quinn::Connection {
+        remote.connection.lock().unwrap().clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_setup_link_runs_over_the_group_endpoint() {
+        for hub_dials in [true, false] {
+            let computer = Computer::new(hub_dials);
+            let hub = group_hub(&[&computer], &[]);
+            let remote = computer.remote(&hub);
+            let member = remote.identity.fingerprint();
+            let order = Arc::new(AtomicUsize::new(0));
+            let (mut first, first_run) = party(&order);
+            let (mut second, second_run) = party(&order);
+            let (mut theirs, their_run) = party(&order);
+            let ((closed, cancelled), remote_side, ()) =
+                tokio::time::timeout(TEST_DEADLINE, async {
+                    tokio::join!(
+                        async {
+                            let closed = hub_link(&hub, member, first_run).await;
+                            (closed, hub_link(&hub, member, second_run).await)
+                        },
+                        remote_link(&remote, &hub, their_run),
+                        async {
+                            assert!(connected_to(&mut first.inbox).await == member);
+                            wait_connected(&mut theirs.inbox).await;
+                            applies(&mut first, &mut theirs, b"layout from the hub").await;
+                            applies(&mut theirs, &mut first, b"layout from the member").await;
+
+                            // Closing says goodbye and ends only this member's connection.
+                            closes(&mut first).await;
+                            wait_peer_closed(&mut theirs.inbox).await;
+                            assert!(!hub.group.revocation().is_stopping());
+
+                            // The same endpoint carries the next link, and a cancelled link lets
+                            // go of its connection through the endpoint as well.
+                            wait_connected(&mut second.inbox).await;
+                            wait_connected(&mut theirs.inbox).await;
+                            let connection = remote_connection(&remote);
+                            second.cancel.revoke();
+                            closed_with(&connection, MEMBER_RELEASED_REASON).await;
+                            assert!(hub.group.admits(member));
+                            assert!(!hub.group.revocation().is_stopping());
+                            theirs.cancel.revoke();
+                        }
+                    )
+                })
+                .await
+                .expect("bounded group setup link test");
+            assert_eq!(closed, Ok(()), "hub dials: {hub_dials}");
+            assert_eq!(cancelled, Err(SetupFailure::Cancelled));
+            assert_eq!(remote_side, Err(SetupFailure::Cancelled));
+        }
+    }
+
+    #[tokio::test]
+    async fn two_members_setup_links_run_concurrently_on_one_endpoint() {
+        let computers = [Computer::new(true), Computer::new(false)];
+        let hub = group_hub(&computers.each_ref(), &[]);
+        let [dialed, awaited] = computers.map(|computer| computer.remote(&hub));
+        let order = Arc::new(AtomicUsize::new(0));
+        let (mut ours_dialed, ours_dialed_run) = party(&order);
+        let (mut ours_awaited, ours_awaited_run) = party(&order);
+        let (mut theirs_dialed, theirs_dialed_run) = party(&order);
+        let (mut theirs_awaited, theirs_awaited_run) = party(&order);
+        let (hub_dialed, hub_awaited, remote_dialed, remote_awaited, ()) =
+            tokio::time::timeout(TEST_DEADLINE, async {
+                tokio::join!(
+                    hub_link(&hub, dialed.identity.fingerprint(), ours_dialed_run),
+                    hub_link(&hub, awaited.identity.fingerprint(), ours_awaited_run),
+                    remote_link(&dialed, &hub, theirs_dialed_run),
+                    remote_link(&awaited, &hub, theirs_awaited_run),
+                    async {
+                        assert!(
+                            connected_to(&mut ours_dialed.inbox).await
+                                == dialed.identity.fingerprint()
+                        );
+                        assert!(
+                            connected_to(&mut ours_awaited.inbox).await
+                                == awaited.identity.fingerprint()
+                        );
+                        wait_connected(&mut theirs_dialed.inbox).await;
+                        wait_connected(&mut theirs_awaited.inbox).await;
+                        // One transaction on each member's connection at the same time.
+                        tokio::join!(
+                            applies(&mut ours_dialed, &mut theirs_dialed, b"layout one"),
+                            applies(&mut theirs_awaited, &mut ours_awaited, b"layout two")
+                        );
+                        closes(&mut ours_dialed).await;
+                        closes(&mut ours_awaited).await;
+                        theirs_dialed.cancel.revoke();
+                        theirs_awaited.cancel.revoke();
+                    }
+                )
+            })
+            .await
+            .expect("bounded group setup link test");
+        assert_eq!(hub_dialed, Ok(()));
+        assert_eq!(hub_awaited, Ok(()));
+        assert_eq!(remote_dialed, Err(SetupFailure::Cancelled));
+        assert_eq!(remote_awaited, Err(SetupFailure::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn closing_one_members_link_keeps_the_other_members_link_and_session() {
+        let computers = [
+            Computer::new(true),
+            Computer::new(false),
+            Computer::new(true),
+        ];
+        let hub = group_hub(&computers.each_ref(), &[sharing(&computers[2])]);
+        let [closing, kept, shared] = computers.map(|computer| computer.remote(&hub));
+        let order = Arc::new(AtomicUsize::new(0));
+        let (mut ours_closing, ours_closing_run) = party(&order);
+        let (mut ours_kept, ours_kept_run) = party(&order);
+        let (mut theirs_closing, theirs_closing_run) = party(&order);
+        let (mut theirs_kept, theirs_kept_run) = party(&order);
+        let (hub_closing, hub_kept, remote_closing, remote_kept, ()) =
+            tokio::time::timeout(TEST_DEADLINE, async {
+                tokio::join!(
+                    hub_link(&hub, closing.identity.fingerprint(), ours_closing_run),
+                    hub_link(&hub, kept.identity.fingerprint(), ours_kept_run),
+                    remote_link(&closing, &hub, theirs_closing_run),
+                    remote_link(&kept, &hub, theirs_kept_run),
+                    async {
+                        for party in [
+                            &mut ours_closing,
+                            &mut ours_kept,
+                            &mut theirs_closing,
+                            &mut theirs_kept,
+                        ] {
+                            wait_connected(&mut party.inbox).await;
+                        }
+                        let (session, answered) = share(&hub, &shared).await;
+
+                        closes(&mut ours_closing).await;
+                        wait_peer_closed(&mut theirs_closing.inbox).await;
+
+                        // The other link and the share session carry on over the same endpoint.
+                        applies(&mut ours_kept, &mut theirs_kept, b"layout after a close").await;
+                        still_carries(&session.session.connection, &answered.connection).await;
+                        assert!(!session.cancel.is_stopping());
+                        assert!(!hub.group.revocation().is_stopping());
+
+                        closes(&mut ours_kept).await;
+                        wait_peer_closed(&mut theirs_kept.inbox).await;
+                        still_carries(&session.session.connection, &answered.connection).await;
+                        theirs_closing.cancel.revoke();
+                        theirs_kept.cancel.revoke();
+                    }
+                )
+            })
+            .await
+            .expect("bounded group setup link test");
+        assert_eq!(hub_closing, Ok(()));
+        assert_eq!(hub_kept, Ok(()));
+        assert_eq!(remote_closing, Err(SetupFailure::Cancelled));
+        assert_eq!(remote_kept, Err(SetupFailure::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn a_setup_link_and_a_share_session_with_different_members_coexist() {
+        let computers = [Computer::new(false), Computer::new(false)];
+        let hub = group_hub(&computers.each_ref(), &[sharing(&computers[1])]);
+        let [linked, shared] = computers.map(|computer| computer.remote(&hub));
+        let order = Arc::new(AtomicUsize::new(0));
+        let (mut ours, our_run) = party(&order);
+        let (mut theirs, their_run) = party(&order);
+        let (hub_side, remote_side, ()) = tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::join!(
+                hub_link(&hub, linked.identity.fingerprint(), our_run),
+                remote_link(&linked, &hub, their_run),
+                async {
+                    // Both computers wait on the one accept router at once.
+                    let (session, answered) = share(&hub, &shared).await;
+                    wait_connected(&mut ours.inbox).await;
+                    wait_connected(&mut theirs.inbox).await;
+                    applies(&mut ours, &mut theirs, b"layout beside a share").await;
+                    still_carries(&session.session.connection, &answered.connection).await;
+
+                    // Ending the share leaves the link alone.
+                    hub.group.close_member(shared.identity.fingerprint());
+                    closed_with(&answered.connection, MEMBER_RELEASED_REASON).await;
+                    assert!(session.cancel.is_stopping());
+                    applies(&mut theirs, &mut ours, b"layout after the share").await;
+
+                    closes(&mut ours).await;
+                    theirs.cancel.revoke();
+                }
+            )
+        })
+        .await
+        .expect("bounded group setup link test");
+        assert_eq!(hub_side, Ok(()));
+        assert_eq!(remote_side, Err(SetupFailure::Cancelled));
+    }
+
+    /// Per H2 two computers hold either a setup link or a share session, never both. The newest
+    /// connection wins: the setup link it replaced ends as cancelled instead of redialing and
+    /// replacing the share in turn.
+    #[tokio::test]
+    async fn a_new_share_connect_supersedes_a_members_setup_link() {
+        let computer = Computer::new(false);
+        let hub = group_hub(&[&computer], &[sharing(&computer)]);
+        let remote = computer.remote(&hub);
+        let member = remote.identity.fingerprint();
+        let order = Arc::new(AtomicUsize::new(0));
+        let (mut ours, our_run) = party(&order);
+        let (mut theirs, their_run) = party(&order);
+        let (hub_side, remote_side, ()) = tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::join!(
+                hub_link(&hub, member, our_run),
+                remote_link(&remote, &hub, their_run),
+                async {
+                    wait_connected(&mut ours.inbox).await;
+                    wait_connected(&mut theirs.inbox).await;
+                    let link = remote_connection(&remote);
+                    let (session, answered) = share(&hub, &remote).await;
+                    closed_with(&link, MEMBER_SUPERSEDED_REASON).await;
+                    ends_without_another_attempt(&mut ours.inbox).await;
+
+                    // The other computer's link dials again and nothing waits for it.
+                    wait_for(&mut theirs.inbox, |event| {
+                        matches!(
+                            event,
+                            LinkEvent::Disconnected {
+                                reason: LinkDisconnect::Attempt
+                            }
+                        )
+                    })
+                    .await;
+                    still_carries(&session.session.connection, &answered.connection).await;
+                    assert!(!session.cancel.is_stopping());
+                    theirs.cancel.revoke();
+                }
+            )
+        })
+        .await
+        .expect("bounded group setup link test");
+        assert_eq!(hub_side, Err(SetupFailure::Cancelled));
+        assert_eq!(remote_side, Err(SetupFailure::Cancelled));
+    }
+
+    /// The same holds while the replaced link waits to redial: its next attempt never starts.
+    #[tokio::test]
+    async fn a_share_connected_while_a_setup_link_waits_to_redial_ends_that_link() {
+        let computer = Computer::new(false);
+        let hub = group_hub(&[&computer], &[sharing(&computer)]);
+        let remote = computer.remote(&hub);
+        let member = remote.identity.fingerprint();
+        let order = Arc::new(AtomicUsize::new(0));
+        let (mut ours, our_run) = party(&order);
+        let (mut theirs, their_run) = party(&order);
+        let (hub_side, remote_side, ()) = tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::join!(
+                hub_link(&hub, member, our_run),
+                remote_link(&remote, &hub, their_run),
+                async {
+                    wait_connected(&mut ours.inbox).await;
+                    wait_connected(&mut theirs.inbox).await;
+                    // The other computer's link goes away without a goodbye.
+                    theirs.cancel.revoke();
+                    remote_connection(&remote).close(0_u32.into(), b"gone");
+                    wait_for(&mut ours.inbox, |event| {
+                        matches!(event, LinkEvent::Disconnected { .. })
+                    })
+                    .await;
+                    let (session, answered) = share(&hub, &remote).await;
+                    ends_without_another_attempt(&mut ours.inbox).await;
+                    still_carries(&session.session.connection, &answered.connection).await;
+                    assert!(!session.cancel.is_stopping());
+                }
+            )
+        })
+        .await
+        .expect("bounded group setup link test");
+        assert_eq!(hub_side, Err(SetupFailure::Cancelled));
+        assert_eq!(remote_side, Err(SetupFailure::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_member_ends_its_setup_link_as_pairing_required() {
+        let computer = Computer::new(true);
+        let hub = group_hub(&[&computer], &[]);
+        let remote = computer.remote(&hub);
+        let member = remote.identity.fingerprint();
+        let order = Arc::new(AtomicUsize::new(0));
+        let (mut ours, our_run) = party(&order);
+        let (mut theirs, their_run) = party(&order);
+        let (hub_side, remote_side, ()) = tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::join!(
+                hub_link(&hub, member, our_run),
+                remote_link(&remote, &hub, their_run),
+                async {
+                    wait_connected(&mut ours.inbox).await;
+                    wait_connected(&mut theirs.inbox).await;
+                    hub.group.forget(member);
+                    ends_without_another_attempt(&mut ours.inbox).await;
+                    theirs.cancel.revoke();
+                }
+            )
+        })
+        .await
+        .expect("bounded group setup link test");
+        assert_eq!(hub_side, Err(SetupFailure::PairingRequired));
+        assert_eq!(remote_side, Err(SetupFailure::Cancelled));
     }
 }

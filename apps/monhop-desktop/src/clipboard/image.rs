@@ -96,6 +96,7 @@ impl fmt::Debug for Rgba {
 }
 
 impl Rgba {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(width: u32, height: u32, pixels: Vec<u8>) -> Result<Self, ImageError> {
         if pixels.len() != rgba_len(width, height)? {
             return Err(ImageError::Malformed);
@@ -107,18 +108,22 @@ impl Rgba {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn width(&self) -> u32 {
         self.width
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn height(&self) -> u32 {
         self.height
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn dibv5_len(&self) -> usize {
         BITMAPV5HEADER_LEN + self.pixels.len()
     }
@@ -127,6 +132,7 @@ impl Rgba {
     /// straight alpha. Rows go bottom-up because some programs cannot paste a negative-height DIB.
     /// `out` must be exactly `dibv5_len` bytes (the start of a rounded-up clipboard allocation);
     /// any other size is refused untouched.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn write_dibv5(&self, out: &mut [u8]) -> Result<(), ImageError> {
         if out.len() != self.dibv5_len() {
             return Err(ImageError::Malformed);

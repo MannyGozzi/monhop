@@ -802,14 +802,40 @@ struct Carrier {
 }
 
 impl Carrier {
-    fn guarded<I: DatagramIo>(socket: GuardedSocket<I>) -> Self {
+    fn guarded<I: DatagramIo>(socket: Arc<GuardedSocket<I>>) -> Self {
         Self {
             signal: socket.revocation(),
             lifetime: socket.lifetime(),
             reachability: socket.reachability(),
-            socket: Arc::new(socket),
+            socket,
         }
     }
+}
+
+/// What the readmission timer runs besides the endpoint's own state: the network watch's check,
+/// its cadence, and the socket's resolution probe.
+struct Readmitting {
+    check: native::SharedCheck,
+    cadence: native::Cadence,
+    prober: socket::Prober,
+}
+
+/// Probes a member slot at its recorded address while that computer is still paired here, never
+/// once it is forgotten.
+fn member_probe(shared: &Arc<Shared>, prober: socket::Prober) -> native::Probe {
+    let shared = Arc::downgrade(shared);
+    Box::new(move |slot| {
+        let address = shared.upgrade().and_then(|shared| {
+            shared
+                .members
+                .get(slot)
+                .filter(|member| member.admitted())
+                .map(|member| member.address)
+        });
+        if let Some(address) = address {
+            prober(address);
+        }
+    })
 }
 
 impl GuardedEndpoint {
@@ -856,33 +882,39 @@ impl GuardedEndpoint {
         let runtime = HandleRuntime::current()?;
         let members = member_configs(identity, &selection.members)?;
         let refusing = SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?;
-        let prepared = native::prepare(&pinned, runtime.handle())?;
-        let socket = GuardedSocket::new(
+        let prepared = native::prepare(&pinned)?;
+        let socket = Arc::new(GuardedSocket::new(
             prepared.socket,
             &prepared.lock,
             pinned.local,
             &pinned.peers,
             prepared.reachability,
             prepared.signal,
-        )?;
+        )?);
+        let readmitting = Readmitting {
+            check: prepared.check,
+            cadence: native::CADENCE,
+            prober: socket.prober(),
+        };
         Self::assemble(
             Carrier::guarded(socket),
             members,
             refusing,
             runtime,
             Some(prepared.watch),
-            prepared.readmission,
+            Some(readmitting),
         )
     }
 
-    /// No default client config: every dial names one member's pinned configuration.
+    /// No default client config: every dial names one member's pinned configuration. The
+    /// readmission timer runs on `runtime`.
     fn assemble(
         carrier: Carrier,
         members: Box<[Member]>,
         refusing: quinn::ServerConfig,
         runtime: HandleRuntime,
         watch: Option<native::Watch>,
-        readmission: Option<native::Readmission>,
+        readmitting: Option<Readmitting>,
     ) -> io::Result<Self> {
         let Carrier {
             socket,
@@ -912,6 +944,16 @@ impl GuardedEndpoint {
             reachability,
             signal,
             endpoint: Mutex::new(Some(endpoint.clone())),
+        });
+        let readmission = readmitting.and_then(|readmitting| {
+            native::Readmission::for_group(
+                &network,
+                readmitting.check,
+                member_probe(&shared, readmitting.prober),
+                &shared.signal,
+                &shared.reachability,
+                readmitting.cadence,
+            )
         });
         Ok(Self {
             acceptor: tokio::sync::Mutex::new(Some(Acceptor::new(shared.clone(), network))),
@@ -1065,33 +1107,28 @@ impl GuardedEndpoint {
         Self::over_socket_rechecking(socket, selection, identity, None)
     }
 
-    /// As `over_socket`, and while a member is set aside `recheck` runs its check on its interval
-    /// the way a bind runs its network watch's check.
+    /// As `over_socket`, and while a member is set aside the timer runs `recheck`'s check and
+    /// probes on its cadence, as a bind runs its network watch's check.
     fn over_socket_rechecking<I: DatagramIo>(
         socket: GuardedSocket<I>,
         selection: &GroupSelection,
         identity: &DeviceIdentity,
-        recheck: Option<(native::SharedCheck, Duration)>,
+        recheck: Option<(native::SharedCheck, native::Cadence)>,
     ) -> io::Result<Self> {
         selection.validate(identity)?;
-        let carrier = Carrier::guarded(socket);
-        let runtime = HandleRuntime::current()?;
-        let readmission = recheck.map(|(check, interval)| {
-            native::Readmission::start(
-                runtime.handle(),
-                check,
-                carrier.signal.clone(),
-                carrier.reachability.clone(),
-                interval,
-            )
+        let socket = Arc::new(socket);
+        let readmitting = recheck.map(|(check, cadence)| Readmitting {
+            check,
+            cadence,
+            prober: socket.prober(),
         });
         Self::assemble(
-            carrier,
+            Carrier::guarded(socket),
             member_configs(identity, &selection.members)?,
             SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?,
-            runtime,
+            HandleRuntime::current()?,
             None,
-            readmission,
+            readmitting,
         )
     }
 

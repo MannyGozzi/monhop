@@ -39,6 +39,9 @@ use super::settings::{
 /// Tauri event carrying a `ClipboardView` whenever it changes.
 pub const EVENT: &str = "clipboard";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How long stopping waits for a read in progress. A read held past it (a macOS paste-access
+/// prompt left open, a program slow to render what it copied) finishes on its own and is dropped.
+const READ_WAIT: Duration = Duration::from_secs(1);
 
 /// Receives every changed view; the app forwards it to the window as the `EVENT` event.
 pub trait ViewEmitter: Send + Sync + 'static {
@@ -61,6 +64,7 @@ struct Backend {
     poll: Duration,
     /// macOS asks for paste access on the first read, so that read happens as the switch turns on.
     probe_on_switch: bool,
+    read_wait: Duration,
 }
 
 impl Backend {
@@ -70,6 +74,7 @@ impl Backend {
             reencode: Box::new(image::reencode_png),
             poll: POLL_INTERVAL,
             probe_on_switch: cfg!(target_os = "macos"),
+            read_wait: READ_WAIT,
         }
     }
 }
@@ -205,6 +210,71 @@ struct Watch {
     /// Set once the thread opened the clipboard.
     waker: Option<Waker>,
     thread: JoinHandle<()>,
+    gate: Arc<ReadGate>,
+}
+
+/// Every clipboard read of one watch passes through its gate, so stopping the watch can close it
+/// and wait until nothing is reading. Lock order: a gate before `Shared::state`, never the
+/// reverse, so a gate is closed only with `state` unlocked.
+struct ReadGate {
+    reads: Mutex<Reads>,
+    finished: Condvar,
+}
+
+struct Reads {
+    may_read: bool,
+    reading: bool,
+}
+
+impl ReadGate {
+    fn open() -> Arc<Self> {
+        Arc::new(Self {
+            reads: Mutex::new(Reads {
+                may_read: true,
+                reading: false,
+            }),
+            finished: Condvar::new(),
+        })
+    }
+
+    /// Runs `read` only while the gate is open and `allowed` holds. Both are checked under the
+    /// gate, and the read counts as in progress from then on, so `close` never misses one.
+    fn read<T>(&self, allowed: impl FnOnce() -> bool, read: impl FnOnce() -> T) -> Option<T> {
+        {
+            let mut reads = lock(&self.reads);
+            if !reads.may_read || !allowed() {
+                return None;
+            }
+            reads.reading = true;
+        }
+        let _reading = Reading(self);
+        Some(read())
+    }
+
+    /// No read starts after this returns, and none is in progress unless it outlasted `wait`.
+    fn close(&self, wait: Duration) {
+        let mut reads = lock(&self.reads);
+        reads.may_read = false;
+        let (reads, _) = self
+            .finished
+            .wait_timeout_while(reads, wait, |reads| reads.reading)
+            .unwrap_or_else(PoisonError::into_inner);
+        if reads.reading {
+            log::warn!(
+                "clipboard: a clipboard read is still in progress after sharing stopped; what it reads is dropped"
+            );
+        }
+    }
+}
+
+/// Ends a read in progress, also when the read unwinds.
+struct Reading<'a>(&'a ReadGate);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.reads).reading = false;
+        self.0.finished.notify_all();
+    }
 }
 
 /// A received item on its way to the clipboard.
@@ -328,10 +398,12 @@ impl ClipboardHub {
     }
 
     /// Saves the switch (it takes effect for this run even if saving fails). Turning it off stops
-    /// the clipboard thread, withdraws the item on offer and refuses transfers in progress.
+    /// the clipboard thread, withdraws the item on offer and refuses transfers in progress; once
+    /// it returns no clipboard read starts, and none is in progress unless it outlasted
+    /// `READ_WAIT`, the longest this waits.
     pub fn set_enabled(&self, enabled: bool) -> ClipboardView {
         let shared = &self.shared;
-        {
+        let stopped = {
             let mut state = shared.lock();
             if let Err(error) = state.setting.set_enabled(enabled) {
                 log::warn!("clipboard: the preference could not be saved: {error}");
@@ -341,10 +413,12 @@ impl ClipboardHub {
             shared.local_enabled.send_replace(enabled);
             if enabled {
                 shared.watch_if_needed(&mut state, shared.backend.probe_on_switch);
+                None
             } else {
-                shared.stop_watching(&mut state);
+                shared.stop_watching(&mut state)
             }
-        }
+        };
+        shared.close(stopped, shared.backend.read_wait);
         shared.announce()
     }
 
@@ -484,15 +558,18 @@ impl Shared {
         let generation = state.generation;
         let previous = state.stopping.take();
         let shared = Arc::clone(self);
+        let gate = ReadGate::open();
+        let reads = Arc::clone(&gate);
         match thread::Builder::new()
             .name("monhop-clipboard".into())
-            .spawn(move || shared.run_watch(generation, previous, probe))
+            .spawn(move || shared.run_watch(generation, previous, probe, reads))
         {
             Ok(thread) => {
                 state.watch = Some(Watch {
                     generation,
                     waker: None,
                     thread,
+                    gate,
                 });
             }
             Err(error) => log::warn!("clipboard: the clipboard thread could not start: {error}"),
@@ -500,21 +577,36 @@ impl Shared {
     }
 
     /// Drops all queued work and the item on offer, and tells the clipboard thread to stop.
-    fn stop_watching(&self, state: &mut State) {
+    /// Returns that thread's read gate, for `close` once `state` is unlocked.
+    #[must_use]
+    fn stop_watching(&self, state: &mut State) -> Option<Arc<ReadGate>> {
         state.encode = None;
         state.decode = None;
         state.apply = None;
         self.outbound.send_replace(None);
-        if let Some(watch) = state.watch.take() {
-            if let Some(waker) = &watch.waker {
-                waker.wake_by_ref();
-            }
-            state.stopping = Some(watch.thread);
+        let watch = state.watch.take()?;
+        if let Some(waker) = &watch.waker {
+            waker.wake_by_ref();
+        }
+        state.stopping = Some(watch.thread);
+        Some(watch.gate)
+    }
+
+    /// Returns once no read of the stopped watch is in progress or can start, waiting at most
+    /// `wait`. Never call it with the state locked.
+    fn close(&self, stopped: Option<Arc<ReadGate>>, wait: Duration) {
+        if let Some(gate) = stopped {
+            gate.close(wait);
         }
     }
 
     fn detach(&self, id: u64) {
-        {
+        self.detach_within(id, self.backend.read_wait);
+    }
+
+    /// Detaches `id`, waiting at most `wait` for a read of a watch this stops.
+    fn detach_within(&self, id: u64, wait: Duration) {
+        let stopped = {
             let mut state = self.lock();
             let Some(peer) = state.peers.remove(&id) else {
                 return;
@@ -525,9 +617,12 @@ impl Shared {
                 state.peers.len()
             );
             if state.peers.is_empty() {
-                self.stop_watching(&mut state);
+                self.stop_watching(&mut state)
+            } else {
+                None
             }
-        }
+        };
+        self.close(stopped, wait);
         self.announce();
     }
 
@@ -538,7 +633,8 @@ impl Shared {
                 return;
             }
             state.shutting_down = true;
-            self.stop_watching(&mut state);
+            // Shutdown never waits; a read not yet begun sees `shutting_down` under its gate.
+            let _ = self.stop_watching(&mut state);
         }
         self.codec_work.notify_all();
         if let Some(io) = &self.io {
@@ -547,7 +643,13 @@ impl Shared {
         log::info!("clipboard: stopping");
     }
 
-    fn run_watch(self: Arc<Self>, generation: u64, previous: Option<JoinHandle<()>>, probe: bool) {
+    fn run_watch(
+        self: Arc<Self>,
+        generation: u64,
+        previous: Option<JoinHandle<()>>,
+        probe: bool,
+        gate: Arc<ReadGate>,
+    ) {
         if let Some(previous) = previous {
             let _ = previous.join();
         }
@@ -566,7 +668,10 @@ impl Shared {
         if probe {
             // Raises the paste-access prompt while the user is at the switch; the item it returns
             // is discarded, never shared.
-            let _ = native.read(&ReadLimits::STANDARD);
+            let _ = gate.read(
+                || self.lock().watching(generation),
+                || native.read(&ReadLimits::STANDARD),
+            );
         }
         if !self.watch_started(generation, native.waker(), native.access()) {
             return;
@@ -574,6 +679,7 @@ impl Shared {
         log::info!("clipboard: watching local copies");
         Watcher {
             shared: &self,
+            gate: &gate,
             generation,
             native,
             guard,
@@ -610,7 +716,8 @@ impl Shared {
     fn watch_failed(&self, generation: u64) {
         let mut state = self.lock();
         if state.watching(generation) {
-            self.stop_watching(&mut state);
+            // Only this thread reads through the gate, and it never opened the clipboard.
+            let _ = self.stop_watching(&mut state);
         }
     }
 
@@ -948,6 +1055,7 @@ impl Shared {
 /// The clipboard thread's loop. It alone touches the adapter.
 struct Watcher<'a> {
     shared: &'a Shared,
+    gate: &'a ReadGate,
     generation: u64,
     native: Box<dyn NativeClipboard>,
     guard: EchoGuard,
@@ -984,11 +1092,14 @@ impl Watcher<'_> {
             Observation::Unchanged if !self.unread => return,
             Observation::Unchanged | Observation::Changed => {}
         }
-        if !self.shared.wants_content(self.generation) {
+        let read = self.gate.read(
+            || self.shared.wants_content(self.generation),
+            || self.native.read(&ReadLimits::STANDARD),
+        );
+        let Some(read) = read else {
             self.unread = false;
             return;
-        }
-        let read = self.native.read(&ReadLimits::STANDARD);
+        };
         let access = self.native.access();
         match read {
             Ok(snapshot) => {
@@ -1076,6 +1187,14 @@ impl ClipboardSink for LinkSink {
     fn note(&self, peer: CertificateFingerprint, note: ClipboardNote) {
         if let Some(shared) = self.shared.upgrade() {
             shared.note(self.id, peer, note);
+        }
+    }
+
+    /// Detaches at once, before the attachment is dropped. This runs on the link thread, so a
+    /// read in flight is left to finish and be discarded rather than waited for.
+    fn closed(&self, _: CertificateFingerprint) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.detach_within(self.id, Duration::ZERO);
         }
     }
 }
@@ -1225,7 +1344,10 @@ mod tests {
         source: Option<SourceMarker>,
         opened: usize,
         closed: usize,
+        /// Reads started.
         reads: usize,
+        /// Reads started and not yet returned.
+        reading: usize,
         waits: usize,
         writes: Vec<Written>,
     }
@@ -1255,16 +1377,60 @@ mod tests {
         }
     }
 
+    /// Blocks every call that passes it while held, counting the calls that arrived.
+    #[derive(Default)]
+    struct Hold {
+        held: Mutex<bool>,
+        released: Condvar,
+        arrived: AtomicUsize,
+    }
+
+    impl Hold {
+        fn hold(&self) {
+            *lock(&self.held) = true;
+        }
+
+        fn release(&self) {
+            *lock(&self.held) = false;
+            self.released.notify_all();
+        }
+
+        fn arrived(&self) -> usize {
+            self.arrived.load(Ordering::SeqCst)
+        }
+
+        fn pass(&self) {
+            self.arrived.fetch_add(1, Ordering::SeqCst);
+            let mut held = lock(&self.held);
+            while *held {
+                held = self
+                    .released
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+    }
+
+    /// Where the fake adapter can be held: opening the clipboard, and inside each read.
+    #[derive(Default)]
+    struct Holds {
+        open: Hold,
+        read: Hold,
+    }
+
     struct FakeNative {
         board: Arc<Mutex<Board>>,
+        holds: Arc<Holds>,
         thread: thread::Thread,
     }
 
     impl FakeNative {
-        fn open(board: Arc<Mutex<Board>>) -> Self {
+        fn open(board: Arc<Mutex<Board>>, holds: Arc<Holds>) -> Self {
+            holds.open.pass();
             lock(&board).opened += 1;
             Self {
                 board,
+                holds,
                 thread: thread::current(),
             }
         }
@@ -1322,8 +1488,14 @@ mod tests {
         }
 
         fn read(&mut self, _: &ReadLimits) -> Result<Snapshot, NativeError> {
+            {
+                let mut board = lock(&self.board);
+                board.reads += 1;
+                board.reading += 1;
+            }
+            self.holds.read.pass();
             let mut board = lock(&self.board);
-            board.reads += 1;
+            board.reading -= 1;
             let origin = board
                 .source
                 .map_or(Origin::Local, |marker| Origin::MonHop(Some(marker)));
@@ -1425,22 +1597,35 @@ mod tests {
         clipboard: FakeClipboard,
         decoder: Arc<Decoder>,
         views: Arc<Views>,
+        holds: Arc<Holds>,
     }
 
     impl Harness {
+        /// Stopping waits for a read in progress as long as any test waits for anything.
         fn new(decoder: Arc<Decoder>, probe_on_switch: bool) -> Self {
+            Self::with_read_wait(decoder, probe_on_switch, WAIT)
+        }
+
+        fn with_read_wait(
+            decoder: Arc<Decoder>,
+            probe_on_switch: bool,
+            read_wait: Duration,
+        ) -> Self {
             capture_logs();
             let clipboard = FakeClipboard::default();
             let board = Arc::clone(&clipboard.0);
+            let holds = Arc::new(Holds::default());
+            let adapter_holds = Arc::clone(&holds);
             let reencode = Arc::clone(&decoder);
             let backend = Backend {
                 native: Box::new(move || {
-                    let native = FakeNative::open(Arc::clone(&board));
+                    let native = FakeNative::open(Arc::clone(&board), Arc::clone(&adapter_holds));
                     Ok(Box::new(native) as Box<dyn NativeClipboard>)
                 }),
                 reencode: Box::new(move |png| reencode.reencode(png)),
                 poll: Duration::from_millis(10),
                 probe_on_switch,
+                read_wait,
             };
             let views = Arc::new(Views::default());
             let hub = ClipboardHub::launch(Box::new(Arc::clone(&views)), None, backend);
@@ -1449,6 +1634,7 @@ mod tests {
                 clipboard,
                 decoder,
                 views,
+                holds,
             }
         }
 
@@ -1499,11 +1685,50 @@ mod tests {
         fn outbound_is_empty(&self) -> bool {
             self.hub.shared.outbound.borrow().is_none()
         }
+
+        fn reading(&self) -> usize {
+            self.clipboard.board().reading
+        }
+
+        /// Runs `stop` on another thread while a read is held there, checks that it is still
+        /// waiting well after, then releases the read. Returns what `stop` returned and the reads
+        /// in progress as it returned.
+        fn stop_during_read<T: Send>(&self, stop: impl FnOnce() -> T + Send) -> (T, usize) {
+            assert_eq!(self.reading(), 1, "a read is held");
+            thread::scope(|scope| {
+                let stopping = scope.spawn(|| {
+                    let stopped = stop();
+                    (stopped, self.reading())
+                });
+                thread::sleep(QUIET);
+                assert!(
+                    !stopping.is_finished(),
+                    "stopping waits for the read in progress"
+                );
+                self.holds.read.release();
+                stopping.join().expect("stopping does not panic")
+            })
+        }
+
+        /// Copies after sharing stopped, and checks that nothing reads it.
+        async fn reads_nothing_more(&self) {
+            let reads = self.clipboard.reads();
+            self.clipboard
+                .copy(Item::Text("copied after sharing stopped".into()));
+            settle().await;
+            assert_eq!(
+                self.clipboard.reads(),
+                reads,
+                "a read started after sharing stopped"
+            );
+        }
     }
 
     impl Drop for Harness {
         fn drop(&mut self) {
             self.decoder.release();
+            self.holds.open.release();
+            self.holds.read.release();
         }
     }
 
@@ -1525,6 +1750,8 @@ mod tests {
         }
 
         fn note(&self, _: CertificateFingerprint, _: ClipboardNote) {}
+
+        fn closed(&self, _: CertificateFingerprint) {}
     }
 
     impl Recorder {
@@ -2091,6 +2318,171 @@ mod tests {
         );
         assert_eq!(peer.remote().recorder.received().len(), 1);
         assert_eq!(harness.clipboard.board().opened, 1);
+    }
+
+    #[tokio::test]
+    async fn switching_off_waits_for_an_in_flight_read_and_none_starts_after() {
+        let harness = Harness::on();
+        let peer = connect(&harness.hub, Some(true)).await;
+        harness.watching().await;
+        harness.ready(&peer).await;
+        harness.holds.read.hold();
+        harness
+            .clipboard
+            .copy(Item::Text("read as the switch goes off".into()));
+        until("the read to start", || harness.reading() == 1).await;
+
+        let (view, reading) = harness.stop_during_read(|| harness.hub.set_enabled(false));
+        assert!(!view.enabled);
+        assert_eq!(
+            reading, 0,
+            "no read is in progress once switching off returns"
+        );
+        harness.reads_nothing_more().await;
+        assert_eq!(harness.clipboard.reads(), 1);
+        until("the clipboard thread to stop", || {
+            harness.clipboard.board().closed == 1
+        })
+        .await;
+        assert!(
+            peer.remote().recorder.received().is_empty(),
+            "what the late read returned stays here"
+        );
+        assert!(harness.outbound_is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_last_detach_waits_for_an_in_flight_read_and_none_starts_after() {
+        let harness = Harness::on();
+        let mut first = connect(&harness.hub, Some(true)).await;
+        let mut last = connect(&harness.hub, Some(true)).await;
+        harness.watching().await;
+        harness.ready(&first).await;
+        harness.ready(&last).await;
+        harness.holds.read.hold();
+        harness
+            .clipboard
+            .copy(Item::Text("read as the last computer leaves".into()));
+        until("the read to start", || harness.reading() == 1).await;
+
+        // Another computer is still attached, so this detach neither stops nor waits.
+        first.attachment = None;
+        assert_eq!(harness.reading(), 1);
+        assert!(harness.hub.shared.lock().watch.is_some());
+
+        let attachment = last.attachment.take().expect("still attached");
+        let ((), reading) = harness.stop_during_read(move || drop(attachment));
+        assert_eq!(
+            reading, 0,
+            "no read is in progress once the last detach returns"
+        );
+        harness.reads_nothing_more().await;
+        assert_eq!(harness.clipboard.reads(), 1);
+        until("the clipboard thread to stop", || {
+            harness.clipboard.board().closed == 1
+        })
+        .await;
+        assert!(harness.hub.view().peers.is_empty());
+        for peer in [&first, &last] {
+            assert!(peer.remote().recorder.received().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_connection_detaches_before_its_attachment_drops() {
+        let harness = Harness::on();
+        let peer = connect(&harness.hub, Some(true)).await;
+        harness.watching().await;
+        harness.ready(&peer).await;
+        peer.pair.remote_side.close(quinn::VarInt::from_u32(0), b"");
+        until("the closed connection to detach", || {
+            harness.hub.view().peers.is_empty()
+        })
+        .await;
+        assert!(peer.attachment.is_some());
+        until("the clipboard thread to stop", || {
+            harness.clipboard.board().closed == 1
+        })
+        .await;
+        harness.reads_nothing_more().await;
+        // Switching on again while the attachment is still held starts no watch and no probe.
+        assert!(!harness.hub.set_enabled(false).enabled);
+        assert!(harness.hub.set_enabled(true).enabled);
+        settle().await;
+        assert!(harness.hub.shared.lock().watch.is_none());
+        harness.reads_nothing_more().await;
+    }
+
+    #[tokio::test]
+    async fn a_probe_read_never_starts_after_the_switch_turns_off() {
+        let harness = Harness::new(Arc::new(Decoder::default()), true);
+        let peer = connect(&harness.hub, Some(true)).await;
+        harness.ready(&peer).await;
+
+        // Off while the clipboard thread is still opening the clipboard: no probe follows.
+        harness.holds.open.hold();
+        assert!(harness.hub.set_enabled(true).enabled);
+        until("the clipboard thread to open the clipboard", || {
+            harness.holds.open.arrived() == 1
+        })
+        .await;
+        assert!(!harness.hub.set_enabled(false).enabled);
+        harness.holds.open.release();
+        until("the clipboard thread to stop", || {
+            harness.clipboard.board().closed == 1
+        })
+        .await;
+        assert_eq!(harness.clipboard.board().opened, 1);
+        assert_eq!(harness.clipboard.reads(), 0, "no probe after the switch");
+
+        // Off during the probe: switching off waits for it, and nothing is read after.
+        harness.holds.read.hold();
+        assert!(harness.hub.set_enabled(true).enabled);
+        until("the probe to start", || harness.reading() == 1).await;
+        let (view, reading) = harness.stop_during_read(|| harness.hub.set_enabled(false));
+        assert!(!view.enabled);
+        assert_eq!(
+            reading, 0,
+            "no probe is in progress once switching off returns"
+        );
+        harness.reads_nothing_more().await;
+        assert_eq!(harness.clipboard.reads(), 1);
+        until("the clipboard thread to stop", || {
+            harness.clipboard.board().closed == 2
+        })
+        .await;
+        assert!(peer.remote().recorder.received().is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_off_stops_waiting_for_a_stuck_read_and_none_starts_after() {
+        const GIVE_UP: Duration = Duration::from_millis(100);
+        let harness = Harness::with_read_wait(Arc::new(Decoder::default()), false, GIVE_UP);
+        assert!(harness.hub.set_enabled(true).enabled);
+        let peer = connect(&harness.hub, Some(true)).await;
+        harness.watching().await;
+        harness.ready(&peer).await;
+        harness.holds.read.hold();
+        harness
+            .clipboard
+            .copy(Item::Text("read by a clipboard that hangs".into()));
+        until("the read to start", || harness.reading() == 1).await;
+
+        let started = Instant::now();
+        assert!(!harness.hub.set_enabled(false).enabled);
+        let waited = started.elapsed();
+        assert!(waited >= GIVE_UP && waited < WAIT, "waited {waited:?}");
+        assert_eq!(harness.reading(), 1, "the stuck read is left to finish");
+
+        harness.holds.read.release();
+        until("the stuck read to finish", || harness.reading() == 0).await;
+        harness.reads_nothing_more().await;
+        assert_eq!(harness.clipboard.reads(), 1);
+        until("the clipboard thread to stop", || {
+            harness.clipboard.board().closed == 1
+        })
+        .await;
+        assert!(peer.remote().recorder.received().is_empty());
     }
 
     #[tokio::test]

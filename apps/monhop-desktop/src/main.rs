@@ -21,6 +21,7 @@ mod pairing;
 mod public_code_copy;
 mod settings;
 mod sharing;
+mod sharing_hub;
 mod sharing_preferences;
 mod snapshot;
 #[cfg(windows)]
@@ -146,11 +147,12 @@ fn pairing_status(controller: tauri::State<'_, Arc<PairingController>>) -> Pairi
     controller.status()
 }
 
+/// `fingerprint`, when given, is switched on first; the links open to every computer switched on.
 #[tauri::command]
 async fn sharing_edit_begin(
     app: tauri::AppHandle,
     interface_id: String,
-    fingerprint: String,
+    fingerprint: Option<String>,
 ) -> Result<SharingView, String> {
     #[cfg(target_os = "macos")]
     on_main_thread(&app, display_labels::refresh).await?;
@@ -158,7 +160,7 @@ async fn sharing_edit_begin(
     monhop_platform_windows::refresh_display_names();
     let controller = app.state::<Arc<AppController>>().inner().clone();
     spawn_blocking_command(
-        move || controller.edit_begin(interface_id, &fingerprint),
+        move || controller.edit_begin(interface_id, fingerprint.as_deref()),
         "Arranging did not start. Try again.",
     )
     .await?
@@ -184,6 +186,22 @@ async fn sharing_set_active(
     spawn_blocking_command(
         move || controller.set_active(fingerprint.as_deref(), interface_id.as_deref()),
         "The choice of computer did not apply. Try again.",
+    )
+    .await?
+}
+
+/// Switches one computer in or out of the group; the other computers stay as they are.
+#[tauri::command]
+async fn sharing_set_enabled(
+    app: tauri::AppHandle,
+    fingerprint: String,
+    enabled: bool,
+    interface_id: Option<String>,
+) -> Result<SharingView, String> {
+    let controller = app.state::<Arc<AppController>>().inner().clone();
+    spawn_blocking_command(
+        move || controller.set_enabled(&fingerprint, enabled, interface_id.as_deref()),
+        "The switch did not change. Try again.",
     )
     .await?
 }
@@ -328,15 +346,17 @@ async fn sharing_arrangements_for(
     .await?
 }
 
+/// `members` names the entry's computers when several entries of that name include `fingerprint`.
 #[tauri::command]
 async fn sharing_arrangement_forget(
     app: tauri::AppHandle,
     fingerprint: String,
     name: String,
+    members: Option<Vec<String>>,
 ) -> Result<Vec<arrangement_library::ArrangementView>, String> {
     let controller = app.state::<Arc<AppController>>().inner().clone();
     spawn_blocking_command(
-        move || controller.forget_arrangement(&fingerprint, &name),
+        move || controller.forget_arrangement(&fingerprint, &name, members.as_deref()),
         "The arrangement could not be forgotten.",
     )
     .await?
@@ -655,6 +675,7 @@ fn main() {
             sharing_edit_begin,
             sharing_edit_end,
             sharing_set_active,
+            sharing_set_enabled,
             sharing_apply_setup,
             sharing_touch,
             sharing_set_control,
@@ -673,6 +694,8 @@ fn main() {
             dimming::dimming_toggle,
             appearance::appearance_status,
             appearance::appearance_set_theme,
+            clipboard::clipboard_status,
+            clipboard::clipboard_set_enabled,
             window_hide,
             computers_load,
             computers_rename,
@@ -707,6 +730,15 @@ fn main() {
             }
             app.state::<Arc<AppController>>()
                 .use_setup_path(sharing_setup_path(app.handle())?);
+            // Idle until a Share session attaches; the switch it loads decides whether it ever
+            // reads the clipboard.
+            let clipboard = clipboard::ClipboardHub::start(
+                app.handle().clone(),
+                clipboard::setting_path(app.handle()),
+            );
+            app.state::<Arc<AppController>>()
+                .use_clipboard(Arc::clone(&clipboard));
+            app.manage(clipboard);
             autostart::init(app.handle());
             #[cfg(target_os = "macos")]
             if let Some(marker) = objc2::MainThreadMarker::new() {
@@ -983,6 +1015,7 @@ mod tests {
                 "allow-sharing-edit-begin",
                 "allow-sharing-edit-end",
                 "allow-sharing-set-active",
+                "allow-sharing-set-enabled",
                 "allow-sharing-apply-setup",
                 "allow-sharing-touch",
                 "allow-sharing-set-control",
@@ -1001,6 +1034,8 @@ mod tests {
                 "allow-dimming-toggle",
                 "allow-appearance-status",
                 "allow-appearance-set-theme",
+                "allow-clipboard-status",
+                "allow-clipboard-set-enabled",
                 "core:window:allow-start-dragging",
                 "core:window:allow-internal-toggle-maximize",
                 "core:window:allow-minimize",

@@ -58,6 +58,8 @@ struct StatusInput {
     sharing_phase: &'static str,
     /// Named so the menu can say which computer is on the other end of the link.
     peer_platform: Option<&'static str>,
+    /// Computers a link is connected with; with several the menu counts them instead.
+    connected_peers: usize,
 }
 
 impl TrayPresentation {
@@ -92,6 +94,9 @@ fn presentation_for(input: StatusInput) -> TrayPresentation {
     }
     let label = match input.sharing_phase {
         "connecting" => "Connecting".to_owned(),
+        "connected" if input.connected_peers > 1 => {
+            format!("Connected to {} computers", input.connected_peers)
+        }
         "connected" => format!("Connected to {}", peer_name(input.peer_platform)),
         "reconnecting" => "Reconnecting".to_owned(),
         "stopping" => "Stopping".to_owned(),
@@ -107,11 +112,13 @@ fn presentation_for(input: StatusInput) -> TrayPresentation {
 
 fn presentation_from_controller(controller: &AppController) -> TrayPresentation {
     let sharing = controller.sharing.status();
+    let (connected_peers, connected_platform) = sharing.connected_peers();
     presentation_for(StatusInput {
         sharing_active: sharing.sharing_active,
         busy: sharing.busy,
         sharing_phase: sharing.phase,
-        peer_platform: sharing.peer_platform,
+        peer_platform: connected_platform.or(sharing.peer_platform),
+        connected_peers,
     })
 }
 
@@ -376,7 +383,41 @@ mod tests {
             busy,
             sharing_phase,
             peer_platform: None,
+            connected_peers: 0,
         })
+    }
+
+    fn connected(peer_platform: Option<&'static str>, connected_peers: usize) -> TrayPresentation {
+        presentation_for(StatusInput {
+            sharing_active: false,
+            busy: false,
+            sharing_phase: "connected",
+            peer_platform,
+            connected_peers,
+        })
+    }
+
+    #[test]
+    fn several_connected_computers_are_counted_and_one_is_named() {
+        assert_eq!(connected(Some("macos"), 1).label, "Connected to Mac");
+        assert_eq!(
+            connected(Some("windows"), 1).menu_label(),
+            "Status: Connected to Windows PC"
+        );
+        let two = connected(None, 2);
+        assert_eq!(two.label, "Connected to 2 computers");
+        assert_eq!(two.tooltip(), "MonHop — Connected to 2 computers");
+        assert_eq!(two.tone, IconTone::Idle);
+        assert_eq!(connected(None, 3).label, "Connected to 3 computers");
+        // Sharing with any of them still outranks being connected to the rest.
+        let sharing = presentation_for(StatusInput {
+            sharing_active: true,
+            busy: true,
+            sharing_phase: "sharing",
+            peer_platform: None,
+            connected_peers: 2,
+        });
+        assert_eq!(sharing.label, "Sharing active");
     }
 
     #[test]
@@ -388,21 +429,13 @@ mod tests {
         assert_eq!(connecting.tone, IconTone::Idle);
         assert_eq!(status(false, true, "reconnecting").tone, IconTone::Idle);
         assert_eq!(status(false, true, "stopping").tone, IconTone::Idle);
-        let connected = presentation_for(StatusInput {
-            sharing_active: false,
-            busy: false,
-            sharing_phase: "connected",
-            peer_platform: Some("macos"),
-        });
-        assert_eq!(connected.label, "Connected to Mac");
-        assert_eq!(connected.tone, IconTone::Idle);
-        let windows_peer = presentation_for(StatusInput {
-            sharing_active: false,
-            busy: false,
-            sharing_phase: "connected",
-            peer_platform: Some("windows"),
-        });
-        assert_eq!(windows_peer.label, "Connected to Windows PC");
+        let mac = connected(Some("macos"), 1);
+        assert_eq!(mac.label, "Connected to Mac");
+        assert_eq!(mac.tone, IconTone::Idle);
+        assert_eq!(
+            connected(Some("windows"), 1).label,
+            "Connected to Windows PC"
+        );
         let sharing = status(true, true, "sharing");
         assert_eq!(sharing.label, "Sharing active");
         assert_eq!(sharing.tone, IconTone::Active);

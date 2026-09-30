@@ -230,6 +230,25 @@ impl GroupRecord {
         Ok(record)
     }
 
+    /// `new` for a layout made in the window, refused with the reason the window shows.
+    pub(crate) fn checked(
+        revision: u64,
+        author: &str,
+        mut members: Vec<GroupMember>,
+        layout: LayoutRequest,
+    ) -> Result<Self, String> {
+        members.sort_by_key(|member| fingerprint_key(&member.fingerprint));
+        let record = Self {
+            version: GROUP_RECORD_VERSION,
+            revision,
+            author: canonical_fingerprint(author).map_err(|error| error.to_string())?,
+            members,
+            layout,
+        };
+        record.check()?;
+        Ok(record)
+    }
+
     /// Today's pairwise record as a two-member group. Both computers' copies came from the same
     /// bytes, so they get the same content; the old decider's copy (lower DeviceId) is revision 2
     /// and the other's revision 1, so a pair whose copies drifted converges to the decider's.
@@ -272,6 +291,7 @@ impl GroupRecord {
 
     /// The two computers of a link and `layout`, stamped as a local change of the link's local
     /// end at `revision`.
+    #[cfg(test)]
     pub(crate) fn for_link(
         inspection: &InspectedPeer,
         layout: LayoutRequest,

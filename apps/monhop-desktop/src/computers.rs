@@ -61,6 +61,10 @@ pub struct ComputerView {
     platform: ComputerPlatform,
     address: Option<SocketAddrV4>,
     setup: SavedSetupView,
+    /// Switched on for sharing.
+    enabled: bool,
+    /// Named by the active group's record.
+    member: bool,
 }
 
 #[derive(Serialize)]
@@ -69,6 +73,15 @@ pub struct ComputersView {
     computers: Vec<ComputerView>,
     active: Option<String>,
     interface_id: Option<String>,
+    /// Every computer switched on for sharing, lowercase and sorted.
+    enabled: Vec<String>,
+    paused: bool,
+    /// The active group's record as Home draws it; null while the group needs arranging.
+    group: Option<SavedSetupView>,
+    /// A newer MonHop wrote the setup file, which this one reads as empty and never saves over.
+    setup_written_by_newer: bool,
+    /// The same for the saved arrangements.
+    arrangements_written_by_newer: bool,
 }
 
 /// The displays the live link or session reports, valid for exactly one computer.
@@ -80,13 +93,15 @@ pub struct LiveInspection<'a> {
 impl ComputersView {
     /// A computer with a trust record or a saved layout but no list entry (an older installation,
     /// or a list write that failed) is shown with a default name so it can be used or forgotten;
-    /// nothing is written until the user renames or pairs.
+    /// nothing is written until the user renames or pairs. `live` are the connections running
+    /// now, each drawn on its own computer's card.
     pub fn assemble(
         list: &ComputerList,
         trusted: &[PairedPeer],
         setup: &SetupFile,
-        live: Option<LiveInspection<'_>>,
+        live: &[LiveInspection<'_>],
         revision: &str,
+        arrangements_written_by_newer: bool,
     ) -> Self {
         let mut computers = list.computers.clone();
         let mut seed = |fingerprint: String, address, platform| {
@@ -117,22 +132,26 @@ impl ComputersView {
         for fingerprint in recorded {
             seed(fingerprint.to_ascii_uppercase(), None, None);
         }
+        let inspection_of = |fingerprint: &str| {
+            live.iter()
+                .find(|live| live.fingerprint == fingerprint)
+                .map(|live| live.inspection)
+        };
+        let active = setup.active_group();
         let computers = computers
             .into_iter()
             .map(|computer| {
                 let fingerprint = fingerprint_key(&computer.fingerprint);
-                let inspection = live
-                    .as_ref()
-                    .filter(|live| live.fingerprint == fingerprint)
-                    .map(|live| live.inspection);
                 ComputerView {
                     setup: SavedSetupView::from_group(
                         setup.group_with(&fingerprint),
                         setup.local(),
                         &fingerprint,
-                        inspection,
+                        inspection_of(&fingerprint),
                         revision,
                     ),
+                    enabled: setup.enabled().contains(&fingerprint),
+                    member: active.is_some_and(|record| record.has_member(&fingerprint)),
                     fingerprint,
                     name: computer.name,
                     platform: computer.platform,
@@ -140,10 +159,18 @@ impl ComputersView {
                 }
             })
             .collect();
+        let connections: Vec<&InspectedPeer> = live.iter().map(|live| live.inspection).collect();
         Self {
             computers,
             active: setup.active().map(str::to_owned),
             interface_id: setup.interface_id().map(str::to_owned),
+            enabled: setup.enabled().to_vec(),
+            paused: setup.paused(),
+            group: active.map(|record| {
+                SavedSetupView::for_group(record, setup.local(), &connections, revision)
+            }),
+            setup_written_by_newer: setup.written_by_newer(),
+            arrangements_written_by_newer,
         }
     }
 }
@@ -350,7 +377,7 @@ mod tests {
     fn first_launch_does_not_create_metadata_or_any_authority() {
         let directory = Directory::new();
         let list = ComputerList::load(&directory.file()).unwrap();
-        let view = ComputersView::assemble(&list, &[], &SetupFile::default(), None, "0");
+        let view = ComputersView::assemble(&list, &[], &SetupFile::default(), &[], "0", false);
         assert!(view.computers.is_empty());
         assert!(view.active.is_none());
         assert!(!directory.file().exists());
@@ -389,9 +416,15 @@ mod tests {
             fingerprint: &"b".repeat(64),
             inspection: &inspection,
         };
-        let view =
-            serde_json::to_value(ComputersView::assemble(&list, &[], &setup, Some(live), "7"))
-                .unwrap();
+        let view = serde_json::to_value(ComputersView::assemble(
+            &list,
+            &[],
+            &setup,
+            &[live],
+            "7",
+            false,
+        ))
+        .unwrap();
         assert_eq!(view["active"], "b".repeat(64));
         assert_eq!(view["interfaceId"], "en0:4:192.168.1.4");
         let computers = view["computers"].as_array().unwrap();
@@ -426,6 +459,147 @@ mod tests {
         assert!(view["computers"][0]["setup"]["peerFingerprint"].is_null());
     }
 
+    fn sorted_keys(value: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn the_views_carry_every_key_the_window_reads() {
+        use crate::sharing_preferences::tests::{file_with, inspection, preferences};
+        let saved = preferences();
+        let live_link = inspection(&saved);
+        let setup = file_with(saved);
+        let live = LiveInspection {
+            fingerprint: &"b".repeat(64),
+            inspection: &live_link,
+        };
+        let view = serde_json::to_value(ComputersView::assemble(
+            &ComputerList::default(),
+            &[],
+            &setup,
+            &[live],
+            "2",
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            sorted_keys(&view),
+            [
+                "active",
+                "arrangementsWrittenByNewer",
+                "computers",
+                "enabled",
+                "group",
+                "interfaceId",
+                "paused",
+                "setupWrittenByNewer",
+            ]
+        );
+        assert_eq!(view["enabled"], serde_json::json!(["b".repeat(64)]));
+        assert_eq!(view["paused"], false);
+        assert_eq!(view["setupWrittenByNewer"], false);
+        let card = &view["computers"][0];
+        assert_eq!(
+            sorted_keys(card),
+            [
+                "address",
+                "enabled",
+                "fingerprint",
+                "member",
+                "name",
+                "platform",
+                "setup"
+            ]
+        );
+        assert_eq!(card["enabled"], true);
+        assert_eq!(card["member"], true);
+        let setup_keys = [
+            "layout",
+            "live",
+            "localDisplays",
+            "members",
+            "message",
+            "peerDisplays",
+            "previewLayout",
+            "recordRevision",
+            "revision",
+            "saved",
+        ];
+        assert_eq!(sorted_keys(&card["setup"]), setup_keys);
+        assert_eq!(sorted_keys(&view["group"]), setup_keys);
+        // The group is the pair here, so Home draws exactly the card's picture.
+        assert_eq!(view["group"], card["setup"]);
+        assert_eq!(
+            sorted_keys(&view["group"]["members"][0]),
+            ["displays", "fingerprint"]
+        );
+        assert_eq!(view["group"]["members"][0]["fingerprint"], "a".repeat(64));
+        assert_eq!(view["group"]["members"][1]["displays"][0]["id"], "2");
+    }
+
+    #[test]
+    fn every_connected_computer_draws_its_own_live_displays() {
+        use crate::sharing_preferences::tests::{
+            file_with, inspection, keep_group, preferences, preferences_for_peer,
+        };
+        let with_b = preferences();
+        let mut with_c = preferences_for_peer('C');
+        with_c.peer_displays[0].size = [1280.0, 800.0];
+        let mut setup = file_with(with_b.clone());
+        keep_group(&mut setup, &with_c);
+        let (to_b, to_c) = (inspection(&with_b), inspection(&with_c));
+        let (b, c) = ("b".repeat(64), "c".repeat(64));
+        let live = [
+            LiveInspection {
+                fingerprint: &b,
+                inspection: &to_b,
+            },
+            LiveInspection {
+                fingerprint: &c,
+                inspection: &to_c,
+            },
+        ];
+        let view = serde_json::to_value(ComputersView::assemble(
+            &ComputerList::default(),
+            &[],
+            &setup,
+            &live,
+            "5",
+            false,
+        ))
+        .unwrap();
+        let card = |fingerprint: &str| {
+            view["computers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|computer| computer["fingerprint"] == fingerprint)
+                .cloned()
+                .expect("a card for each connected computer")
+        };
+        assert_eq!(
+            card(&b)["setup"]["live"]["peerDisplays"][0]["size"][0],
+            2560.0
+        );
+        assert_eq!(
+            card(&c)["setup"]["live"]["peerDisplays"][0]["size"][0],
+            1280.0
+        );
+        // Each card's layout fits its own connection; only B is switched on.
+        assert!(card(&b)["setup"]["layout"].is_object());
+        assert!(card(&c)["setup"]["layout"].is_object());
+        assert_eq!(card(&b)["enabled"], true);
+        assert_eq!(card(&c)["enabled"], false);
+        assert_eq!(card(&c)["member"], false);
+    }
+
     #[test]
     fn corrupt_or_oversized_lists_are_preserved() {
         let directory = Directory::new();
@@ -449,8 +623,9 @@ mod tests {
             &list,
             &trusted,
             &SetupFile::default(),
-            None,
+            &[],
             "1",
+            false,
         ))
         .unwrap();
         let computers = view["computers"].as_array().unwrap();

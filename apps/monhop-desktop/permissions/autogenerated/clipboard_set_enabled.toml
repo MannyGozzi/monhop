@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clipboard-set-enabled"
+description = "Enables the clipboard_set_enabled command without any pre-configured scope."
+commands.allow = ["clipboard_set_enabled"]
+
+[[permission]]
+identifier = "deny-clipboard-set-enabled"
+description = "Denies the clipboard_set_enabled command without any pre-configured scope."
+commands.deny = ["clipboard_set_enabled"]

@@ -326,6 +326,8 @@ fn start_with<N: NativeInput>(
         batch: Vec::new(),
         gaps: TickGap::new(now),
         last_floor: None,
+        #[cfg(test)]
+        passes: Rc::default(),
         _network_thread: PhantomData,
     };
     let hub = ShareHub {
@@ -832,6 +834,9 @@ pub(crate) struct HubLoop<N: NativeInput> {
     batch: Vec<HubAction>,
     gaps: TickGap,
     last_floor: Option<(FloorState, FloorPeer)>,
+    /// Loop passes so far.
+    #[cfg(test)]
+    passes: Rc<std::cell::Cell<u32>>,
     _network_thread: PhantomData<Rc<()>>,
 }
 
@@ -840,10 +845,17 @@ impl<N: NativeInput> HubLoop<N> {
         let mut tick = tokio::time::interval(SESSION_POLL_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let outcome = loop {
-            let housekeeping = tokio::select! {
-                _ = tick.tick() => true,
-                () = self.wake.notified() => false,
+            let housekeeping = if self.is_idle() {
+                self.park().await;
+                false
+            } else {
+                tokio::select! {
+                    _ = tick.tick() => true,
+                    () = self.wake.notified() => false,
+                }
             };
+            #[cfg(test)]
+            self.passes.set(self.passes.get() + 1);
             match self.step(housekeeping).await {
                 Ok(None) => {}
                 Ok(Some(end)) => break Ok(end),
@@ -851,6 +863,25 @@ impl<N: NativeInput> HubLoop<N> {
             }
         };
         self.teardown(outcome).await
+    }
+
+    /// No link, nothing queued and native input idle: the tick has nothing to time.
+    fn is_idle(&self) -> bool {
+        self.workers.state == NativeState::Idle
+            && self.queued.is_empty()
+            && self.seats.iter().all(|seat| matches!(seat, Seat::Empty))
+    }
+
+    /// Waits, with no timer, for a command or a revocation. A stop request wakes nothing, so it
+    /// is seen at the next wake.
+    async fn park(&mut self) {
+        self.report();
+        tokio::select! {
+            () = self.wake.notified() => {}
+            () = std::future::poll_fn(|cx| self.revocation.poll_revoked(cx)) => {}
+        }
+        // Time spent parked is not a stalled tick.
+        self.gaps = TickGap::new(self.origin.elapsed());
     }
 
     /// One pass: native lifecycle, commands, each link's frames in turn, captured records,
@@ -1563,7 +1594,7 @@ mod tests {
     };
     use monhop_protocol::{Capabilities, ControlPermissions, DisplayDescription};
     use std::{
-        cell::{Ref, RefCell},
+        cell::{Cell, Ref, RefCell},
         future::Future,
         net::{Ipv4Addr, SocketAddr},
         sync::atomic::{AtomicBool, AtomicU32, Ordering},
@@ -2247,6 +2278,8 @@ mod tests {
         hub: ShareHub,
         events: HubEvents,
         run: JoinHandle<Result<(), SessionFailure>>,
+        /// The hub loop's passes so far.
+        passes: Rc<Cell<u32>>,
         peers: Vec<Option<Rc<RefCell<Peer>>>>,
         endpoints: Vec<[quinn::Endpoint; 2]>,
     }
@@ -2263,6 +2296,7 @@ mod tests {
             )
             .expect("the hub starts");
             Self {
+                passes: run.passes.clone(),
                 run: tokio::task::spawn_local(run.run()),
                 peers: (0..count).map(|_| None).collect(),
                 endpoints: Vec::new(),
@@ -2650,6 +2684,68 @@ mod tests {
             assert_eq!(status.active_is_local, Some(false));
             group.quiet().await;
             group.finish().await;
+        });
+    }
+
+    /// Long enough for a ticking loop to make many passes, even on a coarse OS timer.
+    const IDLE: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn an_idle_hub_does_not_wake_until_a_command_arrives() {
+        scenario(async {
+            let mut group = Group::start(2);
+            tokio::time::sleep(IDLE).await;
+            let started = group.passes.get();
+            assert!(started <= 2, "an idle hub made {started} passes");
+
+            group.hub.request_local().unwrap();
+            group
+                .until("the hub serves the command", |group| {
+                    group.passes.get() > started
+                })
+                .await;
+            let served = group.passes.get();
+            tokio::time::sleep(IDLE).await;
+            let parked = group.passes.get() - served;
+            assert!(
+                parked <= 2,
+                "the hub made {parked} passes after the command"
+            );
+
+            // A link brings the tick back, and the hub parks again once native input is idle.
+            group.join(1).await;
+            let joined = group.passes.get();
+            tokio::time::sleep(IDLE).await;
+            let ticked = group.passes.get() - joined;
+            assert!(ticked >= 5, "a hub with a link made only {ticked} passes");
+            group.hub.remove_peer(group.device(1), DELIBERATE).unwrap();
+            assert_eq!(group.ended(1).await, Err(SessionFailure::Revoked));
+            group.native_idle().await;
+            let idle = group.passes.get();
+            tokio::time::sleep(IDLE).await;
+            let parked = group.passes.get() - idle;
+            assert!(parked <= 2, "the hub made {parked} passes once idle again");
+            group.finish().await;
+        });
+    }
+
+    #[test]
+    fn an_idle_hub_still_ends_on_its_revocation() {
+        scenario(async {
+            let computers: Vec<Computer> = (0..2).map(computer).collect();
+            let config = config(&computers, &ring(&computers));
+            let revocation = config.revocation.clone();
+            let (_hub, _events, run) =
+                start_with(config, FakeInput::default(), Duration::from_millis(500)).unwrap();
+            let mut run = tokio::task::spawn_local(run.run());
+            tokio::time::sleep(QUIET).await;
+            revocation.revoke();
+            let ended = timeout(PATIENCE, &mut run)
+                .await
+                .expect("the hub ends in time")
+                .expect("the hub's task");
+            assert_eq!(ended, Err(SessionFailure::Revoked));
+            assert!(!NativeSessionClaim::is_claimed());
         });
     }
 }

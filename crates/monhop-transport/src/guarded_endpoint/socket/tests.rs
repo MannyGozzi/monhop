@@ -62,6 +62,8 @@ struct TestIo {
     routes: Vec<(SocketAddrV4, Arc<Mutex<Inbox>>)>,
     receives: AtomicUsize,
     sends: AtomicUsize,
+    /// Every send attempt, whatever came of it: when, where to, and what.
+    attempts: Mutex<Vec<(Instant, SocketAddrV4, Vec<u8>)>>,
     blocked: AtomicBool,
     partial_send: AtomicBool,
     hard_send_error: AtomicBool,
@@ -85,6 +87,7 @@ impl TestIo {
             routes: Vec::new(),
             receives: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
+            attempts: Mutex::default(),
             blocked: AtomicBool::new(false),
             partial_send: AtomicBool::new(false),
             hard_send_error: AtomicBool::new(false),
@@ -117,6 +120,16 @@ impl TestIo {
     fn heal_sends(&self) {
         self.send_failures.lock().unwrap().clear();
     }
+    /// When each send to `destination` was attempted, and what it carried.
+    fn attempts_to(&self, destination: SocketAddrV4) -> Vec<(Instant, Vec<u8>)> {
+        self.attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, to, _)| *to == destination)
+            .map(|(at, _, bytes)| (*at, bytes.clone()))
+            .collect()
+    }
 }
 impl DatagramIo for TestIo {
     fn poll_receive(&self, cx: &mut Context<'_>, buffer: &mut [u8]) -> Poll<io::Result<Arrival>> {
@@ -141,6 +154,10 @@ impl DatagramIo for TestIo {
     }
     fn try_send_to(&self, buffer: &[u8], peer: SocketAddrV4) -> io::Result<usize> {
         self.sends.fetch_add(1, Ordering::SeqCst);
+        self.attempts
+            .lock()
+            .unwrap()
+            .push((Instant::now(), peer, buffer.to_vec()));
         if let Some(signal) = self.revoke_on_send.lock().unwrap().take() {
             signal.revoke();
         }
@@ -877,7 +894,7 @@ async fn the_socket_outlives_its_last_handle_until_the_drivers_run() {
 
 use super::super::{
     EndpointHandle, GroupMember, GroupSelection, GuardedEndpoint, MemberHandshakeFailure,
-    native::SharedCheck,
+    native::{Cadence, SharedCheck},
 };
 use crate::{
     crypto::CertificateFingerprint,
@@ -1728,6 +1745,7 @@ async fn dropping_the_endpoint_stops_the_timer() {
     let hub_id = DeviceIdentity::generate().unwrap();
     let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
     let [hub_socket, _, _] = two_member_network();
+    let hub_io = hub_socket.io.clone();
     let checks = Arc::new(AtomicUsize::new(0));
     // Finds the member still set aside on every run, so only a stop ends the timer.
     let check: SharedCheck = {
@@ -1738,23 +1756,27 @@ async fn dropping_the_endpoint_stops_the_timer() {
         })
     };
     let held = Arc::downgrade(&check);
+    let cadence = Cadence {
+        recheck: INTERVAL,
+        probe: INTERVAL * 2,
+    };
     let hub = GuardedEndpoint::over_socket_rechecking(
         hub_socket,
         &group(LOCAL, &[(MEMBERS[0], &ids[0]), (MEMBERS[1], &ids[1])]),
         &hub_id,
-        Some((check, INTERVAL)),
+        Some((check, cadence)),
     )
     .unwrap();
     let signal = hub.revocation_signal();
     let closed = hub.socket_closed();
     hub.set_reachable(&[false, true]);
     tokio::time::timeout(DEADLINE, async {
-        while checks.load(Ordering::SeqCst) < 2 {
+        while checks.load(Ordering::SeqCst) < 2 || hub_io.attempts_to(MEMBERS[0]).is_empty() {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
-    .expect("the timer rechecks while a member is set aside");
+    .expect("the timer rechecks and probes while a member is set aside");
 
     drop(hub);
     assert!(signal.is_revoked());
@@ -1766,11 +1788,331 @@ async fn dropping_the_endpoint_stops_the_timer() {
     .await
     .expect("the timer let go of its check");
     let stopped = checks.load(Ordering::SeqCst);
+    let probed = hub_io.attempts_to(MEMBERS[0]).len();
     tokio::time::sleep(INTERVAL * 5).await;
     assert_eq!(checks.load(Ordering::SeqCst), stopped);
+    assert_eq!(hub_io.attempts_to(MEMBERS[0]).len(), probed);
     tokio::time::timeout(DEADLINE, closed)
         .await
         .expect("the timer kept no part of the endpoint open");
+}
+
+/// Stands in for the production cadence, so probing runs in real time.
+const PROBING: Cadence = Cadence {
+    recheck: Duration::from_millis(20),
+    probe: Duration::from_millis(150),
+};
+
+/// A hub admitting two members on the memory link, its timer probing on `PROBING`, with each
+/// side's io. The timer's check finds every route once `routes_back` is set and changes nothing
+/// before.
+struct Probing {
+    hub: GuardedEndpoint,
+    hub_io: Arc<TestIo>,
+    reachability: Arc<Reachability>,
+    routes_back: Arc<AtomicBool>,
+    members: [(GuardedEndpoint, Arc<TestIo>); 2],
+    ids: [DeviceIdentity; 2],
+}
+
+fn probing() -> Probing {
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let [hub_socket, first_socket, second_socket] = two_member_network();
+    let hub_io = hub_socket.io.clone();
+    let reachability = hub_socket.reachability();
+    let routes_back = Arc::new(AtomicBool::new(false));
+    let check: SharedCheck = {
+        let (reachability, routes_back) = (reachability.clone(), routes_back.clone());
+        Arc::new(move || {
+            if routes_back.load(Ordering::SeqCst) {
+                reachability.set(&[true, true]);
+            }
+            true
+        })
+    };
+    let hub = GuardedEndpoint::over_socket_rechecking(
+        hub_socket,
+        &group(LOCAL, &[(MEMBERS[0], &ids[0]), (MEMBERS[1], &ids[1])]),
+        &hub_id,
+        Some((check, PROBING)),
+    )
+    .unwrap();
+    let members = [(first_socket, &ids[0]), (second_socket, &ids[1])].map(|(socket, id)| {
+        let io = socket.io.clone();
+        (guarded(socket, id, &[(LOCAL, &hub_id)]), io)
+    });
+    Probing {
+        hub,
+        hub_io,
+        reachability,
+        routes_back,
+        members,
+        ids,
+    }
+}
+
+/// When each send to `member` went out, once there are at least `count`, all of them probes.
+async fn probes(io: &TestIo, member: SocketAddrV4, count: usize) -> Vec<Instant> {
+    let sent = tokio::time::timeout(DEADLINE * 5, async {
+        loop {
+            let sent = io.attempts_to(member);
+            if sent.len() >= count {
+                break sent;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the timer probed the member");
+    assert!(sent.iter().all(|(_, bytes)| bytes[..] == PROBE));
+    sent.into_iter().map(|(at, _)| at).collect()
+}
+
+#[tokio::test]
+async fn a_set_aside_member_gets_a_probe_after_the_interval_and_none_before() {
+    let Probing {
+        hub,
+        hub_io,
+        members: [(first, first_io), (second, _)],
+        ids,
+        ..
+    } = probing();
+    let marked = Instant::now();
+    hub.set_reachable(&[false, true]);
+    tokio::time::sleep(PROBING.probe * 2 / 3).await;
+    assert!(hub_io.attempts_to(MEMBERS[0]).is_empty(), "probed early");
+    let probed = probes(&hub_io, MEMBERS[0], 2).await;
+    assert!(probed[0] >= marked + PROBING.probe);
+    assert!(probed[1] >= probed[0] + PROBING.probe);
+    assert!(hub_io.attempts_to(MEMBERS[1]).is_empty());
+    assert!(!hub.is_revoked());
+
+    // The member's Quinn drops each probe without a reply, and its endpoint carries on.
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let read = {
+                let inbox = first_io.inbox.lock().unwrap();
+                inbox.arrivals >= 2 && inbox.queue.is_empty()
+            };
+            if read {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the member read both probes");
+    tokio::time::sleep(PROBING.recheck).await;
+    assert_eq!(first_io.sends.load(Ordering::SeqCst), 0);
+    assert!(!first.is_revoked());
+
+    hub.set_reachable(&[true, true]);
+    let print = ids[0].fingerprint();
+    let (dialed, answered) = tokio::time::timeout(DEADLINE, async {
+        tokio::join!(
+            async { hub.connect_member(print).unwrap().await.unwrap() },
+            async { first.accept().await.unwrap() }
+        )
+    })
+    .await
+    .expect("the readmitted member answers");
+    hub.confirm_member(print, &dialed).unwrap();
+    delivers(&dialed, &answered).await;
+    for endpoint in [&hub, &first, &second] {
+        endpoint.revoke();
+    }
+}
+
+#[test]
+fn the_probe_passes_every_policy_check_and_is_one_byte() {
+    let [hub, first, second] = two_member_network();
+    // A reachable member needs no probe.
+    hub.probe(MEMBERS[0]);
+    assert_eq!(hub.io.sends.load(Ordering::SeqCst), 0);
+
+    hub.reachability.set(&[false, true]);
+    hub.probe(MEMBERS[0]);
+    hub.probe(MEMBERS[1]);
+    let sent = hub.io.attempts_to(MEMBERS[0]);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, [0]);
+    assert!(hub.io.attempts_to(MEMBERS[1]).is_empty());
+    assert_eq!(second.io.inbox.lock().unwrap().arrivals, 0);
+    {
+        let inbox = first.io.inbox.lock().unwrap();
+        let Some(Ok(Packet { arrival, bytes })) = inbox.queue.front() else {
+            panic!("the member set aside got no probe");
+        };
+        assert_eq!(bytes[..], PROBE);
+        assert_eq!(
+            (arrival.source, arrival.destination, arrival.interface_index),
+            (LOCAL, *MEMBERS[0].ip(), INDEX)
+        );
+    }
+    assert!(!hub.signal.is_revoked());
+
+    // Each reaches the member's Quinn without spending its first-packet budget.
+    for _ in 1..2 * FIRST_PACKET_BURST {
+        hub.probe(MEMBERS[0]);
+    }
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..2 * FIRST_PACKET_BURST {
+        let (result, meta) = receive(&first, &mut cx);
+        assert!(matches!(result, Poll::Ready(Ok(1))));
+        assert_eq!((meta.addr, meta.len), (LOCAL.into(), PROBE.len()));
+    }
+    assert!(receive(&first, &mut cx).0.is_pending());
+    assert_eq!(first.dropped[0].first_packets.load(Ordering::SeqCst), 0);
+
+    // Revoked, the socket probes no one.
+    hub.signal.revoke();
+    hub.probe(MEMBERS[0]);
+    assert_eq!(
+        hub.io.sends.load(Ordering::SeqCst),
+        2 * FIRST_PACKET_BURST as usize
+    );
+}
+
+#[test]
+fn a_probe_send_error_never_revokes() {
+    #[cfg(windows)]
+    let access_denied = 10_013; // WSAEACCES
+    #[cfg(not(windows))]
+    let access_denied = 13; // EACCES
+    let failures = [
+        io::ErrorKind::HostUnreachable,
+        io::ErrorKind::NetworkUnreachable,
+        io::ErrorKind::NetworkDown,
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::ConnectionRefused,
+        io::ErrorKind::WouldBlock,
+        io::ErrorKind::Other,
+    ]
+    .map(SendFailure::Kind)
+    .into_iter()
+    .chain(
+        unreachable_codes()
+            .into_iter()
+            .chain([access_denied])
+            .map(SendFailure::Os),
+    );
+    for failure in failures {
+        let [hub, first, second] = two_member_network();
+        hub.reachability.set(&[false, true]);
+        hub.io.fail_sends_to(MEMBERS[0], failure);
+        hub.probe(MEMBERS[0]);
+        hub.probe(MEMBERS[0]);
+        assert!(!hub.signal.is_revoked());
+        assert_eq!(hub.io.failed_sends.load(Ordering::SeqCst), 2);
+        assert_eq!(hub.dropped[0].probes.load(Ordering::SeqCst), 2);
+        // The other member's session carries on, and a probe once sends heal gets through.
+        hub.try_send(&to(MEMBERS[1])).unwrap();
+        assert_eq!(second.io.inbox.lock().unwrap().arrivals, 1);
+        hub.io.heal_sends();
+        hub.probe(MEMBERS[0]);
+        assert_eq!(first.io.inbox.lock().unwrap().arrivals, 1);
+        assert!(!hub.signal.is_revoked());
+    }
+
+    let stuck: [fn(&TestIo) -> &AtomicBool; 2] = [|io| &io.hard_send_error, |io| &io.blocked];
+    for stuck in stuck {
+        let [hub, _, _] = two_member_network();
+        hub.reachability.set(&[false, true]);
+        stuck(&hub.io).store(true, Ordering::SeqCst);
+        hub.probe(MEMBERS[0]);
+        assert!(!hub.signal.is_revoked());
+        assert_eq!(hub.dropped[0].probes.load(Ordering::SeqCst), 1);
+    }
+
+    // A short write is no send error: the socket misreported a datagram, and that still revokes.
+    let [hub, _, _] = two_member_network();
+    hub.reachability.set(&[false, true]);
+    hub.io.partial_send.store(true, Ordering::SeqCst);
+    hub.probe(MEMBERS[0]);
+    assert!(hub.signal.is_revoked());
+}
+
+#[tokio::test]
+async fn probing_stops_once_the_member_is_reachable() {
+    let Probing {
+        hub,
+        hub_io,
+        reachability,
+        routes_back,
+        members: [(first, _), (second, _)],
+        ..
+    } = probing();
+    hub.set_reachable(&[false, true]);
+    probes(&hub_io, MEMBERS[0], 1).await;
+
+    // The timer's own check finds its route again.
+    routes_back.store(true, Ordering::SeqCst);
+    tokio::time::timeout(DEADLINE, async {
+        while !reachability.reaches(0) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the timer readmitted the member");
+    let probed = hub_io.attempts_to(MEMBERS[0]).len();
+    tokio::time::sleep(PROBING.probe * 3).await;
+    assert_eq!(hub_io.attempts_to(MEMBERS[0]).len(), probed);
+
+    // Set aside again, it waits a whole interval for its first probe once more.
+    routes_back.store(false, Ordering::SeqCst);
+    let marked = Instant::now();
+    hub.set_reachable(&[false, true]);
+    let again = probes(&hub_io, MEMBERS[0], probed + 1).await;
+    assert!(again[probed] >= marked + PROBING.probe);
+    assert!(!hub.is_revoked());
+    for endpoint in [&hub, &first, &second] {
+        endpoint.revoke();
+    }
+}
+
+#[tokio::test]
+async fn no_probe_is_sent_to_a_non_member() {
+    let lock = memory_lock(LOCAL, &MEMBERS);
+    for stranger in [
+        "192.168.50.14:24800",
+        "192.168.50.12:24801",
+        "192.168.50.12:0",
+        "192.168.50.10:24800",
+    ] {
+        let socket = GuardedSocket::new(
+            TestIo::new(LOCAL, Arc::default(), Arc::default()),
+            &lock,
+            LOCAL,
+            &MEMBERS,
+            Reachability::new(MEMBERS.len()),
+            RevocationSignal::default(),
+        )
+        .unwrap();
+        // Even with every member set aside, a probe must name one of them exactly.
+        socket.reachability.set(&[false; 3]);
+        socket.probe(stranger.parse().unwrap());
+        assert!(socket.signal.is_revoked());
+        socket.probe(MEMBERS[0]);
+        assert_eq!(socket.io.sends.load(Ordering::SeqCst), 0);
+    }
+
+    // A computer forgotten on the endpoint is no longer paired there, and is never probed.
+    let Probing {
+        hub,
+        hub_io,
+        members: [(first, _), (second, _)],
+        ids,
+        ..
+    } = probing();
+    hub.forget_member(ids[0].fingerprint());
+    hub.set_reachable(&[false, false]);
+    probes(&hub_io, MEMBERS[1], 2).await;
+    assert!(hub_io.attempts_to(MEMBERS[0]).is_empty());
+    assert!(!hub.is_revoked());
+    for endpoint in [&hub, &first, &second] {
+        endpoint.revoke();
+    }
 }
 
 #[tokio::test]
@@ -1950,4 +2292,122 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
         Err(quinn::ConnectError::EndpointStopping)
     ));
     second.signal.revoke();
+}
+
+/// Runs on this Mac's physical network: `MONHOP_TEST_SOURCE` is its IPv4 address there and
+/// `MONHOP_TEST_SILENT_PEER` an unused address on the same subnet, which nothing answers. XNU
+/// rejects the silent member once resolution gives up and ignores route lookups until a send after
+/// its hold-down; the production timer's probe must be that send.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "set MONHOP_TEST_SOURCE and MONHOP_TEST_SILENT_PEER to an unused address on its subnet"]
+async fn native_probe_lifts_the_rejection_of_a_member_that_stopped_answering() {
+    use super::super::native::{CADENCE, Probe, Readmission};
+    use monhop_platform_macos::{network, udp_receive};
+
+    /// XNU's default net.link.ether.inet.host_down_time is 20 s; this allows for a longer one.
+    const HOLD_DOWN: Duration = Duration::from_secs(30);
+    let address = |variable: &str| -> Ipv4Addr {
+        std::env::var(variable)
+            .unwrap_or_else(|_| panic!("{variable} must be set for this explicit native test"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{variable} must contain an IPv4 address"))
+    };
+    let source = address("MONHOP_TEST_SOURCE");
+    let silent = address("MONHOP_TEST_SILENT_PEER");
+    let index = network::enumerate_adapters()
+        .unwrap()
+        .into_iter()
+        .find(|adapter| adapter.address == source)
+        .expect("the source's interface")
+        .index;
+    let socket = std::net::UdpSocket::bind((source, 0)).unwrap();
+    network::restrict_udp_interface(&socket, index).unwrap();
+    let receiver: NativeSocket = udp_receive::UdpReceiver::configure(socket)
+        .unwrap()
+        .into_async()
+        .unwrap()
+        .into();
+    let local = receiver.local_addr().unwrap();
+    let member = SocketAddrV4::new(silent, 9);
+    // Only this private fixture skips the lock; its member is an on-link private address all the same.
+    let hub = Arc::new(pinned_socket(receiver, local, &[member], index));
+
+    // Each session send is one resolution attempt; XNU rejects the entry once they run out.
+    NativeSocket::writable(&hub.io).await.unwrap();
+    for _ in 0..8 {
+        hub.try_send(&Transmit {
+            destination: member.into(),
+            ecn: None,
+            contents: b"resolve",
+            segment_size: None,
+            src_ip: None,
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+    }
+    let error = network::best_route(source, silent).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::HostUnreachable, "{error}");
+    let marked = Instant::now();
+    hub.reachability.set(&[false]);
+
+    // The production cadence and a check that reads only this member's route.
+    let check: SharedCheck = {
+        let reachability = hub.reachability();
+        Arc::new(move || match network::best_route(source, silent) {
+            Ok(route) if route.interface_index == index && route.next_hop.is_unspecified() => {
+                reachability.set(&[true]);
+                true
+            }
+            Ok(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::HostUnreachable => {
+                reachability.set(&[false]);
+                true
+            }
+            Err(_) => false,
+        })
+    };
+    let probed = Arc::new(Mutex::new(Vec::new()));
+    let probe: Probe = {
+        let (prober, probed) = (hub.prober(), probed.clone());
+        Box::new(move |_| {
+            probed.lock().unwrap().push(Instant::now());
+            prober(member);
+        })
+    };
+    let _timer = Readmission::start(
+        &tokio::runtime::Handle::current(),
+        check,
+        probe,
+        hub.revocation(),
+        hub.reachability(),
+        CADENCE,
+    );
+    let since_mark = |at: &Instant| *at - marked;
+    let readmitted = tokio::time::timeout(HOLD_DOWN + CADENCE.probe + CADENCE.recheck, async {
+        while !hub.reachability.reaches(0) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Instant::now()
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let probed: Vec<_> = probed.lock().unwrap().iter().map(since_mark).collect();
+        let revoked = hub.signal.is_revoked();
+        panic!("still set aside (revoked: {revoked}); probed {probed:?} after the mark")
+    });
+    assert!(!hub.signal.is_revoked());
+
+    // Readmitted by the check just after a probe, never by the passing of time alone.
+    let probed = probed.lock().unwrap().clone();
+    let last = *probed.last().expect("the member was probed");
+    let report = format!(
+        "readmitted {:?} and probed {:?} after the mark, {} probes failing in the hold-down",
+        since_mark(&readmitted),
+        probed.iter().map(since_mark).collect::<Vec<_>>(),
+        hub.dropped[0].probes.load(Ordering::SeqCst),
+    );
+    assert!(probed[0] >= marked + CADENCE.probe, "{report}");
+    assert!(readmitted - last <= CADENCE.recheck, "{report}");
+    hub.signal.revoke();
 }

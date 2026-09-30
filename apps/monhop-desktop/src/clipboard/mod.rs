@@ -1,8 +1,5 @@
 //! Optional clipboard sharing with connected computers: text and images, off by default.
 
-// The hub wiring step removes this once the app calls into the module.
-#![cfg_attr(not(test), allow(dead_code))]
-
 mod content;
 mod hub;
 mod image;
@@ -18,16 +15,11 @@ use std::{path::PathBuf, sync::Arc};
 
 use tauri::{AppHandle, Manager};
 
-pub use hub::ClipboardHub;
-// Each Share session holds one once the wiring step lands.
-#[allow(unused_imports)]
 pub use hub::ClipboardAttachment;
+pub use hub::ClipboardHub;
 pub use settings::ClipboardView;
 
-// The app glue below needs an AppHandle, which unit tests cannot build; main.rs uses it once wired.
-
 /// Where the switch is saved: `clipboard.json` in the app's local data directory.
-#[cfg_attr(test, allow(dead_code))]
 pub fn setting_path(app: &AppHandle) -> Option<PathBuf> {
     app.path()
         .app_local_data_dir()
@@ -35,17 +27,17 @@ pub fn setting_path(app: &AppHandle) -> Option<PathBuf> {
         .map(|directory| directory.join(settings::FILE_NAME))
 }
 
-#[cfg_attr(test, allow(dead_code))]
 #[tauri::command]
 pub fn clipboard_status(hub: tauri::State<'_, Arc<ClipboardHub>>) -> ClipboardView {
     hub.view()
 }
 
-#[cfg_attr(test, allow(dead_code))]
+/// Turning the switch off waits for a clipboard read in progress, so it never runs on the UI
+/// thread.
 #[tauri::command]
-pub fn clipboard_set_enabled(
-    hub: tauri::State<'_, Arc<ClipboardHub>>,
-    enabled: bool,
-) -> ClipboardView {
-    hub.set_enabled(enabled)
+pub async fn clipboard_set_enabled(app: AppHandle, enabled: bool) -> Result<ClipboardView, String> {
+    let hub = app.state::<Arc<ClipboardHub>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || hub.set_enabled(enabled))
+        .await
+        .map_err(|_| "The clipboard switch did not change. Try again.".to_owned())
 }

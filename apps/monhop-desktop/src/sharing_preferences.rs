@@ -47,6 +47,8 @@ const MIGRATED_CLOCK: u64 = 2;
 
 const MAX_INTERFACE_ID_BYTES: usize = 512;
 pub(crate) const MAX_LINKS: usize = 64;
+const GROUP_FULL: &str = "At most 8 computers can share together. Switch one off first.";
+const NOT_ANOTHER_COMPUTER: &str = "Choose one of the other computers.";
 const TEMPORARY_FILE_ATTEMPTS: usize = 64;
 
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
@@ -182,8 +184,9 @@ struct VersionedFile {
 impl SetupFile {
     /// `path` is this version's file. While it is absent, the version 3 file beside it is
     /// migrated in memory; that file is never written, so an older MonHop keeps its own setup,
-    /// and the next save writes `path`. A `path` a newer MonHop wrote loads empty and read-only,
-    /// an older file with nothing to migrate loads empty, and a damaged one is an error.
+    /// and the next save writes `path`. A file a newer MonHop wrote, in either place, loads empty
+    /// and read-only, so no save hides it; an older file with nothing to migrate loads empty, and
+    /// a damaged one is an error.
     pub fn load(path: &Path) -> io::Result<Self> {
         Self::load_as(
             path,
@@ -207,15 +210,7 @@ impl SetupFile {
                 SETUP_FILE_VERSION => {
                     serde_json::from_slice::<Self>(&bytes).map_err(|_| invalid_data())?
                 }
-                version if version > SETUP_FILE_VERSION => {
-                    log::warn!(
-                        "setup: the saved setup is version {version}, from a newer MonHop; it is kept as it is and nothing is saved over it"
-                    );
-                    return Ok(Self {
-                        newer: true,
-                        ..Self::default()
-                    });
-                }
+                version if version > SETUP_FILE_VERSION => return Ok(Self::from_newer(version)),
                 _ => return Err(invalid_data()),
             };
             file.validate().map_err(|_| invalid_data())?;
@@ -241,10 +236,23 @@ impl SetupFile {
             SETUP_FILE_VERSION => {
                 serde_json::from_slice::<Self>(&bytes).map_err(|_| invalid_data())?
             }
+            version if version > SETUP_FILE_VERSION => return Ok(Self::from_newer(version)),
             _ => return Ok(Self::default()),
         };
         file.validate().map_err(|_| invalid_data())?;
         Ok(file)
+    }
+
+    /// Empty and never saved: a save would overwrite the newer file, or, when it sits in the
+    /// version 3 place, hide it behind a `path` that is read instead from then on.
+    fn from_newer(version: u8) -> Self {
+        log::warn!(
+            "setup: the saved setup is version {version}, from a newer MonHop; it is kept as it is and nothing is saved over it"
+        );
+        Self {
+            newer: true,
+            ..Self::default()
+        }
     }
 
     /// The file `load` reads for `path` right now: `path` itself, else the version 3 file it
@@ -282,7 +290,6 @@ impl SetupFile {
         &self.enabled
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn paused(&self) -> bool {
         self.paused
     }
@@ -405,6 +412,54 @@ impl SetupFile {
         if !chosen {
             self.touch_active();
         }
+    }
+
+    /// Switches one other computer into or out of the enabled group as a local choice, touching
+    /// the resulting group's record. Switching one off leaves a group without a record of its
+    /// own derived from the previous record without it; a group that cannot be derived needs
+    /// arranging. Switching a computer on resumes a paused group; switching one off never does.
+    pub(crate) fn set_enabled(
+        &mut self,
+        fingerprint: &CertificateFingerprint,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        let key = fingerprint_key(&fingerprint.full_hex());
+        if self.local.as_deref().map(fingerprint_key).as_ref() == Some(&key) {
+            return Err(NOT_ANOTHER_COMPUTER);
+        }
+        let was = self.enabled.contains(&key);
+        if was == enabled && !(enabled && self.paused) {
+            return Ok(());
+        }
+        let previous = self.active_group().cloned();
+        if enabled {
+            if !was {
+                if self.enabled.len() + 1 >= MAX_GROUP_MEMBERS {
+                    return Err(GROUP_FULL);
+                }
+                self.enabled.push(key.clone());
+                self.enabled.sort();
+            }
+            self.paused = false;
+        } else {
+            self.enabled.retain(|peer| *peer != key);
+        }
+        if self.enabled.is_empty() || self.touch_active() || enabled {
+            return Ok(());
+        }
+        if let (Some(previous), Some(local)) = (previous, self.local.clone()) {
+            let revision = self.clock.saturating_add(1);
+            if let Some(derived) = previous.without_member(&key, revision, &local) {
+                self.store(derived);
+                self.clock = revision;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends a pause, keeping the group.
+    pub(crate) fn resume(&mut self) {
+        self.paused = false;
     }
 
     /// Restamps the active group's record as this computer's newest change; false when that
@@ -753,6 +808,7 @@ pub(crate) fn parse_fingerprint(value: &str) -> Result<CertificateFingerprint, S
 }
 
 /// Both directions allowed: the control map of a pair that has no record yet.
+#[cfg(test)]
 pub(crate) fn both_directions(local_fingerprint: &str, peer_fingerprint: &str) -> ControlMap {
     [local_fingerprint, peer_fingerprint]
         .into_iter()
@@ -860,6 +916,18 @@ pub struct SavedSetupView {
     /// Null unless this computer is the one with a live link or session.
     live: Option<LiveDisplays>,
     message: &'static str,
+    /// Every computer the record names, this one included, with the displays it holds for each.
+    members: Vec<MemberDisplays>,
+    /// Null without a record.
+    record_revision: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberDisplays {
+    /// Lowercase.
+    fingerprint: String,
+    displays: Vec<DisplaySnapshot>,
 }
 
 impl SavedSetupView {
@@ -872,11 +940,53 @@ impl SavedSetupView {
         inspection: Option<&InspectedPeer>,
         revision: &str,
     ) -> Self {
-        let layout = saved
+        let fits = saved
             .zip(inspection)
-            .filter(|(saved, inspection)| saved.fits_link(inspection))
-            .map(|(saved, _)| saved.layout().clone());
-        let message = if layout.is_some() {
+            .is_some_and(|(saved, inspection)| saved.fits_link(inspection));
+        Self {
+            live: inspection.map(|inspection| LiveDisplays {
+                local_displays: snapshots(&inspection.local_displays),
+                peer_displays: snapshots(&inspection.peer_displays),
+            }),
+            ..Self::drawn(saved, local, Some(peer), fits, revision)
+        }
+    }
+
+    /// The active group's picture. `live` are this computer's live connections; a pair draws
+    /// exactly as its card does, and a larger group fits while every connection it names does.
+    pub fn for_group(
+        record: &GroupRecord,
+        local: Option<&str>,
+        live: &[&InspectedPeer],
+        revision: &str,
+    ) -> Self {
+        let local_key = local.map(fingerprint_key);
+        let others: Vec<String> = record
+            .member_keys()
+            .into_iter()
+            .filter(|member| Some(member) != local_key.as_ref())
+            .collect();
+        let with = |member: &str| {
+            live.iter().copied().find(|inspection| {
+                fingerprint_key(&inspection.peer_fingerprint.full_hex()) == member
+            })
+        };
+        if let [peer] = others.as_slice() {
+            return Self::from_group(Some(record), local, peer, with(peer), revision);
+        }
+        let named: Vec<&InspectedPeer> = others.iter().filter_map(|member| with(member)).collect();
+        let fits = !named.is_empty() && named.iter().all(|inspection| record.fits_link(inspection));
+        Self::drawn(Some(record), local, None, fits, revision)
+    }
+
+    fn drawn(
+        saved: Option<&GroupRecord>,
+        local: Option<&str>,
+        peer: Option<&str>,
+        fits: bool,
+        revision: &str,
+    ) -> Self {
+        let message = if fits {
             "Saved layout fits the connected displays."
         } else if saved.is_some() {
             "Layout saved. The displays are checked when this computer connects."
@@ -893,15 +1003,25 @@ impl SavedSetupView {
         Self {
             saved: saved.is_some(),
             local_displays: displays(local),
-            peer_displays: displays(Some(peer)),
+            peer_displays: displays(peer),
             revision: revision.to_owned(),
-            layout,
+            layout: saved.filter(|_| fits).map(|saved| saved.layout().clone()),
             preview_layout: saved.map(|saved| saved.layout().clone()),
-            live: inspection.map(|inspection| LiveDisplays {
-                local_displays: snapshots(&inspection.local_displays),
-                peer_displays: snapshots(&inspection.peer_displays),
-            }),
+            live: None,
             message,
+            members: saved
+                .map(|saved| {
+                    saved
+                        .members()
+                        .iter()
+                        .map(|member| MemberDisplays {
+                            fingerprint: fingerprint_key(member.fingerprint()),
+                            displays: member.displays().to_vec(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            record_revision: saved.map(GroupRecord::revision),
         }
     }
 }
@@ -3185,6 +3305,36 @@ pub(crate) mod tests {
             Err(io::ErrorKind::Unsupported)
         );
         assert_eq!(fs::read(&path).unwrap(), newer);
+    }
+
+    #[test]
+    fn a_newer_legacy_setup_loads_read_only() {
+        let directory = TestDirectory::new();
+        let path = directory.path(SETUP_FILE);
+        let old_path = directory.path(V3_SETUP_FILE);
+        let mut newer = serde_json::to_value(file_with(preferences())).unwrap();
+        newer["version"] = serde_json::json!(SETUP_FILE_VERSION + 1);
+        newer["members"] = serde_json::json!({ "unknown": "to this version" });
+        let newer = serde_json::to_vec(&newer).unwrap();
+        write_raw(&old_path, &newer);
+        let mut loaded = SetupFile::load(&path).unwrap();
+        assert!(loaded.written_by_newer());
+        assert!(loaded.groups().is_empty());
+        assert!(!loaded.sharing_chosen());
+
+        // The first save is refused, so the newer file is never hidden behind one written here.
+        loaded.set_interface_id("en7:12:10.1.1.7");
+        assert_eq!(
+            loaded.save(&path).map_err(|error| error.kind()),
+            Err(io::ErrorKind::Unsupported)
+        );
+        let names: Vec<_> = fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [V3_SETUP_FILE], "no file was created");
+        assert_eq!(fs::read(&old_path).unwrap(), newer);
+        assert!(SetupFile::load(&path).unwrap().written_by_newer());
     }
 
     #[test]

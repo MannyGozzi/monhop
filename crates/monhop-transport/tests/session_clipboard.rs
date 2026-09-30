@@ -72,6 +72,8 @@ impl ClipboardSink for Recorder {
     fn note(&self, peer: CertificateFingerprint, note: ClipboardNote) {
         self.push(Event::Note(*peer.as_bytes(), note));
     }
+
+    fn closed(&self, _: CertificateFingerprint) {}
 }
 
 impl Recorder {
@@ -668,6 +670,32 @@ async fn four_violations_disable_the_link_once() {
         assert!(client.close_reason().is_none());
         assert!(pair.server.connection.close_reason().is_none());
         control_round_trip(&mut pair.client, &mut pair.server).await;
+    })
+    .await
+    .expect("test exceeded its deadline");
+}
+
+#[tokio::test]
+async fn a_link_disabled_for_violations_reports_the_peer_switch_off() {
+    let runtime = ClipboardRuntime::start();
+    timeout(TEST_TIMEOUT, async {
+        let pair = negotiated_pair().await;
+        let epoch = pair.server.initial_epoch.get();
+        let server = Side::attach(&pair.server, pair.client_id, true, &runtime);
+        let _client = Side::attach(&pair.client, pair.server_id, true, &runtime);
+        server.recorder.wait_peer_state(0, true).await;
+        let client = pair.client.connection.clone();
+        let mut bad_magic = header(ClipboardKind::Text, epoch, 1, 5);
+        bad_magic[0] ^= 0xFF;
+        for _ in 0..4 {
+            let stream = raw_stream(&client, &bad_magic).await;
+            assert_stopped(&stream).await;
+        }
+        server.recorder.wait_note(0, ClipboardNote::Disabled).await;
+        assert_eq!(
+            server.recorder.wait_peer_state(0, false).await,
+            *pair.client_id.as_bytes()
+        );
     })
     .await
     .expect("test exceeded its deadline");

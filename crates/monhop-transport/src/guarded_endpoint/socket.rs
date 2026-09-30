@@ -73,6 +73,15 @@ fn is_first_packet(datagram: &[u8]) -> bool {
     datagram.first().is_some_and(|first| first & 0xB0 == 0x80)
 }
 
+/// A resolution probe's whole datagram. Its short-header form never spends the receiver's
+/// first-packet budget, and Quinn drops it without a reply: one byte cannot hold the connection
+/// ID every MonHop endpoint's short header carries.
+const PROBE: [u8; 1] = [0];
+const _: () = assert!(PROBE[0] & 0x80 == 0);
+
+/// Sends one resolution probe to an address, through a socket that may already be gone.
+pub(super) type Prober = Box<dyn Fn(SocketAddrV4) + Send + Sync>;
+
 /// Which members the last route check could reach. A member without a usable route is absent:
 /// nothing is sent to it, nothing from it reaches Quinn and dials to it fail, until a later check
 /// finds its route. Shared by the route checks, the socket and the dialer.
@@ -140,6 +149,7 @@ impl Reachability {
 struct Dropped {
     sends: AtomicU64,
     first_packets: AtomicU64,
+    probes: AtomicU64,
 }
 
 /// Counts one drop, logging the count at powers of two so a lasting outage stays a few lines.
@@ -390,6 +400,46 @@ impl<I: DatagramIo> GuardedSocket<I> {
             return None;
         }
         Some((member, destination))
+    }
+
+    /// Sends `PROBE` to `destination` when it is a member set aside, so the platform resolves that
+    /// neighbor again: macOS keeps an unanswered neighbor rejected, and its route lookups failing,
+    /// until something sends to it after a hold-down. It takes the transmit path's checks and
+    /// pinned socket, and failing a check revokes; only the set-aside drop is skipped. A send
+    /// error is ignored: the next route check reads whether resolution resumed.
+    fn probe(&self, destination: SocketAddrV4) {
+        if self.signal.is_revoked() {
+            return;
+        }
+        let transmit = Transmit {
+            destination: destination.into(),
+            ecn: None,
+            contents: &PROBE,
+            segment_size: None,
+            src_ip: None,
+        };
+        let Some((member, destination)) = self.permitted_destination(&transmit) else {
+            self.revoke_because(&"a probe left the pinned peers");
+            return;
+        };
+        if self.reachability.reaches(member) {
+            return;
+        }
+        match self.io.try_send_to(transmit.contents, destination) {
+            Ok(length) if length == PROBE.len() => {}
+            Ok(_) => self.revoke_because(&"a probe was written short"),
+            Err(error) => count_drop(&self.dropped[member].probes, member, "probes", &error),
+        }
+    }
+
+    /// Probes through this socket only while something else keeps it open.
+    pub(super) fn prober(self: &Arc<Self>) -> Prober {
+        let socket = Arc::downgrade(self);
+        Box::new(move |destination| {
+            if let Some(socket) = socket.upgrade() {
+                socket.probe(destination);
+            }
+        })
     }
 }
 

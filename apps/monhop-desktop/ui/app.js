@@ -101,6 +101,7 @@ import {
   loadGate,
   pressForget,
 } from "./computer-card-model.mjs";
+import { clipboardContext, invokeSetComputerEnabled, pollFingerprint } from "./app-actions.mjs";
 import { forgetArrangementMotion } from "./dashboard-arrangement.mjs";
 import {
   applyDimmingView,
@@ -167,6 +168,10 @@ let sharingStatusPending = false;
 let dropCopyFeedback = emptyCopyFeedback();
 let dropCopyRequest = 0;
 let dimming = initialDimming();
+// Undefined until clipboard_status succeeds or a "clipboard" event arrives, so a backend built
+// before clipboard sharing landed leaves the Settings card hidden rather than showing a broken one.
+let clipboardView;
+let clipboardPending = false;
 let theme = "system";
 let themePending = false;
 // The header icon animates once after a click, not on every poll-driven render.
@@ -298,6 +303,8 @@ if (!uiCheck) {
   void refreshSharingStatus();
   void loadDimming();
   listenDimming();
+  void loadClipboard();
+  listenClipboard();
   void loadUpdatesStatus();
   // The initial page never runs through goToPage's entry hooks, so this covers a fresh
   // launch landing straight on Setup or Settings; the hooks below cover later visits.
@@ -481,6 +488,7 @@ function context() {
     computers,
     sharingView: sharing.view,
     active,
+    enabled: computers.enabled,
     nativeAvailable: state.nativeAvailable,
     localName: platformLabel(platform, true),
   });
@@ -516,6 +524,7 @@ function context() {
     copyFeedback: copyFeedbackFor(copyFeedback, pairingCodeSubject()),
     dropCopyFeedback,
     dimming,
+    clipboard: clipboardContext(clipboardView, clipboardPending),
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
     busy: controlsBusy(),
@@ -552,6 +561,8 @@ function context() {
       editCandidate,
       toggleCompared,
       useComputer,
+      setComputerEnabled,
+      setClipboardEnabled,
       startRename,
       draftRename,
       cancelRename,
@@ -1331,6 +1342,21 @@ async function useComputer(fingerprint) {
   await runSharing("active", () => core.invoke("sharing_set_active", { fingerprint, interfaceId }));
 }
 
+// Switches one computer on or off within the group everything else is enabled. Falls back to
+// today's single-active-computer command on its own (see invokeSetComputerEnabled) so this keeps
+// working unchanged against a backend built before sharing_set_enabled existed.
+async function setComputerEnabled(fingerprint, enabled) {
+  const interfaceId = state.selectedInterfaceId ?? null;
+  await runSharing("enabled", () =>
+    invokeSetComputerEnabled(
+      (command, payload) => core.invoke(command, payload),
+      fingerprint,
+      enabled,
+      interfaceId,
+    ),
+  );
+}
+
 async function beginLayoutEdit(fingerprint = activeFingerprint()) {
   const interfaceId = state.selectedInterfaceId;
   if (!fingerprint || !canEditLayout(sharing, interfaceId)) return;
@@ -1478,6 +1504,50 @@ function endDimDrag() {
   if (!renderAfterDrag) return;
   renderAfterDrag = false;
   render();
+}
+
+// ---------- clipboard ----------
+
+async function loadClipboard() {
+  if (!core?.invoke) return;
+  try {
+    clipboardView = await core.invoke("clipboard_status");
+    render();
+  } catch {
+    // No such command on this backend yet (or a transient failure): the card stays hidden until a
+    // status read succeeds or a "clipboard" event proves the backend actually has it.
+  }
+}
+
+// Rust announces every change (a toggle here, on the other computer, or a peer attaching), so the
+// card stays live without polling.
+function listenClipboard() {
+  const listen = window.__TAURI__?.event?.listen;
+  if (typeof listen !== "function") return;
+  void listen("clipboard", (event) => {
+    clipboardView = event.payload;
+    render();
+  });
+}
+
+// One in-flight clipboard command at a time; a failure surfaces in the page alert like updates and
+// autostart do, since the card itself carries no failure text of its own.
+async function runClipboardCommand(invoke) {
+  if (!core?.invoke || clipboardPending) return;
+  clipboardPending = true;
+  render();
+  try {
+    clipboardView = await invoke();
+  } catch (error) {
+    state = { ...state, messages: [nativeError(error)] };
+  } finally {
+    clipboardPending = false;
+    render();
+  }
+}
+
+function setClipboardEnabled(enabled) {
+  void runClipboardCommand(() => core.invoke("clipboard_set_enabled", { enabled }));
 }
 
 // ---------- updates ----------
@@ -1657,7 +1727,11 @@ async function refreshSharingStatus() {
 }
 
 function scheduleSharingPoll() {
-  if (sharingPollTimer !== null || !core?.invoke || !shouldPollSharing(sharing, computers.active))
+  if (
+    sharingPollTimer !== null ||
+    !core?.invoke ||
+    !shouldPollSharing(sharing, pollFingerprint(computers))
+  )
     return;
   sharingPollTimer = window.setTimeout(() => {
     sharingPollTimer = null;

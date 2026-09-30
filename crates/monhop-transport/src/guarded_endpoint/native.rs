@@ -6,7 +6,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use monhop_core::RevocationSignal;
@@ -83,7 +83,8 @@ pub(super) struct PreparedNetwork {
     pub reachability: Arc<Reachability>,
     pub signal: RevocationSignal,
     pub watch: Watch,
-    pub readmission: Option<Readmission>,
+    /// The watch's own check, for the readmission timer to rerun.
+    pub check: SharedCheck,
 }
 
 struct PreparedSelection {
@@ -95,8 +96,7 @@ struct PreparedSelection {
     check: SharedCheck,
 }
 
-/// `network` is the runtime that will drive the endpoint; it hosts the readmission timer.
-pub(super) fn prepare(pinned: &PinnedNetwork, network: &Handle) -> io::Result<PreparedNetwork> {
+pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
     let PreparedSelection {
         initial,
         mut lock,
@@ -129,7 +129,6 @@ pub(super) fn prepare(pinned: &PinnedNetwork, network: &Handle) -> io::Result<Pr
 
     revalidate_selection(&initial, pinned, &mut lock, &signal, None)?;
     reachability.set(lock.reachable());
-    let readmission = Readmission::for_group(network, check, &signal, &reachability);
 
     Ok(PreparedNetwork {
         socket,
@@ -137,7 +136,7 @@ pub(super) fn prepare(pinned: &PinnedNetwork, network: &Handle) -> io::Result<Pr
         reachability,
         signal,
         watch,
-        readmission,
+        check,
     })
 }
 
@@ -398,46 +397,69 @@ fn checking(
     })
 }
 
-/// How long after a member is set aside, and then how often, the timer reruns the check.
-const READMIT_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the timer reruns the check while a member is set aside, and how long each member set
+/// aside waits for each resolution probe.
+#[derive(Clone, Copy)]
+pub(super) struct Cadence {
+    pub recheck: Duration,
+    pub probe: Duration,
+}
+
+/// macOS holds an unanswered neighbor rejected for about 20 s and fails every send to it until
+/// then, so a probe every 10 s lands within 10 s of that hold-down ending.
+pub(super) const CADENCE: Cadence = Cadence {
+    recheck: Duration::from_secs(2),
+    probe: Duration::from_secs(10),
+};
+
+/// Sends one resolution probe to a member slot.
+pub(super) type Probe = Box<dyn Fn(usize) + Send + Sync>;
 
 /// Reruns the change watch's check while any member is set aside, because nothing may announce
-/// that member's route coming back: macOS reports no neighbor-entry change, for one. Dropping it
-/// stops the timer.
+/// that member's route coming back: macOS reports no neighbor-entry change, for one. It also
+/// probes each member set aside, because macOS lifts an unanswered neighbor's rejection only once
+/// something sends to it after the hold-down, and the socket sends such a member nothing else.
+/// Dropping it stops the timer.
 pub(super) struct Readmission(AbortHandle);
 
 impl Readmission {
-    /// None for a lone member: it is never set aside, so there is nothing to readmit.
-    fn for_group(
+    /// None for a lone member: it is never set aside, so there is nothing to readmit or probe.
+    pub(super) fn for_group(
         network: &Handle,
         check: SharedCheck,
+        probe: Probe,
         signal: &RevocationSignal,
         reachability: &Arc<Reachability>,
+        cadence: Cadence,
     ) -> Option<Self> {
         (reachability.len() > 1).then(|| {
             Self::start(
                 network,
                 check,
+                probe,
                 signal.clone(),
                 Arc::clone(reachability),
-                READMIT_INTERVAL,
+                cadence,
             )
         })
     }
 
-    /// The first check runs `interval` after a member is set aside, then one every `interval`
-    /// until every member is back or `signal` is revoked. Checks run on `network`'s blocking
-    /// pool, never on the workers driving the endpoint.
+    /// The first check runs `cadence.recheck` after a member is set aside, then one every
+    /// `cadence.recheck` until every member is back or `signal` is revoked. Each member set aside
+    /// is probed just before a check, first `cadence.probe` after the timer sees it set aside and
+    /// then no more often. Checks run on `network`'s blocking pool, never on the workers driving
+    /// the endpoint.
     pub(super) fn start(
         network: &Handle,
         check: SharedCheck,
+        probe: Probe,
         signal: RevocationSignal,
         reachability: Arc<Reachability>,
-        interval: Duration,
+        cadence: Cadence,
     ) -> Self {
         Self(
             network
-                .spawn(readmit(check, signal, reachability, interval))
+                .spawn(readmit(check, probe, signal, reachability, cadence))
                 .abort_handle(),
         )
     }
@@ -449,18 +471,63 @@ impl Drop for Readmission {
     }
 }
 
+/// When each member set aside is next due a resolution probe; none while it is reachable.
+struct ProbeSchedule {
+    due: Box<[Option<Instant>]>,
+    interval: Duration,
+}
+
+impl ProbeSchedule {
+    fn new(members: usize, interval: Duration) -> Self {
+        Self {
+            due: vec![None; members].into(),
+            interval,
+        }
+    }
+
+    /// Starts the wait of each member newly set aside and clears it for each reachable again; with
+    /// `probe`, also probes each member set aside whose wait ran out.
+    fn run(&mut self, reachability: &Reachability, probe: Option<&Probe>) {
+        let now = Instant::now();
+        for (member, due) in self.due.iter_mut().enumerate() {
+            if reachability.reaches(member) {
+                *due = None;
+                continue;
+            }
+            match (*due, probe) {
+                (None, _) => *due = Some(now + self.interval),
+                (Some(at), Some(probe)) if at <= now => {
+                    probe(member);
+                    // Counted from after the send, so two sends are never closer than `interval`.
+                    *due = Some(Instant::now() + self.interval);
+                }
+                (Some(_), _) => {}
+            }
+        }
+    }
+}
+
 async fn readmit(
     check: SharedCheck,
+    probe: Probe,
     signal: RevocationSignal,
     reachability: Arc<Reachability>,
-    interval: Duration,
+    cadence: Cadence,
 ) {
+    let mut probes = ProbeSchedule::new(reachability.len(), cadence.probe);
     loop {
+        if reachability.reaches_all() {
+            // A member set aside again later waits a whole interval for its first probe.
+            probes.due.fill(None);
+        }
         reachability.some_set_aside().await;
-        tokio::time::sleep(interval).await;
+        probes.run(&reachability, None);
+        tokio::time::sleep(cadence.recheck).await;
         if signal.is_revoked() {
             return;
         }
+        // Just before a check, so the check reads what the probe changed.
+        probes.run(&reachability, Some(&probe));
         if reachability.reaches_all() {
             continue;
         }
@@ -667,8 +734,6 @@ fn policy_category(error: PolicyError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
 
     #[test]
@@ -1039,6 +1104,8 @@ mod tests {
 
     /// Stands in for the two seconds, so the timer's cadence runs in real time.
     const INTERVAL: Duration = Duration::from_millis(20);
+    /// Stands in for the ten seconds between probes.
+    const PROBE_INTERVAL: Duration = Duration::from_millis(150);
     const SETTLE: Duration = Duration::from_secs(5);
 
     /// What the next check reads in place of the native adapter and route lookups, and when each
@@ -1065,12 +1132,14 @@ mod tests {
         }
     }
 
-    /// A group bound with `routes`, the check its watch and timer share, and the running timer.
+    /// A group bound with `routes`, the check its watch and timer share, the running timer, and
+    /// each probe it sent, by member slot.
     struct Readmitting {
         watched: PinnedLock,
         network: Arc<Network>,
         check: SharedCheck,
         signal: RevocationSignal,
+        probes: Arc<Mutex<Vec<(usize, Instant)>>>,
         _timer: Readmission,
     }
 
@@ -1084,20 +1153,41 @@ mod tests {
             let reading = Arc::clone(&network);
             let check = checking(&watched, move || reading.observe());
             let signal = RevocationSignal::default();
+            let probes = Arc::new(Mutex::new(Vec::new()));
+            let probe: Probe = {
+                let probes = Arc::clone(&probes);
+                Box::new(move |member| probes.lock().unwrap().push((member, Instant::now())))
+            };
             let timer = Readmission::start(
                 &Handle::current(),
                 Arc::clone(&check),
+                probe,
                 signal.clone(),
                 Arc::clone(&watched.reachability),
-                INTERVAL,
+                Cadence {
+                    recheck: INTERVAL,
+                    probe: PROBE_INTERVAL,
+                },
             );
             Self {
                 watched,
                 network,
                 check,
                 signal,
+                probes,
                 _timer: timer,
             }
+        }
+
+        /// When each probe to `member` went out.
+        fn probed(&self, member: usize) -> Vec<Instant> {
+            self.probes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(probed, _)| *probed == member)
+                .map(|(_, at)| *at)
+                .collect()
         }
 
         /// A change notice that reads `routes`: the watch runs the shared check once.
@@ -1245,14 +1335,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_group_of_one_has_nothing_to_readmit() {
+    async fn each_member_set_aside_waits_its_own_interval_for_a_probe() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let members = member_routes();
+        let group = Readmitting::bound(&selected, &members);
+        let first_marked = Instant::now();
+        group.notice(&selected, &with_down(&members, &[0]));
+        tokio::time::sleep(PROBE_INTERVAL / 2).await;
+        let second_marked = Instant::now();
+        group.notice(&selected, &with_down(&members, &[0, 2]));
+        until("both members are probed twice", || {
+            group.probed(0).len() >= 2 && group.probed(2).len() >= 2
+        })
+        .await;
+        for (member, marked) in [(0, first_marked), (2, second_marked)] {
+            let probed = group.probed(member);
+            assert!(
+                probed[0] >= marked + PROBE_INTERVAL,
+                "slot {member} probed early"
+            );
+            assert!(
+                probed[1] >= probed[0] + PROBE_INTERVAL,
+                "slot {member} probed twice"
+            );
+        }
+        assert!(group.probed(1).is_empty());
+        assert_eq!(reaches(&group.watched), [false, true, false]);
+        assert!(!group.signal.is_revoked());
+    }
+
+    #[tokio::test]
+    async fn a_group_of_one_has_nothing_to_readmit_or_probe() {
         let check: SharedCheck = Arc::new(|| true);
+        let probe = || -> Probe { Box::new(|_| panic!("a lone member was probed")) };
         let signal = RevocationSignal::default();
         let network = Handle::current();
         let alone = Reachability::new(1);
-        assert!(Readmission::for_group(&network, check.clone(), &signal, &alone).is_none());
+        assert!(
+            Readmission::for_group(&network, check.clone(), probe(), &signal, &alone, CADENCE)
+                .is_none()
+        );
         let group = Reachability::new(2);
-        assert!(Readmission::for_group(&network, check, &signal, &group).is_some());
+        assert!(
+            Readmission::for_group(&network, check, probe(), &signal, &group, CADENCE).is_some()
+        );
     }
 
     #[test]
