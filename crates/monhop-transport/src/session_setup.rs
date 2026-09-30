@@ -195,6 +195,25 @@ pub fn names_adapter(interface_id: &str, stable_id: &str, address: Ipv4Addr) -> 
         })
 }
 
+/// Whether two saved network ids resolve to the same adapter: ids that differ only in the index
+/// name one network, so neither needs the other's connections ended.
+pub fn same_network(saved: &str, chosen: &str) -> bool {
+    // Split from the right: a stable id may itself contain ':'.
+    let mut parts = chosen.rsplitn(3, ':');
+    let adapter = parts
+        .next()
+        .and_then(|address| address.parse().ok())
+        .and_then(|address| {
+            parts.next()?.parse::<u32>().ok()?;
+            Some((
+                parts.next().filter(|stable_id| !stable_id.is_empty())?,
+                address,
+            ))
+        });
+    saved == chosen
+        || adapter.is_some_and(|(stable_id, address)| names_adapter(saved, stable_id, address))
+}
+
 pub fn selected_network(interface_id: &str) -> Result<NetworkSelection, SetupFailure> {
     selected_adapter(interface_id).map(|(selection, _)| selection)
 }
@@ -1957,6 +1976,26 @@ mod network_id_tests {
             "mac:a0b1c2d3e4f5",
             ADDRESS
         ));
+    }
+
+    #[test]
+    fn ids_differing_only_in_the_index_are_the_same_network() {
+        let saved = interface_id("mac:a0b1c2d3e4f5", 19, ADDRESS);
+        assert!(same_network(&saved, &saved));
+        assert!(same_network(
+            &saved,
+            &interface_id("mac:a0b1c2d3e4f5", 18, ADDRESS)
+        ));
+        for other in [
+            interface_id("mac:a0b1c2d3e4f6", 19, ADDRESS),
+            interface_id("mac:a0b1c2d3e4f5", 19, Ipv4Addr::new(192, 168, 1, 5)),
+            ":19:192.168.1.4".into(),
+            "mac:a0b1c2d3e4f5:x:192.168.1.4".into(),
+            "mac:a0b1c2d3e4f5:19:192.168.1.4:9".into(),
+            String::new(),
+        ] {
+            assert!(!same_network(&saved, &other), "{other}");
+        }
     }
 }
 

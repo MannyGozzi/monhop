@@ -25,7 +25,7 @@ use monhop_transport::{
     session_handshake::{NegotiatedSession, device_id_from_fingerprint},
     session_hub::{HubClosed, HubConfig, HubEvent, HubEvents, PeerEnd, ShareHub, start_share_hub},
     session_link::{LinkCommand, LinkEvent, LinkPersist, run_setup_link_on},
-    session_setup::{GroupEndpoint, GroupMemberRecord, InspectedPeer, SetupFailure},
+    session_setup::{GroupEndpoint, GroupMemberRecord, InspectedPeer, SetupFailure, same_network},
 };
 use tokio::{
     sync::{
@@ -1002,7 +1002,7 @@ async fn ensure_endpoint<P: ShareHubPort>(
                 );
             }
             (
-                bound.interface_id == interface_id
+                same_network(&bound.interface_id, interface_id)
                     && !bound.endpoint.revocation().is_stopping()
                     && !left_out,
                 Rc::clone(&bound.endpoint),
@@ -2525,6 +2525,34 @@ mod tests {
             .collect();
         assert_eq!(binds.len(), 2);
         assert!(binds[0] < retired && retired < binds[1]);
+        finish(&app, &path);
+    }
+
+    #[test]
+    fn enabling_a_computer_on_the_same_adapter_renumbered_ends_nothing() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let record = trio(3, true);
+        let path = setup_holding("renumbered", &record);
+        let fake = Fake::default();
+        fake.accept('B', &record);
+        fake.answer('C', Answer::Refuse(SetupFailure::PeerIdentityChanged));
+        fake.accept('C', &record);
+        let app = app(&fake, &path);
+        supervise_until(&app, || {
+            sharing_with(&app, 'B') && peer_json(&app, 'C')["phase"] == "error"
+        });
+        // The file records index 4; the adapter came back as index 9 with its stable id and
+        // address. B's session is kept, and C's next worker dials under the renumbered id over
+        // the endpoint bound under the old one.
+        app.set_enabled(&key('B'), true, Some("en0:9:192.168.1.4"))
+            .unwrap();
+        supervise_until(&app, || sharing_with(&app, 'C'));
+        assert!(sharing_with(&app, 'B'));
+        assert_eq!((fake.added('B'), fake.added('C')), (1, 1));
+        assert_eq!(fake.count(|call| *call == Call::Retire), 0);
+        assert_eq!(fake.count(|call| matches!(call, Call::Bind(_))), 1);
+        let file = SetupFile::load(&path).unwrap();
+        assert_eq!(file.interface_id(), Some("en0:9:192.168.1.4"));
         finish(&app, &path);
     }
 

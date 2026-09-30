@@ -314,6 +314,25 @@ mod tests {
     }
 
     #[test]
+    fn the_middle_button_decodes_both_ways_unless_injected() {
+        assert_button(
+            decode_mouse(WM_MBUTTONDOWN, 0, 0, 0, 0, 0),
+            MouseButton::Middle,
+            true,
+        );
+        assert_button(
+            decode_mouse(WM_MBUTTONUP, 0, 0, 0, 0, 0),
+            MouseButton::Middle,
+            false,
+        );
+        // Mouse software that re-emits the button through SendInput is not physical input.
+        assert!(matches!(
+            decode_mouse(WM_MBUTTONDOWN, LLMHF_INJECTED, 0, 0, 0, 0),
+            DecodedInput::Ignored
+        ));
+    }
+
+    #[test]
     fn xbuttons_decode_to_back_and_forward() {
         assert_button(
             decode_mouse(WM_XBUTTONDOWN, 0, 0, u32::from(XBUTTON1) << 16, 0, 0),

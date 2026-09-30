@@ -9,7 +9,7 @@ use std::{
 
 use monhop_transport::{
     crypto::CertificateFingerprint,
-    session_setup::{DisplayTopology, InspectedPeer},
+    session_setup::{DisplayTopology, InspectedPeer, same_network},
 };
 
 use crate::{
@@ -464,7 +464,10 @@ impl AppController {
             return Ok(());
         }
         let file = self.load_setup(path, "The saved setup could not be read.")?;
-        if file.interface_id() == Some(interface_id) {
+        if file
+            .interface_id()
+            .is_some_and(|saved| same_network(saved, interface_id))
+        {
             return Ok(());
         }
         log::info!("user: chose another network; ending every connection first");
