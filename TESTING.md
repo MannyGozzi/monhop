@@ -223,6 +223,15 @@ Test 125/500/1000 Hz motion, simultaneous typing, both scroll axes, repeated cro
 MonHop must fail local when elevated Windows targets reject SendInput. It must not affect UAC or the secure desktop. macOS tests must follow TCC rather than bypassing it, and must verify tap-disable recovery. Dimming tests cover the chord with local input, the chord forwarded to the other computer while a session routes input there, edge switching while dimmed, the overlay's exclusion from screen capture, and the Home card's switch, darkness slider and Dim now button on both platforms.
 
 
+Autoscroll tests drive a Windows mouse on a Mac. They cover:
+
+- hold-and-drag and click-then-move in a browser, with the marker appearing and fading;
+- a middle click on a link and on a tab;
+- a click or key ending toggle mode, with Escape held before the click;
+- take-back and a pulled cable mid-scroll leaving no button or key down;
+- the Home switch off restoring plain middle drags;
+- a Mac source never autoscrolling.
+
 ## Explicit pairing checkpoint
 
 The new desktop pairing controller has no input command. Startup, pane navigation and native UI smoke checks do not read identity/trust storage or open a pairing socket. Pure tests cover public-code/record/message bounds, wrong/self identities, restart, duplicate/corrupt storage, readback failures, stale confirmation, cancellation around writes and a blocked store write.

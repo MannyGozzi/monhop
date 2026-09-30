@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-autoscroll-set-enabled"
+description = "Enables the autoscroll_set_enabled command without any pre-configured scope."
+commands.allow = ["autoscroll_set_enabled"]
+
+[[permission]]
+identifier = "deny-autoscroll-set-enabled"
+description = "Denies the autoscroll_set_enabled command without any pre-configured scope."
+commands.deny = ["autoscroll_set_enabled"]

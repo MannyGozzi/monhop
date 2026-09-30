@@ -43,6 +43,8 @@
     "allow-appearance-set-theme",
     "allow-clipboard-status",
     "allow-clipboard-set-enabled",
+    "allow-autoscroll-status",
+    "allow-autoscroll-set-enabled",
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-minimize",

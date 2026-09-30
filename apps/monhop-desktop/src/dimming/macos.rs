@@ -16,10 +16,12 @@ use objc2::{
 use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAnimationContext,
     NSApplicationDidChangeScreenParametersNotification, NSBackingStoreType, NSColor, NSScreen,
-    NSScreenSaverWindowLevel, NSWindow, NSWindowCollectionBehavior, NSWindowSharingType,
-    NSWindowStyleMask,
+    NSScreenSaverWindowLevel, NSWindow, NSWindowCollectionBehavior, NSWindowLevel,
+    NSWindowSharingType, NSWindowStyleMask,
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol, NSOperationQueue};
+use objc2_foundation::{
+    NSNotification, NSNotificationCenter, NSObjectProtocol, NSOperationQueue, NSRect,
+};
 
 const FADE_SECONDS: f64 = 0.18;
 
@@ -113,11 +115,24 @@ fn cover_screens(mtm: MainThreadMarker) -> Vec<Retained<NSWindow>> {
 }
 
 fn cover(mtm: MainThreadMarker, screen: &NSScreen) -> Retained<NSWindow> {
-    // SAFETY: a borderless buffered window created on the main thread from an AppKit screen frame.
+    let window = overlay_window(mtm, screen.frame(), NSScreenSaverWindowLevel);
+    window.setBackgroundColor(Some(&NSColor::blackColor()));
+    window.orderFrontRegardless();
+    window
+}
+
+/// A borderless window at `level` on every Space that is never an input target, in the window
+/// cycle or in a screen recording. It starts transparent and ordered out.
+pub(crate) fn overlay_window(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    level: NSWindowLevel,
+) -> Retained<NSWindow> {
+    // SAFETY: a borderless buffered window created on the main thread from a global-space frame.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer_screen(
             mtm.alloc::<NSWindow>(),
-            screen.frame(),
+            frame,
             NSWindowStyleMask::Borderless,
             NSBackingStoreType::Buffered,
             false,
@@ -126,7 +141,7 @@ fn cover(mtm: MainThreadMarker, screen: &NSScreen) -> Retained<NSWindow> {
     };
     // SAFETY: the Retained handle owns the window; AppKit must not release it on close.
     unsafe { window.setReleasedWhenClosed(false) };
-    window.setLevel(NSScreenSaverWindowLevel);
+    window.setLevel(level);
     window.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
             | NSWindowCollectionBehavior::Stationary
@@ -134,7 +149,6 @@ fn cover(mtm: MainThreadMarker, screen: &NSScreen) -> Retained<NSWindow> {
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
     );
     window.setIgnoresMouseEvents(true);
-    window.setBackgroundColor(Some(&NSColor::blackColor()));
     window.setOpaque(false);
     window.setHasShadow(false);
     // Never part of a screen recording or a shared screen, like the display list never sees it.
@@ -142,11 +156,15 @@ fn cover(mtm: MainThreadMarker, screen: &NSScreen) -> Retained<NSWindow> {
     window.setHidesOnDeactivate(false);
     window.setCanHide(false);
     window.setAlphaValue(0.0);
-    window.orderFrontRegardless();
     window
 }
 
-fn fade(windows: &[Retained<NSWindow>], alpha: f64, completion: Option<RcBlock<dyn Fn()>>) {
+/// Animates every window's opacity to `alpha` over `FADE_SECONDS`, from wherever it is now.
+pub(crate) fn fade(
+    windows: &[Retained<NSWindow>],
+    alpha: f64,
+    completion: Option<RcBlock<dyn Fn()>>,
+) {
     let targets = windows.to_vec();
     let changes = RcBlock::new(move |context: NonNull<NSAnimationContext>| {
         // SAFETY: AppKit hands the block a live animation context for the duration of the call.
@@ -158,7 +176,7 @@ fn fade(windows: &[Retained<NSWindow>], alpha: f64, completion: Option<RcBlock<d
     NSAnimationContext::runAnimationGroup_completionHandler(&changes, completion.as_deref());
 }
 
-fn close_all(windows: Vec<Retained<NSWindow>>) {
+pub(crate) fn close_all(windows: Vec<Retained<NSWindow>>) {
     for window in windows {
         window.orderOut(None);
         window.close();

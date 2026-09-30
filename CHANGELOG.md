@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- A Windows mouse controlling a Mac autoscrolls with its middle button like it does on Windows: hold and drag, or click once and move, then click or press Escape to stop. A small ring marks where it started. Turn off Middle-click autoscroll on the Mac's Home screen to keep plain middle clicks and drags.
+
 ### Fixed
 
 - A key or mouse button held down when sharing started no longer silently stops the pointer from crossing to another computer: Home names what to release.

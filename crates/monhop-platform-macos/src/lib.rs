@@ -391,9 +391,22 @@ impl MacInjector {
     }
 
     pub fn scroll(&mut self, horizontal: f64, vertical: f64) -> Result<(), MacError> {
-        backend::ensure_injection_permission()?;
-        let flags = self.modifier_flags();
         let point = self.cursor.anchor()?;
+        self.scroll_at(horizontal, vertical, point)
+    }
+
+    /// Like [`Self::scroll`], with the event located at `point`, clamped to the displays, instead
+    /// of the pointer. The pointer does not move.
+    pub fn scroll_at(
+        &mut self,
+        horizontal: f64,
+        vertical: f64,
+        point: Point,
+    ) -> Result<(), MacError> {
+        backend::ensure_injection_permission()?;
+        validate_absolute_point(point)?;
+        let point = self.cursor.bounds.clamp(point)?;
+        let flags = self.modifier_flags();
         self.scroll_residual.post(horizontal, vertical, |x, y| {
             backend::post_scroll(self.destination, x, y, SYNTHETIC_EVENT_MARKER, flags, point)
         })

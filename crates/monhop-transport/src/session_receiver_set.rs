@@ -235,7 +235,7 @@ impl<D: InputDestination> InputDestination for OwnerGuard<'_, D> {
 }
 
 /// Slot 1 is index 0; [`FloorPeer::NONE`] has none.
-fn index(slot: FloorPeer) -> Option<usize> {
+pub(crate) fn index(slot: FloorPeer) -> Option<usize> {
     usize::from(slot.get())
         .checked_sub(1)
         .filter(|&index| index < MAX_GROUP_PEERS)

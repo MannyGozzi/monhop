@@ -11,6 +11,8 @@ pub mod native_storage;
 pub mod pairing;
 pub mod session;
 pub mod session_actor;
+#[cfg(any(target_os = "macos", all(windows, test)))]
+mod session_autoscroll;
 pub mod session_clipboard;
 pub(crate) mod session_clock;
 #[cfg(any(windows, target_os = "macos"))]

@@ -23,7 +23,8 @@ use crate::{
     session_handshake::NegotiatedSession,
     session_hub_actor::{HubDestinationActor, PeerRefusal, SlotEvent},
     session_native::{
-        NativeDestination, current_displays, current_pointer_position, double_click_interval,
+        NativeDestination, SourcePlatforms, current_displays, current_pointer_position,
+        double_click_interval,
     },
     session_source::SourceController,
     session_source_runtime::{
@@ -32,8 +33,8 @@ use crate::{
 };
 use monhop_core::{
     CapturePermit, DeviceId, DisplayId, FloorOwner, FloorPeer, FloorState, InjectionPermit,
-    MAX_GROUP_PEERS, NativeSessionClaim, Point, RevocationSignal, SharedFloor, TakeBackGate,
-    Topology,
+    MAX_GROUP_PEERS, NativeSessionClaim, Platform, Point, RevocationSignal, SharedFloor,
+    TakeBackGate, Topology,
     capture::{CapturedEvent, StopReason},
 };
 use monhop_protocol::{DisplayTopology, Frame, SessionEpoch, SessionPurpose};
@@ -306,6 +307,7 @@ fn start_with<N: NativeInput>(
         starting: None,
         injection: None,
         destination: None,
+        sources: SourcePlatforms::default(),
     };
     let now = origin.elapsed();
     let run = HubLoop {
@@ -364,6 +366,7 @@ pub(crate) trait NativeInput: Clone + Send + 'static {
         revocation: RevocationSignal,
         permit: InjectionPermit,
         gate: TakeBackGate,
+        sources: SourcePlatforms,
     ) -> Result<HubDestinationActor, ActorFailure>;
     fn pointer(&self) -> Option<Point>;
 }
@@ -413,6 +416,7 @@ impl NativeInput for PlatformInput {
         revocation: RevocationSignal,
         permit: InjectionPermit,
         gate: TakeBackGate,
+        sources: SourcePlatforms,
     ) -> Result<HubDestinationActor, ActorFailure> {
         let local = self.local;
         let (native_displays, native_revocation, native_gate) =
@@ -429,6 +433,7 @@ impl NativeInput for PlatformInput {
                     permit,
                     native_revocation,
                     native_gate,
+                    sources,
                 )
             },
         )
@@ -465,6 +470,8 @@ struct Workers<N: NativeInput> {
     /// Held from the claim until the destination actor takes it.
     injection: Option<InjectionPermit>,
     destination: Option<HubDestinationActor>,
+    /// Each joined slot's platform, which the destination reads to know who drives it.
+    sources: SourcePlatforms,
 }
 
 /// What each native worker was doing when `CLEANUP_WAIT` ran out.
@@ -554,6 +561,7 @@ impl<N: NativeInput> Workers<N> {
                     self.revocation.clone(),
                     permit,
                     self.gate.clone(),
+                    self.sources.clone(),
                 )
                 .map_err(destination_failure)?;
             *lock(&self.actor_waker) = Some(actor.waker());
@@ -730,6 +738,7 @@ impl Setup {
 /// fills.
 struct Link {
     peer: DeviceId,
+    platform: Platform,
     io: LinkIo,
     inbox: mpsc::Receiver<Result<Frame, SessionFailure>>,
     reader: JoinHandle<()>,
@@ -749,7 +758,7 @@ impl Link {
         cancel: RevocationSignal,
         wake: Arc<Notify>,
     ) -> Self {
-        let peer = session.peer.device_id;
+        let (peer, platform) = (session.peer.device_id, session.peer.platform);
         let (mut reader, io) = LinkIo::split(session, progress.clone());
         let (frames, inbox) = mpsc::channel(SESSION_QUEUE_CAPACITY);
         let reader = tokio::spawn(async move {
@@ -767,6 +776,7 @@ impl Link {
         });
         Self {
             peer,
+            platform,
             io,
             inbox,
             reader,
@@ -1286,6 +1296,12 @@ impl<N: NativeInput> HubLoop<N> {
             local_lower,
             enabled,
         } = join;
+        let platform = match &self.seats[seat(slot)] {
+            Seat::Live(link) => Some(link.platform),
+            Seat::Empty | Seat::Closed(_) => None,
+        };
+        // Before the receiver runs, so its first press already knows its source.
+        self.workers.sources.set(slot, platform);
         let actor = self
             .workers
             .destination
@@ -1372,6 +1388,7 @@ impl<N: NativeInput> HubLoop<N> {
             return;
         };
         lock(&self.shared.peers)[index] = None;
+        self.workers.sources.set(slot, None);
         self.report_end(slot, *closed);
         self.admit_queued();
     }
@@ -2013,6 +2030,7 @@ mod tests {
             revocation: RevocationSignal,
             permit: InjectionPermit,
             gate: TakeBackGate,
+            _: SourcePlatforms,
         ) -> Result<HubDestinationActor, ActorFailure> {
             HubDestinationActor::start_after_local_enable(
                 displays,

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-autoscroll-status"
+description = "Enables the autoscroll_status command without any pre-configured scope."
+commands.allow = ["autoscroll_status"]
+
+[[permission]]
+identifier = "deny-autoscroll-status"
+description = "Denies the autoscroll_status command without any pre-configured scope."
+commands.deny = ["autoscroll_status"]

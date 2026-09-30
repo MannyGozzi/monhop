@@ -9,7 +9,8 @@ use crate::{
     session_clock::{SessionClock, millis_u64},
     session_handshake::NegotiatedSession,
     session_native::{
-        NativeDestination, current_displays, current_pointer_position, double_click_interval,
+        NativeDestination, SourcePlatforms, current_displays, current_pointer_position,
+        double_click_interval,
     },
     session_source::{SourceController, SourceEffect, SourceMode},
     session_source_runtime::{
@@ -126,6 +127,7 @@ pub async fn run_session(
     }
     let local = session.local.device_id;
     let peer = session.peer.device_id;
+    let sources = SourcePlatforms::sole(session.peer.platform);
     let expected_displays = session.local.topology.clone();
     let permissions = session.permissions;
     let outbound_scope = session.outbound_scope();
@@ -232,6 +234,7 @@ pub async fn run_session(
                 let native_gate = gate.clone();
                 let native_cancel = cancel.clone();
                 let displays = expected_displays.clone();
+                let sources = sources.clone();
                 let actor = DestinationActor::start_after_local_enable(
                     expected_displays.clone(),
                     cancel.clone(),
@@ -246,6 +249,7 @@ pub async fn run_session(
                             permit,
                             native_cancel,
                             native_gate,
+                            sources,
                         )
                     },
                 )

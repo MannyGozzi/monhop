@@ -6,11 +6,15 @@ use crate::{
     session_receiver::{DestinationAction, DestinationFailure, InputDestination},
 };
 use monhop_core::{
-    DeviceId, DisplayId, GesturePhase, InjectionPermit, Point, PointerGesture, RevocationSignal,
-    TakeBackGate,
+    DeviceId, DisplayId, FloorPeer, GesturePhase, InjectionPermit, MAX_GROUP_PEERS, Platform,
+    Point, PointerGesture, RevocationSignal, TakeBackGate,
     clicks::{ClickLanding, FALLBACK_DOUBLE_CLICK_INTERVAL},
 };
 use monhop_protocol::{DisplayDescription, DisplayTopology};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 /// Scroll wire values use signed wheel detents: positive right and positive up.
 /// A macOS pixel-scroll detent is forty points, with residual fractions retained by the injector.
@@ -18,10 +22,69 @@ pub const MAC_POINTS_PER_DETENT: f64 = 40.0;
 pub const WINDOWS_UNITS_PER_DETENT: f64 = 120.0;
 
 /// The last native destination check that failed in this process, as a small code for diagnostics.
-static LAST_DESTINATION_STEP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static LAST_DESTINATION_STEP: AtomicU8 = AtomicU8::new(0);
 
 pub fn last_destination_step() -> u8 {
-    LAST_DESTINATION_STEP.load(std::sync::atomic::Ordering::Acquire)
+    LAST_DESTINATION_STEP.load(Ordering::Acquire)
+}
+
+/// Off until the app applies the saved switch, so nothing autoscrolls before it decides.
+static AUTOSCROLL: AtomicBool = AtomicBool::new(false);
+static AUTOSCROLL_MARKER: OnceLock<Box<dyn Fn(AutoscrollMarker) + Send + Sync>> = OnceLock::new();
+
+/// Where the Mac's autoscroll origin marker goes: sent as an episode starts and as it ends.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AutoscrollMarker {
+    Show(Point),
+    Hide,
+}
+
+/// Whether a Windows mouse's middle button autoscrolls this Mac; off also ends a running episode.
+pub fn set_autoscroll_enabled(enabled: bool) {
+    AUTOSCROLL.store(enabled, Ordering::Release);
+}
+
+/// Registers the one marker sink; a second is refused. It runs on the injection thread, so it must
+/// hand the change to its own thread and return without waiting.
+pub fn set_autoscroll_marker(sink: impl Fn(AutoscrollMarker) + Send + Sync + 'static) -> bool {
+    AUTOSCROLL_MARKER.set(Box::new(sink)).is_ok()
+}
+
+/// The platform of the peer in each floor slot, so a destination knows which computer drives it.
+#[derive(Clone, Default)]
+pub(crate) struct SourcePlatforms(Arc<[AtomicU8; MAX_GROUP_PEERS]>);
+
+impl SourcePlatforms {
+    pub(crate) fn sole(platform: Platform) -> Self {
+        let sources = Self::default();
+        sources.set(FloorPeer::SOLE, Some(platform));
+        sources
+    }
+
+    pub(crate) fn set(&self, slot: FloorPeer, platform: Option<Platform>) {
+        if let Some(cell) = self.cell(slot) {
+            let code = match platform {
+                None => 0,
+                Some(Platform::Windows) => 1,
+                Some(Platform::MacOs) => 2,
+            };
+            cell.store(code, Ordering::Release);
+        }
+    }
+
+    /// None for an unknown or empty slot, which never starts autoscroll.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn of(&self, slot: FloorPeer) -> Option<Platform> {
+        match self.cell(slot)?.load(Ordering::Acquire) {
+            1 => Some(Platform::Windows),
+            2 => Some(Platform::MacOs),
+            _ => None,
+        }
+    }
+
+    fn cell(&self, slot: FloorPeer) -> Option<&AtomicU8> {
+        crate::session_receiver_set::index(slot).map(|index| &self.0[index])
+    }
 }
 
 fn note_step(step: u8) -> DestinationFailure {
@@ -113,6 +176,40 @@ pub(crate) struct NativeDestination {
     native: NativeInput,
     _ownership: InjectionPermit,
     sequencer: Sequencer,
+    #[cfg(target_os = "macos")]
+    autoscroll: MacAutoscroll,
+}
+
+/// A Windows mouse's middle button autoscrolls this Mac while the switch is on.
+#[cfg(target_os = "macos")]
+struct MacAutoscroll {
+    machine: crate::session_autoscroll::Autoscroll,
+    sources: SourcePlatforms,
+    /// The marker the app was last told about.
+    shown: Option<Point>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacAutoscroll {
+    /// The controller when a middle press may start autoscroll: a Windows source holds the floor.
+    fn starts(&self, sequencer: &Sequencer) -> Option<u64> {
+        let source = sequencer.admission.gate.floor().snapshot().peer;
+        (AUTOSCROLL.load(Ordering::Acquire) && self.sources.of(source) == Some(Platform::Windows))
+            .then(|| sequencer.controller())
+            .flatten()
+    }
+
+    /// Tells the app about changes only, so each episode signals once each way.
+    fn signal_marker(&mut self) {
+        let wanted = self.machine.marker();
+        if wanted == self.shown {
+            return;
+        }
+        self.shown = wanted;
+        if let Some(sink) = AUTOSCROLL_MARKER.get() {
+            sink(wanted.map_or(AutoscrollMarker::Hide, AutoscrollMarker::Show));
+        }
+    }
 }
 
 /// What must still hold for injection: no revocation, the ordinary desktop on Windows or the
@@ -146,10 +243,13 @@ impl NativeDestination {
         ownership: InjectionPermit,
         revocation: RevocationSignal,
         gate: TakeBackGate,
+        sources: SourcePlatforms,
     ) -> Result<Self, DestinationFailure> {
         if revocation.is_stopping() {
             return Err(note_step(1));
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = sources;
         #[cfg(windows)]
         let (left, top, right, bottom) = displays.displays().iter().fold(
             (
@@ -189,8 +289,23 @@ impl NativeDestination {
                 #[cfg(target_os = "macos")]
                 injector: monhop_platform_macos::MacInjector::new().map_err(|_| note_step(4))?,
             },
+            #[cfg(target_os = "macos")]
+            autoscroll: MacAutoscroll {
+                machine: crate::session_autoscroll::Autoscroll::new(),
+                sources,
+                shown: None,
+            },
         };
         Ok(result)
+    }
+}
+
+/// A destination that goes away mid-episode still takes its marker down.
+#[cfg(target_os = "macos")]
+impl Drop for NativeDestination {
+    fn drop(&mut self) {
+        self.autoscroll.machine.stop(std::time::Instant::now());
+        self.autoscroll.signal_marker();
     }
 }
 
@@ -209,6 +324,26 @@ impl WatchedDestination for NativeDestination {
     #[cfg(windows)]
     fn tick(&mut self) {
         self.native.injector.tick(std::time::Instant::now());
+    }
+    /// Posts the autoscroll owed since the last tick, behind the same gates as any other input.
+    #[cfg(target_os = "macos")]
+    fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        let (controller, enabled) = (
+            self.sequencer.controller(),
+            AUTOSCROLL.load(Ordering::Acquire),
+        );
+        if let Some(step) = self.autoscroll.machine.tick(now, controller, enabled) {
+            let native = &mut self.native;
+            if self
+                .sequencer
+                .apply(step.scroll, |post| native.post_scroll_at(post, step.at))
+                .is_err()
+            {
+                self.autoscroll.machine.stop(now);
+            }
+        }
+        self.autoscroll.signal_marker();
     }
 }
 
@@ -249,6 +384,20 @@ impl InputDestination for NativeDestination {
     fn apply(&mut self, action: DestinationAction) -> Result<(), DestinationFailure> {
         let native = &mut self.native;
         let displays = &self.displays;
+        #[cfg(target_os = "macos")]
+        {
+            let sequencer = &mut self.sequencer;
+            let starts = self.autoscroll.starts(sequencer);
+            let routed = self.autoscroll.machine.apply(
+                action,
+                starts,
+                std::time::Instant::now(),
+                |action| sequencer.apply(action, |post| native.post(displays, post)),
+            );
+            self.autoscroll.signal_marker();
+            routed
+        }
+        #[cfg(not(target_os = "macos"))]
         self.sequencer
             .apply(action, |post| native.post(displays, post))
     }
@@ -341,6 +490,13 @@ impl Sequencer {
     /// False once a take-back or a revocation has ended control since the action's admission.
     fn still_in_control(&self) -> bool {
         !self.revocation.is_stopping() && self.admission.gate.admits_injection()
+    }
+
+    /// The floor generation now in control, which a take-back or a new claim changes.
+    #[cfg(any(target_os = "macos", test))]
+    fn controller(&self) -> Option<u64> {
+        self.still_in_control()
+            .then(|| self.admission.gate.floor().snapshot().generation)
     }
 }
 
@@ -442,10 +598,10 @@ impl NativeInput {
                 DestinationAction::Scroll {
                     horizontal,
                     vertical,
-                } => self.injector.scroll(
-                    -horizontal * MAC_POINTS_PER_DETENT,
-                    vertical * MAC_POINTS_PER_DETENT,
-                ),
+                } => {
+                    let (horizontal, vertical) = mac_scroll_pixels(horizontal, vertical);
+                    self.injector.scroll(horizontal, vertical)
+                }
                 DestinationAction::Gesture(gesture) => self.injector.gesture(gesture),
                 DestinationAction::System(gesture) => self.injector.system_gesture(gesture),
                 DestinationAction::EndGestures => self.injector.end_gestures(),
@@ -462,6 +618,35 @@ impl NativeInput {
             Err(DestinationFailure)
         }
     }
+
+    /// An autoscroll step's scroll, its event placed at the origin rather than the pointer.
+    #[cfg(target_os = "macos")]
+    fn post_scroll_at(
+        &mut self,
+        action: DestinationAction,
+        at: Point,
+    ) -> Result<(), DestinationFailure> {
+        let DestinationAction::Scroll {
+            horizontal,
+            vertical,
+        } = action
+        else {
+            return Err(note_step(13));
+        };
+        let (horizontal, vertical) = mac_scroll_pixels(horizontal, vertical);
+        self.injector
+            .scroll_at(horizontal, vertical, at)
+            .map_err(|_| note_step(13))
+    }
+}
+
+/// Wire detents as macOS pixel-scroll deltas, whose horizontal axis runs the other way.
+#[cfg(target_os = "macos")]
+fn mac_scroll_pixels(horizontal: f64, vertical: f64) -> (f64, f64) {
+    (
+        -horizontal * MAC_POINTS_PER_DETENT,
+        vertical * MAC_POINTS_PER_DETENT,
+    )
 }
 
 /// Only the Windows injector keeps a key down through a pinch (its Ctrl); the Mac's zoom steps press
@@ -641,6 +826,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn each_floor_slot_names_its_source_platform_and_an_unknown_slot_names_none() {
+        let sources = SourcePlatforms::sole(Platform::Windows);
+        assert_eq!(sources.of(FloorPeer::SOLE), Some(Platform::Windows));
+        assert_eq!(sources.of(FloorPeer::NONE), None);
+        let second = FloorPeer::slot(2).unwrap();
+        assert_eq!(sources.of(second), None);
+        sources.clone().set(second, Some(Platform::MacOs));
+        assert_eq!(
+            sources.of(second),
+            Some(Platform::MacOs),
+            "clones share slots"
+        );
+        sources.set(FloorPeer::SOLE, None);
+        assert_eq!(sources.of(FloorPeer::SOLE), None);
+        sources.set(FloorPeer::NONE, Some(Platform::Windows));
+        assert_eq!(sources.of(FloorPeer::NONE), None);
+    }
 
     #[test]
     fn power_or_network_revocation_blocks_input_but_not_managed_release() {
@@ -1071,6 +1275,116 @@ mod landing_tests {
                 [Posted::ReleaseAll]
             );
         }
+    }
+
+    #[test]
+    fn autoscroll_started_under_control_never_scrolls_once_control_ends() {
+        use crate::session_autoscroll::Autoscroll;
+        use std::time::{Duration, Instant};
+        for revoke in [false, true] {
+            let (mut sequencer, gate) = sequencer();
+            let revocation = sequencer.revocation.clone();
+            let mut autoscroll = Autoscroll::new();
+            let start = Instant::now();
+            let controller = sequencer.controller();
+            assert!(controller.is_some());
+            let middle = |pressed| DestinationAction::Button {
+                button: MouseButton::Middle,
+                pressed,
+                click_count: 1,
+            };
+            let mut delivered = Vec::new();
+            for (millis, action) in [
+                (0, move_to(100.0, 100.0)),
+                (1, middle(true)),
+                (2, middle(false)),
+                (3, move_to(100.0, 400.0)),
+            ] {
+                let at = start + Duration::from_millis(millis);
+                autoscroll
+                    .apply(action, controller, at, |action| {
+                        let (result, posts) = apply(&mut sequencer, action, None);
+                        delivered.extend(posts);
+                        result
+                    })
+                    .unwrap();
+            }
+            assert_eq!(
+                delivered,
+                [
+                    Posted::Move(100.0, 100.0),
+                    Posted::Button(MouseButton::Middle, true, 1),
+                    Posted::Button(MouseButton::Middle, false, 1),
+                    Posted::Move(100.0, 400.0)
+                ]
+            );
+            assert!(!gate.injected_held());
+            let owed = start + Duration::from_millis(20);
+            assert!(
+                autoscroll
+                    .tick(owed, sequencer.controller(), true)
+                    .is_some()
+            );
+
+            end_control(&gate, &revocation, revoke);
+            assert_eq!(sequencer.controller(), None);
+            let later = start + Duration::from_millis(40);
+            assert_eq!(autoscroll.tick(later, sequencer.controller(), true), None);
+            assert_eq!(autoscroll.marker(), None, "the marker comes down");
+            let reclaimed = start + Duration::from_millis(60);
+            assert_eq!(
+                autoscroll.tick(reclaimed, controller, true),
+                None,
+                "and stays down"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_back_middle_click_never_drags_a_held_left_button() {
+        use crate::session_autoscroll::Autoscroll;
+        use std::time::Instant;
+        let (mut sequencer, _gate) = sequencer();
+        let controller = sequencer.controller();
+        let mut autoscroll = Autoscroll::new();
+        let middle = |pressed, click_count| DestinationAction::Button {
+            button: MouseButton::Middle,
+            pressed,
+            click_count,
+        };
+        let mut delivered = Vec::new();
+        for action in [
+            move_to(100.0, 100.0),
+            middle(true, 1),
+            middle(false, 1),
+            middle(true, 2),
+            middle(false, 2),
+            move_to(104.0, 100.0),
+            middle(true, 3),
+            left(true, 1),
+            middle(false, 3),
+        ] {
+            autoscroll
+                .apply(action, controller, Instant::now(), |action| {
+                    let (result, posts) = apply(&mut sequencer, action, None);
+                    delivered.extend(posts);
+                    result
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            delivered,
+            [
+                Posted::Move(100.0, 100.0),
+                Posted::Button(MouseButton::Middle, true, 1),
+                Posted::Button(MouseButton::Middle, false, 1),
+                Posted::Move(104.0, 100.0),
+                Posted::Button(MouseButton::Left, true, 1),
+                Posted::Button(MouseButton::Middle, true, 1),
+                Posted::Button(MouseButton::Middle, false, 1),
+            ],
+            "no snap back to an earlier click while left is down"
+        );
     }
 
     #[test]

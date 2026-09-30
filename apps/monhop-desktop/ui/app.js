@@ -102,6 +102,7 @@ import {
   pressForget,
 } from "./computer-card-model.mjs";
 import { clipboardContext, invokeSetComputerEnabled, pollFingerprint } from "./app-actions.mjs";
+import { autoscrollContext } from "./autoscroll-model.mjs";
 import { forgetArrangementMotion } from "./dashboard-arrangement.mjs";
 import {
   applyDimmingView,
@@ -172,6 +173,9 @@ let dimming = initialDimming();
 // before clipboard sharing landed leaves the Home card hidden rather than showing a broken one.
 let clipboardView;
 let clipboardPending = false;
+// Undefined until autoscroll_status answers; the card is a Mac's only.
+let autoscrollView;
+let autoscrollPending = false;
 let theme = "system";
 let themePending = false;
 // The header icon animates once after a click, not on every poll-driven render.
@@ -305,6 +309,7 @@ if (!uiCheck) {
   listenDimming();
   void loadClipboard();
   listenClipboard();
+  if (platform === "macos") void loadAutoscroll();
   void loadUpdatesStatus();
   // The initial page never runs through goToPage's entry hooks, so this covers a fresh
   // launch landing straight on Setup or Settings; the hooks below cover later visits.
@@ -525,6 +530,7 @@ function context() {
     dropCopyFeedback,
     dimming,
     clipboard: clipboardContext(clipboardView, clipboardPending),
+    autoscroll: autoscrollContext(platform, autoscrollView, autoscrollPending),
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
     busy: controlsBusy(),
@@ -563,6 +569,7 @@ function context() {
       useComputer,
       setComputerEnabled,
       setClipboardEnabled,
+      setAutoscrollEnabled,
       startRename,
       draftRename,
       cancelRename,
@@ -1548,6 +1555,37 @@ async function runClipboardCommand(invoke) {
 
 function setClipboardEnabled(enabled) {
   void runClipboardCommand(() => core.invoke("clipboard_set_enabled", { enabled }));
+}
+
+// ---------- autoscroll ----------
+
+async function loadAutoscroll() {
+  if (!core?.invoke) return;
+  try {
+    autoscrollView = await core.invoke("autoscroll_status");
+    render();
+  } catch {
+    // A backend without the command leaves the card hidden.
+  }
+}
+
+// One in-flight change at a time; a failed call surfaces in the page alert, a failed save on the card.
+async function runAutoscrollCommand(invoke) {
+  if (!core?.invoke || autoscrollPending) return;
+  autoscrollPending = true;
+  render();
+  try {
+    autoscrollView = await invoke();
+  } catch (error) {
+    state = { ...state, messages: [nativeError(error)] };
+  } finally {
+    autoscrollPending = false;
+    render();
+  }
+}
+
+function setAutoscrollEnabled(enabled) {
+  void runAutoscrollCommand(() => core.invoke("autoscroll_set_enabled", { enabled }));
 }
 
 // ---------- updates ----------

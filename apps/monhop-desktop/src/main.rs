@@ -2,6 +2,7 @@
 
 mod appearance;
 mod arrangement_library;
+mod autoscroll;
 mod autostart;
 mod clipboard;
 mod computers;
@@ -697,6 +698,8 @@ fn main() {
             appearance::appearance_set_theme,
             clipboard::clipboard_status,
             clipboard::clipboard_set_enabled,
+            autoscroll::autoscroll_status,
+            autoscroll::autoscroll_set_enabled,
             window_hide,
             computers_load,
             computers_rename,
@@ -746,6 +749,7 @@ fn main() {
                 display_labels::watch(marker);
             }
             app.manage(dimming::Dimming::start(app.handle(), !check_ui));
+            app.manage(autoscroll::Autoscroll::start(app.handle()));
             app.manage(updates::Updates::start(app.handle(), !check_ui));
             let appearance = appearance::Appearance::start(app.handle());
             app.manage(appearance.clone());
@@ -1037,6 +1041,8 @@ mod tests {
                 "allow-appearance-set-theme",
                 "allow-clipboard-status",
                 "allow-clipboard-set-enabled",
+                "allow-autoscroll-status",
+                "allow-autoscroll-set-enabled",
                 "core:window:allow-start-dragging",
                 "core:window:allow-internal-toggle-maximize",
                 "core:window:allow-minimize",

@@ -13,6 +13,7 @@ import {
   shortcutDescription,
 } from "./dimming-model.mjs";
 import { canInstall, installHint } from "./updates-model.mjs";
+import { AUTOSCROLL_LABEL, AUTOSCROLL_NOTE } from "./autoscroll-model.mjs";
 import {
   CLIPBOARD_PRIVACY,
   clipboardAccessNotice,
@@ -101,6 +102,8 @@ export function renderHome(nodes, ctx) {
   const clipboard = presence("home-clipboard", clipboardCard(ctx));
   if (clipboard) nodes.homeContent.append(clipboard);
   nodes.homeContent.append(dimmingCard(ctx));
+  const autoscroll = presence("home-autoscroll", autoscrollCard(ctx));
+  if (autoscroll) nodes.homeContent.append(autoscroll);
 
   const logPath = state.snapshot?.logPath;
   if (typeof logPath === "string" && logPath)
@@ -250,6 +253,28 @@ function dimmingCard({ core, dimming, actions }) {
         focusKey: "home-dimming-toggle",
         onClick: actions.toggleDimming,
       }),
+    ],
+  });
+}
+
+// Only on a Mac, once app.js has Rust's view: the switch matters when a Windows mouse controls it.
+function autoscrollCard({ core, autoscroll, actions }) {
+  if (!autoscroll) return null;
+  const { view, pending } = autoscroll;
+  return card({
+    id: "home-autoscroll",
+    title: "Mouse",
+    children: [
+      rows([
+        switchRow(AUTOSCROLL_LABEL, {
+          checked: view.enabled,
+          description: AUTOSCROLL_NOTE,
+          disabled: !core || pending || typeof actions.setAutoscrollEnabled !== "function",
+          focusKey: "home-autoscroll-enable",
+          onChange: actions.setAutoscrollEnabled,
+        }),
+      ]),
+      presence("home-autoscroll-message", view.error ? note(view.error, "danger") : null),
     ],
   });
 }
