@@ -7867,8 +7867,10 @@
         "monhop-transport@0.2.4",
         "objc2-app-kit@0.3.2",
         "objc2-core-graphics@0.3.2",
+        "objc2-core-image@0.3.2",
         "objc2-core-location@0.3.2",
         "objc2-foundation@0.3.2",
+        "objc2-quartz-core@0.3.2",
         "objc2-service-management@0.3.2",
         "objc2@0.6.4",
         "png@0.18.1",
@@ -8034,6 +8036,7 @@
         "objc2-core-foundation@0.3.2",
         "objc2-core-graphics@0.3.2",
         "objc2-foundation@0.3.2",
+        "objc2-quartz-core@0.3.2",
         "objc2@0.6.4"
       ]
     },
@@ -8124,7 +8127,9 @@
       "ref": "objc2-quartz-core@0.3.2",
       "dependsOn": [
         "bitflags@2.13.2",
+        "block2@0.6.2",
         "objc2-core-foundation@0.3.2",
+        "objc2-core-graphics@0.3.2",
         "objc2-foundation@0.3.2",
         "objc2@0.6.4"
       ]

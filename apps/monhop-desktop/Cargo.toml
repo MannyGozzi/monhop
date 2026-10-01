@@ -26,12 +26,14 @@ arboard = { version = "=3.6.1", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "=0.6.2", default-features = false, features = ["std"] }
-objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGEvent", "CGEventTypes", "objc2"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGColor", "CGEvent", "CGEventTypes", "CGPath", "objc2"] }
+objc2-core-image = { version = "=0.3.2", default-features = false, features = ["std", "CIFilter"] }
+objc2-quartz-core = { version = "=0.3.2", default-features = false, features = ["std", "block2", "CALayer", "CAAnimation", "CAMediaTiming", "CAMediaTimingFunction", "CAShapeLayer", "CATransaction", "objc2-core-foundation", "objc2-core-graphics"] }
 objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWorkspace", "NSScreen", "NSGraphics", "NSWindow", "NSView", "NSEvent", "NSResponder", "NSColor", "NSAnimation", "NSAnimationContext", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSBitmapImageRep", "NSBox", "NSAccessibility", "block2", "objc2-core-graphics"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWorkspace", "NSScreen", "NSGraphics", "NSWindow", "NSView", "NSEvent", "NSResponder", "NSColor", "NSAnimation", "NSAnimationContext", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSBitmapImageRep", "NSBox", "NSAccessibility", "block2", "objc2-core-graphics", "objc2-quartz-core"] }
 objc2-core-location = { version = "=0.3.2", default-features = false, features = ["std", "CLLocationManager", "CLLocationManagerDelegate"] }
 objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSDictionary", "NSValue", "NSProcessInfo", "NSNotification", "NSOperation", "NSError", "NSData", "NSArray", "objc2-core-foundation"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSDictionary", "NSValue", "NSProcessInfo", "NSNotification", "NSOperation", "NSError", "NSData", "NSArray", "NSKeyValueCoding", "objc2-core-foundation"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.38.2"

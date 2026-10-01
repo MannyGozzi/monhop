@@ -1,11 +1,14 @@
-//! The autoscroll origin marker: a small ring with a center dot in its own click-through window
-//! above normal windows on every Space. Everything here runs on the main thread, which is why each
-//! entry point takes a `MainThreadMarker`.
+//! The autoscroll origin marker: a ring with a center dot in the shared pointer-mark ink, in its own
+//! click-through window above normal windows on every Space. Everything here runs on the main
+//! thread, which is why each entry point takes a `MainThreadMarker`.
 
 use std::cell::RefCell;
 
 use block2::RcBlock;
-use monhop_core::Point;
+use monhop_core::{
+    Point,
+    pointer_mark::{MARK_INK, MARK_SHADE},
+};
 use monhop_transport::session_native::{AutoscrollMarker, set_autoscroll_marker};
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{
@@ -21,11 +24,6 @@ use crate::dimming::macos::{close_all, fade, overlay_window};
 const DIAMETER: f64 = 28.0;
 const RING_WIDTH: f64 = 2.0;
 const DOT_DIAMETER: f64 = 6.0;
-/// A white ring and dot over a translucent dark disc read on light and dark content alike.
-const INK_WHITE: f64 = 1.0;
-const INK_ALPHA: f64 = 0.9;
-const DISC_WHITE: f64 = 0.0;
-const DISC_ALPHA: f64 = 0.35;
 
 thread_local! {
     static MARKER: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
@@ -101,8 +99,8 @@ fn reduce_motion() -> bool {
 fn drawing(mtm: MainThreadMarker) -> Retained<NSView> {
     let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(DIAMETER, DIAMETER));
     let view = NSView::initWithFrame(mtm.alloc(), bounds);
-    let ink = NSColor::colorWithWhite_alpha(INK_WHITE, INK_ALPHA);
-    let disc = NSColor::colorWithWhite_alpha(DISC_WHITE, DISC_ALPHA);
+    let ink = NSColor::colorWithWhite_alpha(MARK_INK.white, MARK_INK.alpha);
+    let disc = NSColor::colorWithWhite_alpha(MARK_SHADE.white, MARK_SHADE.alpha);
     view.addSubview(&circle(mtm, bounds, RING_WIDTH, &disc, &ink));
     let inset = (DIAMETER - DOT_DIAMETER) / 2.0;
     let dot = NSRect::new(

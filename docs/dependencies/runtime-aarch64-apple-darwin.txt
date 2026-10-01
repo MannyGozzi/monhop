@@ -107,10 +107,12 @@ objc2 v0.6.4 MIT
 objc2-app-kit v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-core-foundation v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-core-graphics v0.3.2 Zlib OR Apache-2.0 OR MIT
+objc2-core-image v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-core-location v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-encode v4.1.0 MIT
 objc2-exception-helper v0.1.1 Zlib OR Apache-2.0 OR MIT
 objc2-foundation v0.3.2 MIT
+objc2-quartz-core v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-service-management v0.3.2 Zlib OR Apache-2.0 OR MIT
 objc2-web-kit v0.3.2 Zlib OR Apache-2.0 OR MIT
 once_cell v1.21.4 MIT OR Apache-2.0

@@ -9,6 +9,7 @@ use monhop_core::{
     DeviceId, DisplayId, FloorPeer, GesturePhase, InjectionPermit, MAX_GROUP_PEERS, Platform,
     Point, PointerGesture, RevocationSignal, TakeBackGate,
     clicks::{ClickLanding, FALLBACK_DOUBLE_CLICK_INTERVAL},
+    pointer_mark::{PageDirection, PageTurn},
 };
 use monhop_protocol::{DisplayDescription, DisplayTopology};
 use std::sync::{
@@ -30,7 +31,29 @@ pub fn last_destination_step() -> u8 {
 
 /// Off until the app applies the saved switch, so nothing autoscrolls before it decides.
 static AUTOSCROLL: AtomicBool = AtomicBool::new(false);
-static AUTOSCROLL_MARKER: OnceLock<Box<dyn Fn(AutoscrollMarker) + Send + Sync>> = OnceLock::new();
+static AUTOSCROLL_MARKER: MarkSink<AutoscrollMarker> = MarkSink::new();
+static PAGE_TURN_MARK: MarkSink<PageTurn> = MarkSink::new();
+
+/// A pointer mark's one app-registered sink. It runs on the injection thread, so it must hand the
+/// change to its own thread and return without waiting.
+struct MarkSink<T>(OnceLock<Box<dyn Fn(T) + Send + Sync>>);
+
+impl<T> MarkSink<T> {
+    const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    /// A second registration is refused.
+    fn set(&self, sink: impl Fn(T) + Send + Sync + 'static) -> bool {
+        self.0.set(Box::new(sink)).is_ok()
+    }
+
+    fn signal(&self, mark: T) {
+        if let Some(sink) = self.0.get() {
+            sink(mark);
+        }
+    }
+}
 
 /// Where the Mac's autoscroll origin marker goes: sent as an episode starts and as it ends.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,10 +67,14 @@ pub fn set_autoscroll_enabled(enabled: bool) {
     AUTOSCROLL.store(enabled, Ordering::Release);
 }
 
-/// Registers the one marker sink; a second is refused. It runs on the injection thread, so it must
-/// hand the change to its own thread and return without waiting.
+/// Registers the autoscroll marker's sink; see `MarkSink`.
 pub fn set_autoscroll_marker(sink: impl Fn(AutoscrollMarker) + Send + Sync + 'static) -> bool {
-    AUTOSCROLL_MARKER.set(Box::new(sink)).is_ok()
+    AUTOSCROLL_MARKER.set(sink)
+}
+
+/// Registers the sink told about each page turn a swipe from another computer sends; see `MarkSink`.
+pub fn set_page_turn_mark(sink: impl Fn(PageTurn) + Send + Sync + 'static) -> bool {
+    PAGE_TURN_MARK.set(sink)
 }
 
 /// The platform of the peer in each floor slot, so a destination knows which computer drives it.
@@ -206,9 +233,7 @@ impl MacAutoscroll {
             return;
         }
         self.shown = wanted;
-        if let Some(sink) = AUTOSCROLL_MARKER.get() {
-            sink(wanted.map_or(AutoscrollMarker::Hide, AutoscrollMarker::Show));
-        }
+        AUTOSCROLL_MARKER.signal(wanted.map_or(AutoscrollMarker::Hide, AutoscrollMarker::Show));
     }
 }
 
@@ -384,22 +409,35 @@ impl InputDestination for NativeDestination {
     fn apply(&mut self, action: DestinationAction) -> Result<(), DestinationFailure> {
         let native = &mut self.native;
         let displays = &self.displays;
+        let mut turned = None;
+        let mut post = |post: DestinationAction| {
+            native.post(displays, post)?;
+            if let DestinationAction::System(gesture) = post {
+                turned = PageDirection::of(gesture);
+            }
+            Ok(())
+        };
         #[cfg(target_os = "macos")]
-        {
+        let applied = {
             let sequencer = &mut self.sequencer;
             let starts = self.autoscroll.starts(sequencer);
             let routed = self.autoscroll.machine.apply(
                 action,
                 starts,
                 std::time::Instant::now(),
-                |action| sequencer.apply(action, |post| native.post(displays, post)),
+                |action| sequencer.apply(action, &mut post),
             );
             self.autoscroll.signal_marker();
             routed
-        }
+        };
         #[cfg(not(target_os = "macos"))]
-        self.sequencer
-            .apply(action, |post| native.post(displays, post))
+        let applied = self.sequencer.apply(action, &mut post);
+        if let Some(direction) = turned
+            && let Some(at) = current_pointer_position()
+        {
+            PAGE_TURN_MARK.signal(PageTurn { direction, at });
+        }
+        applied
     }
 }
 

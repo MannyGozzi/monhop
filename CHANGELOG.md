@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- A swipe between pages now shows on the computer it lands on: a chevron blooms beside the pointer, pointing the way the page went.
+
 ## [0.2.4] - 2026-09-30
 
 Middle-click autoscroll and trackpad page swipes across computers, a new sharing button, and a fix for keys held down when sharing starts. This version still connects to 0.2.3, so computers can update one at a time.

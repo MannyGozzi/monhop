@@ -239,6 +239,7 @@ Swipe-between-pages tests drive a Mac trackpad on a Windows PC and on another Ma
 - the momentum glide after a lift never navigating again;
 - the same direction with natural scrolling turned off in the Mac's Trackpad settings;
 - the same swipe while the Mac controls itself left to macOS alone;
+- a chevron blooming beside the pointer on the controlled computer for each page turn, pointing the way the page went, including two quick swipes in a row and with reduced motion on;
 - the Home switch off keeping plain sideways scrolling.
 
 ## Explicit pairing checkpoint

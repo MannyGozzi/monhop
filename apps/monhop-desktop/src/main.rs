@@ -19,6 +19,7 @@ mod location;
 #[cfg(windows)]
 mod log_reveal;
 mod logging;
+mod page_turn;
 mod pairing;
 mod public_code_copy;
 mod settings;
@@ -754,6 +755,7 @@ fn main() {
             }
             app.manage(dimming::Dimming::start(app.handle(), !check_ui));
             app.manage(autoscroll::Autoscroll::start(app.handle()));
+            page_turn::register(app.handle());
             app.manage(swipe::Swipe::start(app.handle()));
             app.manage(updates::Updates::start(app.handle(), !check_ui));
             let appearance = appearance::Appearance::start(app.handle());

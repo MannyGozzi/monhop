@@ -13,6 +13,8 @@ pub mod keymap;
 #[cfg(windows)]
 #[path = "capture/native.rs"]
 pub mod native_capture;
+#[cfg(any(windows, test))]
+pub mod page_turn;
 
 #[cfg(windows)]
 pub mod identity;
