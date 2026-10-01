@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+Middle-click autoscroll and trackpad page swipes across computers, a new sharing button, and a fix for keys held down when sharing starts. This version still connects to 0.2.3, so computers can update one at a time.
+
 ### Added
 
 - A Windows mouse controlling a Mac autoscrolls with its middle button like it does on Windows: hold and drag, or click once and move, then click or press Escape to stop. A small ring marks where it started. Turn off Middle-click autoscroll on the Mac's Home screen to keep plain middle clicks and drags.
