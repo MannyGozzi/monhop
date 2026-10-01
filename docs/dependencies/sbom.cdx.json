@@ -2527,8 +2527,8 @@
     {
       "type": "library",
       "name": "monhop",
-      "version": "0.2.4",
-      "bom-ref": "monhop@0.2.4",
+      "version": "0.2.5",
+      "bom-ref": "monhop@0.2.5",
       "properties": [
         {
           "name": "monhop:source",
@@ -2544,8 +2544,8 @@
     {
       "type": "library",
       "name": "monhop-core",
-      "version": "0.2.4",
-      "bom-ref": "monhop-core@0.2.4",
+      "version": "0.2.5",
+      "bom-ref": "monhop-core@0.2.5",
       "properties": [
         {
           "name": "monhop:source",
@@ -2561,8 +2561,8 @@
     {
       "type": "library",
       "name": "monhop-desktop",
-      "version": "0.2.4",
-      "bom-ref": "monhop-desktop@0.2.4",
+      "version": "0.2.5",
+      "bom-ref": "monhop-desktop@0.2.5",
       "properties": [
         {
           "name": "monhop:source",
@@ -2578,8 +2578,8 @@
     {
       "type": "library",
       "name": "monhop-platform-macos",
-      "version": "0.2.4",
-      "bom-ref": "monhop-platform-macos@0.2.4",
+      "version": "0.2.5",
+      "bom-ref": "monhop-platform-macos@0.2.5",
       "properties": [
         {
           "name": "monhop:source",
@@ -2595,8 +2595,8 @@
     {
       "type": "library",
       "name": "monhop-platform-windows",
-      "version": "0.2.4",
-      "bom-ref": "monhop-platform-windows@0.2.4",
+      "version": "0.2.5",
+      "bom-ref": "monhop-platform-windows@0.2.5",
       "properties": [
         {
           "name": "monhop:source",
@@ -2612,8 +2612,8 @@
     {
       "type": "library",
       "name": "monhop-protocol",
-      "version": "0.2.4",
-      "bom-ref": "monhop-protocol@0.2.4",
+      "version": "0.2.5",
+      "bom-ref": "monhop-protocol@0.2.5",
       "properties": [
         {
           "name": "monhop:source",
@@ -2629,8 +2629,8 @@
     {
       "type": "library",
       "name": "monhop-transport",
-      "version": "0.2.4",
-      "bom-ref": "monhop-transport@0.2.4",
+      "version": "0.2.5",
+      "bom-ref": "monhop-transport@0.2.5",
       "properties": [
         {
           "name": "monhop:source",
@@ -7849,22 +7849,22 @@
       ]
     },
     {
-      "ref": "monhop-core@0.2.4",
+      "ref": "monhop-core@0.2.5",
       "dependsOn": [
         "futures-util@0.3.34"
       ]
     },
     {
-      "ref": "monhop-desktop@0.2.4",
+      "ref": "monhop-desktop@0.2.5",
       "dependsOn": [
         "arboard@3.6.1",
         "block2@0.6.2",
         "log@0.4.34",
-        "monhop-core@0.2.4",
-        "monhop-platform-macos@0.2.4",
-        "monhop-platform-windows@0.2.4",
-        "monhop-protocol@0.2.4",
-        "monhop-transport@0.2.4",
+        "monhop-core@0.2.5",
+        "monhop-platform-macos@0.2.5",
+        "monhop-platform-windows@0.2.5",
+        "monhop-protocol@0.2.5",
+        "monhop-transport@0.2.5",
         "objc2-app-kit@0.3.2",
         "objc2-core-graphics@0.3.2",
         "objc2-core-image@0.3.2",
@@ -7887,41 +7887,41 @@
       ]
     },
     {
-      "ref": "monhop-platform-macos@0.2.4",
+      "ref": "monhop-platform-macos@0.2.5",
       "dependsOn": [
         "core-foundation@0.10.1",
         "log@0.4.34",
-        "monhop-core@0.2.4",
+        "monhop-core@0.2.5",
         "security-framework-sys@2.17.0",
         "tokio@1.53.1",
         "zeroize@1.9.0"
       ]
     },
     {
-      "ref": "monhop-platform-windows@0.2.4",
+      "ref": "monhop-platform-windows@0.2.5",
       "dependsOn": [
         "log@0.4.34",
-        "monhop-core@0.2.4",
+        "monhop-core@0.2.5",
         "tokio@1.53.1",
         "windows-sys@0.61.2",
         "zeroize@1.9.0"
       ]
     },
     {
-      "ref": "monhop-protocol@0.2.4",
+      "ref": "monhop-protocol@0.2.5",
       "dependsOn": [
-        "monhop-core@0.2.4"
+        "monhop-core@0.2.5"
       ]
     },
     {
-      "ref": "monhop-transport@0.2.4",
+      "ref": "monhop-transport@0.2.5",
       "dependsOn": [
         "bytes@1.12.1",
         "log@0.4.34",
-        "monhop-core@0.2.4",
-        "monhop-platform-macos@0.2.4",
-        "monhop-platform-windows@0.2.4",
-        "monhop-protocol@0.2.4",
+        "monhop-core@0.2.5",
+        "monhop-platform-macos@0.2.5",
+        "monhop-platform-windows@0.2.5",
+        "monhop-protocol@0.2.5",
         "quinn-proto@0.11.18",
         "quinn@0.11.11",
         "rcgen@0.14.10",
@@ -7932,13 +7932,13 @@
       ]
     },
     {
-      "ref": "monhop@0.2.4",
+      "ref": "monhop@0.2.5",
       "dependsOn": [
-        "monhop-core@0.2.4",
-        "monhop-platform-macos@0.2.4",
-        "monhop-platform-windows@0.2.4",
-        "monhop-protocol@0.2.4",
-        "monhop-transport@0.2.4",
+        "monhop-core@0.2.5",
+        "monhop-platform-macos@0.2.5",
+        "monhop-platform-windows@0.2.5",
+        "monhop-protocol@0.2.5",
+        "monhop-transport@0.2.5",
         "zeroize@1.9.0"
       ]
     },
