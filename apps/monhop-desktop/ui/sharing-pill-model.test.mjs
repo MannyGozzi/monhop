@@ -2,14 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  COMET_DOTS,
-  cometDot,
-  orbitPath,
-  orbitShown,
+  INHALE_LOW,
+  ORBIT_MAX_STEP,
+  coastRest,
+  loopAngle,
+  orbitMotion,
+  orbitSpeed,
+  orbitStep,
   pillChange,
   pillLook,
+  pillWords,
+  restAngle,
   tweenTiming,
 } from "./sharing-pill-model.mjs";
+
+const TURN = 2 * Math.PI;
 
 test("hover and focus reshape the capsule only when a press would act", () => {
   assert.deepEqual(pillLook({ inUse: false, hover: true }), {
@@ -32,133 +39,137 @@ test("right after a press the capsule shows the result, not the next action", ()
 test("a render that repeats the look changes nothing, so no motion restarts", () => {
   const live = pillLook({ inUse: true });
   assert.equal(pillChange(live, pillLook({ inUse: true })), null);
-  assert.deepEqual(pillChange(null, live), { animate: false, sweep: false });
+  assert.deepEqual(pillChange(null, live), { animate: false, inhale: false });
 });
 
-test("the light sweep crosses only when the pair goes live", () => {
+test("the capsule inhales only when its words change", () => {
   const idle = pillLook();
+  const lean = pillLook({ hover: true });
   const busy = pillLook({ busy: true });
   const live = pillLook({ inUse: true });
-  assert.deepEqual(pillChange(idle, live), { animate: true, sweep: true });
-  assert.deepEqual(pillChange(busy, live), { animate: true, sweep: true });
-  assert.equal(pillChange(live, idle).sweep, false);
-  assert.equal(pillChange(live, pillLook({ inUse: true, hover: true })).sweep, false);
+  const pause = pillLook({ inUse: true, hover: true });
+  assert.deepEqual(pillChange(idle, live), { animate: true, inhale: true });
+  assert.equal(pillChange(live, pause).inhale, true);
+  assert.equal(pillChange(pause, idle).inhale, true);
+  assert.equal(pillChange(idle, lean).inhale, false);
+  assert.equal(pillChange(idle, busy).inhale, false);
+  assert.ok(INHALE_LOW > 0 && INHALE_LOW < 1);
 });
 
-test("the orbit shows while live and as the busy arc", () => {
-  assert.equal(orbitShown(pillLook()), false);
-  assert.equal(orbitShown(pillLook({ busy: true })), true);
-  assert.equal(orbitShown(pillLook({ inUse: true })), true);
+test("the words follow the state and Pause", () => {
+  assert.equal(pillWords(pillLook()), "start");
+  assert.equal(pillWords(pillLook({ busy: true })), "start");
+  assert.equal(pillWords(pillLook({ inUse: true })), "sharing");
+  assert.equal(pillWords(pillLook({ inUse: true, hover: true })), "pause");
 });
 
-test("the nodes glide at once and fade only after meeting, and the dot appears as they merge", () => {
-  const glide = tweenTiming({ part: "node", property: "transform", rising: false });
-  assert.deepEqual(glide, { duration: "--motion-spring", easing: "--ease-spring", delay: null });
-  assert.equal(
-    tweenTiming({ part: "node", property: "opacity", rising: false }).delay,
-    "--motion-fast",
-  );
-  assert.equal(
-    tweenTiming({ part: "dot", property: "opacity", rising: true }).delay,
-    "--motion-fast",
-  );
-  assert.equal(
-    tweenTiming({ part: "dot", property: "transform", rising: true }).delay,
-    "--motion-fast",
-  );
-  // Splitting apart, the nodes appear at once while the dot leaves.
-  assert.equal(tweenTiming({ part: "node", property: "opacity", rising: true }).delay, null);
-  assert.equal(tweenTiming({ part: "dot", property: "opacity", rising: false }).delay, null);
+test("the pair spins fast while busy, slowly while live, and rests otherwise", () => {
+  assert.deepEqual(orbitMotion(pillLook({ busy: true })), { lap: "--loop-orbit-busy", rest: null });
+  assert.deepEqual(orbitMotion(pillLook({ inUse: true, busy: true })).lap, "--loop-orbit-busy");
+  assert.deepEqual(orbitMotion(pillLook({ inUse: true })), { lap: "--loop-orbit", rest: null });
+  // Idle rests on whole turns so each computer keeps its side; Pause on half turns.
+  assert.deepEqual(orbitMotion(pillLook()), { lap: null, rest: TURN });
+  assert.deepEqual(orbitMotion(pillLook({ hover: true })), { lap: null, rest: TURN });
+  assert.deepEqual(orbitMotion(pillLook({ inUse: true, focus: true })), {
+    lap: null,
+    rest: Math.PI,
+  });
 });
 
-test("an incoming label waits for the outgoing one to clear", () => {
-  const out = tweenTiming({ part: "label", property: "opacity", rising: false });
-  assert.equal(out.delay, null);
-  for (const property of ["opacity", "transform"])
-    assert.equal(tweenTiming({ part: "label", property, rising: true }).delay, "--motion-instant");
+test("a lap converts to a speed and a running loop back to its angle", () => {
+  assert.equal(orbitSpeed(1000), TURN);
+  assert.equal(orbitSpeed(0), 0);
+  assert.equal(loopAngle(1, 250, 1000), 1 + TURN / 4);
+  assert.equal(loopAngle(1, 1250, 1000), 1 + TURN / 4);
+  assert.equal(restAngle(3.3, Math.PI), Math.PI);
+  assert.equal(restAngle(3.3, TURN), TURN);
 });
 
-test("width glides without overshoot and surfaces fade slowly", () => {
-  assert.deepEqual(tweenTiming({ part: "capsule", property: "width", rising: true }), {
-    duration: "--motion-slow",
-    easing: "--ease-glide",
+function run(state, goal, seconds) {
+  let next = { ...state, done: false };
+  for (let t = 0; t < seconds && !next.done; t += 1 / 60) next = orbitStep(next, goal, 1 / 60);
+  return next;
+}
+
+test("spinning up eases toward the lap's speed, then hands off at exactly that speed", () => {
+  const target = orbitSpeed(1000);
+  const first = orbitStep({ angle: 0, speed: 0 }, { target, rest: null }, 1 / 60);
+  assert.ok(first.speed > 0 && first.speed < target / 5);
+  assert.equal(first.done, false);
+  const steady = run({ angle: 0, speed: 0 }, { target, rest: null }, 3);
+  assert.equal(steady.done, true);
+  assert.equal(steady.speed, target);
+});
+
+test("slowing from a fast spin to a slow one never stops the pair", () => {
+  let state = { angle: 0, speed: orbitSpeed(700), done: false };
+  const target = orbitSpeed(5000);
+  while (!state.done) {
+    state = orbitStep(state, { target, rest: null }, 1 / 60);
+    assert.ok(state.speed >= target);
+  }
+});
+
+test("from any spin the pair comes to rest on a well, keeping each computer's side when idle", () => {
+  for (const speed of [orbitSpeed(700), orbitSpeed(5000), -3, 0.5, 0])
+    for (const angle of [0.3, 2, Math.PI, 4, 9]) {
+      const idle = run({ angle, speed }, { target: 0, rest: TURN }, 5);
+      assert.equal(idle.done, true);
+      assert.equal(idle.speed, 0);
+      assert.ok(Math.abs(idle.angle / TURN - Math.round(idle.angle / TURN)) < 1e-12);
+      const pause = run({ angle, speed }, { target: 0, rest: Math.PI }, 5);
+      assert.equal(pause.done, true);
+      assert.ok(Math.abs(pause.angle / Math.PI - Math.round(pause.angle / Math.PI)) < 1e-12);
+    }
+});
+
+test("a coast stops at the well nearest where its momentum carries it", () => {
+  // A fast spin carries on forward past the nearest well rather than snapping back to it.
+  const speed = orbitSpeed(700);
+  assert.equal(coastRest(1.2, speed, Math.PI), Math.PI);
+  assert.equal(coastRest(1.2, 0, Math.PI), 0);
+  const stop = run({ angle: 1.2, speed }, { target: 0, rest: Math.PI }, 5);
+  assert.equal(stop.angle, Math.PI);
+  // Sitting on Pause's half turn when idle takes over, it still settles instead of balancing there.
+  const idle = run({ angle: Math.PI, speed: 0 }, { target: 0, rest: TURN }, 3);
+  assert.equal(idle.done, true);
+  assert.ok(ORBIT_MAX_STEP > 0 && ORBIT_MAX_STEP <= 0.05);
+});
+
+test("shapes spring, colours fade, the glow blooms and an incoming label starts a beat late", () => {
+  assert.deepEqual(tweenTiming({ part: "arm", property: "transform", rising: false }), {
+    duration: "--motion-spring",
+    easing: "--ease-spring",
     delay: null,
   });
+  assert.equal(tweenTiming({ part: "capsule", property: "width" }).easing, "--ease-spring");
+  assert.equal(tweenTiming({ part: "dot", property: "backgroundColor" }).duration, "--motion-slow");
   assert.equal(
-    tweenTiming({ part: "tint", property: "opacity", rising: true }).duration,
-    "--motion-slow",
+    tweenTiming({ part: "glow", property: "opacity", rising: true }).duration,
+    "--motion-bloom",
   );
   assert.equal(
-    tweenTiming({ part: "label", property: "opacity", rising: false }).duration,
-    "--motion-fast",
+    tweenTiming({ part: "label", property: "filter", rising: false }).duration,
+    "--motion-spring",
   );
+  for (const property of ["opacity", "transform", "filter"]) {
+    assert.equal(tweenTiming({ part: "label", property, rising: true }).delay, "--motion-stagger");
+    assert.equal(tweenTiming({ part: "label", property, rising: false }).delay, null);
+  }
 });
 
 test("every timing token exists in styles.css", async () => {
   const { readFile } = await import("node:fs/promises");
   const css = await readFile(new URL("styles.css", import.meta.url), "utf8");
-  const parts = [
-    "capsule",
-    "halo",
-    "tint",
-    "edge",
-    "ring",
-    "orbit",
-    "mark",
-    "node",
-    "dot",
-    "bar",
-    "label",
-  ];
+  const parts = ["capsule", "halo", "edge", "glow", "words", "arm", "dot", "label"];
+  const properties = ["width", "opacity", "transform", "filter", "backgroundColor", "boxShadow"];
   for (const part of parts)
-    for (const property of ["width", "opacity", "transform"])
+    for (const property of properties)
       for (const rising of [true, false]) {
         const timing = tweenTiming({ part, property, rising });
         for (const token of [timing.duration, timing.easing, timing.delay].filter(Boolean))
           assert.match(css, new RegExp(`\\n\\s*${token}:`), token);
       }
-});
-
-test("the orbit spends time on each stretch of edge in proportion to its length", () => {
-  const { perimeter, keyframes } = orbitPath({ width: 90, height: 30, inset: 0.75 });
-  const straight = 60;
-  const arc = Math.PI * 14.25;
-  assert.ok(Math.abs(perimeter - 2 * (straight + arc)) < 1e-9);
-  const offsets = keyframes.map((frame) => frame.offset);
-  const expected = [0, straight, straight + arc, 2 * straight + arc, perimeter].map(
-    (mark) => mark / perimeter,
-  );
-  offsets.forEach((offset, index) => assert.ok(Math.abs(offset - expected[index]) < 1e-9));
-  // Each stretch pairs one moving component: the straights translate, the ends turn.
-  assert.equal(
-    keyframes[0].transform,
-    "translateX(calc(-50% + 15px)) rotate(0turn) translateY(-14.25px)",
-  );
-  assert.equal(
-    keyframes[2].transform,
-    "translateX(calc(50% - 15px)) rotate(0.5turn) translateY(-14.25px)",
-  );
-  assert.equal(
-    keyframes[4].transform,
-    "translateX(calc(-50% + 15px)) rotate(1turn) translateY(-14.25px)",
-  );
-});
-
-test("a round capsule has no straight stretch", () => {
-  const { keyframes } = orbitPath({ width: 30, height: 30, inset: 0 });
-  assert.equal(keyframes[1].offset, 0);
-  assert.equal(keyframes[2].offset, 0.5);
-});
-
-test("the comet trails its head by an even share of the tail and fades out", () => {
-  const geometry = { perimeter: 200, tail: 50 };
-  const dots = Array.from({ length: COMET_DOTS }, (_, index) => cometDot(index, geometry));
-  assert.deepEqual(dots[0], { lag: 0, opacity: 1, scale: 1 });
-  const step = dots[1].lag - dots[0].lag;
-  for (let index = 1; index < COMET_DOTS; index += 1) {
-    assert.ok(Math.abs(dots[index].lag - dots[index - 1].lag - step) < 1e-12);
-    assert.ok(dots[index].opacity < dots[index - 1].opacity);
-    assert.ok(dots[index].scale < dots[index - 1].scale);
-  }
-  assert.ok(dots.at(-1).lag < 50 / 200);
+  for (const token of ["--loop-orbit", "--loop-orbit-busy", "--loop-breathe", "--motion-inhale"])
+    assert.match(css, new RegExp(`\\n\\s*${token}:`), token);
 });

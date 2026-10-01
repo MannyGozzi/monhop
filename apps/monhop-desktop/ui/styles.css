@@ -47,16 +47,19 @@
   --switch-track-off: light-dark(oklch(.2 .01 275 / 16%), oklch(1 0 0 / 15%));
   --thumb: oklch(1 0 0);
   --live-line: linear-gradient(90deg, transparent, color-mix(in oklab, var(--success) var(--mix-live-line), transparent), transparent);
-  /* Link capsule: glass at rest, a live tint and glow, one light sweep. */
+  /* Link capsule: frosted glass, a live bloom and glow, and the two computers' dots, ice and emerald. */
   --glass-fill: linear-gradient(light-dark(oklch(.995 .002 275), oklch(1 0 0 / 9%)), light-dark(oklch(.955 .004 275), oklch(1 0 0 / 4%)));
   --glass-edge: light-dark(oklch(.2 .01 275 / 12%), oklch(1 0 0 / 11%));
   --glass-edge-hover: light-dark(oklch(.2 .01 275 / 26%), oklch(1 0 0 / 26%));
   --glass-highlight: inset 0 1px 0 light-dark(oklch(1 0 0), oklch(1 0 0 / 9%));
   --glass-lift: 0 1px 2px light-dark(oklch(.2 .01 275 / 8%), oklch(0 0 0 / 35%));
-  --live-fill: linear-gradient(color-mix(in oklab, var(--success) var(--mix-tint-strong), var(--card)), color-mix(in oklab, var(--success) var(--mix-faint), var(--card)));
   --live-edge: color-mix(in oklab, var(--success) var(--mix-edge), transparent);
   --live-glow: 0 0 var(--sharing-glow-blur) light-dark(color-mix(in oklab, var(--success) var(--mix-tint), transparent), color-mix(in oklab, var(--success) var(--mix-icon), transparent));
-  --sweep-light: linear-gradient(100deg, transparent 35%, light-dark(oklch(1 0 0 / 75%), oklch(1 0 0 / 22%)) 50%, transparent 65%);
+  --live-bloom: radial-gradient(130% 150% at calc(var(--gap-2) + var(--sharing-mark-size) / 2) 50%, color-mix(in oklab, var(--success) var(--mix-bloom), transparent), transparent 62%);
+  --sharing-orbit-local: light-dark(oklch(.55 .05 240), oklch(.93 .035 230));
+  --sharing-orbit-peer: light-dark(oklch(.55 .13 160), oklch(.74 .14 160));
+  --sharing-orbit-live-local: light-dark(oklch(.62 .09 168), oklch(.96 .06 160));
+  --sharing-orbit-live-peer: var(--success);
   /* Setup ladder: step markers, and the rail between them (coral once done, softening toward the next step). */
   --step-fill: color-mix(in oklab, var(--primary) var(--mix-faint), transparent);
   --step-glow: light-dark(color-mix(in oklab, var(--primary) var(--mix-edge), transparent), color-mix(in oklab, var(--primary) var(--mix-glow-strong), transparent));
@@ -74,9 +77,11 @@
   --mix-tint-strong: 20%;
   --mix-icon: 26%;
   --mix-edge: 35%;
+  --mix-bloom: 42%;
   --mix-tile-edge: 45%;
   --mix-glow-strong: 50%;
   --mix-live-line: 55%;
+  --mix-dot-glow: 70%;
 
   /* Shadows */
   --shadow-card-lift: inset 0 1px 0 var(--edge-light), 0 10px 30px -14px light-dark(oklch(.2 .01 275 / 18%), oklch(0 0 0 / 65%));
@@ -161,19 +166,18 @@
   --slider-track: 4px;
   --slider-thumb: 18px;
   --slider-value-width: 40px;
-  /* Link capsule: two computer nodes that merge into the live dot, and a comet that laps the edge. */
+  /* Link capsule: two computer dots on one orbit, its radius per state, and Pause's bars. */
   --sharing-mark-size: 14px;
-  --sharing-node-size: 5px;
-  --sharing-node-spread: 4px;
-  --sharing-node-lean: 1.25px;
-  --sharing-bar-width: 2.5px;
-  --sharing-bar-height: 9px;
+  --sharing-dot-size: 5px;
+  --sharing-orbit-rest: 4px;
+  --sharing-orbit-lean: 2.75px;
+  --sharing-orbit-busy: 3px;
+  --sharing-orbit-live: 3.25px;
   --sharing-bar-offset: 2.25px;
-  --sharing-ring-width: 1.5px;
-  --sharing-comet-size: 2px;
-  --sharing-comet-length: 3.5px;
-  --sharing-comet-tail: 56px;
+  --sharing-dot-glow: 8px;
   --sharing-glow-blur: 14px;
+  --frost-blur: 16px;
+  --frost-saturate: 170%;
   --tooltip-max-width: 200px;
   --textarea-min-height: 64px;
   --scrollbar-size: 10px;
@@ -224,7 +228,8 @@
   --rotate-open: 90deg;
   --rotate-pop: 30deg;
   --opacity-dim: .4;
-  --opacity-orbit-dim: .3;
+  --opacity-busy: .6;
+  --opacity-breath: .5;
   --scale-pop: .8;
   --scale-enter: .96;
   --scale-thumb-hover: 1.08;
@@ -234,6 +239,11 @@
   --scale-use-ring: 1.6;
   --opacity-live-ring: .5;
   --scale-breathe: 1.12;
+  /* A dot becomes a pause bar by narrowing and stretching: 5px round to 2.5 by 9. */
+  --scale-bar-x: .5;
+  --scale-bar-y: 1.8;
+  --scale-defocus: .94;
+  --scale-inhale: .955;
 
   /* Motion: the only durations and easings in this file. JS reads them through dom.mjs motionMs(). */
   --motion-instant: 90ms;
@@ -245,14 +255,16 @@
   --motion-rise: 4px;
   --motion-rise-page: 6px;
   --motion-blur: 3px;
+  --motion-blur-deep: 14px;
   --motion-demo: 1100ms;
-  --motion-sweep: 620ms;
+  --motion-bloom: 760ms;
+  --motion-inhale: 620ms;
   --loop-spin: 800ms;
   --loop-pulse: 1500ms;
   --loop-live: 2400ms;
   --loop-breathe: 3200ms;
-  --loop-orbit: 3600ms;
-  --loop-orbit-busy: 900ms;
+  --loop-orbit: 5000ms;
+  --loop-orbit-busy: 714ms;
   --ease-out: cubic-bezier(.22, 1, .36, 1);
   --ease-in-out: cubic-bezier(.65, 0, .35, 1);
   /* Height glides: --ease-out would cover a fifth of a tall panel in the first frame. No overshoot. */
@@ -608,66 +620,56 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .swap > * { grid-area: 1 / 1; min-width: 0; }
 .swap > [data-exit="true"] { pointer-events: none; }
 
-/* Link capsule (Home): the two computers as nodes that merge into the live dot, on glass that tints
-   and gains a comet lapping its edge while sharing. computer-card.mjs tweens between these looks. */
+/* Link capsule (Home): frosted glass and the two computers as dots that circle each other while
+   connecting and sharing, then stretch into Pause's bars. computer-card.mjs tweens between these looks
+   and turns the orbit. */
 .sharing-pill-wrap { position: relative; display: inline-flex; flex: none; border-radius: var(--radius-pill); }
 .sharing-pill-wrap[data-busy="true"] { cursor: progress; }
 .sharing-pill-halo { position: absolute; inset: 0; border-radius: inherit; box-shadow: var(--live-glow); opacity: 0; pointer-events: none; }
 .sharing-pill { position: relative; isolation: isolate; display: inline-flex; align-items: center; gap: var(--gap-2); height: var(--control-height); overflow: hidden; border: 0; border-radius: var(--radius-pill); padding: 0 var(--gap-3) 0 var(--gap-2); background: transparent; box-shadow: var(--glass-lift); color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-semibold); line-height: var(--leading-none); white-space: nowrap; }
 .sharing-pill:disabled { cursor: inherit; }
 .sharing-pill:focus-visible { box-shadow: var(--shadow-focus), var(--glass-lift); }
-.sharing-pill-glass, .sharing-pill-tint, .sharing-pill-edge, .sharing-pill-sweep, .sharing-pill-ring { position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; }
-.sharing-pill-glass { background: var(--glass-fill); box-shadow: var(--glass-highlight), inset 0 0 0 var(--hairline-width) var(--glass-edge); }
+.sharing-pill-glass, .sharing-pill-edge, .sharing-pill-glow, .sharing-pill-breath { position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; }
+.sharing-pill-glass { background: var(--glass-fill); -webkit-backdrop-filter: blur(var(--frost-blur)) saturate(var(--frost-saturate)); backdrop-filter: blur(var(--frost-blur)) saturate(var(--frost-saturate)); box-shadow: var(--glass-highlight), inset 0 0 0 var(--hairline-width) var(--glass-edge); }
 .sharing-pill-edge { box-shadow: inset 0 0 0 var(--hairline-width) var(--glass-edge-hover); opacity: 0; }
-.sharing-pill-tint { background: var(--live-fill); box-shadow: var(--glass-highlight), inset 0 0 0 var(--hairline-width) var(--live-edge); opacity: 0; }
-.sharing-pill-sweep { background: var(--sweep-light); transform: translateX(-100%); }
-.sharing-pill-ring { opacity: 0; }
-/* Each comet dot's box is the capsule's, so its path's % moves follow the capsule's width. A dot's
-   own x axis is the direction of travel, so dots stretched along it overlap into one streak. */
-.sharing-pill-orbit, .sharing-pill-comet { position: absolute; inset: 0; }
-.sharing-pill-orbit { opacity: 0; }
-.sharing-pill-comet::after { content: ""; position: absolute; top: 50%; left: 50%; width: var(--sharing-comet-length); height: var(--sharing-comet-size); margin: calc(var(--sharing-comet-size) / -2) 0 0 calc(var(--sharing-comet-length) / -2); border-radius: var(--radius-pill); background: var(--success); opacity: var(--comet-opacity); transform: scale(var(--comet-scale)); }
+.sharing-pill-glow { opacity: 0; }
+.sharing-pill-breath { background: var(--live-bloom); box-shadow: inset 0 0 0 var(--hairline-width) var(--live-edge); }
+/* The orbit turns the two arms; each arm holds its dot out at the radius the state asks for. */
 .sharing-pill-mark { position: relative; flex: none; width: var(--sharing-mark-size); height: var(--sharing-mark-size); }
-.sharing-pill-mark > * { position: absolute; top: 50%; left: 50%; }
-.sharing-pill-node { width: var(--sharing-node-size); height: var(--sharing-node-size); margin: calc(var(--sharing-node-size) / -2) 0 0 calc(var(--sharing-node-size) / -2); border-radius: var(--radius-circle); }
-.sharing-pill-node.local { background: var(--display-local); transform: translateX(calc(var(--sharing-node-spread) * -1)); }
-.sharing-pill-node.peer { background: var(--display-peer); transform: translateX(var(--sharing-node-spread)); }
-.sharing-pill-dot { width: var(--dot-size); height: var(--dot-size); margin: calc(var(--dot-size) / -2) 0 0 calc(var(--dot-size) / -2); border-radius: var(--radius-circle); background: var(--success); opacity: 0; transform: scale(var(--scale-pop)); }
-.sharing-pill-pulse { position: absolute; inset: 0; border-radius: inherit; background: inherit; opacity: 0; }
-.sharing-pill-bar { width: var(--sharing-bar-width); height: var(--sharing-bar-height); margin: calc(var(--sharing-bar-height) / -2) 0 0 calc(var(--sharing-bar-width) / -2); border-radius: var(--radius-swatch); background: var(--foreground); opacity: 0; filter: blur(var(--motion-blur)); }
-.sharing-pill-bar.first { transform: translateX(calc(var(--sharing-bar-offset) * -1)) scaleY(var(--scale-pop)); }
-.sharing-pill-bar.second { transform: translateX(var(--sharing-bar-offset)) scaleY(var(--scale-pop)); }
+.sharing-pill-orbit { position: absolute; inset: 0; }
+.sharing-pill-arm { position: absolute; top: 50%; left: 50%; }
+.sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-rest) * -1)); }
+.sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-rest)); }
+.sharing-pill-dot { position: absolute; width: var(--sharing-dot-size); height: var(--sharing-dot-size); margin: calc(var(--sharing-dot-size) / -2) 0 0 calc(var(--sharing-dot-size) / -2); border-radius: var(--radius-circle); box-shadow: 0 0 0 transparent; }
+.sharing-pill-dot.local { background: var(--sharing-orbit-local); }
+.sharing-pill-dot.peer { background: var(--sharing-orbit-peer); }
 /* Labels share one cell; only the current state's labels take space, so the width follows them. */
 .sharing-pill-label { position: relative; display: grid; text-align: start; }
-.sharing-pill-label > span { grid-area: 1 / 1; opacity: 0; filter: blur(var(--motion-blur)); }
+.sharing-pill-label > span { grid-area: 1 / 1; opacity: 0; filter: blur(var(--motion-blur-deep)); transform: scale(var(--scale-defocus)); transform-origin: left center; }
 .sharing-pill-wrap:not([data-state="active"]) .sharing-pill-label > :not(.start), .sharing-pill-wrap[data-state="active"] .sharing-pill-label > .start { position: absolute; top: 0; left: 0; }
-.sharing-pill-label > .start { color: var(--foreground); transform: translateY(calc(var(--motion-rise) * -1)); }
-.sharing-pill-label > .sharing { color: var(--success-text); transform: translateY(var(--motion-rise)); }
-.sharing-pill-label > .pause { color: var(--foreground); transform: translateY(var(--motion-rise)); }
-/* Idle: hover leans the nodes in and brightens the edge. */
+.sharing-pill-label > .start, .sharing-pill-label > .pause { color: var(--foreground); }
+.sharing-pill-label > .sharing { color: var(--success-text); }
+/* Idle: hover leans the dots in and brightens the edge. */
 .sharing-pill-wrap:not([data-state="active"]) .sharing-pill-label > .start { opacity: 1; transform: none; filter: none; }
 .sharing-pill-wrap[data-lean="true"] .sharing-pill-edge { opacity: 1; }
-.sharing-pill-wrap[data-lean="true"] .sharing-pill-node.local { transform: translateX(calc((var(--sharing-node-spread) - var(--sharing-node-lean)) * -1)); }
-.sharing-pill-wrap[data-lean="true"] .sharing-pill-node.peer { transform: translateX(calc(var(--sharing-node-spread) - var(--sharing-node-lean))); }
-/* Live: the nodes have merged into the dot, the glass is tinted and the comet laps the edge. */
-.sharing-pill-wrap[data-state="active"] :is(.sharing-pill-halo, .sharing-pill-tint, .sharing-pill-ring, .sharing-pill-dot) { opacity: 1; }
-.sharing-pill-wrap[data-state="active"] .sharing-pill-node { opacity: 0; transform: none; }
-.sharing-pill-wrap[data-state="active"] .sharing-pill-dot { transform: none; }
-.sharing-pill-wrap:is([data-state="active"], [data-busy="true"]) .sharing-pill-orbit { opacity: 1; }
+.sharing-pill-wrap[data-lean="true"] .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-lean) * -1)); }
+.sharing-pill-wrap[data-lean="true"] .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-lean)); }
+/* Busy: the pair circles fast on a tighter orbit and the words step back. */
+.sharing-pill-wrap[data-busy="true"] .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-busy) * -1)); }
+.sharing-pill-wrap[data-busy="true"] .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-busy)); }
+.sharing-pill-wrap[data-busy="true"] .sharing-pill-label { opacity: var(--opacity-busy); }
+/* Live: the glass blooms green from the dots, and the pair brightens and glows on a slow orbit. */
+.sharing-pill-wrap[data-state="active"] :is(.sharing-pill-halo, .sharing-pill-glow) { opacity: 1; }
+.sharing-pill-wrap[data-state="active"]:not([data-busy="true"], [data-pause="true"]) .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-live) * -1)); }
+.sharing-pill-wrap[data-state="active"]:not([data-busy="true"], [data-pause="true"]) .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-live)); }
+.sharing-pill-wrap[data-state="active"] .sharing-pill-dot.local { background: var(--sharing-orbit-live-local); box-shadow: 0 0 var(--sharing-dot-glow) color-mix(in oklab, var(--sharing-orbit-live-local) var(--mix-dot-glow), transparent); }
+.sharing-pill-wrap[data-state="active"] .sharing-pill-dot.peer { background: var(--sharing-orbit-live-peer); box-shadow: 0 0 var(--sharing-dot-glow) color-mix(in oklab, var(--sharing-orbit-live-peer) var(--mix-dot-glow), transparent); }
 .sharing-pill-wrap[data-state="active"]:not([data-pause="true"]) .sharing-pill-label > .sharing { opacity: 1; transform: none; filter: none; }
-/* Live and engaged: the comet dims, the dot becomes Pause's two bars and the label rolls to Pause. */
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-orbit { opacity: var(--opacity-orbit-dim); }
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-dot { opacity: 0; transform: scale(var(--scale-pop)); filter: blur(var(--motion-blur)); }
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-bar { opacity: 1; filter: none; }
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-bar.first { transform: translateX(calc(var(--sharing-bar-offset) * -1)); }
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-bar.second { transform: translateX(var(--sharing-bar-offset)); }
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-label > .sharing { transform: translateY(calc(var(--motion-rise) * -1)); }
+/* Live and engaged: the pair stops side by side and stretches into Pause's two bars. */
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-bar-offset) * -1)); }
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-arm.peer { transform: translateX(var(--sharing-bar-offset)); }
+.sharing-pill-wrap[data-pause="true"] .sharing-pill-dot:is(.local, .peer) { background: var(--foreground); box-shadow: 0 0 0 transparent; transform: scale(var(--scale-bar-x), var(--scale-bar-y)); }
 .sharing-pill-wrap[data-pause="true"] .sharing-pill-label > .pause { opacity: 1; transform: none; filter: none; }
-/* Busy: the comet races as the progress indicator and the mark steps back. */
-.sharing-pill-wrap[data-busy="true"] .sharing-pill-ring { opacity: 1; }
-.sharing-pill-wrap[data-busy="true"] .sharing-pill-mark { opacity: var(--opacity-disabled); }
-/* Without motion the busy comet stands still and the live ring is the tinted edge alone. */
-@media (prefers-reduced-motion: reduce) { .sharing-pill-wrap:not([data-busy="true"]) .sharing-pill-orbit { display: none; } }
 
 /* Use toggle: the setup card's play/stop icon button. */
 .use-toggle.icon-button.button { border-radius: var(--radius-pill); }

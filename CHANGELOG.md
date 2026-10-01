@@ -9,6 +9,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 - A Windows mouse controlling a Mac autoscrolls with its middle button like it does on Windows: hold and drag, or click once and move, then click or press Escape to stop. A small ring marks where it started. Turn off Middle-click autoscroll on the Mac's Home screen to keep plain middle clicks and drags.
 - A Mac trackpad controlling another computer swipes between pages: a quick two-finger swipe right goes back and left goes forward, while slower sideways scrolling still just scrolls. Turn off Swipe between pages on the Mac's Home screen to keep plain sideways scrolling.
 
+### Changed
+
+- The Start sharing button on Home is frosted glass with two dots for the two computers, ice and emerald. They circle each other quickly while connecting and slowly while sharing, glowing over a breathing green light, and stop side by side as the pause bars when you point at the button. Its words blur from one to the next instead of sliding up.
+
 ### Fixed
 
 - A key or mouse button held down when sharing started no longer silently stops the pointer from crossing to another computer: Home names what to release.

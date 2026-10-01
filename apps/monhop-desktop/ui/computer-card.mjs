@@ -41,12 +41,15 @@ import {
   switchRow,
 } from "./dom.mjs";
 import {
-  COMET_DOTS,
-  cometDot,
-  orbitPath,
-  orbitShown,
+  INHALE_LOW,
+  ORBIT_MAX_STEP,
+  loopAngle,
+  orbitMotion,
+  orbitSpeed,
+  orbitStep,
   pillChange,
   pillLook,
+  restAngle,
   tweenTiming,
 } from "./sharing-pill-model.mjs";
 
@@ -170,8 +173,7 @@ export function computerCard(
 const pills = new Map();
 const PILL_LABELS = { start: "Start sharing", sharing: "Sharing", pause: "Pause" };
 const GLYPH = ["opacity", "transform", "filter"];
-// Play states of a tween that no longer moves anything.
-const UNTWEENED = new Set(["finished", "idle"]);
+const DOT = ["transform", "backgroundColor", "boxShadow"];
 let pillsQueued = false;
 reducedMotion.addEventListener("change", () => {
   for (const pill of pills.values()) {
@@ -202,32 +204,27 @@ function pillLayer(className, children) {
 }
 
 function buildPill(fingerprint) {
-  const cometNodes = Array.from({ length: COMET_DOTS }, () => pillLayer("sharing-pill-comet"));
-  const [orbit, pulse] = [
-    pillLayer("sharing-pill-orbit", cometNodes),
-    pillLayer("sharing-pill-pulse"),
-  ];
-  const [halo, tint, edge, ring, sweep] = [
+  const [halo, edge, breath] = [
     pillLayer("sharing-pill-halo"),
-    pillLayer("sharing-pill-tint"),
     pillLayer("sharing-pill-edge"),
-    pillLayer("sharing-pill-ring", [orbit]),
-    pillLayer("sharing-pill-sweep"),
+    pillLayer("sharing-pill-breath"),
   ];
-  const glyphs = [
-    ["node", pillLayer("sharing-pill-node local")],
-    ["node", pillLayer("sharing-pill-node peer")],
-    ["dot", pillLayer("sharing-pill-dot", [pulse])],
-    ["bar", pillLayer("sharing-pill-bar first")],
-    ["bar", pillLayer("sharing-pill-bar second")],
-  ];
+  const glow = pillLayer("sharing-pill-glow", [breath]);
+  const arms = ["local", "peer"].map((side) => {
+    const dot = pillLayer(`sharing-pill-dot ${side}`);
+    return { arm: pillLayer(`sharing-pill-arm ${side}`, [dot]), dot };
+  });
+  const orbit = pillLayer(
+    "sharing-pill-orbit",
+    arms.map(({ arm }) => arm),
+  );
   const labels = Object.entries(PILL_LABELS).map(([kind, text]) =>
     el("span", { className: kind, text }),
   );
-  const mark = el("span", {
-    className: "sharing-pill-mark",
+  const words = el("span", {
+    className: "sharing-pill-label",
     attrs: { "aria-hidden": "true" },
-    children: glyphs.map(([, node]) => node),
+    children: labels,
   });
   const control = el("button", {
     className: "sharing-pill",
@@ -235,50 +232,55 @@ function buildPill(fingerprint) {
     dataset: { focusKey: `sharing-pill-${fingerprint}` },
     children: [
       pillLayer("sharing-pill-glass"),
-      tint,
       edge,
-      sweep,
-      ring,
-      mark,
+      glow,
       el("span", {
-        className: "sharing-pill-label",
+        className: "sharing-pill-mark",
         attrs: { "aria-hidden": "true" },
-        children: labels,
+        children: [orbit],
       }),
+      words,
     ],
   });
   const wrap = el("span", { className: "sharing-pill-wrap", children: [halo, control] });
   const parts = [
     [control, "capsule", ["width"]],
     [halo, "halo"],
-    [tint, "tint"],
     [edge, "edge"],
-    [ring, "ring"],
-    [orbit, "orbit"],
-    [mark, "mark"],
-    ...glyphs.map(([part, node]) => [node, part, GLYPH]),
+    [glow, "glow"],
+    [words, "words"],
+    ...arms.flatMap(({ arm, dot }) => [
+      [arm, "arm", ["transform"]],
+      [dot, "dot", DOT],
+    ]),
     ...labels.map((node) => [node, "label", GLYPH]),
   ].map(([node, part, properties = ["opacity"]]) => ({ node, part, properties }));
   const pill = {
     key: fingerprint,
     wrap,
     button: control,
-    ring,
-    sweep,
-    cometNodes,
-    pulse,
+    glow,
+    breath,
+    orbit,
     parts,
     want: { inUse: false, busy: false, hover: false, focus: false, rested: false },
     shown: null,
     tweens: [],
-    loops: [],
-    comet: [],
-    cometWidth: null,
-    cometLap: null,
-    following: false,
+    breathing: null,
+    spin: {
+      angle: 0,
+      speed: 0,
+      target: 0,
+      rest: null,
+      well: null,
+      lap: 0,
+      from: 0,
+      loop: null,
+      frame: 0,
+      at: null,
+    },
     moved: false,
-    width: Number.NaN,
-    sweepTween: null,
+    inhaleTween: null,
     pressTween: null,
     pressed: false,
     press: null,
@@ -327,8 +329,9 @@ function syncPill(pill) {
   const next = pillLook(pill.want);
   const change = pillChange(pill.shown, next);
   if (change) applyLook(pill, next, change);
-  else if (!Number.isFinite(pill.width)) pill.width = settledWidth(pill);
-  runOrbit(pill, pill.shown);
+  runBreath(pill);
+  turnOrbit(pill);
+  pill.moved = false;
 }
 
 function applyLook(pill, next, change) {
@@ -341,20 +344,8 @@ function applyLook(pill, next, change) {
   pill.wrap.dataset.pause = String(next.pause);
   pill.wrap.dataset.lean = String(next.lean);
   pill.shown = next;
-  pill.width = settledWidth(pill);
   if (motion) pill.tweens = tweenParts(pill, from, readParts(pill));
-  if (motion && change.sweep) {
-    pill.sweepTween?.cancel();
-    pill.sweepTween = pill.sweep.animate(
-      { transform: ["translateX(-100%)", "translateX(100%)"] },
-      { duration: motionMs("--motion-sweep"), easing: motionEase("--ease-in-out") },
-    );
-  }
-}
-
-// Read before any tween starts, so it is the width the capsule settles at; NaN while not laid out.
-function settledWidth(pill) {
-  return Number.parseFloat(getComputedStyle(pill.button).width);
+  if (motion && change.inhale) inhale(pill);
 }
 
 function readParts(pill) {
@@ -388,98 +379,43 @@ function tweenParts(pill, from, to) {
   return tweens;
 }
 
-// The comet and the dot's breath run on the compositor, phased to the document clock. WebKit stops
-// compositing a running animation once its playbackRate leaves 1 or its node is re-inserted, so busy
-// rebuilds the comet on a shorter lap and every render rebuilds both in phase. Leaving, they keep
-// going until the ring has faded.
-function runOrbit(pill, look) {
-  if (orbitShown(look)) {
-    if (!Number.isFinite(pill.width)) return;
-    const lap = motionMs(look.busy ? "--loop-orbit-busy" : "--loop-orbit");
-    const width = orbitWidth(pill);
-    if (pill.moved || width !== pill.cometWidth || lap !== pill.cometLap)
-      runComet(pill, lap, width);
-    followWidth(pill);
-    if (reducedMotion.matches) for (const dot of pill.comet) dot.pause();
-    if (pill.moved) {
-      for (const animation of pill.loops) animation.cancel();
-      pill.loops = [];
-    }
-    pill.moved = false;
-    if (!reducedMotion.matches && !pill.loops.length)
-      pill.loops = [loop(pill.pulse, livePulse(), "--loop-live", motionEase("--ease-out"))];
-    return;
-  }
-  pill.moved = false;
-  const fade = pill.tweens.find((tween) => tween.effect.target === pill.ring);
-  if (!fade) {
-    stopLoops(pill);
-    return;
-  }
-  followWidth(pill);
-  void settle(fade, () => {
-    if (!orbitShown(pill.shown)) stopLoops(pill);
-  });
-}
-
-// WebKit fixes a composited orbit's % to the width the capsule had when it started, so while the
-// width tweens the comet is rebuilt around the width on screen every frame, then once where it lands.
-function followWidth(pill) {
-  if (pill.following || !widthTweening(pill)) return;
-  pill.following = true;
-  const frame = () => {
-    const running = pill.comet.length > 0 && pill.wrap.isConnected;
-    const width = orbitWidth(pill);
-    if (running && Number.isFinite(width) && width !== pill.cometWidth)
-      runComet(pill, pill.cometLap, width);
-    pill.following = running && widthTweening(pill);
-    if (pill.following) requestAnimationFrame(frame);
-  };
-  requestAnimationFrame(frame);
-}
-
-function widthTweening(pill) {
-  return pill.tweens.some(
-    (tween) => tween.effect?.target === pill.button && !UNTWEENED.has(tween.playState),
+// A change of words dips the whole capsule and lets it fill back out, from wherever it is now.
+function inhale(pill) {
+  const from = getComputedStyle(pill.wrap).transform;
+  pill.inhaleTween?.cancel();
+  pill.inhaleTween = pill.wrap.animate(
+    [
+      { transform: from },
+      { transform: `scale(${motionToken("--scale-inhale")})`, offset: INHALE_LOW },
+      { transform: "none" },
+    ],
+    { duration: motionMs("--motion-inhale"), easing: motionEase("--ease-glide") },
   );
 }
 
-// The width the comet circles: the one drawn this frame while the width tweens, else where it lands.
-function orbitWidth(pill) {
-  return widthTweening(pill) ? Number.parseFloat(getComputedStyle(pill.button).width) : pill.width;
-}
-
-// A new width or lap rebuilds the comet at the old head's share of its lap, already running, so it
-// carries on unbroken without a held frame.
-function runComet(pill, duration, width) {
-  const now = document.timeline.currentTime;
-  const was = pill.comet[0]?.currentTime;
-  const head = was == null ? now % duration : ((was % pill.cometLap) / pill.cometLap) * duration;
-  for (const dot of pill.comet) dot.cancel();
-  const { perimeter, keyframes } = orbitPath({
-    width,
-    height: pill.button.offsetHeight,
-    inset: Number.parseFloat(motionToken("--sharing-ring-width")) / 2,
+// The live glow breathes on the compositor, phased to the document clock. WebKit stops compositing a
+// running animation once its node is re-inserted, so every render rebuilds it in phase. Leaving, it
+// keeps breathing until the glow has faded.
+function runBreath(pill) {
+  if (pill.moved) stopBreath(pill);
+  if (pill.shown?.state === "active") {
+    if (!pill.breathing && !reducedMotion.matches)
+      pill.breathing = loop(
+        pill.breath,
+        { opacity: [Number(motionToken("--opacity-breath")), 1] },
+        "--loop-breathe",
+        motionEase("--ease-in-out"),
+      );
+    return;
+  }
+  const fade = pill.tweens.find((tween) => tween.effect.target === pill.glow);
+  if (!fade) {
+    stopBreath(pill);
+    return;
+  }
+  void settle(fade, () => {
+    if (pill.shown?.state !== "active") stopBreath(pill);
   });
-  const tail = Number.parseFloat(motionToken("--sharing-comet-tail"));
-  pill.comet = pill.cometNodes.map((node, index) => {
-    const { lag, opacity, scale } = cometDot(index, { perimeter, tail });
-    node.style.setProperty("--comet-opacity", String(opacity));
-    node.style.setProperty("--comet-scale", String(scale));
-    const animation = node.animate(keyframes, { duration, iterations: Infinity });
-    animation.startTime = now - (head + duration * (1 - lag));
-    return animation;
-  });
-  pill.cometWidth = width;
-  pill.cometLap = duration;
-}
-
-function livePulse() {
-  const scale = motionToken("--scale-live-ring");
-  return {
-    opacity: [Number(motionToken("--opacity-live-ring")), 0],
-    transform: ["none", `scale(${scale})`],
-  };
 }
 
 function loop(node, keyframes, duration, easing) {
@@ -487,23 +423,91 @@ function loop(node, keyframes, duration, easing) {
     duration: motionMs(duration),
     easing,
     iterations: Infinity,
+    direction: "alternate",
   });
   animation.startTime = 0;
   return animation;
 }
 
-function stopLoops(pill) {
-  for (const animation of [...pill.loops, ...pill.comet]) animation.cancel();
-  pill.loops = [];
-  pill.comet = [];
-  pill.cometWidth = null;
-  pill.cometLap = null;
+function stopBreath(pill) {
+  pill.breathing?.cancel();
+  pill.breathing = null;
+}
+
+// The pair's turn runs on the compositor while its speed holds; script steps it only while it speeds
+// up, slows or coasts to rest, so every change bends from the angle on screen. WebKit stops
+// compositing a re-inserted node's animation, so a render restarts a running loop at its angle.
+function turnOrbit(pill) {
+  const spin = pill.spin;
+  const motion = orbitMotion(pill.shown);
+  const lap = motion.lap ? motionMs(motion.lap) : 0;
+  const target = orbitSpeed(lap);
+  if (spin.loop && target === spin.target && !pill.moved) return;
+  if (spin.loop) {
+    spin.angle = loopAngle(spin.from, spin.loop.currentTime ?? 0, spin.lap);
+    spin.loop.cancel();
+    spin.loop = null;
+    drawOrbit(pill);
+  }
+  if (target !== spin.target || motion.rest !== spin.rest) spin.well = null;
+  spin.target = target;
+  spin.rest = motion.rest;
+  spin.lap = lap;
+  if (!motionEnabled()) {
+    cancelAnimationFrame(spin.frame);
+    spin.frame = 0;
+    if (!target) spin.angle = restAngle(spin.angle, motion.rest);
+    spin.speed = 0;
+    drawOrbit(pill);
+    return;
+  }
+  if (target && spin.speed === target) startSpin(pill);
+  else if (!spin.frame) {
+    spin.at = null;
+    spin.frame = requestAnimationFrame((now) => stepOrbit(pill, now));
+  }
+}
+
+function stepOrbit(pill, now) {
+  const spin = pill.spin;
+  spin.frame = 0;
+  if (!pill.wrap.isConnected) return;
+  const dt = spin.at === null ? 0 : Math.min((now - spin.at) / 1000, ORBIT_MAX_STEP);
+  spin.at = now;
+  const next = orbitStep(spin, spin, dt);
+  spin.angle = next.angle;
+  spin.speed = next.speed;
+  spin.well = next.well;
+  drawOrbit(pill);
+  if (next.done && spin.target) startSpin(pill);
+  else if (!next.done) spin.frame = requestAnimationFrame((time) => stepOrbit(pill, time));
+}
+
+function startSpin(pill) {
+  const spin = pill.spin;
+  spin.from = spin.angle % (2 * Math.PI);
+  spin.loop = pill.orbit.animate(
+    { transform: [`rotate(${spin.from}rad)`, `rotate(${spin.from + 2 * Math.PI}rad)`] },
+    { duration: spin.lap, iterations: Infinity },
+  );
+}
+
+function drawOrbit(pill) {
+  pill.orbit.style.transform = `rotate(${pill.spin.angle}rad)`;
 }
 
 function stillPill(pill) {
-  for (const animation of [...pill.tweens, pill.sweepTween, pill.pressTween]) animation?.cancel();
+  for (const animation of [...pill.tweens, pill.inhaleTween, pill.pressTween]) animation?.cancel();
   pill.tweens = [];
-  stopLoops(pill);
+  stopBreath(pill);
+  const spin = pill.spin;
+  cancelAnimationFrame(spin.frame);
+  spin.frame = 0;
+  if (spin.loop) spin.angle = loopAngle(spin.from, spin.loop.currentTime ?? 0, spin.lap);
+  spin.loop?.cancel();
+  spin.loop = null;
+  spin.speed = 0;
+  drawOrbit(pill);
 }
 
 // Press is quick and release springs back, both on the kept node so a render mid-press keeps them.
