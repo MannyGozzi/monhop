@@ -45,9 +45,10 @@ use crate::{
         ActiveDisplayBounds, CG_EVENT_DOCK_CONTROL, CG_EVENT_FLAGS_CHANGED,
         CG_EVENT_FLUID_TOUCH_GESTURE, CG_EVENT_GESTURE, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP,
         CG_EVENT_SCROLL_WHEEL, DecodedInput, DecodedPointer, EventSourceMetadata, GestureDecoder,
-        GestureFields, GestureOutput, HidKeyState, LocalModifierState, PhysicalModifierLedger,
-        PointerFields, decode_gesture, decode_keyboard, decode_pointer, decode_scroll,
-        is_pointer_motion, should_ignore_source, should_keep_quarantine_tap,
+        GestureFields, GestureOutput, HidKeyState, LocalModifierState, PageSwipes,
+        PhysicalModifierLedger, PointerFields, ScrollRecord, decode_gesture, decode_keyboard,
+        decode_pointer, decode_scroll, is_pointer_motion, page_swipes_enabled,
+        should_ignore_source, should_keep_quarantine_tap,
     },
     enumerate_active_displays,
     event_tap::{
@@ -89,6 +90,10 @@ const CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2: CGEventField = 94;
 const CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS: CGEventField = 88;
 const CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1: CGEventField = 96;
 const CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2: CGEventField = 97;
+const CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE: CGEventField = 99;
+const CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: CGEventField = 123;
+/// Private: the field `NSEvent.isDirectionInvertedFromDevice` reads on macOS 27.
+const CG_SCROLL_WHEEL_EVENT_INVERTED: CGEventField = 137;
 // Private gesture fields, named as in capture_decode::GestureFields.
 const CG_GESTURE_HID_TYPE: CGEventField = 110;
 const CG_GESTURE_ZOOM: CGEventField = 113;
@@ -901,6 +906,7 @@ struct CallbackState {
     last_gesture_at: Duration,
     gestures: GestureDecoder,
     gestures_unmapped: u64,
+    page_swipes: PageSwipes,
     /// Where the cursor holds while remote; owed back to it if the route ends without a restore point.
     remote_pin: Option<Point>,
     episode: Option<RemoteEpisode>,
@@ -915,6 +921,10 @@ impl Drop for CallbackState {
             self.unsupported_events,
             self.gestures_unmapped
         );
+        let (navigated, declined) = self.page_swipes.counts();
+        if navigated > 0 || declined > 0 {
+            log::info!("page swipes: {navigated} navigated, {declined} ended without navigating");
+        }
     }
 }
 
@@ -1228,6 +1238,7 @@ impl CallbackState {
             }
             self.route_remote = remote;
             self.physical.set_routing_revision(revision);
+            self.page_swipes.interrupt();
         }
         self.shared.remote_active.store(remote, Ordering::Release);
         ControlCompletion::Applied
@@ -1456,13 +1467,42 @@ impl CallbackState {
                         )
                     }
                 };
-                let withheld = self.decoded(decode_scroll(
+                // SAFETY: the live scroll event exposes its phase fields; a private one it lacks
+                // reads as zero.
+                let (phase, momentum, inverted) = unsafe {
+                    (
+                        CGEventGetIntegerValueField(event, CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE),
+                        CGEventGetIntegerValueField(event, CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE),
+                        CGEventGetIntegerValueField(event, CG_SCROLL_WHEEL_EVENT_INVERTED) != 0,
+                    )
+                };
+                let remote = self.remote();
+                let decoded = decode_scroll(
                     horizontal,
                     vertical,
                     continuous,
                     source,
                     SYNTHETIC_EVENT_MARKER,
-                ));
+                );
+                let physical = matches!(decoded, DecodedInput::Empty | DecodedInput::Event(_));
+                let withheld = self.decoded_for_route(decoded, remote);
+                let record = ScrollRecord {
+                    horizontal,
+                    vertical,
+                    continuous,
+                    phase,
+                    momentum,
+                    inverted,
+                };
+                let now = self.shared.origin.elapsed();
+                // The scroll itself crossed above; a finished flick adds its navigation after it.
+                if physical
+                    && let Some(gesture) =
+                        self.page_swipes
+                            .observe(record, now, remote, page_swipes_enabled())
+                {
+                    self.event_for_route(CaptureEvent::SystemGesture(gesture), remote);
+                }
                 self.tally(EpisodeEvent::Scroll, withheld)
             }
             CG_EVENT_GESTURE | CG_EVENT_DOCK_CONTROL | CG_EVENT_FLUID_TOUCH_GESTURE => {
@@ -1617,6 +1657,7 @@ fn run(
             last_gesture_at: Duration::ZERO,
             gestures: GestureDecoder::default(),
             gestures_unmapped: 0,
+            page_swipes: PageSwipes::default(),
             remote_pin: None,
             episode: None,
         });
@@ -2173,6 +2214,7 @@ mod callback_tests {
     use crate::capture_decode::{
         CG_EVENT_MOUSE_MOVED, CG_EVENT_OTHER_MOUSE_DOWN, CG_EVENT_OTHER_MOUSE_UP,
         CG_EVENT_SOURCE_STATE_HID_SYSTEM, DOCK_SWIPE_COMMIT_PROGRESS, DOCK_SWIPE_VERTICAL_UP_SIGN,
+        set_page_swipes_enabled,
     };
     use monhop_core::{
         FloorState, GesturePhase, LogicalRect, LogicalSize, PointerGesture, SharedFloor,
@@ -2232,6 +2274,7 @@ mod callback_tests {
             last_gesture_at: Duration::ZERO,
             gestures: GestureDecoder::default(),
             gestures_unmapped: 0,
+            page_swipes: PageSwipes::default(),
             remote_pin: None,
             episode: None,
         };
@@ -2377,6 +2420,121 @@ mod callback_tests {
         // SAFETY: event was created above and never transferred.
         unsafe { CFRelease(event) };
         suppressed
+    }
+
+    /// Delivers one natural-direction trackpad scroll record that moved `horizontal` points
+    /// sideways in scroll `phase`.
+    fn deliver_trackpad_scroll(state: &mut CallbackState, phase: i64, horizontal: i32) {
+        // SAFETY: a null source requests the default source; the owned event is never posted.
+        let event = unsafe {
+            CGEventCreateScrollWheelEvent2(
+                ptr::null(),
+                CG_SCROLL_EVENT_UNIT_PIXEL,
+                2,
+                0,
+                horizontal,
+                0,
+            )
+        };
+        assert!(!event.is_null());
+        // SAFETY: event is owned and non-null until the release below.
+        unsafe {
+            CGEventSetIntegerValueField(event, CG_SCROLL_WHEEL_EVENT_SCROLL_PHASE, phase);
+            CGEventSetIntegerValueField(event, CG_SCROLL_WHEEL_EVENT_INVERTED, 1);
+        }
+        state.native_event(CG_EVENT_SCROLL_WHEEL, event, physical_source());
+        // SAFETY: event was created above and never transferred.
+        unsafe { CFRelease(event) };
+    }
+
+    /// One quick flick with the fingers moving right, ending in its lift.
+    fn deliver_flick_right(state: &mut CallbackState) {
+        for (phase, horizontal) in [
+            (PHASE_BEGAN, 30),
+            (PHASE_CHANGED, 30),
+            (PHASE_CHANGED, 30),
+            (PHASE_CHANGED, 30),
+            (PHASE_ENDED, 0),
+        ] {
+            deliver_trackpad_scroll(state, phase, horizontal);
+        }
+    }
+
+    fn page_swipe_events(events: &[(CaptureEvent, bool)]) -> Vec<(CaptureEvent, bool)> {
+        events
+            .iter()
+            .copied()
+            .filter(|(event, _)| matches!(event, CaptureEvent::SystemGesture(_)))
+            .collect()
+    }
+
+    #[test]
+    fn a_remote_trackpad_flick_queues_its_scroll_then_one_navigation() {
+        set_page_swipes_enabled(true);
+        let (mut state, mut consumer) = callback_fixture();
+        // SAFETY: the owned event is released right away and never posted.
+        unsafe {
+            CFRelease(CGEventCreateScrollWheelEvent2(
+                ptr::null(),
+                CG_SCROLL_EVENT_UNIT_PIXEL,
+                1,
+                0,
+                0,
+                0,
+            ));
+        }
+        route_remote_for_gestures(&mut state, &mut consumer);
+        deliver_flick_right(&mut state);
+        let events = queued(&mut consumer);
+        assert_eq!(events.len(), 5, "four scrolls, then the navigation");
+        let (scrolls, navigation) = events.split_at(4);
+        for (event, remote) in scrolls {
+            let sideways = match event {
+                CaptureEvent::LogicalScroll { horizontal, .. } => *horizontal,
+                _ => f64::NAN,
+            };
+            assert!(*remote && sideways == 30.0, "the scroll crosses as before");
+        }
+        assert_eq!(
+            navigation,
+            [(
+                CaptureEvent::SystemGesture(SystemGesture::NavigateBack),
+                true
+            )],
+            "fingers moving right go back"
+        );
+        assert_eq!(state.page_swipes.counts(), (1, 0));
+    }
+
+    #[test]
+    fn a_swipe_cut_by_a_trip_home_never_navigates() {
+        set_page_swipes_enabled(true);
+        let (mut state, mut consumer) = callback_fixture();
+        route_remote_for_gestures(&mut state, &mut consumer);
+        deliver_trackpad_scroll(&mut state, PHASE_BEGAN, 30);
+        deliver_trackpad_scroll(&mut state, PHASE_CHANGED, 30);
+        assert_eq!(
+            state.restore_local_without_transfer(2),
+            ControlCompletion::Applied
+        );
+        let deadline = state.shared.origin.elapsed() + MAX_SUPPRESSION_TTL;
+        assert_eq!(
+            state.activate_remote(3, deadline),
+            ControlCompletion::Applied
+        );
+        deliver_trackpad_scroll(&mut state, PHASE_CHANGED, 30);
+        deliver_trackpad_scroll(&mut state, PHASE_CHANGED, 30);
+        deliver_trackpad_scroll(&mut state, PHASE_ENDED, 0);
+        assert!(page_swipe_events(&queued(&mut consumer)).is_empty());
+    }
+
+    #[test]
+    fn a_local_trackpad_flick_never_navigates() {
+        set_page_swipes_enabled(true);
+        let (mut state, mut consumer) = callback_fixture();
+        deliver_flick_right(&mut state);
+        assert!(page_swipe_events(&queued(&mut consumer)).is_empty());
+        assert_eq!(state.page_swipes.counts(), (0, 0));
     }
 
     /// Returns whether the callback withheld one physical gesture record, built as WebKit builds

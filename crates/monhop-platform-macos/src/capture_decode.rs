@@ -3,7 +3,11 @@
 //! This module does not touch Core Graphics. The owned capture thread supplies copied fields from
 //! its event-tap callback, which keeps the policy testable on non-macOS hosts.
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use monhop_core::{
     GestureKind, GesturePhase, HidUsage, LogicalRect, ModifierState, MouseButton, Point,
@@ -60,6 +64,32 @@ pub const DOCK_SWIPE_HORIZONTAL_NEXT_SIGN: f64 = -1.0;
 pub const DOCK_SWIPE_VERTICAL_UP_SIGN: f64 = -1.0;
 /// Thumb and three fingers: `ShowDesktop` (spread), else `Launcher`.
 pub const DOCK_SWIPE_SCALE_SPREAD_SIGN: f64 = 1.0;
+
+/// Least net sideways travel of a page swipe, in scrolled points: a nudge is not a swipe.
+pub const PAGE_SWIPE_MIN_TRAVEL: f64 = 60.0;
+/// How many times its net vertical travel the sideways travel must be: a diagonal scroll is not one.
+pub const PAGE_SWIPE_MIN_DOMINANCE: f64 = 2.5;
+/// The stretch before the lift whose travel gives the swipe's speed: several trackpad frames.
+pub const PAGE_SWIPE_SPEED_WINDOW: Duration = Duration::from_millis(60);
+/// Least sideways speed over that stretch, in points per second: a flick, not a slow scroll.
+pub const PAGE_SWIPE_MIN_SPEED: f64 = 600.0;
+/// Sign of an uninverted sideways delta when the fingers move right, as a wheel tilted right
+/// scrolls right. Unverified on a trackpad: flip it here.
+pub const PAGE_SWIPE_FINGERS_RIGHT_SIGN: f64 = -1.0;
+/// Speed samples kept: more than any trackpad reports within the window.
+const PAGE_SWIPE_SAMPLES: usize = 32;
+
+/// Off until the app applies the saved switch, so nothing navigates before it decides.
+static PAGE_SWIPES: AtomicBool = AtomicBool::new(false);
+
+/// Whether a quick two-finger swipe on this Mac goes back or forward on the computer it controls.
+pub fn set_page_swipes_enabled(enabled: bool) {
+    PAGE_SWIPES.store(enabled, Ordering::Release);
+}
+
+pub fn page_swipes_enabled() -> bool {
+    PAGE_SWIPES.load(Ordering::Acquire)
+}
 
 // Field 110, the IOHID event type behind a gesture record.
 const HID_ROTATION: i64 = 5;
@@ -850,6 +880,154 @@ fn rotate(fields: GestureFields) -> GestureOutput {
         .map_or(GestureOutput::Unmapped, |gesture| {
             GestureOutput::Event(CaptureEvent::gesture(gesture))
         })
+}
+
+/// Copied fields of one physical scroll record, as page swipes read them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScrollRecord {
+    /// Point deltas when `continuous`, as `decode_scroll` receives them.
+    pub horizontal: f64,
+    pub vertical: f64,
+    pub continuous: bool,
+    /// Field 99: the fingers' phase, numbered like field 132's; 0 on wheel and momentum records.
+    pub phase: i64,
+    /// Field 123: non-zero on the glide macOS adds after the fingers lift.
+    pub momentum: i64,
+    /// Private field 137, which `NSEvent.isDirectionInvertedFromDevice` reads: natural scrolling
+    /// flipped this record's deltas against the fingers.
+    pub inverted: bool,
+}
+
+impl ScrollRecord {
+    /// Sideways travel, positive when the fingers move right whatever the scroll direction setting.
+    fn fingers_right(self) -> f64 {
+        let uninverted = if self.inverted {
+            -self.horizontal
+        } else {
+            self.horizontal
+        };
+        uninverted * PAGE_SWIPE_FINGERS_RIGHT_SIGN
+    }
+}
+
+/// Two-finger page swipes: a scroll gesture from Began to Ended that finishes in a quick sideways
+/// flick fires Back (fingers right) or Forward, once, at its end. Its scroll still crosses as is.
+#[derive(Debug, Default)]
+pub struct PageSwipes {
+    open: Option<PageSwipe>,
+    fired: u64,
+    declined: u64,
+}
+
+impl PageSwipes {
+    /// One physical scroll record at `now` on the capture clock. A record while local or switched
+    /// off drops the open gesture, so a swipe fires only if all of it went to the other computer.
+    pub fn observe(
+        &mut self,
+        record: ScrollRecord,
+        now: Duration,
+        remote: bool,
+        enabled: bool,
+    ) -> Option<SystemGesture> {
+        if !remote || !enabled || !record.horizontal.is_finite() || !record.vertical.is_finite() {
+            self.open = None;
+            return None;
+        }
+        if record.momentum != 0 || !record.continuous {
+            return None;
+        }
+        let Some(NativePhase::Gesture(phase)) = native_phase(record.phase) else {
+            return None;
+        };
+        if phase == GesturePhase::Began {
+            self.open = Some(PageSwipe::default());
+        }
+        let mut swipe = self.open.take()?;
+        swipe.add(now, record.fingers_right(), record.vertical);
+        match phase {
+            GesturePhase::Began | GesturePhase::Changed => {
+                self.open = Some(swipe);
+                None
+            }
+            GesturePhase::Ended => {
+                let fired = swipe.gesture(now);
+                match fired {
+                    Some(_) => self.fired = self.fired.saturating_add(1),
+                    None => self.declined = self.declined.saturating_add(1),
+                }
+                fired
+            }
+            GesturePhase::Cancelled => {
+                self.declined = self.declined.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    /// A route change ends the open gesture, so one swipe never spans two trips to the other computer.
+    pub fn interrupt(&mut self) {
+        self.open = None;
+    }
+
+    /// Gestures that navigated and gestures that ended without navigating, for a count-only line.
+    pub const fn counts(&self) -> (u64, u64) {
+        (self.fired, self.declined)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PageSwipe {
+    /// Net travel; sideways is positive with the fingers moving right.
+    travel_x: f64,
+    travel_y: f64,
+    /// Each record's arrival and sideways travel, the oldest overwritten first.
+    recent: [(Duration, f64); PAGE_SWIPE_SAMPLES],
+    next: usize,
+}
+
+impl Default for PageSwipe {
+    fn default() -> Self {
+        Self {
+            travel_x: 0.0,
+            travel_y: 0.0,
+            recent: [(Duration::ZERO, 0.0); PAGE_SWIPE_SAMPLES],
+            next: 0,
+        }
+    }
+}
+
+impl PageSwipe {
+    fn add(&mut self, at: Duration, fingers_right: f64, vertical: f64) {
+        self.travel_x += fingers_right;
+        self.travel_y += vertical;
+        self.recent[self.next] = (at, fingers_right);
+        self.next = (self.next + 1) % PAGE_SWIPE_SAMPLES;
+    }
+
+    fn gesture(&self, end: Duration) -> Option<SystemGesture> {
+        let sideways = self.travel_x.abs();
+        if !sideways.is_finite()
+            || sideways < PAGE_SWIPE_MIN_TRAVEL
+            || sideways < PAGE_SWIPE_MIN_DOMINANCE * self.travel_y.abs()
+        {
+            return None;
+        }
+        let late: f64 = self
+            .recent
+            .iter()
+            .filter(|(at, _)| end.saturating_sub(*at) <= PAGE_SWIPE_SPEED_WINDOW)
+            .map(|(_, travel)| travel)
+            .sum();
+        let speed = late * self.travel_x.signum() / PAGE_SWIPE_SPEED_WINDOW.as_secs_f64();
+        if speed < PAGE_SWIPE_MIN_SPEED {
+            return None;
+        }
+        Some(if self.travel_x > 0.0 {
+            SystemGesture::NavigateBack
+        } else {
+            SystemGesture::NavigateForward
+        })
+    }
 }
 
 /// The event-tap callback's decode is where a button is stamped on the shared capture clock.
@@ -1942,6 +2120,269 @@ mod tests {
             .to_string(),
             "pinch ended (lost end): 42 records, total scale 1.563"
         );
+    }
+
+    const FRAME: Duration = Duration::from_millis(10);
+    const SCROLL_BEGAN: i64 = 1;
+    const SCROLL_CHANGED: i64 = 2;
+    const SCROLL_ENDED: i64 = 4;
+    const SCROLL_CANCELLED: i64 = 8;
+    const SCROLL_MAY_BEGIN: i64 = 128;
+    const MOMENTUM_CONTINUE: i64 = 2;
+
+    /// One trackpad scroll record whose fingers moved `fingers` points right, with the deltas
+    /// flipped as macOS flips them under natural scrolling.
+    fn trackpad(phase: i64, fingers: f64, vertical: f64, natural: bool) -> ScrollRecord {
+        let uninverted = fingers * PAGE_SWIPE_FINGERS_RIGHT_SIGN;
+        ScrollRecord {
+            horizontal: if natural { -uninverted } else { uninverted },
+            vertical,
+            continuous: true,
+            phase,
+            momentum: 0,
+            inverted: natural,
+        }
+    }
+
+    /// Began, then a Changed per further step, then the lift a frame after the last step.
+    fn flick_on(steps: &[(f64, f64)], end: i64, natural: bool) -> Vec<ScrollRecord> {
+        let mut records: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .map(|(index, (fingers, vertical))| {
+                let phase = if index == 0 {
+                    SCROLL_BEGAN
+                } else {
+                    SCROLL_CHANGED
+                };
+                trackpad(phase, *fingers, *vertical, natural)
+            })
+            .collect();
+        records.push(trackpad(end, 0.0, 0.0, natural));
+        records
+    }
+
+    fn flick(steps: &[(f64, f64)], end: i64) -> Vec<ScrollRecord> {
+        flick_on(steps, end, true)
+    }
+
+    fn sideways(step: f64, frames: usize) -> Vec<(f64, f64)> {
+        vec![(step, 0.0); frames]
+    }
+
+    /// What `records` fire, fed a frame apart from `start` on one route and switch setting.
+    fn swipes_on(
+        swipes: &mut PageSwipes,
+        records: impl IntoIterator<Item = ScrollRecord>,
+        start: Duration,
+        remote: bool,
+        enabled: bool,
+    ) -> Vec<SystemGesture> {
+        (0_u32..)
+            .zip(records)
+            .filter_map(|(frame, record)| {
+                swipes.observe(record, start + FRAME * frame, remote, enabled)
+            })
+            .collect()
+    }
+
+    fn swipes(
+        swipes: &mut PageSwipes,
+        records: impl IntoIterator<Item = ScrollRecord>,
+    ) -> Vec<SystemGesture> {
+        swipes_on(swipes, records, Duration::from_secs(1), true, true)
+    }
+
+    #[test]
+    fn a_quick_sideways_flick_fires_once_at_its_lift_the_way_the_fingers_went() {
+        for natural in [true, false] {
+            for (step, expected) in [
+                (30.0, SystemGesture::NavigateBack),
+                (-30.0, SystemGesture::NavigateForward),
+            ] {
+                let mut detector = PageSwipes::default();
+                let outputs: Vec<_> = (0_u32..)
+                    .zip(flick_on(&sideways(step, 5), SCROLL_ENDED, natural))
+                    .map(|(frame, record)| detector.observe(record, FRAME * frame, true, true))
+                    .collect();
+                assert_eq!(
+                    outputs,
+                    [None, None, None, None, None, Some(expected)],
+                    "natural {natural}, step {step}: only the lift fires"
+                );
+                assert_eq!(detector.counts(), (1, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn a_natural_record_flips_its_deltas_against_the_fingers() {
+        let right = trackpad(SCROLL_CHANGED, 10.0, 0.0, true);
+        assert_eq!(
+            right.horizontal, 10.0,
+            "natural scrolling moves the content with the fingers: a scroll left"
+        );
+        assert_eq!(right.fingers_right(), 10.0);
+        let traditional = ScrollRecord {
+            inverted: false,
+            ..right
+        };
+        assert_eq!(traditional.fingers_right(), -10.0);
+    }
+
+    #[test]
+    fn slow_sideways_scrolling_stays_scrolling() {
+        let mut detector = PageSwipes::default();
+        assert!(swipes(&mut detector, flick(&sideways(3.0, 40), SCROLL_ENDED)).is_empty());
+        let mut slowing = sideways(40.0, 3);
+        slowing.extend(sideways(1.0, 10));
+        assert!(
+            swipes(&mut detector, flick(&slowing, SCROLL_ENDED)).is_empty(),
+            "a fast start that slows before the lift is a scroll"
+        );
+        assert!(
+            swipes(&mut detector, flick(&sideways(25.0, 2), SCROLL_ENDED)).is_empty(),
+            "a quick nudge short of the travel is not a swipe"
+        );
+        let mut paused = flick(&sideways(30.0, 5), SCROLL_ENDED);
+        let lift = paused.pop().unwrap();
+        paused.extend([trackpad(SCROLL_CHANGED, 0.0, 0.0, true); 7]);
+        paused.push(lift);
+        assert!(
+            swipes(&mut detector, paused).is_empty(),
+            "fingers that stop before lifting do not flick"
+        );
+        assert_eq!(detector.counts(), (0, 4));
+    }
+
+    #[test]
+    fn a_mostly_vertical_scroll_does_not_fire() {
+        let mut detector = PageSwipes::default();
+        for vertical in [20.0, -20.0, 30.0] {
+            assert!(
+                swipes(&mut detector, flick(&[(30.0, vertical); 5], SCROLL_ENDED)).is_empty(),
+                "vertical {vertical}"
+            );
+        }
+        assert_eq!(
+            swipes(&mut detector, flick(&[(30.0, 12.0); 5], SCROLL_ENDED)),
+            [SystemGesture::NavigateBack],
+            "sideways travel of exactly 2.5 times the vertical still counts"
+        );
+    }
+
+    #[test]
+    fn momentum_records_never_count_or_start_a_swipe() {
+        let glide = |phase| ScrollRecord {
+            momentum: MOMENTUM_CONTINUE,
+            ..trackpad(phase, 60.0, 0.0, true)
+        };
+        let mut detector = PageSwipes::default();
+        assert!(
+            swipes(
+                &mut detector,
+                [
+                    glide(0),
+                    glide(SCROLL_BEGAN),
+                    glide(0),
+                    trackpad(SCROLL_ENDED, 0.0, 0.0, true),
+                ]
+            )
+            .is_empty(),
+            "a glide starts nothing, and a lift with nothing open fires nothing"
+        );
+        let mut records = flick(&sideways(5.0, 3), SCROLL_ENDED);
+        let lift = records.pop().unwrap();
+        records.extend([glide(0), glide(SCROLL_CHANGED), glide(0)]);
+        records.push(lift);
+        assert!(
+            swipes(&mut detector, records).is_empty(),
+            "a glide inside a slow scroll adds no travel"
+        );
+        assert_eq!(detector.counts(), (0, 1));
+    }
+
+    #[test]
+    fn a_cancelled_or_unphased_gesture_never_fires() {
+        let mut detector = PageSwipes::default();
+        assert!(swipes(&mut detector, flick(&sideways(30.0, 5), SCROLL_CANCELLED)).is_empty());
+        assert_eq!(detector.counts(), (0, 1));
+        let wheel = ScrollRecord {
+            continuous: false,
+            ..trackpad(SCROLL_BEGAN, 30.0, 0.0, true)
+        };
+        let unphased = |phase| trackpad(phase, 30.0, 0.0, true);
+        assert!(
+            swipes(
+                &mut detector,
+                [
+                    wheel,
+                    unphased(0),
+                    unphased(SCROLL_MAY_BEGIN),
+                    unphased(3),
+                    unphased(SCROLL_CHANGED),
+                    trackpad(SCROLL_ENDED, 0.0, 0.0, true),
+                ]
+            )
+            .is_empty(),
+            "only a precise Began opens a swipe"
+        );
+    }
+
+    #[test]
+    fn each_gesture_fires_at_most_once_and_the_next_fires_again() {
+        let mut detector = PageSwipes::default();
+        let mut records = flick(&sideways(30.0, 5), SCROLL_ENDED);
+        records.push(trackpad(SCROLL_ENDED, 0.0, 0.0, true));
+        assert_eq!(
+            swipes(&mut detector, records),
+            [SystemGesture::NavigateBack],
+            "a repeated lift fires nothing"
+        );
+        assert_eq!(
+            swipes(&mut detector, flick(&sideways(-30.0, 5), SCROLL_ENDED)),
+            [SystemGesture::NavigateForward]
+        );
+        assert_eq!(
+            swipes(&mut detector, flick(&sideways(30.0, 5), SCROLL_ENDED)),
+            [SystemGesture::NavigateBack]
+        );
+        assert_eq!(detector.counts(), (3, 0));
+    }
+
+    #[test]
+    fn a_swipe_fires_only_while_remote_and_switched_on() {
+        let start = Duration::from_secs(1);
+        let fast = || flick(&sideways(30.0, 5), SCROLL_ENDED);
+        for (remote, enabled) in [(false, true), (true, false), (false, false)] {
+            let mut detector = PageSwipes::default();
+            assert!(
+                swipes_on(&mut detector, fast(), start, remote, enabled).is_empty(),
+                "remote {remote}, switched on {enabled}"
+            );
+            assert_eq!(detector.counts(), (0, 0));
+        }
+        for (remote, enabled) in [(false, true), (true, false)] {
+            let mut detector = PageSwipes::default();
+            let mut records = fast().into_iter();
+            assert!(
+                swipes_on(&mut detector, records.by_ref().take(2), start, true, true).is_empty()
+            );
+            assert!(
+                swipes_on(
+                    &mut detector,
+                    records.by_ref().take(1),
+                    start,
+                    remote,
+                    enabled
+                )
+                .is_empty()
+            );
+            assert!(
+                swipes_on(&mut detector, records, start, true, true).is_empty(),
+                "one record while local or switched off drops the gesture"
+            );
+        }
     }
 
     #[test]

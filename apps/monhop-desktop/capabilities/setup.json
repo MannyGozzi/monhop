@@ -45,6 +45,8 @@
     "allow-clipboard-set-enabled",
     "allow-autoscroll-status",
     "allow-autoscroll-set-enabled",
+    "allow-swipe-status",
+    "allow-swipe-set-enabled",
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-minimize",

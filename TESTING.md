@@ -232,6 +232,15 @@ Autoscroll tests drive a Windows mouse on a Mac. They cover:
 - the Home switch off restoring plain middle drags;
 - a Mac source never autoscrolling.
 
+Swipe-between-pages tests drive a Mac trackpad on a Windows PC and on another Mac. They cover:
+
+- a quick two-finger swipe right going back and left going forward in a browser, once per swipe;
+- slow sideways scrolling, a mostly vertical scroll and a swipe that pauses before lifting never navigating;
+- the momentum glide after a lift never navigating again;
+- the same direction with natural scrolling turned off in the Mac's Trackpad settings;
+- the same swipe while the Mac controls itself left to macOS alone;
+- the Home switch off keeping plain sideways scrolling.
+
 ## Explicit pairing checkpoint
 
 The new desktop pairing controller has no input command. Startup, pane navigation and native UI smoke checks do not read identity/trust storage or open a pairing socket. Pure tests cover public-code/record/message bounds, wrong/self identities, restart, duplicate/corrupt storage, readback failures, stale confirmation, cancellation around writes and a blocked store write.

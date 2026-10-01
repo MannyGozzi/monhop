@@ -19,6 +19,7 @@ use monhop_core::{
 
 pub use monhop_core::{capture, capture_control, capture_physical};
 pub mod capture_decode;
+pub use capture_decode::set_page_swipes_enabled;
 pub mod gesture_inject;
 use gesture_inject::{
     ChordKeyEvent, MacChord, PinchSteps, StuckChordKeys, SymbolicHotkeys, chord_key_events,

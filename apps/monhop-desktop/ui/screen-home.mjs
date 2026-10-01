@@ -14,6 +14,7 @@ import {
 } from "./dimming-model.mjs";
 import { canInstall, installHint } from "./updates-model.mjs";
 import { AUTOSCROLL_LABEL, AUTOSCROLL_NOTE } from "./autoscroll-model.mjs";
+import { SWIPE_LABEL, SWIPE_NOTE } from "./swipe-model.mjs";
 import {
   CLIPBOARD_PRIVACY,
   clipboardAccessNotice,
@@ -102,8 +103,8 @@ export function renderHome(nodes, ctx) {
   const clipboard = presence("home-clipboard", clipboardCard(ctx));
   if (clipboard) nodes.homeContent.append(clipboard);
   nodes.homeContent.append(dimmingCard(ctx));
-  const autoscroll = presence("home-autoscroll", autoscrollCard(ctx));
-  if (autoscroll) nodes.homeContent.append(autoscroll);
+  const pointer = presence("home-pointer", pointerCard(ctx));
+  if (pointer) nodes.homeContent.append(pointer);
 
   const logPath = state.snapshot?.logPath;
   if (typeof logPath === "string" && logPath)
@@ -257,24 +258,38 @@ function dimmingCard({ core, dimming, actions }) {
   });
 }
 
-// Only on a Mac, once app.js has Rust's view: the switch matters when a Windows mouse controls it.
-function autoscrollCard({ core, autoscroll, actions }) {
-  if (!autoscroll) return null;
-  const { view, pending } = autoscroll;
+// Only on a Mac, once app.js has Rust's views: autoscroll matters when a Windows mouse controls this
+// Mac, swiping between pages when this Mac's trackpad controls another computer.
+function pointerCard({ core, autoscroll, swipe, actions }) {
+  const switches = [
+    autoscroll &&
+      switchRow(AUTOSCROLL_LABEL, {
+        checked: autoscroll.view.enabled,
+        description: AUTOSCROLL_NOTE,
+        disabled: !core || autoscroll.pending || typeof actions.setAutoscrollEnabled !== "function",
+        focusKey: "home-autoscroll-enable",
+        onChange: actions.setAutoscrollEnabled,
+      }),
+    swipe &&
+      switchRow(SWIPE_LABEL, {
+        checked: swipe.view.enabled,
+        description: SWIPE_NOTE,
+        disabled: !core || swipe.pending || typeof actions.setSwipeEnabled !== "function",
+        focusKey: "home-swipe-enable",
+        onChange: actions.setSwipeEnabled,
+      }),
+  ].filter(Boolean);
+  if (!switches.length) return null;
   return card({
-    id: "home-autoscroll",
-    title: "Mouse",
+    id: "home-pointer",
+    title: "Mouse and trackpad",
     children: [
-      rows([
-        switchRow(AUTOSCROLL_LABEL, {
-          checked: view.enabled,
-          description: AUTOSCROLL_NOTE,
-          disabled: !core || pending || typeof actions.setAutoscrollEnabled !== "function",
-          focusKey: "home-autoscroll-enable",
-          onChange: actions.setAutoscrollEnabled,
-        }),
-      ]),
-      presence("home-autoscroll-message", view.error ? note(view.error, "danger") : null),
+      rows(switches),
+      presence(
+        "home-autoscroll-message",
+        autoscroll?.view.error ? note(autoscroll.view.error, "danger") : null,
+      ),
+      presence("home-swipe-message", swipe?.view.error ? note(swipe.view.error, "danger") : null),
     ],
   });
 }

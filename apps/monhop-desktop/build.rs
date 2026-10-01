@@ -53,6 +53,8 @@ fn main() {
             "clipboard_set_enabled",
             "autoscroll_status",
             "autoscroll_set_enabled",
+            "swipe_status",
+            "swipe_set_enabled",
             "window_hide",
             "computers_load",
             "computers_rename",

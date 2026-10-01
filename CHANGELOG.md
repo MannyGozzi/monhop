@@ -7,6 +7,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 ### Added
 
 - A Windows mouse controlling a Mac autoscrolls with its middle button like it does on Windows: hold and drag, or click once and move, then click or press Escape to stop. A small ring marks where it started. Turn off Middle-click autoscroll on the Mac's Home screen to keep plain middle clicks and drags.
+- A Mac trackpad controlling another computer swipes between pages: a quick two-finger swipe right goes back and left goes forward, while slower sideways scrolling still just scrolls. Turn off Swipe between pages on the Mac's Home screen to keep plain sideways scrolling.
 
 ### Fixed
 

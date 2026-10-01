@@ -103,6 +103,7 @@ import {
 } from "./computer-card-model.mjs";
 import { clipboardContext, invokeSetComputerEnabled, pollFingerprint } from "./app-actions.mjs";
 import { autoscrollContext } from "./autoscroll-model.mjs";
+import { swipeContext } from "./swipe-model.mjs";
 import { forgetArrangementMotion } from "./dashboard-arrangement.mjs";
 import {
   applyDimmingView,
@@ -173,9 +174,11 @@ let dimming = initialDimming();
 // before clipboard sharing landed leaves the Home card hidden rather than showing a broken one.
 let clipboardView;
 let clipboardPending = false;
-// Undefined until autoscroll_status answers; the card is a Mac's only.
-let autoscrollView;
-let autoscrollPending = false;
+// The Mac's mouse and trackpad switches: each view is undefined until its status answers.
+const pointerSwitches = {
+  autoscroll: { view: undefined, pending: false },
+  swipe: { view: undefined, pending: false },
+};
 let theme = "system";
 let themePending = false;
 // The header icon animates once after a click, not on every poll-driven render.
@@ -309,7 +312,7 @@ if (!uiCheck) {
   listenDimming();
   void loadClipboard();
   listenClipboard();
-  if (platform === "macos") void loadAutoscroll();
+  if (platform === "macos") void loadPointerSwitches();
   void loadUpdatesStatus();
   // The initial page never runs through goToPage's entry hooks, so this covers a fresh
   // launch landing straight on Setup or Settings; the hooks below cover later visits.
@@ -530,7 +533,12 @@ function context() {
     dropCopyFeedback,
     dimming,
     clipboard: clipboardContext(clipboardView, clipboardPending),
-    autoscroll: autoscrollContext(platform, autoscrollView, autoscrollPending),
+    autoscroll: autoscrollContext(
+      platform,
+      pointerSwitches.autoscroll.view,
+      pointerSwitches.autoscroll.pending,
+    ),
+    swipe: swipeContext(platform, pointerSwitches.swipe.view, pointerSwitches.swipe.pending),
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
     busy: controlsBusy(),
@@ -570,6 +578,7 @@ function context() {
       setComputerEnabled,
       setClipboardEnabled,
       setAutoscrollEnabled,
+      setSwipeEnabled,
       startRename,
       draftRename,
       cancelRename,
@@ -1557,35 +1566,43 @@ function setClipboardEnabled(enabled) {
   void runClipboardCommand(() => core.invoke("clipboard_set_enabled", { enabled }));
 }
 
-// ---------- autoscroll ----------
+// ---------- mouse and trackpad ----------
 
-async function loadAutoscroll() {
+// Both answers land in one render, so the card enters whole instead of growing a row. A backend
+// without a command leaves that row out.
+async function loadPointerSwitches() {
   if (!core?.invoke) return;
-  try {
-    autoscrollView = await core.invoke("autoscroll_status");
-    render();
-  } catch {
-    // A backend without the command leaves the card hidden.
-  }
+  const status = (command) => core.invoke(command).catch(() => undefined);
+  const [autoscroll, swipe] = await Promise.all([
+    status("autoscroll_status"),
+    status("swipe_status"),
+  ]);
+  pointerSwitches.autoscroll.view = autoscroll;
+  pointerSwitches.swipe.view = swipe;
+  render();
 }
 
-// One in-flight change at a time; a failed call surfaces in the page alert, a failed save on the card.
-async function runAutoscrollCommand(invoke) {
-  if (!core?.invoke || autoscrollPending) return;
-  autoscrollPending = true;
+// One in-flight change per switch; a failed call surfaces in the page alert, a failed save on the card.
+async function setPointerSwitch(entry, command, enabled) {
+  if (!core?.invoke || entry.pending) return;
+  entry.pending = true;
   render();
   try {
-    autoscrollView = await invoke();
+    entry.view = await core.invoke(command, { enabled });
   } catch (error) {
     state = { ...state, messages: [nativeError(error)] };
   } finally {
-    autoscrollPending = false;
+    entry.pending = false;
     render();
   }
 }
 
 function setAutoscrollEnabled(enabled) {
-  void runAutoscrollCommand(() => core.invoke("autoscroll_set_enabled", { enabled }));
+  void setPointerSwitch(pointerSwitches.autoscroll, "autoscroll_set_enabled", enabled);
+}
+
+function setSwipeEnabled(enabled) {
+  void setPointerSwitch(pointerSwitches.swipe, "swipe_set_enabled", enabled);
 }
 
 // ---------- updates ----------
