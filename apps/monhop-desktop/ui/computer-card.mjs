@@ -119,7 +119,7 @@ export function computerCard(
           className: "computer-actions",
           children: [
             scope === "home"
-              ? sharingPill(ctx, fingerprint, name, enabled)
+              ? sharingPill(ctx, fingerprint, name, enabled, status.key === "sharing")
               : useToggle(ctx, fingerprint, scope, enabled),
           ],
         }),
@@ -171,7 +171,12 @@ export function computerCard(
 // Each computer's Link capsule outlives renders: Home is rebuilt whenever a status poll changes it,
 // and a kept node keeps its tweens, orbit, hover and focus through each rebuild.
 const pills = new Map();
-const PILL_LABELS = { start: "Start sharing", sharing: "Sharing", pause: "Pause" };
+const PILL_LABELS = {
+  start: "Start sharing",
+  connecting: "Connecting…",
+  sharing: "Sharing",
+  pause: "Pause",
+};
 const GLYPH = ["opacity", "transform", "filter"];
 const DOT = ["transform", "backgroundColor", "boxShadow"];
 let pillsQueued = false;
@@ -183,7 +188,7 @@ reducedMotion.addEventListener("change", () => {
   queuePills();
 });
 
-function sharingPill(ctx, fingerprint, name, enabled) {
+function sharingPill(ctx, fingerprint, name, enabled, live) {
   const pill = pills.get(fingerprint) ?? buildPill(fingerprint);
   pills.set(fingerprint, pill);
   const control = pill.button;
@@ -193,7 +198,7 @@ function sharingPill(ctx, fingerprint, name, enabled) {
   else control.removeAttribute("aria-busy");
   control.disabled = ctx.busy;
   pill.press = () => toggleComputerEnabled(ctx.actions, fingerprint, enabled);
-  pill.want = { ...pill.want, inUse: enabled, busy: ctx.busy };
+  pill.want = { ...pill.want, inUse: enabled, live, busy: ctx.busy };
   pill.moved = true;
   queuePills();
   return pill.wrap;
@@ -263,7 +268,7 @@ function buildPill(fingerprint) {
     breath,
     orbit,
     parts,
-    want: { inUse: false, busy: false, hover: false, focus: false, rested: false },
+    want: { inUse: false, live: false, busy: false, hover: false, focus: false, rested: false },
     shown: null,
     tweens: [],
     breathing: null,

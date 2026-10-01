@@ -646,17 +646,19 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 /* Labels share one cell; only the current state's labels take space, so the width follows them. */
 .sharing-pill-label { position: relative; display: grid; text-align: start; }
 .sharing-pill-label > span { grid-area: 1 / 1; opacity: 0; filter: blur(var(--motion-blur-deep)); transform: scale(var(--scale-defocus)); transform-origin: left center; }
-.sharing-pill-wrap:not([data-state="active"]) .sharing-pill-label > :not(.start), .sharing-pill-wrap[data-state="active"] .sharing-pill-label > .start { position: absolute; top: 0; left: 0; }
+.sharing-pill-wrap:not([data-state="active"], [data-state="connecting"]) .sharing-pill-label > :not(.start), .sharing-pill-wrap[data-state="connecting"] .sharing-pill-label > :is(.start, .sharing), .sharing-pill-wrap[data-state="active"] .sharing-pill-label > :is(.start, .connecting) { position: absolute; top: 0; left: 0; }
 .sharing-pill-label > .start, .sharing-pill-label > .pause { color: var(--foreground); }
+.sharing-pill-label > .connecting { color: var(--muted-foreground); }
 .sharing-pill-label > .sharing { color: var(--success-text); }
 /* Idle: hover leans the dots in and brightens the edge. */
-.sharing-pill-wrap:not([data-state="active"]) .sharing-pill-label > .start { opacity: 1; transform: none; filter: none; }
+.sharing-pill-wrap:not([data-state="active"], [data-state="connecting"]) .sharing-pill-label > .start { opacity: 1; transform: none; filter: none; }
 .sharing-pill-wrap[data-lean="true"] .sharing-pill-edge { opacity: 1; }
 .sharing-pill-wrap[data-lean="true"] .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-lean) * -1)); }
 .sharing-pill-wrap[data-lean="true"] .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-lean)); }
 /* Busy: the pair circles fast on a tighter orbit and the words step back. */
-.sharing-pill-wrap[data-busy="true"] .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-busy) * -1)); }
-.sharing-pill-wrap[data-busy="true"] .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-busy)); }
+.sharing-pill-wrap:is([data-busy="true"], [data-state="connecting"]:not([data-pause="true"])) .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-busy) * -1)); }
+.sharing-pill-wrap:is([data-busy="true"], [data-state="connecting"]:not([data-pause="true"])) .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-busy)); }
+.sharing-pill-wrap[data-state="connecting"]:not([data-pause="true"]) .sharing-pill-label > .connecting { opacity: 1; transform: none; filter: none; }
 .sharing-pill-wrap[data-busy="true"] .sharing-pill-label { opacity: var(--opacity-busy); }
 /* Live: the glass blooms green from the dots, and the pair brightens and glows on a slow orbit. */
 .sharing-pill-wrap[data-state="active"] :is(.sharing-pill-halo, .sharing-pill-glow) { opacity: 1; }

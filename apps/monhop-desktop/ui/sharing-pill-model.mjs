@@ -1,16 +1,18 @@
-// What the Link capsule shows. Hover and keyboard focus reshape it only when a press would act:
-// idle, the two computers lean in; live, the orbit stops into Pause's bars. Right after a press
-// (`rested`) it shows the result instead of the next action.
+// What the Link capsule shows. Switched on, it is connecting until the session is `live`. Hover and
+// keyboard focus reshape it only when a press would act: idle, the two computers lean in; switched
+// on, the orbit stops into Pause's bars. Right after a press (`rested`) it shows the result instead
+// of the next action.
 export function pillLook({
   inUse = false,
+  live = false,
   busy = false,
   hover = false,
   focus = false,
   rested = false,
 } = {}) {
-  const state = inUse ? "active" : "idle";
+  const state = inUse ? (live ? "active" : "connecting") : "idle";
   const engaged = !busy && !rested && (hover || focus);
-  return { state, busy, pause: state === "active" && engaged, lean: state === "idle" && engaged };
+  return { state, busy, pause: state !== "idle" && engaged, lean: state === "idle" && engaged };
 }
 
 // Null when the capsule already shows `next`, so a render never restarts its motion. The first look
@@ -27,8 +29,9 @@ const LOOK_KEYS = ["state", "busy", "pause", "lean"];
 
 // The label the capsule shows.
 export function pillWords(look) {
-  if (look.state !== "active") return "start";
-  return look.pause ? "pause" : "sharing";
+  if (look.state === "idle") return "start";
+  if (look.pause) return "pause";
+  return look.state === "active" ? "sharing" : "connecting";
 }
 
 // Where the inhale bottoms out, as a share of its run.
@@ -51,12 +54,13 @@ export function tweenTiming({ part, property, rising }) {
 const TURN = 2 * Math.PI;
 
 // How the two computers circle: a lap token while they spin, else the turn they come to rest on.
-// Idle rests on whole turns so each computer keeps its side; Pause rests on half turns, where either
-// way round the pair reads as the two bars.
+// They spin fast while busy or connecting and slowly while sharing. Idle rests on whole turns so
+// each computer keeps its side; Pause rests on half turns, where either way round the pair reads
+// as the two bars.
 export function orbitMotion(look) {
   if (look.busy) return { lap: "--loop-orbit-busy", rest: null };
-  if (look.state === "active" && !look.pause) return { lap: "--loop-orbit", rest: null };
-  return { lap: null, rest: look.pause ? TURN / 2 : TURN };
+  if (look.pause || look.state === "idle") return { lap: null, rest: look.pause ? TURN / 2 : TURN };
+  return { lap: look.state === "active" ? "--loop-orbit" : "--loop-orbit-busy", rest: null };
 }
 
 // Radians per second for a lap of `lapMs`, or 0 for none.

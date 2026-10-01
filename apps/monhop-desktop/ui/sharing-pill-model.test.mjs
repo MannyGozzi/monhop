@@ -18,6 +18,14 @@ import {
 
 const TURN = 2 * Math.PI;
 
+test("switched on, the capsule is connecting until the session is live", () => {
+  assert.equal(pillLook({ inUse: true }).state, "connecting");
+  assert.equal(pillLook({ inUse: true, live: true }).state, "active");
+  assert.equal(pillLook({ live: true }).state, "idle");
+  assert.equal(pillLook({ inUse: true, hover: true }).pause, true);
+  assert.equal(pillLook({ inUse: true, live: true, hover: true }).pause, true);
+});
+
 test("hover and focus reshape the capsule only when a press would act", () => {
   assert.deepEqual(pillLook({ inUse: false, hover: true }), {
     state: "idle",
@@ -46,9 +54,11 @@ test("the capsule inhales only when its words change", () => {
   const idle = pillLook();
   const lean = pillLook({ hover: true });
   const busy = pillLook({ busy: true });
-  const live = pillLook({ inUse: true });
-  const pause = pillLook({ inUse: true, hover: true });
-  assert.deepEqual(pillChange(idle, live), { animate: true, inhale: true });
+  const connecting = pillLook({ inUse: true });
+  const live = pillLook({ inUse: true, live: true });
+  const pause = pillLook({ inUse: true, live: true, hover: true });
+  assert.deepEqual(pillChange(idle, connecting), { animate: true, inhale: true });
+  assert.equal(pillChange(connecting, live).inhale, true);
   assert.equal(pillChange(live, pause).inhale, true);
   assert.equal(pillChange(pause, idle).inhale, true);
   assert.equal(pillChange(idle, lean).inhale, false);
@@ -59,14 +69,23 @@ test("the capsule inhales only when its words change", () => {
 test("the words follow the state and Pause", () => {
   assert.equal(pillWords(pillLook()), "start");
   assert.equal(pillWords(pillLook({ busy: true })), "start");
-  assert.equal(pillWords(pillLook({ inUse: true })), "sharing");
+  assert.equal(pillWords(pillLook({ inUse: true })), "connecting");
+  assert.equal(pillWords(pillLook({ inUse: true, live: true })), "sharing");
   assert.equal(pillWords(pillLook({ inUse: true, hover: true })), "pause");
+  assert.equal(pillWords(pillLook({ inUse: true, live: true, hover: true })), "pause");
 });
 
-test("the pair spins fast while busy, slowly while live, and rests otherwise", () => {
+test("the pair spins fast while busy or connecting, slowly while live, and rests otherwise", () => {
   assert.deepEqual(orbitMotion(pillLook({ busy: true })), { lap: "--loop-orbit-busy", rest: null });
   assert.deepEqual(orbitMotion(pillLook({ inUse: true, busy: true })).lap, "--loop-orbit-busy");
-  assert.deepEqual(orbitMotion(pillLook({ inUse: true })), { lap: "--loop-orbit", rest: null });
+  assert.deepEqual(orbitMotion(pillLook({ inUse: true })), {
+    lap: "--loop-orbit-busy",
+    rest: null,
+  });
+  assert.deepEqual(orbitMotion(pillLook({ inUse: true, live: true })), {
+    lap: "--loop-orbit",
+    rest: null,
+  });
   // Idle rests on whole turns so each computer keeps its side; Pause on half turns.
   assert.deepEqual(orbitMotion(pillLook()), { lap: null, rest: TURN });
   assert.deepEqual(orbitMotion(pillLook({ hover: true })), { lap: null, rest: TURN });
