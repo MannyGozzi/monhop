@@ -10,7 +10,7 @@ import {
 const questions = [
   {
     q: 'Does anything leave my network?',
-    a: 'No. Keystrokes, pointer moves and the pairing all stay on your Wi-Fi or Ethernet, over an encrypted link pinned to one interface and one computer you verified. The only thing MonHop ever fetches from the internet is a signed update, and only when you ask for it.',
+    a: 'No. Keystrokes, pointer moves, clipboard contents and the pairing all stay on your Wi-Fi or Ethernet, over an encrypted link pinned to one interface and one computer you verified. The only thing MonHop ever fetches from the internet is a signed update, and only when you ask for it.',
   },
   {
     q: 'Which pairings work?',
@@ -18,7 +18,7 @@ const questions = [
   },
   {
     q: 'How many computers can I pair?',
-    a: 'Up to 16 from each computer. Your keyboard and mouse reach one of them at a time, and you pick which one from Home. Every pair keeps its own display arrangements.',
+    a: 'Up to 16 from each computer, and up to eight can share at once. Switch on the ones you want on Home: their displays form one arrangement, and any of their keyboards and mice can move across all of them.',
   },
   {
     q: 'What does it cost?',

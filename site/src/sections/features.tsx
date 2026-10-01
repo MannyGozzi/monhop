@@ -1,4 +1,14 @@
-import { ArrowLeftRight, Lock, Monitor, ShieldCheck, SunDim, WifiOff } from 'lucide-react'
+import {
+  ArrowLeftRight,
+  ChevronsLeftRight,
+  ClipboardCopy,
+  Lock,
+  Monitor,
+  Mouse,
+  ShieldCheck,
+  SunDim,
+  WifiOff,
+} from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
 
 import { Reveal } from '@/components/reveal'
@@ -8,7 +18,7 @@ const features = [
   {
     icon: WifiOff,
     title: 'Local only',
-    body: 'Keystrokes and pointer moves never leave your network. No cloud, no account, no telemetry.',
+    body: 'Keystrokes, pointer moves and clipboard contents never leave your network. No cloud, no account, no telemetry.',
   },
   {
     icon: Lock,
@@ -23,7 +33,22 @@ const features = [
   {
     icon: ArrowLeftRight,
     title: 'Any pairing, any number',
-    body: 'Mac to Windows, Mac to Mac, Windows to Windows. Pair up to 16 computers and choose which one your keyboard reaches.',
+    body: 'Mac to Windows, Mac to Mac, Windows to Windows. Pair up to 16 computers and share with up to eight at once, all in one arrangement.',
+  },
+  {
+    icon: ClipboardCopy,
+    title: 'Shared clipboard',
+    body: 'Copy text or an image on one computer and paste it on another. Off until you turn it on, and its contents are never logged.',
+  },
+  {
+    icon: ChevronsLeftRight,
+    title: 'Swipe between pages',
+    body: 'A quick two-finger swipe on a Mac trackpad goes back or forward on the computer it controls, with a chevron at the pointer to show it landed.',
+  },
+  {
+    icon: Mouse,
+    title: 'Middle-click autoscroll',
+    body: 'A Windows mouse autoscrolls a Mac with its middle button, the way it does on Windows: hold and drag, or click once and move.',
   },
   {
     icon: SunDim,

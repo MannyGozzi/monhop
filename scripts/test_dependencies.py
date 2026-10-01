@@ -257,10 +257,12 @@ class DependencyReportsTest(unittest.TestCase):
 
     def test_checked_in_license_supplements_are_hashed_and_exactly_mapped(self):
         supplements = dependencies.load_license_supplements()
-        self.assertEqual(len(supplements), 28)
+        self.assertEqual(len(supplements), 30)
         self.assertIn("selectors@0.36.1", supplements)
         self.assertIn("webview2-com@0.38.2", supplements)
         self.assertIn("objc2-core-location@0.3.2", supplements)
+        self.assertIn("objc2-quartz-core@0.3.2", supplements)
+        self.assertIn("objc2-core-image@0.3.2", supplements)
         self.assertEqual(supplements["clipboard-win@5.4.1"]["path_in_vcs"], "")
 
     def test_local_paths_are_not_written_to_reports(self):

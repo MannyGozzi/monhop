@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+A chevron at the pointer when a trackpad swipe turns the page, and a sharing button that says Connecting… until the computers are connected. This version still connects to 0.2.3 and 0.2.4, so computers can update one at a time.
+
 ### Added
 
 - A swipe between pages now shows on the computer it lands on: a chevron blooms beside the pointer, pointing the way the page went.
