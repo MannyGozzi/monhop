@@ -2,9 +2,9 @@ import {
   ArrowLeftRight,
   ChevronsLeftRight,
   ClipboardCopy,
+  Keyboard,
   Lock,
   Monitor,
-  Mouse,
   ShieldCheck,
   SunDim,
   WifiOff,
@@ -46,9 +46,9 @@ const features = [
     body: 'A quick two-finger swipe on a Mac trackpad goes back or forward on the computer it controls, with a chevron at the pointer to show it landed.',
   },
   {
-    icon: Mouse,
-    title: 'Middle-click autoscroll',
-    body: 'A Windows mouse autoscrolls a Mac with its middle button, the way it does on Windows: hold and drag, or click once and move.',
+    icon: Keyboard,
+    title: 'Windows habits on a Mac',
+    body: 'Ctrl+C, Ctrl+V and the rest of your Windows shortcuts work on a Mac, and a Windows mouse autoscrolls it with its middle button.',
   },
   {
     icon: SunDim,
