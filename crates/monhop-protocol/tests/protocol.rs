@@ -80,6 +80,7 @@ fn all_messages() -> Vec<Message> {
         Message::ActivateDisplayAt {
             display_id: DisplayId(12),
             position: Point::new(-1_920.0, 1_080.0),
+            control_as_command: true,
         },
         Message::ActivationAck(DisplayId(12)),
         Message::ActivationDeclined {
@@ -294,10 +295,11 @@ fn activation_protocol_v2_has_exact_bodies_and_reliable_delivery() {
         ),
         (
             15_u8,
-            24_u16,
+            32_u16,
             Message::ActivateDisplayAt {
                 display_id: DisplayId(12),
                 position: Point::new(-1_920.0, 1_080.0),
+                control_as_command: false,
             },
         ),
         (16_u8, 8_u16, Message::ActivationAck(DisplayId(12))),
@@ -515,17 +517,29 @@ fn activation_protocol_rejects_nonfinite_out_of_range_and_malformed_frames() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(12),
             position: Point::new(-1_920.0, 1_080.0),
+            control_as_command: true,
         },
     );
     source
         .encode_into(&mut encoded)
         .expect("encode activation frame");
+    assert_eq!(&encoded[52..60], &[1, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(decode(&encoded), Ok(source));
+
+    let mut not_a_boolean = encoded.clone();
+    not_a_boolean[52] = 2;
+    assert_eq!(decode(&not_a_boolean), Err(DecodeError::InvalidBoolean));
+
+    let mut reserved = encoded.clone();
+    reserved[59] = 1;
+    assert_eq!(decode(&reserved), Err(DecodeError::NonZeroReservedField));
 
     let nonfinite = frame(
         2,
         Message::ActivateDisplayAt {
             display_id: DisplayId(12),
             position: Point::new(f64::NAN, 0.0),
+            control_as_command: false,
         },
     );
     assert_eq!(
@@ -538,6 +552,7 @@ fn activation_protocol_rejects_nonfinite_out_of_range_and_malformed_frames() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(12),
             position: Point::new(MAX_LOGICAL_ORIGIN_ABS + 1.0, 0.0),
+            control_as_command: false,
         },
     );
     assert_eq!(
@@ -561,12 +576,12 @@ fn activation_protocol_rejects_nonfinite_out_of_range_and_malformed_frames() {
     );
 
     let mut wrong_length = encoded.clone();
-    wrong_length[8..10].copy_from_slice(&23_u16.to_be_bytes());
+    wrong_length[8..10].copy_from_slice(&31_u16.to_be_bytes());
     assert_eq!(decode(&wrong_length), Err(DecodeError::InvalidLength));
 
     let mut trailing = encoded.clone();
     trailing.push(0);
-    trailing[8..10].copy_from_slice(&25_u16.to_be_bytes());
+    trailing[8..10].copy_from_slice(&33_u16.to_be_bytes());
     assert_eq!(decode(&trailing), Err(DecodeError::TrailingBytes));
 
     let mut old_version = encoded.clone();
@@ -686,10 +701,10 @@ fn readiness_requires_the_current_protocol_and_an_empty_reliable_body() {
     let ready = frame(3, Message::SessionReady);
     let mut bytes = Vec::new();
     ready.encode_into(&mut bytes).unwrap();
-    assert_eq!(PROTOCOL_VERSION, 12);
+    assert_eq!(PROTOCOL_VERSION, 13);
     assert_eq!(ready.delivery(), DeliveryClass::Reliable);
     assert_eq!(decode(&bytes), Ok(ready));
-    for version in 1_u16..=11 {
+    for version in 1_u16..=12 {
         let mut old = bytes.clone();
         old[4..6].copy_from_slice(&version.to_be_bytes());
         assert_eq!(decode(&old), Err(DecodeError::UnsupportedVersion));

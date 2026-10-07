@@ -1,7 +1,9 @@
 //! Keyboard chords a receiver injects for system gestures, planned so a chord never presses or
 //! releases a key the wire holds and so never leaves a modifier stuck.
 
-use crate::{HID_LEFT_CONTROL, HidUsage, Platform, SystemGesture};
+use crate::{
+    HID_LEFT_ARROW, HID_LEFT_CONTROL, HID_RIGHT_ARROW, HID_TAB, HidUsage, Platform, SystemGesture,
+};
 
 /// Modifier kinds a chord needs. Either side of a held modifier satisfies its kind; a chord that
 /// must press one presses the left key.
@@ -75,7 +77,7 @@ pub struct KeyPlan {
 }
 
 impl KeyPlan {
-    const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         steps: [KeyStep {
             usage: HidUsage(0),
             pressed: false,
@@ -83,7 +85,7 @@ impl KeyPlan {
         len: 0,
     };
 
-    fn push(&mut self, usage: HidUsage, pressed: bool) {
+    pub(crate) fn push(&mut self, usage: HidUsage, pressed: bool) {
         self.steps[self.len] = KeyStep { usage, pressed };
         self.len += 1;
     }
@@ -130,15 +132,15 @@ pub fn chord_plan(held: impl IntoIterator<Item = HidUsage>, chord: Chord) -> Key
 const KEY_D: HidUsage = HidUsage(0x07);
 const KEY_N: HidUsage = HidUsage(0x11);
 const KEY_S: HidUsage = HidUsage(0x16);
-const KEY_TAB: HidUsage = HidUsage(0x2B);
+const KEY_TAB: HidUsage = HID_TAB;
 const KEY_SPACE: HidUsage = HidUsage(0x2C);
 const KEY_MINUS: HidUsage = HidUsage(0x2D);
 const KEY_EQUAL: HidUsage = HidUsage(0x2E);
 const KEY_LEFT_BRACKET: HidUsage = HidUsage(0x2F);
 const KEY_RIGHT_BRACKET: HidUsage = HidUsage(0x30);
 const KEY_F11: HidUsage = HidUsage(0x44);
-const KEY_RIGHT_ARROW: HidUsage = HidUsage(0x4F);
-const KEY_LEFT_ARROW: HidUsage = HidUsage(0x50);
+const KEY_RIGHT_ARROW: HidUsage = HID_RIGHT_ARROW;
+const KEY_LEFT_ARROW: HidUsage = HID_LEFT_ARROW;
 const KEY_DOWN_ARROW: HidUsage = HidUsage(0x51);
 const KEY_UP_ARROW: HidUsage = HidUsage(0x52);
 const KEY_LEFT_SYSTEM: HidUsage = HidUsage(0xE3);

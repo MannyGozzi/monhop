@@ -11,7 +11,11 @@
 //! epochs carry only activation, input, and release messages. Keeping those sequence spaces apart
 //! lets a Ping race an activation without becoming an input-epoch violation.
 
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use monhop_core::{
     DeviceId, DisplayId, Edge, EdgeTransition, FloorOwner, FloorPeer, FloorSnapshot, FloorState,
@@ -30,6 +34,15 @@ use crate::session_health::{
     BARRIER_RESEND_AFTER, HOLD_LIMIT, HealthError, PeerHealth, RETREAT_AFTER, hold_stats,
 };
 use crate::session_startup::ReadyControl;
+
+/// Off until the app applies the saved switch, so no activation asks for it before it decides.
+static CONTROL_AS_COMMAND: AtomicBool = AtomicBool::new(false);
+
+/// Whether this computer's keyboard asks a Mac it controls for Ctrl as Command, from the next time
+/// the pointer enters that Mac.
+pub fn set_control_as_command(enabled: bool) {
+    CONTROL_AS_COMMAND.store(enabled, Ordering::Release);
+}
 
 /// Maximum effects produced by one controller call.
 ///
@@ -431,6 +444,8 @@ pub struct SourceController {
     barrier_sent_at: Duration,
     holds: u32,
     held_max: Duration,
+    /// Read as the pointer enters the peer, so a change applies from the next crossing.
+    control_as_command: &'static AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -727,6 +742,7 @@ impl SourceController {
             barrier_sent_at: Duration::ZERO,
             holds: 0,
             held_max: Duration::ZERO,
+            control_as_command: &CONTROL_AS_COMMAND,
         })
     }
 
@@ -735,6 +751,12 @@ impl SourceController {
         self.free_generation = floor.snapshot().generation;
         self.floor = floor;
         self.enabled = enabled;
+        self
+    }
+
+    /// Reads the keyboard switch from `switch` instead of the app's [`set_control_as_command`].
+    pub fn with_control_as_command(mut self, switch: &'static AtomicBool) -> Self {
+        self.control_as_command = switch;
         self
     }
 
@@ -2377,6 +2399,7 @@ impl SourceController {
             Message::ActivateDisplayAt {
                 display_id: target.display,
                 position: self.peer_point(target.display, entry),
+                control_as_command: self.control_as_command.load(Ordering::Acquire),
             },
             effects,
         );

@@ -104,6 +104,7 @@ import {
 import { clipboardContext, invokeSetComputerEnabled, pollFingerprint } from "./app-actions.mjs";
 import { autoscrollContext } from "./autoscroll-model.mjs";
 import { swipeContext } from "./swipe-model.mjs";
+import { controlAsCommandContext } from "./keyboard-model.mjs";
 import { forgetArrangementMotion } from "./dashboard-arrangement.mjs";
 import {
   applyDimmingView,
@@ -179,6 +180,8 @@ const pointerSwitches = {
   autoscroll: { view: undefined, pending: false },
   swipe: { view: undefined, pending: false },
 };
+// Windows's keyboard switch, undefined until its status answers.
+const controlAsCommand = { view: undefined, pending: false };
 let theme = "system";
 let themePending = false;
 // The header icon animates once after a click, not on every poll-driven render.
@@ -313,6 +316,7 @@ if (!uiCheck) {
   void loadClipboard();
   listenClipboard();
   if (platform === "macos") void loadPointerSwitches();
+  if (platform === "windows") void loadControlAsCommand();
   void loadUpdatesStatus();
   // The initial page never runs through goToPage's entry hooks, so this covers a fresh
   // launch landing straight on Setup or Settings; the hooks below cover later visits.
@@ -539,6 +543,11 @@ function context() {
       pointerSwitches.autoscroll.pending,
     ),
     swipe: swipeContext(platform, pointerSwitches.swipe.view, pointerSwitches.swipe.pending),
+    controlAsCommand: controlAsCommandContext(
+      platform,
+      controlAsCommand.view,
+      controlAsCommand.pending,
+    ),
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
     busy: controlsBusy(),
@@ -579,6 +588,7 @@ function context() {
       setClipboardEnabled,
       setAutoscrollEnabled,
       setSwipeEnabled,
+      setControlAsCommand,
       startRename,
       draftRename,
       cancelRename,
@@ -1583,7 +1593,7 @@ async function loadPointerSwitches() {
 }
 
 // One in-flight change per switch; a failed call surfaces in the page alert, a failed save on the card.
-async function setPointerSwitch(entry, command, enabled) {
+async function setSavedSwitch(entry, command, enabled) {
   if (!core?.invoke || entry.pending) return;
   entry.pending = true;
   render();
@@ -1598,11 +1608,24 @@ async function setPointerSwitch(entry, command, enabled) {
 }
 
 function setAutoscrollEnabled(enabled) {
-  void setPointerSwitch(pointerSwitches.autoscroll, "autoscroll_set_enabled", enabled);
+  void setSavedSwitch(pointerSwitches.autoscroll, "autoscroll_set_enabled", enabled);
 }
 
 function setSwipeEnabled(enabled) {
-  void setPointerSwitch(pointerSwitches.swipe, "swipe_set_enabled", enabled);
+  void setSavedSwitch(pointerSwitches.swipe, "swipe_set_enabled", enabled);
+}
+
+// ---------- keyboard ----------
+
+async function loadControlAsCommand() {
+  if (!core?.invoke) return;
+  // A backend without the command leaves the card out.
+  controlAsCommand.view = await core.invoke("control_as_command_status").catch(() => undefined);
+  render();
+}
+
+function setControlAsCommand(enabled) {
+  void setSavedSwitch(controlAsCommand, "control_as_command_set_enabled", enabled);
 }
 
 // ---------- updates ----------

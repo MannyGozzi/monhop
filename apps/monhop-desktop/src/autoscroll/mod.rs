@@ -22,7 +22,7 @@ pub struct Autoscroll(SwitchPreference);
 impl Autoscroll {
     /// Loads the switch and hands it to the transport before any session starts. Runs in setup.
     pub fn start(app: &AppHandle) -> Arc<Self> {
-        let preference = SwitchPreference::start(app, NAMES, set_autoscroll_enabled);
+        let preference = SwitchPreference::start(app, NAMES, true, set_autoscroll_enabled);
         #[cfg(target_os = "macos")]
         macos::register(app);
         Arc::new(Self(preference))

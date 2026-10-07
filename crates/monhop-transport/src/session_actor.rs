@@ -1074,6 +1074,7 @@ mod tests {
             Message::ActivateDisplayAt {
                 display_id: DisplayId(1),
                 position: Point::new(20.0, 20.0),
+                control_as_command: false,
             },
         )
     }

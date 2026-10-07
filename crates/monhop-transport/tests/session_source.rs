@@ -481,6 +481,7 @@ fn activate_remote_from(source: &mut SourceController, at: Point, push: Point, e
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: entry,
+            control_as_command: false,
         },
     );
     complete_activation(source, DisplayId(2), after_crossing(0));
@@ -752,6 +753,7 @@ fn activation(outcome: &SourceOutcome) -> Option<(DisplayId, Point)> {
                 Message::ActivateDisplayAt {
                     display_id,
                     position,
+                    ..
                 },
             ..
         }) => Some((*display_id, *position)),
@@ -861,6 +863,7 @@ fn edge_activation_uses_input_epoch_while_health_stays_on_base_epoch() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 
@@ -930,6 +933,7 @@ fn local_absolute_resolves_nonprimary_before_edge_intent() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -1229,6 +1233,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(3),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
     let remote_ack =
@@ -2942,6 +2947,7 @@ fn a_slow_crossing_through_the_dead_zone_still_reaches_the_linked_display() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -2966,6 +2972,7 @@ fn a_push_from_the_dead_zone_still_reaches_the_linked_display() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -3061,6 +3068,7 @@ fn a_display_not_in_use_is_space_past_the_edge_of_the_display_the_pointer_left()
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 70.0),
+            control_as_command: false,
         },
     );
 }
@@ -3093,6 +3101,7 @@ fn a_pointer_already_resting_on_a_display_not_in_use_crosses_once_pushed_on() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 80.0),
+            control_as_command: false,
         },
     );
 }
@@ -3133,6 +3142,7 @@ fn a_pointer_on_a_display_not_in_use_settles_through_the_in_use_display_that_bor
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -3174,6 +3184,7 @@ fn an_observed_pointer_position_crosses_like_a_hook_sample() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 60.0),
+            control_as_command: false,
         },
     );
     // Once the crossing is under way the poll changes nothing.
@@ -3239,6 +3250,7 @@ fn an_observed_pointer_position_on_the_pointer_display_only_moves_the_anchor() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -3279,6 +3291,7 @@ fn a_crossing_into_space_outside_the_layout_still_reaches_the_linked_display() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -3411,6 +3424,7 @@ fn a_return_through_an_edge_guards_that_home_edge_until_the_pointer_moves_away()
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -3437,6 +3451,7 @@ fn a_take_back_return_leaves_the_home_edge_unguarded() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -3781,6 +3796,7 @@ fn a_guard_is_dropped_once_the_pointer_is_on_another_display() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     );
 }
@@ -4610,6 +4626,7 @@ fn in_a_corner_of_two_linked_edges_a_push_goes_through_the_edge_it_points_at() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(99.0, 1.0),
+            control_as_command: false,
         },
     );
 }
@@ -5467,6 +5484,7 @@ fn sliding_along_the_edge_keeps_the_push() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 70.0),
+            control_as_command: false,
         },
     );
 
@@ -5581,6 +5599,7 @@ fn absolute_samples_push_through_by_how_far_they_go_past_where_the_push_began() 
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 60.0),
+            control_as_command: false,
         },
     );
 }
@@ -5743,4 +5762,32 @@ impl FreshCapture for SourceController {
         record.floor_generation = self.floor_generation();
         self.on_captured(record, now)
     }
+}
+
+#[test]
+fn an_activation_carries_the_keyboard_switch_as_the_pointer_enters() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SWITCH: AtomicBool = AtomicBool::new(false);
+    let mut source = source().with_control_as_command(&SWITCH);
+    SWITCH.store(true, Ordering::Release);
+    assert!(
+        source
+            .fresh_capture(
+                local(NormalizedInput::AbsoluteMotion(Point::new(99.0, 50.0))),
+                ms(0)
+            )
+            .effects
+            .is_empty()
+    );
+    let edge = push_through(&mut source, Point::new(1.0, 0.0), ms(0));
+    assert_frame(
+        edge.effects.iter().next().unwrap(),
+        4,
+        0,
+        Message::ActivateDisplayAt {
+            display_id: DisplayId(2),
+            position: Point::new(1.0, 50.0),
+            control_as_command: true,
+        },
+    );
 }

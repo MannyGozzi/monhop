@@ -15,6 +15,7 @@ import {
 import { canInstall, installHint } from "./updates-model.mjs";
 import { AUTOSCROLL_LABEL, AUTOSCROLL_NOTE } from "./autoscroll-model.mjs";
 import { SWIPE_LABEL, SWIPE_NOTE } from "./swipe-model.mjs";
+import { CONTROL_AS_COMMAND_LABEL, CONTROL_AS_COMMAND_NOTE } from "./keyboard-model.mjs";
 import {
   CLIPBOARD_PRIVACY,
   clipboardAccessNotice,
@@ -105,6 +106,8 @@ export function renderHome(nodes, ctx) {
   nodes.homeContent.append(dimmingCard(ctx));
   const pointer = presence("home-pointer", pointerCard(ctx));
   if (pointer) nodes.homeContent.append(pointer);
+  const keyboard = presence("home-keyboard", keyboardCard(ctx));
+  if (keyboard) nodes.homeContent.append(keyboard);
 
   const logPath = state.snapshot?.logPath;
   if (typeof logPath === "string" && logPath)
@@ -290,6 +293,28 @@ function pointerCard({ core, autoscroll, swipe, actions }) {
         autoscroll?.view.error ? note(autoscroll.view.error, "danger") : null,
       ),
       presence("home-swipe-message", swipe?.view.error ? note(swipe.view.error, "danger") : null),
+    ],
+  });
+}
+
+// Only on Windows, once app.js has Rust's view: the switch matters when this keyboard controls a Mac.
+function keyboardCard({ core, controlAsCommand, actions }) {
+  if (!controlAsCommand) return null;
+  const { view, pending } = controlAsCommand;
+  return card({
+    id: "home-keyboard",
+    title: "Keyboard",
+    children: [
+      rows([
+        switchRow(CONTROL_AS_COMMAND_LABEL, {
+          checked: view.enabled,
+          description: CONTROL_AS_COMMAND_NOTE,
+          disabled: !core || pending || typeof actions.setControlAsCommand !== "function",
+          focusKey: "home-control-as-command-enable",
+          onChange: actions.setControlAsCommand,
+        }),
+      ]),
+      presence("home-keyboard-message", view.error ? note(view.error, "danger") : null),
     ],
   });
 }

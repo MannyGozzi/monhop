@@ -18,7 +18,7 @@ pub mod clipboard;
 
 pub const MAGIC: [u8; 4] = *b"LKM!";
 /// Bumped whenever the wire changes shape; both computers must run the same build.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_FRAME_LEN: usize = 8_192;
 pub use monhop_core::MAX_DISPLAYS;
@@ -396,6 +396,8 @@ pub enum Message {
     ActivateDisplayAt {
         display_id: DisplayId,
         position: Point,
+        /// The source's keyboard asks a Mac for Ctrl as Command until the next activation.
+        control_as_command: bool,
     },
     /// Confirms a completed activation. An acknowledgement is not authority by itself; the session
     /// controller must validate it against the active trusted session.
@@ -986,7 +988,7 @@ fn body_len(message: &Message) -> Result<usize, EncodeError> {
         Message::ActivateDisplay(_) => 8,
         Message::ActivateDisplayAt { position, .. } => {
             validate_input_point(*position).map_err(InputPointError::encode_error)?;
-            24
+            32
         }
         Message::ActivationAck(_) => 8,
         Message::ActivationDeclined { .. } => 16,
@@ -1083,10 +1085,13 @@ fn encode_body(message: &Message, output: &mut Vec<u8>) -> Result<(), EncodeErro
         Message::ActivateDisplayAt {
             display_id,
             position,
+            control_as_command,
         } => {
             write_u64(output, display_id.0);
             write_f64(output, position.x);
             write_f64(output, position.y);
+            output.push(u8::from(*control_as_command));
+            output.extend_from_slice(&[0; 7]);
         }
         Message::ActivationAck(display_id) => write_u64(output, display_id.0),
         Message::ActivationDeclined { display_id, reason } => {
@@ -1259,9 +1264,12 @@ fn decode_body(kind: MessageKind, body: &mut Cursor<'_>) -> Result<Message, Deco
             let display_id = DisplayId(body.read_u64()?);
             let position = Point::new(body.read_f64()?, body.read_f64()?);
             validate_input_point(position).map_err(InputPointError::decode_error)?;
+            let control_as_command = body.read_bool()?;
+            body.require_zero(7)?;
             Ok(Message::ActivateDisplayAt {
                 display_id,
                 position,
+                control_as_command,
             })
         }
         MessageKind::ActivationAck => Ok(Message::ActivationAck(DisplayId(body.read_u64()?))),

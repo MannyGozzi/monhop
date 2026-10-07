@@ -6,6 +6,7 @@ mod autoscroll;
 mod autostart;
 mod clipboard;
 mod computers;
+mod control_as_command;
 mod dimming;
 #[cfg(target_os = "macos")]
 mod display_labels;
@@ -705,6 +706,8 @@ fn main() {
             autoscroll::autoscroll_set_enabled,
             swipe::swipe_status,
             swipe::swipe_set_enabled,
+            control_as_command::control_as_command_status,
+            control_as_command::control_as_command_set_enabled,
             window_hide,
             computers_load,
             computers_rename,
@@ -757,6 +760,7 @@ fn main() {
             app.manage(autoscroll::Autoscroll::start(app.handle()));
             page_turn::register(app.handle());
             app.manage(swipe::Swipe::start(app.handle()));
+            app.manage(control_as_command::ControlAsCommand::start(app.handle()));
             app.manage(updates::Updates::start(app.handle(), !check_ui));
             let appearance = appearance::Appearance::start(app.handle());
             app.manage(appearance.clone());
@@ -1052,6 +1056,8 @@ mod tests {
                 "allow-autoscroll-set-enabled",
                 "allow-swipe-status",
                 "allow-swipe-set-enabled",
+                "allow-control-as-command-status",
+                "allow-control-as-command-set-enabled",
                 "core:window:allow-start-dragging",
                 "core:window:allow-internal-toggle-maximize",
                 "core:window:allow-minimize",

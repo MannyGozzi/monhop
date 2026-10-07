@@ -22,6 +22,7 @@ impl Swipe {
         Arc::new(Self(SwitchPreference::start(
             app,
             NAMES,
+            true,
             set_page_swipes_enabled,
         )))
     }

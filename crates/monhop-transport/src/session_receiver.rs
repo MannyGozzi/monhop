@@ -6,7 +6,7 @@ use crate::session_startup::ReadyControl;
 use monhop_core::{
     DisplayId, FloorOwner, FloorPeer, FloorSnapshot, FloorState, GesturePhase, HidUsage,
     ModifierState, MouseButton, Point, PointerGesture, SharedFloor, SystemGesture, TakeBackGate,
-    gesture_latch::TOUCH_STREAM_IDLE,
+    chord::KeyPlan, control_as_command::ControlAsCommand, gesture_latch::TOUCH_STREAM_IDLE,
 };
 use monhop_protocol::{
     DeclineReason, DeliveryClass, DisplayTopology, Frame, Message, Motion, RateLimiter,
@@ -107,6 +107,12 @@ pub struct InputReceiver {
     /// time is ended, so a lost end never leaves a synthetic modifier held.
     gesture_seen: Duration,
     gesture_normalizations: u32,
+    /// Whether this computer honours a source's Ctrl as Command; a Mac's receivers do.
+    translates_keys: bool,
+    /// What the source's last activation asked for its keyboard.
+    control_as_command: bool,
+    /// Follows the keys injected here, so it forgets them whenever they are all released.
+    keyboard: ControlAsCommand,
 }
 
 impl InputReceiver {
@@ -146,7 +152,16 @@ impl InputReceiver {
             open_gestures: [false; 2],
             gesture_seen: now,
             gesture_normalizations: 0,
+            translates_keys: cfg!(target_os = "macos"),
+            control_as_command: false,
+            keyboard: ControlAsCommand::default(),
         }
+    }
+
+    /// Overrides whether this receiver honours a source's Ctrl as Command, which follows the OS.
+    pub fn translating_keys(mut self, translates: bool) -> Self {
+        self.translates_keys = translates;
+        self
     }
 
     pub fn with_floor(mut self, gate: TakeBackGate, local_lower: bool, enabled: bool) -> Self {
@@ -509,6 +524,7 @@ impl InputReceiver {
         if let Message::ActivateDisplayAt {
             display_id,
             position,
+            control_as_command,
         } = frame.message
         {
             if self.epoch.get().checked_add(1) != Some(frame.epoch.get()) {
@@ -521,6 +537,7 @@ impl InputReceiver {
             self.sequences
                 .accept(frame)
                 .map_err(|_| ReceiverFailure::InvalidSequence)?;
+            self.control_as_command = control_as_command;
             if held {
                 self.epoch = frame.epoch;
                 return Ok(None);
@@ -573,6 +590,7 @@ impl InputReceiver {
                 }
                 self.release_floor();
                 self.keys.fill(false);
+                self.keyboard.clear();
                 self.buttons.fill(false);
                 self.active = None;
                 self.pending_move = None;
@@ -609,12 +627,8 @@ impl InputReceiver {
                     return Err(ReceiverFailure::InvalidPressedState);
                 }
                 if !self.suppress_injection() {
-                    destination
-                        .apply(DestinationAction::Key {
-                            usage: key.usage,
-                            pressed: key.is_down,
-                        })
-                        .map_err(|_| ReceiverFailure::NativeDelivery)?;
+                    let plan = self.keyboard.key(key.usage, key.is_down, self.translates());
+                    deliver_keys(destination, plan)?;
                 }
                 Ok(None)
             }
@@ -625,6 +639,9 @@ impl InputReceiver {
                     return Err(ReceiverFailure::InvalidPressedState);
                 }
                 if !self.suppress_injection() {
+                    if button.is_down {
+                        deliver_keys(destination, self.keyboard.click(self.translates()))?;
+                    }
                     destination
                         .apply(DestinationAction::Button {
                             button: button.button,
@@ -722,6 +739,7 @@ impl InputReceiver {
         }
         self.open_gestures = [false; 2];
         self.keys.fill(false);
+        self.keyboard.clear();
         self.buttons.fill(false);
         self.cleanup_pending = false;
         if native {
@@ -736,6 +754,7 @@ impl InputReceiver {
         destination: &mut impl InputDestination,
     ) -> Result<(), DestinationFailure> {
         self.open_gestures = [false; 2];
+        self.keyboard.clear();
         let ended = destination.apply(DestinationAction::EndGestures);
         destination.apply(DestinationAction::ReleaseAll).and(ended)
     }
@@ -776,6 +795,10 @@ impl InputReceiver {
         deliver(destination, DestinationAction::Gesture(gesture))
     }
 
+    fn translates(&self) -> bool {
+        self.translates_keys && self.control_as_command
+    }
+
     fn require_active(&self) -> Result<(DisplayId, Point), ReceiverFailure> {
         self.active.ok_or(ReceiverFailure::NotActive)
     }
@@ -811,6 +834,22 @@ fn deliver(
     destination
         .apply(action)
         .map_err(|_| ReceiverFailure::NativeDelivery)
+}
+
+fn deliver_keys(
+    destination: &mut impl InputDestination,
+    plan: KeyPlan,
+) -> Result<(), ReceiverFailure> {
+    for step in plan.steps() {
+        deliver(
+            destination,
+            DestinationAction::Key {
+                usage: step.usage,
+                pressed: step.pressed,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// `gesture`'s continuous kind at `phase`, changing nothing.
@@ -901,6 +940,7 @@ mod tests {
             Message::ActivateDisplayAt {
                 display_id: DisplayId(1),
                 position: Point::new(10.0, 10.0),
+                control_as_command: false,
             },
         )
     }
@@ -1150,6 +1190,7 @@ mod tests {
             Message::ActivateDisplayAt {
                 display_id: DisplayId(1),
                 position: Point::new(5.0, 5.0),
+                control_as_command: false,
             },
         );
         assert_eq!(
@@ -1199,6 +1240,7 @@ mod tests {
             Message::ActivateDisplayAt {
                 display_id: DisplayId(1),
                 position: Point::new(1.0, 1.0),
+                control_as_command: false,
             },
         );
         assert_eq!(
@@ -1247,6 +1289,7 @@ mod tests {
                 Message::ActivateDisplayAt {
                     display_id: DisplayId(display),
                     position: Point::new(x, 10.0),
+                    control_as_command: false,
                 },
             )
         };
@@ -1367,6 +1410,7 @@ mod tests {
             Message::ActivateDisplayAt {
                 display_id: DisplayId(1),
                 position: Point::new(100.0, 10.0),
+                control_as_command: false,
             },
         );
         assert_eq!(
@@ -1612,6 +1656,7 @@ mod tests {
             Message::ActivateDisplayAt {
                 display_id: DisplayId(1),
                 position: Point::new(5.0, 5.0),
+                control_as_command: false,
             },
         );
         assert_eq!(
@@ -2038,6 +2083,7 @@ mod tests {
             Message::ActivateDisplayAt {
                 display_id: DisplayId(1),
                 position: Point::new(5.0, 5.0),
+                control_as_command: false,
             },
         );
         receiver
@@ -2133,5 +2179,200 @@ mod tests {
             )
             .unwrap();
         assert_eq!(target.calls.len(), released, "nothing lands once yielded");
+    }
+
+    /// Wire frames for one source's keys, with each frame's modifier state as the source sends it.
+    struct Keyboard {
+        epoch: u64,
+        sequence: u64,
+        modifiers: u8,
+    }
+
+    impl Keyboard {
+        /// Activates display 1 in epoch 2, asking for Ctrl as Command or not.
+        fn activate(
+            receiver: &mut InputReceiver,
+            target: &mut Destination,
+            control_as_command: bool,
+        ) -> Self {
+            let activation = frame(
+                2,
+                0,
+                Message::ActivateDisplayAt {
+                    display_id: DisplayId(1),
+                    position: Point::new(10.0, 10.0),
+                    control_as_command,
+                },
+            );
+            receiver
+                .receive(&activation, Duration::ZERO, target)
+                .unwrap();
+            target.calls.clear();
+            Self {
+                epoch: 2,
+                sequence: 1,
+                modifiers: 0,
+            }
+        }
+
+        fn next(&mut self, message: Message) -> Frame {
+            let frame = frame(self.epoch, self.sequence, message);
+            self.sequence += 1;
+            frame
+        }
+
+        fn key(&mut self, usage: u16, is_down: bool) -> Frame {
+            if (0xE0..=0xE7).contains(&usage) {
+                let bit = 1 << (usage - 0xE0);
+                if is_down {
+                    self.modifiers |= bit;
+                } else {
+                    self.modifiers &= !bit;
+                }
+            }
+            self.next(Message::Key(Key {
+                usage: HidUsage(usage),
+                is_down,
+                repeat: false,
+                modifiers: ModifierState(self.modifiers),
+            }))
+        }
+    }
+
+    fn keys(target: &Destination) -> Vec<(u16, bool)> {
+        target
+            .calls
+            .iter()
+            .filter_map(|action| match action {
+                DestinationAction::Key { usage, pressed } => Some((usage.0, *pressed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const CTRL: u16 = 0xE0;
+    const COMMAND: u16 = 0xE3;
+    const OPTION: u16 = 0xE2;
+    const C: u16 = 0x06;
+    const LEFT_ARROW: u16 = 0x50;
+
+    fn ctrl_c(receiver: InputReceiver, control_as_command: bool) -> Vec<(u16, bool)> {
+        let mut receiver = receiver;
+        let mut target = Destination::default();
+        let mut wire = Keyboard::activate(&mut receiver, &mut target, control_as_command);
+        for (usage, down) in [(CTRL, true), (C, true), (C, false), (CTRL, false)] {
+            assert_eq!(
+                receiver.receive(&wire.key(usage, down), Duration::ZERO, &mut target),
+                Ok(None)
+            );
+        }
+        keys(&target)
+    }
+
+    #[test]
+    fn a_mac_types_ctrl_c_as_command_c_only_when_the_source_asks() {
+        assert_eq!(
+            ctrl_c(receiver().translating_keys(true), true),
+            [(COMMAND, true), (C, true), (C, false), (COMMAND, false)]
+        );
+        let untouched = [(CTRL, true), (C, true), (C, false), (CTRL, false)];
+        assert_eq!(ctrl_c(receiver().translating_keys(true), false), untouched);
+        assert_eq!(
+            ctrl_c(receiver().translating_keys(false), true),
+            untouched,
+            "a Windows computer keeps Ctrl"
+        );
+        assert_eq!(
+            receiver().translates_keys,
+            cfg!(target_os = "macos"),
+            "only a Mac translates by default"
+        );
+    }
+
+    #[test]
+    fn a_click_after_ctrl_left_is_a_command_click() {
+        let mut receiver = receiver().translating_keys(true);
+        let mut target = Destination::default();
+        let mut wire = Keyboard::activate(&mut receiver, &mut target, true);
+        for (usage, down) in [(CTRL, true), (LEFT_ARROW, true), (LEFT_ARROW, false)] {
+            receiver
+                .receive(&wire.key(usage, down), Duration::ZERO, &mut target)
+                .unwrap();
+        }
+        let press = wire.next(Message::Button(monhop_protocol::Button {
+            button: MouseButton::Left,
+            is_down: true,
+            click_count: 1,
+        }));
+        receiver
+            .receive(&press, Duration::ZERO, &mut target)
+            .unwrap();
+        assert_eq!(
+            keys(&target),
+            [
+                (COMMAND, true),
+                (COMMAND, false),
+                (OPTION, true),
+                (LEFT_ARROW, true),
+                (LEFT_ARROW, false),
+                (OPTION, false),
+                (COMMAND, true)
+            ]
+        );
+        assert!(matches!(
+            target.calls.last(),
+            Some(DestinationAction::Button { pressed: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_release_all_forgets_translated_keys_and_a_late_release_lifts_nothing() {
+        let mut receiver = receiver().translating_keys(true);
+        let mut target = Destination::default();
+        let mut wire = Keyboard::activate(&mut receiver, &mut target, true);
+        receiver
+            .receive(&wire.key(CTRL, true), Duration::ZERO, &mut target)
+            .unwrap();
+        assert_eq!(
+            receiver.receive(&wire.next(Message::ReleaseAll), Duration::ZERO, &mut target),
+            Ok(Some(Message::ReleaseAck))
+        );
+        assert!(matches!(
+            target.calls.last(),
+            Some(DestinationAction::ReleaseAll)
+        ));
+        let mut target = Destination::default();
+        let mut wire = Keyboard::activate_again(&mut receiver, &mut target);
+        receiver
+            .receive(&wire.key(CTRL, true), Duration::ZERO, &mut target)
+            .unwrap();
+        receiver
+            .receive(&wire.key(CTRL, false), Duration::ZERO, &mut target)
+            .unwrap();
+        assert_eq!(keys(&target), [(COMMAND, true), (COMMAND, false)]);
+    }
+
+    impl Keyboard {
+        /// A second activation, in epoch 3, after the first one ended.
+        fn activate_again(receiver: &mut InputReceiver, target: &mut Destination) -> Self {
+            let activation = frame(
+                3,
+                0,
+                Message::ActivateDisplayAt {
+                    display_id: DisplayId(1),
+                    position: Point::new(10.0, 10.0),
+                    control_as_command: true,
+                },
+            );
+            receiver
+                .receive(&activation, Duration::ZERO, target)
+                .unwrap();
+            target.calls.clear();
+            Self {
+                epoch: 3,
+                sequence: 1,
+                modifiers: 0,
+            }
+        }
     }
 }

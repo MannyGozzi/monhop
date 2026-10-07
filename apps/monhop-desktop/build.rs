@@ -55,6 +55,8 @@ fn main() {
             "autoscroll_set_enabled",
             "swipe_status",
             "swipe_set_enabled",
+            "control_as_command_status",
+            "control_as_command_set_enabled",
             "window_hide",
             "computers_load",
             "computers_rename",

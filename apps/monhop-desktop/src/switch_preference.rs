@@ -1,5 +1,5 @@
-//! One saved on-or-off setting, on unless the user turned it off, handed to the runtime flag that
-//! acts on it at startup and on every change. A failed save keeps the change for this run.
+//! One saved on-or-off setting, at its default until the user changes it, handed to the runtime
+//! flag that acts on it at startup and on every change. A failed save keeps the change for this run.
 
 use std::{
     io,
@@ -37,19 +37,17 @@ struct SwitchFile {
     enabled: bool,
 }
 
-impl Default for SwitchFile {
-    fn default() -> Self {
+impl SwitchFile {
+    const fn new(enabled: bool) -> Self {
         Self {
             version: FILE_VERSION,
-            enabled: true,
+            enabled,
         }
     }
-}
 
-impl SwitchFile {
-    fn load(path: &Path) -> io::Result<Self> {
+    fn load(path: &Path, default: bool) -> io::Result<Self> {
         let Some(bytes) = crate::sharing_preferences::read_bounded(path, MAX_FILE_BYTES)? else {
-            return Ok(Self::default());
+            return Ok(Self::new(default));
         };
         let file: Self = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
         if file.version != FILE_VERSION {
@@ -89,24 +87,26 @@ pub struct SwitchPreference {
 }
 
 impl SwitchPreference {
-    /// Loads the switch and applies it before any session starts. Runs in setup.
-    pub fn start(app: &AppHandle, names: SwitchNames, apply: fn(bool)) -> Self {
+    /// Loads the switch, `default` until the user changes it, and applies it before any session
+    /// starts. Runs in setup.
+    pub fn start(app: &AppHandle, names: SwitchNames, default: bool, apply: fn(bool)) -> Self {
         let path = app
             .path()
             .app_local_data_dir()
             .ok()
             .map(|directory| directory.join(names.file));
-        let (file, error) = match path.as_deref().map(SwitchFile::load) {
+        let (file, error) = match path.as_deref().map(|path| SwitchFile::load(path, default)) {
             Some(Ok(file)) => (file, None),
             Some(Err(_)) => (
-                SwitchFile::default(),
+                SwitchFile::new(default),
                 Some(format!(
-                    "The saved {} setting could not be read. It is on until you change it.",
-                    names.setting
+                    "The saved {} setting could not be read. It is {} until you change it.",
+                    names.setting,
+                    if default { "on" } else { "off" }
                 )),
             ),
             None => (
-                SwitchFile::default(),
+                SwitchFile::new(default),
                 Some(format!(
                     "The {} setting has nowhere to be saved.",
                     names.setting
@@ -175,10 +175,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_means_the_switch_is_on() {
+    fn a_missing_file_means_the_default() {
         let path = temporary_path("missing");
         let _ = std::fs::remove_file(&path);
-        assert!(SwitchFile::load(&path).unwrap().enabled);
+        assert!(SwitchFile::load(&path, true).unwrap().enabled);
+        assert!(!SwitchFile::load(&path, false).unwrap().enabled);
     }
 
     #[test]
@@ -189,20 +190,20 @@ mod tests {
             enabled: false,
         };
         file.save(&path).unwrap();
-        assert_eq!(SwitchFile::load(&path).unwrap(), file);
+        assert_eq!(SwitchFile::load(&path, true).unwrap(), file);
         std::fs::write(&path, br#"{"version":2,"enabled":true}"#).unwrap();
         assert_eq!(
-            SwitchFile::load(&path).unwrap_err().kind(),
+            SwitchFile::load(&path, true).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
         std::fs::write(&path, br#"{"version":1,"enabled":true,"speed":9}"#).unwrap();
-        assert!(SwitchFile::load(&path).is_err());
+        assert!(SwitchFile::load(&path, true).is_err());
     }
 
     #[test]
     fn a_view_carries_the_switch_and_the_last_failure() {
         let state = State {
-            file: SwitchFile::default(),
+            file: SwitchFile::new(true),
             error: Some("nowhere to save".to_owned()),
         };
         assert_eq!(

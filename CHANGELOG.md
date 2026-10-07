@@ -4,6 +4,14 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- Use Ctrl as Command on a Mac: a new switch on the Windows computer's Home screen, off by default. With it on, a Windows keyboard controlling a Mac types Ctrl+C, Ctrl+V, Ctrl+Z and other shortcuts as the Mac's Command shortcuts, and the Windows key becomes Control. Ctrl+Tab still switches tabs, Alt+Tab switches apps, Ctrl+Left, Ctrl+Right, Ctrl+Backspace and Ctrl+Delete move and delete by word, and Ctrl+Alt+0 still dims the Mac.
+
+### Changed
+
+- Both computers need this version to share: it does not connect to 0.2.5 or earlier.
+
 ## [0.2.5] - 2026-09-30
 
 A chevron at the pointer when a trackpad swipe turns the page, and a sharing button that says Connecting… until the computers are connected. This version still connects to 0.2.3 and 0.2.4, so computers can update one at a time.

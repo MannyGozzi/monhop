@@ -512,6 +512,7 @@ fn disabled_direction_is_a_wall_and_declined() {
         Message::ActivateDisplayAt {
             display_id: DisplayId(2),
             position: Point::new(1.0, 50.0),
+            control_as_command: false,
         },
     )
     .with_scope(c.scopes.inbound);
@@ -689,6 +690,7 @@ fn yielding_receiver_injects_nothing() {
             Message::ActivateDisplayAt {
                 display_id: DisplayId(12),
                 position: Point::new(20.0, 120.0),
+                control_as_command: false,
             },
         )
         .with_scope(scope),

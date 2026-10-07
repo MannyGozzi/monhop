@@ -416,6 +416,7 @@ fn activation(display: u8, x: f64) -> Message {
     Message::ActivateDisplayAt {
         display_id: DisplayId(u64::from(display)),
         position: Point::new(x, 50.0),
+        control_as_command: false,
     }
 }
 

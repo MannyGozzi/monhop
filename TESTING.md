@@ -232,6 +232,16 @@ Autoscroll tests drive a Windows mouse on a Mac. They cover:
 - the Home switch off restoring plain middle drags;
 - a Mac source never autoscrolling.
 
+Ctrl as Command tests drive a Windows keyboard on a Mac with the Windows Home switch on. They cover:
+
+- Ctrl+C, Ctrl+V, Ctrl+Z, Ctrl+A, Ctrl+S and Ctrl+click acting as their Command shortcuts, with both Ctrl keys;
+- the Windows key acting as Control (Win+Tab in a browser, Win+Up for Mission Control);
+- Ctrl+Tab and Ctrl+Shift+Tab switching browser tabs, and Alt+Tab switching apps while Alt stays down;
+- Ctrl+Left, Ctrl+Right, Ctrl+Shift+Left, Ctrl+Backspace and Ctrl+Delete acting by word;
+- Ctrl+Alt+0 dimming the Mac;
+- the switch flipped while Ctrl is held, take-back and a pulled cable leaving no key down;
+- the switch off, and a Mac keyboard, leaving Ctrl as Control.
+
 Swipe-between-pages tests drive a Mac trackpad on a Windows PC and on another Mac. They cover:
 
 - a quick two-finger swipe right going back and left going forward in a browser, once per swipe;

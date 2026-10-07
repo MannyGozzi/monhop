@@ -5,6 +5,11 @@ use std::{collections::BTreeSet, time::Duration};
 use crate::{HidUsage, ModifierState, MouseButton, Platform};
 
 pub const HID_ESCAPE: HidUsage = HidUsage(0x29);
+pub const HID_BACKSPACE: HidUsage = HidUsage(0x2A);
+pub const HID_TAB: HidUsage = HidUsage(0x2B);
+pub const HID_DELETE_FORWARD: HidUsage = HidUsage(0x4C);
+pub const HID_RIGHT_ARROW: HidUsage = HidUsage(0x4F);
+pub const HID_LEFT_ARROW: HidUsage = HidUsage(0x50);
 pub const HID_LEFT_CONTROL: HidUsage = HidUsage(0xE0);
 pub const HID_RIGHT_CONTROL: HidUsage = HidUsage(0xE4);
 
@@ -27,6 +32,23 @@ pub enum SemanticModifierKind {
 pub struct SemanticModifier {
     pub side: ModifierSide,
     pub kind: SemanticModifierKind,
+}
+
+impl SemanticModifier {
+    /// The inverse of [`semantic_modifier`].
+    pub const fn usage(self) -> HidUsage {
+        let side = match self.side {
+            ModifierSide::Left => 0,
+            ModifierSide::Right => 4,
+        };
+        let kind = match self.kind {
+            SemanticModifierKind::Control => 0,
+            SemanticModifierKind::Shift => 1,
+            SemanticModifierKind::Alternate => 2,
+            SemanticModifierKind::System => 3,
+        };
+        HidUsage(0xE0 + side + kind)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
