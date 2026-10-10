@@ -51,8 +51,11 @@ export function autostartOpenLabel(platform) {
   return platform === "windows" ? "Open Startup settings" : "Open Login Items";
 }
 
+// Where MonHop waits while its window is hidden.
+export function trayPlace(platform) {
+  return platform === "windows" ? "the system tray" : "the menu bar";
+}
+
 export function autostartDescription(platform) {
-  return platform === "windows"
-    ? "MonHop starts in the system tray at login and reconnects to this computer."
-    : "MonHop starts in the menu bar at login and reconnects to this computer.";
+  return `MonHop starts in ${trayPlace(platform)} at login and reconnects to this computer.`;
 }

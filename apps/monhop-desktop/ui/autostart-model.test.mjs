@@ -7,6 +7,7 @@ import {
   autostartStatusText,
   normalizeAutostartView,
   showAutostartOpenSettings,
+  trayPlace,
 } from "./autostart-model.mjs";
 
 const base = { enabled: true, state: "on", paired: true, message: "" };
@@ -81,4 +82,6 @@ test("the open-settings label and description follow the platform", () => {
     autostartDescription("windows"),
     "MonHop starts in the system tray at login and reconnects to this computer.",
   );
+  assert.equal(trayPlace("macos"), "the menu bar");
+  assert.equal(trayPlace("windows"), "the system tray");
 });

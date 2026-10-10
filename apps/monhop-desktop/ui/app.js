@@ -133,7 +133,7 @@ import {
   setLabel,
 } from "./dom.mjs";
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
-import { normalizeAutostartView } from "./autostart-model.mjs";
+import { normalizeAutostartView, trayPlace } from "./autostart-model.mjs";
 import { renderReady } from "./screen-ready.mjs";
 import { renderDisplays } from "./screen-displays.mjs";
 import { renderHome } from "./screen-home.mjs";
@@ -699,7 +699,7 @@ function renderPageChrome(ctx) {
     nodes.headerButtons.append(
       iconButton({
         id: "hide-to-tray",
-        label: "Hide to the menu bar",
+        label: `Hide to ${trayPlace(platform)}`,
         iconName: "x",
         variant: "ghost",
         size: "sm",
