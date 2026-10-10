@@ -446,6 +446,10 @@ pub struct SourceController {
     held_max: Duration,
     /// Read as the pointer enters the peer, so a change applies from the next crossing.
     control_as_command: &'static AtomicBool,
+    /// Asked before each crossing: a program confining the cursor owns it.
+    pointer_confined: fn() -> bool,
+    /// A held crossing was logged since the last crossing the cursor was free for.
+    confinement_logged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -743,6 +747,8 @@ impl SourceController {
             holds: 0,
             held_max: Duration::ZERO,
             control_as_command: &CONTROL_AS_COMMAND,
+            pointer_confined: || false,
+            confinement_logged: false,
         })
     }
 
@@ -757,6 +763,12 @@ impl SourceController {
     /// Reads the keyboard switch from `switch` instead of the app's [`set_control_as_command`].
     pub fn with_control_as_command(mut self, switch: &'static AtomicBool) -> Self {
         self.control_as_command = switch;
+        self
+    }
+
+    /// Asks `confined` before each crossing whether a program holds the cursor; unset, none does.
+    pub fn with_pointer_confinement(mut self, confined: fn() -> bool) -> Self {
+        self.pointer_confined = confined;
         self
     }
 
@@ -2323,6 +2335,21 @@ impl SourceController {
         if !self.local_crossing_allowed() {
             return;
         }
+        // A program confining the cursor, as a game's mouse-look does, owns it: the seam is a
+        // wall, and pushing against it starts over.
+        if (self.pointer_confined)() {
+            if !self.confinement_logged {
+                log::info!("crossing held: a program confines the pointer");
+                self.confinement_logged = true;
+            }
+            self.edge_pushes = [None; 2];
+            self.state = State::Local {
+                target: from,
+                cursor: Some(return_position),
+            };
+            return;
+        }
+        self.confinement_logged = false;
         if let Some((from_id, to_id, since, last)) = self.declined
             && from_id == from.display
             && to_id == target.display

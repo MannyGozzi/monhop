@@ -10,7 +10,7 @@ use crate::{
     session_handshake::NegotiatedSession,
     session_native::{
         NativeDestination, SourcePlatforms, current_displays, current_pointer_position,
-        double_click_interval,
+        double_click_interval, pointer_confined,
     },
     session_source::{SourceController, SourceEffect, SourceMode},
     session_source_runtime::{
@@ -154,7 +154,8 @@ pub async fn run_session(
         origin.elapsed(),
     )
     .map_err(|_| SessionFailure::InvalidLayout)?
-    .with_floor(floor.clone(), permissions.allows(outbound_scope));
+    .with_floor(floor.clone(), permissions.allows(outbound_scope))
+    .with_pointer_confinement(pointer_confined);
     source.set_double_click_interval(double_click);
     let mut outbound = Some(StartupControl::new(epoch, sequence, true, origin.elapsed()));
     let mut inbound = Some(StartupControl::new(

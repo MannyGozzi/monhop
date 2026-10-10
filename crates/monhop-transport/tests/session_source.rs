@@ -4191,6 +4191,39 @@ fn a_push_logs_why_it_ended_in_real_record_order_and_never_crossed_against_a_wal
     assert_eq!(logged("end=Inward"), 1);
 }
 
+#[test]
+fn a_game_confining_the_cursor_on_the_seam_never_hands_it_over_until_it_lets_go() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static CONFINED: AtomicBool = AtomicBool::new(true);
+    capture_log();
+    let mut windows =
+        windows_source().with_pointer_confinement(|| CONFINED.load(Ordering::Acquire));
+    move_to(&mut windows, Point::new(10.0, 50.0), ms(0));
+    // Mouse-look holds the hidden, clipped cursor on the seam through several full pushes, all
+    // inside RETREAT_AFTER so the silent test peer still counts as live.
+    let mut cursor = OsCursor::on_square(Point::new(10.0, 50.0));
+    for t in 1..=250 {
+        assert!(!windows_report(
+            &mut windows,
+            &mut cursor,
+            Point::new(5.0, 0.0),
+            false,
+            ms(t)
+        ));
+    }
+    assert_eq!(logged("crossing held: a program confines the pointer"), 1);
+    assert_eq!(logged("push-through:"), 0);
+    // In the game's menu the clip lifts, and a fresh push crosses.
+    CONFINED.store(false, Ordering::Release);
+    assert!((251..=350).any(|t| windows_report(
+        &mut windows,
+        &mut cursor,
+        Point::new(5.0, 0.0),
+        false,
+        ms(t)
+    )));
+}
+
 /// A Windows source whose display 1's right edge links to the Mac's display 2.
 fn windows_source() -> SourceController {
     source_on(

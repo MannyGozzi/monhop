@@ -175,6 +175,18 @@ pub(crate) fn current_pointer_position() -> Option<Point> {
     }
 }
 
+/// Whether a program confines the cursor, as a game's mouse-look does; never where no query exists.
+pub(crate) fn pointer_confined() -> bool {
+    #[cfg(windows)]
+    {
+        monhop_platform_windows::native_capture::pointer_confined()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// This computer's double-click interval, which numbers the clicks it forwards.
 pub(crate) fn double_click_interval() -> std::time::Duration {
     #[cfg(target_os = "macos")]

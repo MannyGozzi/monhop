@@ -19,7 +19,7 @@ use monhop_core::{
     TakeBackGate,
 };
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Input::KeyboardAndMouse::{
@@ -89,6 +89,27 @@ pub fn current_pointer_position() -> Option<Point> {
         return None;
     }
     Some(Point::new(f64::from(position.x), f64::from(position.y)))
+}
+
+/// True while a program confines the cursor to less than the virtual desktop, as a game's
+/// mouse-look does; false when Windows cannot say.
+pub fn pointer_confined() -> bool {
+    let mut clip = RECT::default();
+    // SAFETY: the writable RECT lives through this read-only call; no hook or state is installed.
+    if unsafe { GetClipCursor(&mut clip) } == 0 {
+        return false;
+    }
+    current_virtual_desktop().is_ok_and(|desktop| confines(clip, desktop))
+}
+
+/// `clip` uses Windows' exclusive right and bottom, as the desktop's left plus width does.
+fn confines(clip: RECT, desktop: VirtualDesktop) -> bool {
+    let right = i64::from(desktop.left) + i64::from(desktop.width);
+    let bottom = i64::from(desktop.top) + i64::from(desktop.height);
+    clip.left > desktop.left
+        || clip.top > desktop.top
+        || i64::from(clip.right) < right
+        || i64::from(clip.bottom) < bottom
 }
 
 /// The user's double-click interval, or None when Windows reports none.
@@ -2472,6 +2493,22 @@ mod tests {
             local_cursor_coordinates(Point::new(f64::NAN, -200.0), desktop),
             Err(NativeCaptureError::Stopped(StopReason::InvalidInput))
         );
+    }
+
+    #[test]
+    fn only_a_clip_narrower_than_the_virtual_desktop_confines() {
+        let desktop = VirtualDesktop::new(-2560, -113, 7680, 1766).expect("valid desktop");
+        let clip = |left, top, right, bottom| RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+
+        assert!(!confines(clip(-2560, -113, 5120, 1653), desktop));
+        assert!(confines(clip(1, 1, 2559, 1439), desktop));
+        assert!(confines(clip(-2560, -113, 5119, 1653), desktop));
+        assert!(confines(clip(-2560, -112, 5120, 1653), desktop));
     }
 
     #[test]

@@ -18,6 +18,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 - Opening MonHop on Windows while it already runs now brings up the running window instead of starting a second copy, which fought the first for the network port and could end a live session. After an update, the new version waits for the old one to finish quitting.
 - A single oversized network packet sent to MonHop's port by any device on the network no longer ends a sharing session or stops a pairing.
+- In a game that locks the mouse inside its window on Windows, turning toward the other computer no longer hands the mouse over mid-game. While a program locks the mouse, the edge works as a wall, and it opens again once the game lets go, as in its menus.
 
 ## [0.2.6] - 2026-10-06
 

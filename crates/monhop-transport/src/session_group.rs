@@ -18,6 +18,7 @@ use crate::{
     session::{DISPLAY_CHECK_INTERVAL, SESSION_QUEUE_CAPACITY, SessionFailure, SessionScopes},
     session_clock::SessionClock,
     session_hub_actor::SlotEvent,
+    session_native::pointer_confined,
     session_runtime::POINTER_POLL_INTERVAL,
     session_source::{
         Handover, MotionTarget, NormalizedInput, SourceController, SourceEffect, SourceEffects,
@@ -477,6 +478,7 @@ impl HubCore {
         )
         .map_err(|_| LinkRefusal::Layout)?
         .with_floor(self.floor.clone(), setup.outbound_enabled)
+        .with_pointer_confinement(pointer_confined)
         .with_peer(setup.peer, slot)
         .map_err(|_| LinkRefusal::Layout)?;
         // Its ledger follows every key from here on, so it must start from what is held now.
