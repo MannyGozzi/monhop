@@ -380,6 +380,29 @@ fn revocation_before_and_during_io_blocks_delivery_and_future_io() {
 }
 
 #[test]
+fn an_oversized_datagram_from_anyone_is_dropped_without_revoking() {
+    let socket = fixture();
+    for _ in 0..3 {
+        socket
+            .io
+            .inbox
+            .lock()
+            .unwrap()
+            .queue
+            .push_back(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                OversizedDatagram,
+            )));
+    }
+    socket.io.enqueue(arrival());
+    let (result, meta) = receive(&socket, &mut Context::from_waker(Waker::noop()));
+    assert!(matches!(result, Poll::Ready(Ok(1))));
+    assert_eq!(meta.addr, PEER.into());
+    assert!(!socket.signal.is_revoked());
+    assert_eq!(socket.oversized.load(Ordering::Relaxed), 3);
+}
+
+#[test]
 fn native_errors_and_impossible_lengths_revoke_without_retry() {
     for error_kind in [
         io::ErrorKind::InvalidData,

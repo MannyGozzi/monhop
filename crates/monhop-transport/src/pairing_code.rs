@@ -122,12 +122,16 @@ impl PairingCode {
     }
 
     /// The showing computer's address, as the entering computer at `local` on a `prefix_len`
-    /// subnet reads it: its own upper 16 bits with the code's lower 16.
+    /// subnet reads it: its own upper 16 bits with the code's lower 16. A subnet wider than /16
+    /// could hide different upper bits, so it is refused rather than guessed.
     pub fn showing_address(
         &self,
         local: Ipv4Addr,
         prefix_len: u8,
     ) -> Result<Ipv4Addr, PairingCodeError> {
+        if u32::from(prefix_len) < u32::BITS - ADDRESS_BITS {
+            return Err(PairingCodeError::OffNetwork);
+        }
         let low = (self.data >> SECRET_BITS) as u32;
         let showing = Ipv4Addr::from(u32::from(local) & !(mask(ADDRESS_BITS) as u32) | low);
         validate_subnet_peer(local, prefix_len, showing)
@@ -321,6 +325,11 @@ mod tests {
             (
                 Ipv4Addr::new(8, 8, 1, 20),
                 24,
+                Err(PairingCodeError::OffNetwork),
+            ),
+            (
+                Ipv4Addr::new(192, 168, 7, 20),
+                15,
                 Err(PairingCodeError::OffNetwork),
             ),
         ] {

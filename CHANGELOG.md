@@ -17,6 +17,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 ### Fixed
 
 - Opening MonHop on Windows while it already runs now brings up the running window instead of starting a second copy, which fought the first for the network port and could end a live session. After an update, the new version waits for the old one to finish quitting.
+- A single oversized network packet sent to MonHop's port by any device on the network no longer ends a sharing session or stops a pairing.
 
 ## [0.2.6] - 2026-10-06
 

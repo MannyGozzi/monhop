@@ -292,8 +292,11 @@ fn validate_received_length(length: usize, buffer_length: usize) -> io::Result<(
 }
 
 fn validate_message_flags(flags: c_int) -> io::Result<()> {
-    if flags & (MSG_TRUNC | MSG_CTRUNC) != 0 {
+    if flags & MSG_CTRUNC != 0 {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    if flags & MSG_TRUNC != 0 {
+        return Err(truncated());
     }
     Ok(())
 }
@@ -421,6 +424,30 @@ const fn cmsg_align(length: usize) -> usize {
 
 fn invalid_data() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidData)
+}
+
+/// A datagram longer than the receive buffer. The kernel already discarded it, so the socket is
+/// sound; any sender controls this, so callers drop it instead of failing.
+#[derive(Debug)]
+struct TruncatedDatagram;
+
+impl std::fmt::Display for TruncatedDatagram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("datagram longer than the receive buffer")
+    }
+}
+
+impl std::error::Error for TruncatedDatagram {}
+
+fn truncated() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, TruncatedDatagram)
+}
+
+/// True when `error` reports only a truncated, already discarded datagram.
+pub fn is_truncated(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<TruncatedDatagram>())
 }
 
 #[cfg(test)]
@@ -566,6 +593,20 @@ mod tests {
         assert_invalid(validate_message_flags(MSG_TRUNC));
         assert_invalid(validate_message_flags(MSG_CTRUNC));
         assert_invalid(validate_message_flags(MSG_TRUNC | MSG_CTRUNC));
+    }
+
+    #[test]
+    fn only_a_truncated_payload_reads_as_a_discarded_datagram() {
+        assert!(is_truncated(
+            &validate_message_flags(MSG_TRUNC).unwrap_err()
+        ));
+        assert!(!is_truncated(
+            &validate_message_flags(MSG_CTRUNC).unwrap_err()
+        ));
+        assert!(!is_truncated(
+            &validate_message_flags(MSG_TRUNC | MSG_CTRUNC).unwrap_err()
+        ));
+        assert!(!is_truncated(&invalid_data()));
     }
 
     #[test]
@@ -827,6 +868,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(is_truncated(&error));
         });
     }
 }

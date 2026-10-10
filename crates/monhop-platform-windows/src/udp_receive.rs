@@ -40,6 +40,31 @@ fn invalid_data() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidData)
 }
 
+/// A datagram longer than the receive buffer. Windows already discarded it, so the socket is
+/// sound; any sender controls this, so callers drop it instead of failing.
+#[derive(Debug)]
+struct TruncatedDatagram;
+
+impl std::fmt::Display for TruncatedDatagram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("datagram longer than the receive buffer")
+    }
+}
+
+impl std::error::Error for TruncatedDatagram {}
+
+#[cfg(any(windows, test))]
+fn truncated() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, TruncatedDatagram)
+}
+
+/// True when `error` reports only a truncated, already discarded datagram.
+pub fn is_truncated(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<TruncatedDatagram>())
+}
+
 fn validate_buffer_length(length: usize) -> io::Result<()> {
     if length == 0 || length > MAX_BUFFER_BYTES {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -176,7 +201,7 @@ mod windows {
 
     use super::{
         CONTROL_BYTES, PacketInfo, ReceivedDatagram, invalid_data, parse_ipv4_source,
-        parse_packet_info, validate_buffer_length, validate_received_length,
+        parse_packet_info, truncated, validate_buffer_length, validate_received_length,
     };
 
     type RecvMsg = unsafe extern "system" fn(
@@ -340,12 +365,15 @@ mod windows {
             // SAFETY: WSAGetLastError reads this thread's last socket error.
             return Err(match unsafe { WSAGetLastError() } {
                 WSAEWOULDBLOCK => io::Error::from(io::ErrorKind::WouldBlock),
-                WSAEMSGSIZE => invalid_data(),
+                WSAEMSGSIZE => truncated(),
                 code => io::Error::from_raw_os_error(code),
             });
         }
-        if message.dwFlags & (MSG_TRUNC | MSG_CTRUNC) != 0 {
+        if message.dwFlags & MSG_CTRUNC != 0 {
             return Err(invalid_data());
+        }
+        if message.dwFlags & MSG_TRUNC != 0 {
+            return Err(truncated());
         }
         let received = received as usize;
         validate_received_length(received, buffer.len())?;
@@ -517,6 +545,14 @@ mod tests {
         control[CMSG_HEADER_BYTES + 4..CMSG_HEADER_BYTES + 8]
             .copy_from_slice(&interface_index.to_ne_bytes());
         control
+    }
+
+    #[test]
+    fn only_a_truncated_datagram_reads_as_discarded() {
+        assert!(is_truncated(&truncated()));
+        assert_eq!(truncated().kind(), io::ErrorKind::InvalidData);
+        assert!(!is_truncated(&invalid_data()));
+        assert!(!is_truncated(&io::Error::other("unrelated")));
     }
 
     #[test]
@@ -815,6 +851,7 @@ mod tests {
                 Err(error) => error,
             };
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(is_truncated(&error));
         });
     }
 }

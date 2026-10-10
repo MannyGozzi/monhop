@@ -41,6 +41,11 @@ pub(super) struct NativeSocket {
 }
 
 impl NativeSocket {
+    /// A datagram the OS truncated and already discarded, rather than a failed socket.
+    pub(super) fn is_truncated(error: &io::Error) -> bool {
+        udp_receive::is_truncated(error)
+    }
+
     pub(super) fn poll_receive(
         &self,
         cx: &mut Context<'_>,

@@ -162,6 +162,25 @@ fn count_drop(counter: &AtomicU64, member: usize, what: &str, cause: &dyn fmt::D
     }
 }
 
+/// A datagram longer than the receive buffer, already discarded by the OS. Any sender can cause
+/// one, so it is dropped like other unwanted traffic and never revokes the socket.
+#[derive(Debug)]
+pub(super) struct OversizedDatagram;
+
+impl fmt::Display for OversizedDatagram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("datagram longer than the receive buffer")
+    }
+}
+
+impl std::error::Error for OversizedDatagram {}
+
+fn is_oversized(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<OversizedDatagram>())
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Arrival {
     length: usize,
@@ -180,12 +199,20 @@ pub(super) trait DatagramIo: Send + Sync + 'static {
 impl DatagramIo for NativeSocket {
     fn poll_receive(&self, cx: &mut Context<'_>, buffer: &mut [u8]) -> Poll<io::Result<Arrival>> {
         NativeSocket::poll_receive(self, cx, buffer).map(|result| {
-            result.map(|packet| Arrival {
-                length: packet.length,
-                source: packet.source,
-                destination: packet.destination,
-                interface_index: packet.interface_index,
-            })
+            result
+                .map(|packet| Arrival {
+                    length: packet.length,
+                    source: packet.source,
+                    destination: packet.destination,
+                    interface_index: packet.interface_index,
+                })
+                .map_err(|error| {
+                    if NativeSocket::is_truncated(&error) {
+                        io::Error::new(io::ErrorKind::InvalidData, OversizedDatagram)
+                    } else {
+                        error
+                    }
+                })
         })
     }
 
@@ -257,6 +284,8 @@ pub(super) struct GuardedSocket<I> {
     reachability: Arc<Reachability>,
     first_packets: Mutex<Box<[TokenBucket]>>,
     dropped: Box<[Dropped]>,
+    /// From any source, so counted apart from the member slots.
+    oversized: AtomicU64,
     interface_index: u32,
     signal: RevocationSignal,
     /// Dropped with the socket, ending every `lifetime()` wait. Declared after `io`, so the OS
@@ -379,6 +408,7 @@ impl<I> GuardedSocket<I> {
                     .collect(),
             ),
             dropped: (0..slots).map(|_| Dropped::default()).collect(),
+            oversized: AtomicU64::new(0),
             interface_index,
             signal,
             lifetime: watch::Sender::new(()),
@@ -617,6 +647,16 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
             }
             let packet = match result {
                 Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) if is_oversized(&error) => {
+                    let dropped = self
+                        .oversized
+                        .fetch_add(1, Ordering::Relaxed)
+                        .saturating_add(1);
+                    if dropped.is_power_of_two() {
+                        log::debug!("guarded socket: {dropped} oversized datagrams dropped");
+                    }
+                    continue;
+                }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(self.fail(error))),
                 Poll::Ready(Ok(packet)) => packet,
             };
