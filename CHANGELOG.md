@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-09
+
 ### Added
 
 - Pair with a short code: one computer shows a 12-character code such as 7KQ4-M9XR-2HTW, you type it on the other, and both switch to Paired showing the same picture, one color and three symbols. It replaces copying a long code to each computer and comparing two 64-character fingerprints. A code works once, for two minutes, and is checked with SPAKE2 bound to the encrypted connection, so another device on the network gets a single guess per code and cannot test guesses afterwards.
@@ -222,7 +224,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.7
 [0.2.6]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.6
 [0.2.5]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.5
 [0.2.4]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.4
