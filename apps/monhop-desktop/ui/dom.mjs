@@ -70,17 +70,19 @@ export function iconButton({
 }) {
   const node = button("", { variant, size, disabled, busy, focusKey: id, id, onClick });
   node.classList.add("icon-button");
-  node.dataset.tooltipDismissed = "false";
   node.setAttribute("aria-label", label);
   const glyph = art ?? icon(iconName);
   if (busy) glyph.classList.add("spin");
-  const tooltip = el("span", {
-    className: "tooltip",
-    text: label,
-    attrs: { role: "tooltip", id: `${id}-tooltip` },
-  });
-  node.setAttribute("aria-describedby", tooltip.id);
-  node.append(glyph, tooltip);
+  node.append(glyph);
+  return withTooltip(node, `${id}-tooltip`, label);
+}
+
+// Shows `label` while `node` is hovered or focused. Escape hides it until the next hover or focus.
+export function withTooltip(node, id, label) {
+  node.dataset.tooltipDismissed = "false";
+  const tooltip = el("span", { className: "tooltip", text: label, attrs: { role: "tooltip", id } });
+  node.setAttribute("aria-describedby", id);
+  node.append(tooltip);
   const restore = () => {
     node.dataset.tooltipDismissed = "false";
   };

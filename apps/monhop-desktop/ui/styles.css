@@ -480,9 +480,10 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-control.is-current:not(:disabled) { color: var(--muted-foreground); }
 .icon-button.button { position: relative; width: var(--icon-button-size); height: var(--icon-button-size); border-radius: var(--radius-circle); padding: 0; background: transparent; color: var(--muted-foreground); box-shadow: none; }
 .icon-button.button:hover:not(:disabled) { background: var(--surface-hover); color: var(--foreground); }
-.icon-button .tooltip { position: absolute; z-index: 5; top: calc(100% + var(--gap-2)); right: 0; width: max-content; max-width: var(--tooltip-max-width); border-radius: var(--radius); padding: var(--gap-1) var(--gap-2); background: var(--surface-raised); box-shadow: var(--shadow-raised); color: var(--foreground); font-size: var(--text-sm); font-weight: var(--weight-regular); line-height: var(--leading-tight); text-align: left; white-space: normal; opacity: 0; pointer-events: none; transform: scale(var(--scale-enter)); transform-origin: top right; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
-.icon-button:hover .tooltip, .icon-button:focus-visible .tooltip { opacity: 1; transform: none; }
-.icon-button[data-tooltip-dismissed="true"] .tooltip { opacity: 0; transform: scale(var(--scale-enter)); }
+:is(.icon-button, .pair-picture) .tooltip { position: absolute; z-index: 5; top: calc(100% + var(--gap-2)); right: 0; width: max-content; max-width: var(--tooltip-max-width); border-radius: var(--radius); padding: var(--gap-1) var(--gap-2); background: var(--surface-raised); box-shadow: var(--shadow-raised); color: var(--foreground); font-size: var(--text-sm); font-weight: var(--weight-regular); line-height: var(--leading-tight); text-align: left; white-space: normal; opacity: 0; pointer-events: none; transform: scale(var(--scale-enter)); transform-origin: top right; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
+:is(.icon-button, .pair-picture):is(:hover, :focus-visible) .tooltip { opacity: 1; transform: none; }
+:is(.icon-button, .pair-picture)[data-tooltip-dismissed="true"] .tooltip { opacity: 0; transform: scale(var(--scale-enter)); }
+.pair-picture .tooltip { right: auto; left: 0; transform-origin: top left; }
 .spin { animation: spin var(--loop-spin) linear infinite; }
 .theme-toggle[data-changed="true"] svg { animation: theme-pop var(--motion-spring) var(--ease-spring) both; }
 
@@ -570,6 +571,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .pair-badge[data-color="pink"] { --tone: var(--pair-pink); }
 .pair-badge[data-color="slate"] { --tone: var(--pair-slate); }
 .pair-result { display: grid; justify-items: center; gap: var(--gap-3); min-width: 0; padding-top: var(--gap-2); text-align: center; }
+.pair-picture { position: relative; display: inline-flex; flex: none; align-items: center; gap: var(--gap-2); border-radius: var(--radius-pill); white-space: nowrap; }
 .pair-badge-caption { color: var(--muted-foreground); font-size: var(--text-sm); }
 .pair-result-copy { display: grid; gap: var(--gap-1); min-width: 0; }
 .pair-result-copy strong { font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); line-height: var(--leading-tight); }

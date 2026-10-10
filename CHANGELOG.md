@@ -7,7 +7,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 ### Added
 
 - Pair with a short code: one computer shows a 12-character code such as 7KQ4-M9XR-2HTW, you type it on the other, and both switch to Paired showing the same picture, one color and three symbols. It replaces copying a long code to each computer and comparing two 64-character fingerprints. A code works once, for two minutes, and is checked with SPAKE2 bound to the encrypted connection, so another device on the network gets a single guess per code and cannot test guesses afterwards.
-- Each paired computer's card shows that pairing's picture, the same on both computers.
+- Each paired computer's card shows that pairing's picture, labeled "Pairing picture" and the same on both computers. Pointing at it explains what to do if the two computers show different pictures.
 
 ### Changed
 

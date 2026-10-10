@@ -40,6 +40,7 @@ import {
   statusChip,
   swap,
   switchRow,
+  withTooltip,
 } from "./dom.mjs";
 import {
   INHALE_LOW,
@@ -114,8 +115,7 @@ export function computerCard(
                             .filter(Boolean)
                             .join(" · "),
                     }),
-                    // The same picture the other computer shows on its card for this one.
-                    !editing && computer.badge ? pairBadge(computer.badge) : null,
+                    !editing && computer.badge ? pairPicture(computer, key) : null,
                   ],
                 }),
               ],
@@ -583,6 +583,21 @@ function useGlyph(name, current) {
     dataset: { current: String(current) },
     children: [icon(name, 14)],
   });
+}
+
+// The other computer shows this same picture on its card for this one.
+function pairPicture(computer, key) {
+  const node = el("span", {
+    className: "pair-picture",
+    attrs: { tabindex: 0 },
+    dataset: { focusKey: `${key}-pair-picture` },
+    children: [el("span", { text: "Pairing picture" }), pairBadge(computer.badge)],
+  });
+  return withTooltip(
+    node,
+    `${key}-pair-picture-tooltip`,
+    "The other computer shows this same picture. If they differ, forget this computer and pair again.",
+  );
 }
 
 // The name reads as text and edits in place: a pencil appears on hover and focus, and the
