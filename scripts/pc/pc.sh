@@ -10,7 +10,8 @@ fi
 host=$(sed -n 's/^host=//p' "$conf")
 checkout=$(sed -n 's/^checkout=//p' "$conf")
 mail='.claude\state\mail'
-app='$env:LOCALAPPDATA\Programs\MonHop'
+# The NSIS install the Start menu, login entry and in-app updater all use.
+app='$env:LOCALAPPDATA\MonHop'
 
 # PowerShell from stdin, run in the PC checkout. -EncodedCommand sidesteps every quoting layer.
 ps() {
@@ -78,7 +79,8 @@ EOF
 \$head = git rev-parse --short=9 HEAD
 Get-Process monhop-desktop -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
-foreach (\$exe in 'monhop-desktop.exe', 'monhop.exe') {
+# The installer ships only the app; the CLI runs from target\release.
+foreach (\$exe in @('monhop-desktop.exe')) {
   Copy-Item -LiteralPath "target\release\\\$exe" -Destination "$app\\\$exe" -Force
   \$built = (Get-FileHash "target\release\\\$exe").Hash
   if ((Get-FileHash "$app\\\$exe").Hash -ne \$built) { throw "\$exe did not install intact." }
@@ -98,7 +100,7 @@ EOF
   ask)
     commit=${2:?usage: pc.sh ask <commit> <prompt-file> [model]}
     prompt=${3:?usage: pc.sh ask <commit> <prompt-file> [model]}
-    model=${4:-claude-sonnet-5}
+    model=${4:-claude-sonnet-5-5}
     # Read-only unless a task opts in: the agent reads logs and files that could carry injected instructions.
     mode=${PC_ASK_MODE:-plan}
     sync "$commit"

@@ -29,7 +29,7 @@ Mac's LAN address, and listens on IPv4 only.
 | `run [file]` | Runs PowerShell from a file or stdin in the PC checkout. |
 | `sync <commit>` | Fast-forwards the PC to a pushed commit and proves `HEAD` matches. |
 | `build` | Builds the workspace in release mode with the checkout's own toolchain. |
-| `install` | Stops MonHop, copies the release binaries over the installed app, checks their hashes, launches it. |
+| `install` | Stops MonHop, copies the release app over the installed one in `%LOCALAPPDATA%\MonHop`, checks its hash, launches it. |
 | `launch` | Starts the installed MonHop in the signed-in desktop session. |
 | `log [lines]` | Prints the tail of the PC's MonHop log. |
 | `ask <commit> <prompt-file> [model]` | Syncs, then runs the PC's Claude Code headless on the prompt and prints its answer. Read-only by default; `PC_ASK_MODE=bypassPermissions` lets a task run commands. |
