@@ -164,13 +164,22 @@ impl AppController {
         action(&self.pairing)
     }
 
-    /// A code is only inspected while the list has room, so no pairing can end as a trust
-    /// record without a card.
-    pub fn pairing_inspect(&self, code: String) -> Result<PairingView, String> {
+    /// A code is only shown while the list has room, so no pairing can end as a trust record
+    /// without a card.
+    pub fn pairing_show_code(&self) -> Result<PairingView, String> {
         let _lease = self.gate.begin()?;
         ComputerList::load(&self.list_path()?)?.require_room()?;
         self.release_port_for_pairing()?;
-        self.pairing.inspect(code)
+        self.pairing.show_code()
+    }
+
+    /// A typo or a code for another network is refused before sharing pauses.
+    pub fn pairing_enter_code(&self, code: &str) -> Result<PairingView, String> {
+        let _lease = self.gate.begin()?;
+        ComputerList::load(&self.list_path()?)?.require_room()?;
+        let entered = self.pairing.check_code(code)?;
+        self.release_port_for_pairing()?;
+        self.pairing.enter_code(entered)
     }
 
     fn release_port_for_pairing(&self) -> Result<(), String> {
@@ -977,6 +986,7 @@ impl AppController {
         Ok(ComputersView::assemble(
             &list,
             &self.pairing.paired_peers(),
+            self.pairing.local_fingerprint(),
             &file,
             &live,
             &self.sharing.revision(),

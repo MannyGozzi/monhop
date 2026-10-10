@@ -1,6 +1,7 @@
 // Small DOM helpers and the shared component vocabulary (button, badge, card, row, icon button with tooltip).
 import { icon } from "./icons.mjs";
 import { usableEasing } from "./motion-model.mjs";
+import { pairBadgeLabel, pairBadgeParts } from "./pair-badge-model.mjs";
 
 export { icon };
 
@@ -194,11 +195,21 @@ export function facts(pairs) {
   return list;
 }
 
-export function fingerprintBlock(label, value) {
-  return el("div", {
-    className: "fingerprint",
-    children: [el("span", { text: label }), el("code", { text: value })],
+// The match badge both computers draw for a pairing: one color and three symbols, "lg" on the
+// pairing screen and "sm" on a computer card.
+export function pairBadge(match, size = "sm") {
+  const { color, symbols } = pairBadgeParts(match);
+  const node = el("span", {
+    className: "pair-badge",
+    dataset: { color: color.key, size },
+    attrs: { role: "img", "aria-label": pairBadgeLabel(match) },
   });
+  symbols.forEach((symbol, index) => {
+    const glyph = el("span", { className: "pair-badge-symbol", children: [icon(symbol.icon)] });
+    glyph.style.setProperty("--symbol-index", String(index));
+    node.append(glyph);
+  });
+  return node;
 }
 
 // Enter animations key on a card's tone and title, so a status poll that changes nothing draws nothing.
@@ -507,29 +518,6 @@ export function copyFeedbackControls(feedback, { disabled, focusKey, onClick }) 
       dataset: { state: feedback.state },
     }),
   };
-}
-
-export function textarea({
-  id,
-  value = "",
-  placeholder,
-  readOnly = false,
-  disabled = false,
-  rows: lineCount = 3,
-  ariaLabel,
-  maxLength,
-  onInput,
-}) {
-  const node = el("textarea", {
-    className: "textarea",
-    attrs: { id, rows: lineCount, placeholder, "aria-label": ariaLabel, maxlength: maxLength },
-  });
-  node.value = value;
-  node.readOnly = readOnly;
-  node.disabled = disabled;
-  node.spellcheck = false;
-  if (onInput) node.addEventListener("input", () => onInput(node));
-  return node;
 }
 
 export function nativeError(error) {

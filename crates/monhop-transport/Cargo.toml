@@ -15,6 +15,8 @@ quinn = { version = "=0.11.11", default-features = false, features = ["runtime-t
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "zeroize"] }
 sha2 = "=0.11.0"
+spake2 = "=0.4.0"
+ring = { version = "=0.17.14", default-features = false }
 zeroize = "=1.9.0"
 tokio = { version = "=1.53.1", default-features = false, features = ["rt", "macros", "net", "time", "io-util", "sync"] }
 

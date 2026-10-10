@@ -228,12 +228,16 @@ pub fn refresh(app: &AppHandle) {
     *current = next;
 }
 
+/// Shown before it is restored, so a window hidden while minimized comes back in one restore
+/// instead of restoring hidden first.
 pub fn show_main_window(app: &AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window(MAIN_WINDOW)
         .ok_or_else(|| "The MonHop window is unavailable.".to_owned())?;
-    window.unminimize().map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    set_dock_icon(app, true);
     window.show().map_err(|error| error.to_string())?;
+    window.unminimize().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
 }
 
@@ -244,7 +248,28 @@ pub fn hide_main_window(app: &AppHandle) -> Result<(), String> {
     app.get_webview_window(MAIN_WINDOW)
         .ok_or_else(|| "The MonHop window is unavailable.".to_owned())?
         .hide()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    set_dock_icon(app, false);
+    Ok(())
+}
+
+/// The Dock icon stands for the window: present while it shows, gone while only the menu-bar
+/// control remains.
+#[cfg(target_os = "macos")]
+pub fn dock_policy(window_shown: bool) -> tauri::ActivationPolicy {
+    if window_shown {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_dock_icon(app: &AppHandle, window_shown: bool) {
+    if let Err(error) = app.set_activation_policy(dock_policy(window_shown)) {
+        log::warn!("tray: the Dock icon did not follow the window: {error}");
+    }
 }
 
 /// Dispatches only the fixed native-menu actions. No menu item can begin sharing.

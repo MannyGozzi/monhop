@@ -4,6 +4,20 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- Pair with a short code: one computer shows a 12-character code such as 7KQ4-M9XR-2HTW, you type it on the other, and both switch to Paired showing the same picture, one color and three symbols. It replaces copying a long code to each computer and comparing two 64-character fingerprints. A code works once, for two minutes, and is checked with SPAKE2 bound to the encrypted connection, so another device on the network gets a single guess per code and cannot test guesses afterwards.
+- Each paired computer's card shows that pairing's picture, the same on both computers.
+
+### Changed
+
+- Minimizing MonHop hides it to the tray on Windows and to the menu bar on macOS. On a Mac the Dock icon shows only while the window is open.
+- Pairing a new computer needs this version on both computers. Computers already paired keep working without pairing again, and sharing still works with 0.2.6.
+
+### Fixed
+
+- Opening MonHop on Windows while it already runs now brings up the running window instead of starting a second copy, which fought the first for the network port and could end a live session. After an update, the new version waits for the old one to finish quitting.
+
 ## [0.2.6] - 2026-10-06
 
 ### Added

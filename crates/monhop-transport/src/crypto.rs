@@ -1,7 +1,7 @@
 //! Mutual TLS configuration for explicitly paired MonHop devices.
 //!
-//! Pairing must compare [`CertificateFingerprint`] values out of band on both
-//! physical machines. A pin is never learned from a connection attempt.
+//! A pin is learned only from a pairing connection whose short code both computers confirmed
+//! over that very TLS session, never from a sharing connection attempt.
 
 use std::{
     fmt,
@@ -32,8 +32,11 @@ use zeroize::{Zeroize, Zeroizing};
 /// any network lookup.
 pub const LOCAL_TLS_SERVER_NAME: &str = "monhop.invalid";
 
-/// The one ALPN protocol accepted by MonHop transport.
+/// The ALPN protocol of every sharing connection.
 pub const LOCAL_ALPN: &[u8] = b"monhop/1";
+
+/// The ALPN protocol of a pairing connection, so neither kind of configuration accepts the other.
+pub const PAIRING_ALPN: &[u8] = b"monhop-pair/1";
 
 /// Certificate DER is public but still bounded before parsing or pinning.
 pub const MAX_CERTIFICATE_DER_LENGTH: usize = 16 * 1024;
@@ -344,22 +347,7 @@ impl SecureQuicConfig {
             &provider,
             refused,
         )?);
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| CryptoError::TlsConfiguration)?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_client_cert_resolver(Arc::new(SingleCertAndKey::from(identity.certified_key()?)));
-        tls.alpn_protocols = vec![LOCAL_ALPN.to_vec()];
-        tls.enable_early_data = false;
-        tls.resumption = rustls::client::Resumption::disabled();
-
-        let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
-            .map_err(|_| CryptoError::QuicConfiguration)?;
-        let mut config = quinn::ClientConfig::new(Arc::new(quic_tls));
-        config.transport_config(transport_config());
-        config.token_store(Arc::new(quinn::NoneTokenStore));
-        Ok(config)
+        quic_client(identity, provider, verifier, LOCAL_ALPN)
     }
 
     /// Build a TLS 1.3 server config that requires a client certificate and
@@ -388,7 +376,7 @@ impl SecureQuicConfig {
             .map_err(|_| CryptoError::TlsConfiguration)?
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(Arc::new(SingleCertAndKey::from(identity.certified_key()?)));
-        quic_server(tls)
+        quic_server(tls, LOCAL_ALPN)
     }
 
     /// Build a server config that presents no certificate and refuses every client. It is only
@@ -405,12 +393,61 @@ impl SecureQuicConfig {
             .map_err(|_| CryptoError::TlsConfiguration)?
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(Arc::new(NoServerCertificate));
-        quic_server(tls)
+        quic_server(tls, LOCAL_ALPN)
+    }
+
+    /// A pairing client: TLS 1.3 presenting `identity` and accepting any well-formed MonHop
+    /// certificate whose key signs the handshake. It grants no trust; only the code confirmation
+    /// that runs over it does.
+    pub fn pairing_client(identity: &DeviceIdentity) -> Result<quinn::ClientConfig, CryptoError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(UnpinnedVerifier::new(&provider));
+        quic_client(identity, provider, verifier, PAIRING_ALPN)
+    }
+
+    /// A pairing server: requires a client certificate, accepted on the terms of
+    /// [`Self::pairing_client`].
+    pub fn pairing_server(identity: &DeviceIdentity) -> Result<quinn::ServerConfig, CryptoError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(UnpinnedVerifier::new(&provider));
+        let tls = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| CryptoError::TlsConfiguration)?
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(Arc::new(SingleCertAndKey::from(identity.certified_key()?)));
+        quic_server(tls, PAIRING_ALPN)
     }
 }
 
-fn quic_server(mut tls: rustls::ServerConfig) -> Result<quinn::ServerConfig, CryptoError> {
-    tls.alpn_protocols = vec![LOCAL_ALPN.to_vec()];
+fn quic_client(
+    identity: &DeviceIdentity,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    verifier: Arc<dyn ServerCertVerifier>,
+    alpn: &[u8],
+) -> Result<quinn::ClientConfig, CryptoError> {
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| CryptoError::TlsConfiguration)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_cert_resolver(Arc::new(SingleCertAndKey::from(identity.certified_key()?)));
+    tls.alpn_protocols = vec![alpn.to_vec()];
+    tls.enable_early_data = false;
+    tls.resumption = rustls::client::Resumption::disabled();
+
+    let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+        .map_err(|_| CryptoError::QuicConfiguration)?;
+    let mut config = quinn::ClientConfig::new(Arc::new(quic_tls));
+    config.transport_config(transport_config());
+    config.token_store(Arc::new(quinn::NoneTokenStore));
+    Ok(config)
+}
+
+fn quic_server(
+    mut tls: rustls::ServerConfig,
+    alpn: &[u8],
+) -> Result<quinn::ServerConfig, CryptoError> {
+    tls.alpn_protocols = vec![alpn.to_vec()];
     tls.max_early_data_size = 0;
     tls.send_tls13_tickets = 0;
     tls.max_tls13_tickets = 0;
@@ -486,6 +523,135 @@ impl ClientCertVerifier for RefuseEveryClient {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.schemes.clone()
+    }
+}
+
+/// Pairing only: accepts one well-formed MonHop certificate, checked by WebPKI with only that
+/// certificate as root, whose key signs the TLS 1.3 handshake. Trust comes from the code alone.
+struct UnpinnedVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl UnpinnedVerifier {
+    fn new(provider: &Arc<rustls::crypto::CryptoProvider>) -> Self {
+        Self {
+            provider: provider.clone(),
+        }
+    }
+
+    fn self_rooted(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+    ) -> Result<Arc<RootCertStore>, RustlsError> {
+        if !intermediates.is_empty() {
+            return Err(refused());
+        }
+        let fingerprint = CertificateFingerprint::from_certificate_der(end_entity);
+        let peer = VerifiedPeer::from_certificate_der(end_entity, &fingerprint.full_hex())
+            .map_err(|_| refused())?;
+        peer_root_store(&peer).map(Arc::new).map_err(|_| refused())
+    }
+}
+
+impl fmt::Debug for UnpinnedVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UnpinnedVerifier")
+    }
+}
+
+impl ServerCertVerifier for UnpinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, RustlsError> {
+        let roots = self.self_rooted(end_entity, intermediates)?;
+        WebPkiServerVerifier::builder_with_provider(roots, self.provider.clone())
+            .build()
+            .map_err(|_| refused())?
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(refused())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signed: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signed,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+impl ClientCertVerifier for UnpinnedVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, RustlsError> {
+        let roots = self.self_rooted(end_entity, intermediates)?;
+        WebPkiClientVerifier::builder_with_provider(roots, self.provider.clone())
+            .build()
+            .map_err(|_| refused())?
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Err(refused())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signed: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        ServerCertVerifier::verify_tls13_signature(self, message, certificate, signed)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        ServerCertVerifier::supported_verify_schemes(self)
     }
 }
 
@@ -690,6 +856,20 @@ impl RefusedCertificate {
     fn note(&self, certificate: &CertificateDer<'_>) {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(CertificateFingerprint::from_certificate_der(certificate));
+    }
+}
+
+/// The one certificate the other end presented on a finished handshake.
+pub(crate) fn presented_certificate(
+    connection: &quinn::Connection,
+) -> Option<CertificateDer<'static>> {
+    let certificates = connection
+        .peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()?;
+    match <[CertificateDer<'static>; 1]>::try_from(*certificates) {
+        Ok([certificate]) => Some(certificate),
+        Err(_) => None,
     }
 }
 

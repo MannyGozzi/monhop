@@ -1,36 +1,71 @@
 //! Explicit pairing only. The controller has no capture, injection, or input protocol access.
 
 use std::{
+    net::{Ipv4Addr, SocketAddrV4},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU8, Ordering},
+        mpsc,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use monhop_core::{Platform, RevocationSignal};
+#[cfg(target_os = "macos")]
+use monhop_transport::guarded_endpoint::GuardedEndpoint;
 use monhop_transport::{
-    crypto::CertificateFingerprint,
-    guarded_endpoint::{EndpointRevoker, GuardedEndpoint, NetworkSelection, RouteCheckFailure},
+    crypto::{CertificateFingerprint, DeviceIdentity},
+    guarded_endpoint::{
+        EndpointRevoker, ListenSelection, NetworkSelection, PairingEndpoint, RouteCheckFailure,
+    },
     identity_store::{ProtectedPeerStore, create_identity, load_identity},
     native_storage::{NativeIdentityStore, NativePeerStore},
     pairing::{
-        ConfirmedPeerRecord, PAIR_FRAME_BYTES, PAIRING_PORT, PairFrameKind, PairingOffer,
-        encode_pair_frame, initiates_connection, validate_pair_frame,
+        ConfirmedPeerRecord, MAX_PEER_RECORD_BYTES, PAIRING_PORT, PairBadge, PairingOffer,
+        pair_badge,
     },
+    pairing_code::{PairingCode, ShownCode},
+    pairing_exchange::{PairingFailure, PairingRole, confirm_pairing},
     policy::PolicyError,
     session_setup::names_adapter,
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
+/// How long a shown code works.
 const PAIRING_WINDOW: Duration = Duration::from_secs(120);
+/// How long the entering computer keeps dialing the computer showing the code.
+const DIAL_WINDOW: Duration = Duration::from_secs(30);
 const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 const DIAL_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-#[cfg(any(target_os = "macos", test))]
-const NETWORK_ACCESS_DEADLINE: Duration = Duration::from_secs(30);
-#[cfg(any(target_os = "macos", test))]
-const NETWORK_ACCESS_TIMEOUT_REASON: u8 = 3;
+/// How long Show a code waits for the listener before answering with the code still pending.
+const SHOW_READY_WAIT: Duration = Duration::from_secs(5);
+const STOPPED: u8 = 1;
+const TIMED_OUT: u8 = 2;
+
+const READY: &str = "Show a code on this computer, or enter the code another computer shows.";
+const PREPARING: &str = "Preparing a code.";
+const SHOWING: &str = "Type this code on the other computer. It works once, for 2 minutes.";
+const CONNECTING: &str = "Connecting to the other computer.";
+const VERIFYING: &str = "Checking the code with the other computer.";
+const SAVING: &str = "Code confirmed. Saving the other computer in OS-protected storage.";
+const PAIRED: &str = "Paired. The other computer shows the same picture.";
+const STOPPING: &str = "Stopping. Finish any open system prompt before another pairing action.";
+const PAIRING_STOPPED: &str = "Pairing stopped. Sharing resumes.";
+const CODE_EXPIRED: &str = "This code expired. Show a new code.";
+const ENTERING_TIMED_OUT: &str = "Pairing timed out. Ask for a new code on the other computer.";
+const WRONG_CODE_SHOWN: &str = "Someone entered a wrong code. This code no longer works.";
+const WRONG_CODE_ENTERED: &str =
+    "That code didn't match. Ask for a new code on the other computer.";
+const UNREACHABLE: &str = "Could not reach the other computer. Check that it still shows the code and that both are on the same network.";
+const LISTENER_STOPPED: &str = "This code stopped working. Show a new code.";
+const NETWORK_CHANGED: &str =
+    "The network changed. Pairing stopped. Choose the physical network and try again.";
+const OPEN_FIRST: &str = "Open pairing on the selected network first.";
+const STILL_FINISHING: &str =
+    "Pairing is still finishing. Complete any system prompt, or cancel and wait.";
+const WORKER_FAILED: &str =
+    "The pairing worker stopped unexpectedly. Reopen pairing before continuing.";
 
 #[cfg(windows)]
 fn local_platform() -> Platform {
@@ -48,60 +83,128 @@ fn platform_code(platform: Platform) -> &'static str {
     }
 }
 
+fn role_code(role: PairingRole) -> &'static str {
+    match role {
+        PairingRole::Showing => "showing",
+        PairingRole::Entering => "entering",
+    }
+}
+
+/// The match badge as the window draws it: one of eight colors and three distinct symbols.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct BadgeView {
+    color: u8,
+    symbols: [u8; 3],
+}
+
+impl BadgeView {
+    pub fn between(a: CertificateFingerprint, b: CertificateFingerprint) -> Self {
+        pair_badge(a, b).into()
+    }
+}
+
+impl From<PairBadge> for BadgeView {
+    fn from(badge: PairBadge) -> Self {
+        Self {
+            color: badge.color,
+            symbols: badge.symbols,
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingView {
     phase: &'static str,
-    local_code: Option<String>,
-    local_fingerprint: Option<String>,
-    peer_fingerprint: Option<String>,
-    peer_address: Option<String>,
-    candidate_id: Option<u64>,
     role: Option<&'static str>,
-    storage_outcome: &'static str,
+    #[serde(serialize_with = "shown_code")]
+    code: Option<ShownCode>,
+    code_expires_at_ms: Option<u64>,
     message: String,
     busy: bool,
-    network_access: &'static str,
-    network_access_message: String,
-    local_platform: &'static str,
+    peer_fingerprint: Option<String>,
     peer_platform: Option<&'static str>,
+    peer_address: Option<String>,
+    badge: Option<BadgeView>,
+    storage_outcome: &'static str,
+    local_platform: &'static str,
+    local_fingerprint: Option<String>,
 }
 
 impl Default for PairingView {
     fn default() -> Self {
         Self {
             phase: "closed",
-            local_code: None,
-            local_fingerprint: None,
-            peer_fingerprint: None,
-            peer_address: None,
-            candidate_id: None,
             role: None,
-            storage_outcome: "unchanged",
+            code: None,
+            code_expires_at_ms: None,
             message: "Open pairing to read this computer's saved identity. Sharing stays off."
                 .into(),
             busy: false,
-            network_access: "not-verified",
-            network_access_message: String::new(),
-            local_platform: platform_code(local_platform()),
+            peer_fingerprint: None,
             peer_platform: None,
+            peer_address: None,
+            badge: None,
+            storage_outcome: "unchanged",
+            local_platform: platform_code(local_platform()),
+            local_fingerprint: None,
         }
     }
 }
 
+impl PairingView {
+    /// Forgets everything about the last attempt; the code string is wiped as it drops.
+    fn clear_attempt(&mut self) {
+        self.clear_code();
+        self.role = None;
+        self.peer_fingerprint = None;
+        self.peer_platform = None;
+        self.peer_address = None;
+        self.badge = None;
+        self.storage_outcome = "unchanged";
+    }
+
+    fn clear_code(&mut self) {
+        self.code = None;
+        self.code_expires_at_ms = None;
+    }
+}
+
+fn shown_code<S: Serializer>(code: &Option<ShownCode>, serializer: S) -> Result<S::Ok, S::Error> {
+    code.as_ref()
+        .map(|code| code.as_str())
+        .serialize(serializer)
+}
+
+/// One pairing attempt: this computer showing a code, or entering one.
 #[derive(Clone)]
-struct Candidate {
+struct Attempt {
     id: u64,
+    role: PairingRole,
     interface_id: String,
     local: PairingOffer,
-    peer: PairingOffer,
+}
+
+/// What the attempt's worker does: show a fresh code, or dial the computer showing `code`.
+enum Job {
+    Show,
+    Enter {
+        code: PairingCode,
+        showing: Ipv4Addr,
+    },
+}
+
+/// A typed code that passed its check and points at a host of the selected network.
+pub struct EnteredCode {
+    code: PairingCode,
+    showing: Ipv4Addr,
 }
 
 /// One pairing that reached protected storage, for the app to list and make active.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CompletedPairing {
     pub fingerprint: CertificateFingerprint,
-    pub address: std::net::SocketAddrV4,
+    pub address: SocketAddrV4,
     pub platform: Option<Platform>,
     pub interface_id: String,
 }
@@ -110,7 +213,7 @@ pub struct CompletedPairing {
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairedPeer {
     pub fingerprint: CertificateFingerprint,
-    pub address: std::net::SocketAddrV4,
+    pub address: SocketAddrV4,
     pub platform: Option<Platform>,
 }
 
@@ -122,7 +225,7 @@ struct PairingState {
     local: Option<PairingOffer>,
     /// Every computer paired with this identity, as read when pairing opened.
     saved: Vec<ConfirmedPeerRecord>,
-    candidate: Option<Candidate>,
+    attempt: Option<Attempt>,
     control: Option<Arc<PairingControl>>,
     /// Handed over once through `take_completed`, even when the view moved on.
     completed: Vec<CompletedPairing>,
@@ -136,14 +239,23 @@ pub struct PairingController {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
-#[derive(Default)]
 struct PairingControl {
+    role: PairingRole,
     reason: AtomicU8,
     cancel: RevocationSignal,
     revoker: Mutex<Option<EndpointRevoker>>,
 }
 
 impl PairingControl {
+    fn new(role: PairingRole) -> Self {
+        Self {
+            role,
+            reason: AtomicU8::new(0),
+            cancel: RevocationSignal::default(),
+            revoker: Mutex::new(None),
+        }
+    }
+
     fn stop(&self, reason: u8) {
         self.cancel.revoke();
         let _ = self
@@ -162,24 +274,32 @@ impl PairingControl {
         *slot = Some(revoker);
     }
 
+    /// Why the user or the window stopped this attempt, if either did.
+    fn stopped(&self) -> Option<String> {
+        match (self.reason.load(Ordering::Acquire), self.role) {
+            (STOPPED, _) => Some(PAIRING_STOPPED.into()),
+            (TIMED_OUT, PairingRole::Showing) => Some(CODE_EXPIRED.into()),
+            (TIMED_OUT, PairingRole::Entering) => Some(ENTERING_TIMED_OUT.into()),
+            _ => None,
+        }
+    }
+
     fn check(&self) -> Result<(), String> {
-        match self.reason.load(Ordering::Acquire) {
-            1 => return Err("Pairing stopped. Sharing is off.".into()),
-            2 => {
-                return Err(
-                    "Pairing timed out. Start the waiting computer first, then connect again."
-                        .into(),
-                );
-            }
-            _ => {}
+        if let Some(reason) = self.stopped() {
+            return Err(reason);
         }
         if lock(&self.revoker)
             .as_ref()
             .is_some_and(EndpointRevoker::is_revoked)
         {
-            return Err("The network changed. Pairing stopped. Choose the physical network and reconnect explicitly.".into());
+            return Err(NETWORK_CHANGED.into());
         }
         Ok(())
+    }
+
+    /// The control's own reason when it ended the attempt, else `fallback`.
+    fn or(&self, fallback: impl Into<String>) -> String {
+        self.check().err().unwrap_or_else(|| fallback.into())
     }
 }
 
@@ -204,6 +324,14 @@ impl PairingController {
 
     pub fn status(&self) -> PairingView {
         lock(&self.state).view.clone()
+    }
+
+    /// This computer's identity as pairing last read it; none before pairing opens.
+    pub fn local_fingerprint(&self) -> Option<CertificateFingerprint> {
+        lock(&self.state)
+            .local
+            .as_ref()
+            .map(PairingOffer::fingerprint)
     }
 
     /// The trust records read when pairing last opened, plus any exchange finished since; empty
@@ -232,35 +360,21 @@ impl PairingController {
         state.completed = pairings;
     }
 
-    /// True while a code exchange is in progress: from inspecting a code until it is paired or
-    /// cancelled. Pairing and sharing use one port, so no connection may run meanwhile.
+    /// True while a pairing attempt is in progress: from showing or entering a code until it is
+    /// paired or ends. Pairing and sharing use one port, so no connection may run meanwhile.
     pub fn occupies_port(&self) -> bool {
         let state = lock(&self.state);
-        state.candidate.is_some() && state.view.phase != "paired"
-    }
-
-    pub fn code_for_copy(&self) -> Result<String, String> {
-        lock(&self.state)
-            .view
-            .local_code
-            .clone()
-            .ok_or_else(|| "Open pairing before copying this computer's code.".into())
+        state.attempt.is_some() && state.view.phase != "paired"
     }
 
     fn require_idle(&self) -> Result<(), String> {
         self.require_open_app()?;
         let mut worker = lock(&self.worker);
         if worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
-            return Err(
-                "Pairing is still finishing. Complete any system prompt, or cancel and wait."
-                    .into(),
-            );
+            return Err(STILL_FINISHING.into());
         }
         if let Some(worker) = worker.take() {
-            worker.join().map_err(|_| {
-                "The pairing worker stopped unexpectedly. Reopen pairing before continuing."
-                    .to_owned()
-            })?;
+            worker.join().map_err(|_| WORKER_FAILED.to_owned())?;
         }
         Ok(())
     }
@@ -275,7 +389,7 @@ impl PairingController {
             let mut state = lock(&self.state);
             self.require_open_app()?;
             state.generation += 1;
-            state.candidate = None;
+            state.attempt = None;
             state.saved.clear();
             state.local = None;
             state.control = None;
@@ -284,7 +398,7 @@ impl PairingController {
             state.generation
         };
         let result = (|| {
-            let adapter = selected_network(&interface_id)?;
+            let adapter = selected_adapter(&interface_id)?;
             self.require_open_app()?;
             let identity = if create {
                 Some(create_identity(&NativeIdentityStore).map_err(display_error)?)
@@ -295,7 +409,7 @@ impl PairingController {
                 return Ok(None);
             };
             self.require_open_app()?;
-            let local = PairingOffer::new(adapter.local, identity.certificate_der())
+            let local = PairingOffer::new(adapter.local(), identity.certificate_der())
                 .map_err(display_error)?
                 .with_platform(local_platform());
             let saved = read_saved(&NativePeerStore, identity.fingerprint())?;
@@ -311,12 +425,11 @@ impl PairingController {
                 state.view.message = "Create an identity for this computer. Its private key stays in OS-protected storage.".into();
             }
             Ok(Some((local, saved))) => {
-                state.view.local_code = Some(local.to_code());
                 state.view.local_fingerprint = Some(local.fingerprint().full_hex());
                 state.local = Some(local);
                 state.saved = saved;
                 state.view.phase = "ready";
-                state.view.message = "Exchange connection codes, then compare the full fingerprints on both screens.".into();
+                state.view.message = READY.into();
             }
             Err(error) => {
                 state.view.phase = "error";
@@ -326,208 +439,113 @@ impl PairingController {
         Ok(state.view.clone())
     }
 
-    pub fn inspect(&self, code: String) -> Result<PairingView, String> {
+    /// Shows a fresh code and listens for the computer that types it; a code already showing is
+    /// spent first. Waits briefly so the returned view usually carries the code.
+    pub fn show_code(&self) -> Result<PairingView, String> {
         let _operation = lock(&self.operation);
-        self.require_idle()?;
-        let mut state = lock(&self.state);
         self.require_open_app()?;
-        state.generation += 1;
-        state.candidate = None;
-        state.view.candidate_id = None;
-        let peer = PairingOffer::parse(&code).map_err(display_error)?;
-        if state
-            .local
-            .as_ref()
-            .is_some_and(|local| local.fingerprint() == peer.fingerprint())
-        {
-            return Err(
-                "That is this computer's own code. Paste the other computer's code.".into(),
-            );
-        }
-        if state
-            .saved
-            .iter()
-            .any(|saved| saved.peer().fingerprint() == peer.fingerprint())
-        {
-            return Err(
-                "That computer is already paired. Choose it on Home to share with it.".into(),
-            );
-        }
-        set_candidate(&mut state, peer)?;
-        state.view.phase = "review";
-        state.view.message = "Compare the full peer fingerprint here with This computer on the other screen. Confirm on both computers.".into();
-        Ok(state.view.clone())
+        self.spend_shown_code()?;
+        self.require_idle()?;
+        let (ready, shown) = mpsc::channel();
+        self.start(PairingRole::Showing, Job::Show, Some(ready))?;
+        let _ = shown.recv_timeout(SHOW_READY_WAIT);
+        Ok(self.status())
     }
 
-    pub fn confirm(&self, candidate_id: u64) -> Result<PairingView, String> {
+    /// Checks a typed code without sending anything: its format and check symbol, and that it
+    /// names another host of the selected network.
+    pub fn check_code(&self, typed: &str) -> Result<EnteredCode, String> {
+        self.require_open_app()?;
+        let code = PairingCode::parse(typed).map_err(display_error)?;
+        let interface_id = {
+            let state = lock(&self.state);
+            state.local.as_ref().ok_or(OPEN_FIRST)?;
+            state.interface_id.clone().ok_or(OPEN_FIRST)?
+        };
+        let adapter = selected_adapter(&interface_id)?;
+        let showing = code
+            .showing_address(adapter.address, adapter.prefix_len)
+            .map_err(display_error)?;
+        Ok(EnteredCode { code, showing })
+    }
+
+    /// Dials the computer showing `entered` and confirms the code with it; a code this computer
+    /// shows is spent first.
+    pub fn enter_code(&self, entered: EnteredCode) -> Result<PairingView, String> {
         let _operation = lock(&self.operation);
+        self.require_open_app()?;
+        self.spend_shown_code()?;
         self.require_idle()?;
+        let EnteredCode { code, showing } = entered;
+        self.start(PairingRole::Entering, Job::Enter { code, showing }, None)?;
+        Ok(self.status())
+    }
+
+    /// A shown code is burned before another attempt starts, and its listener closes.
+    fn spend_shown_code(&self) -> Result<(), String> {
+        if lock(&self.state).view.phase != "showing" {
+            return Ok(());
+        }
+        self.cancel();
+        let worker = lock(&self.worker).take();
+        if let Some(worker) = worker {
+            worker.join().map_err(|_| WORKER_FAILED.to_owned())?;
+        }
+        Ok(())
+    }
+
+    fn start(
+        &self,
+        role: PairingRole,
+        job: Job,
+        ready: Option<mpsc::Sender<()>>,
+    ) -> Result<(), String> {
         let mut state = lock(&self.state);
         self.require_open_app()?;
-        let candidate = state
-            .candidate
-            .as_ref()
-            .filter(|candidate| candidate.id == candidate_id)
-            .cloned()
-            .ok_or(
-                "That confirmation is no longer current. Inspect the other computer's code again.",
-            )?;
-        let control = Arc::new(PairingControl::default());
-        state.control = Some(control.clone());
-        state.view.busy = true;
-        state.view.storage_outcome = "unchanged";
-        state.view.phase = "connecting";
-        state.view.message =
-            "Checking the saved identity and selected physical network. Sharing stays off.".into();
+        let (attempt, control) = begin_attempt(&mut state, role)?;
         let shared = self.state.clone();
         let spawn = std::thread::Builder::new()
             .name("monhop-pairing".into())
             .spawn(move || {
-                let result = run_worker(&candidate, &control, &shared);
-                let mut state = lock(&shared);
-                finish_exchange(
-                    &mut state,
-                    candidate.id,
-                    result.and_then(|_| control.check()),
-                );
+                // Success means both records are saved, so only a failure takes the stop reason.
+                let result = run_worker(&attempt, job, &control, &shared, ready)
+                    .map_err(|error| control.stopped().unwrap_or(error));
+                finish_attempt(&mut lock(&shared), attempt.id, result);
                 if let Some(revoker) = lock(&control.revoker).take() {
                     revoker.revoke();
                 }
             });
         match spawn {
-            Ok(worker) => {
-                *lock(&self.worker) = Some(worker);
-            }
+            Ok(worker) => *lock(&self.worker) = Some(worker),
             Err(_) => {
+                state.attempt = None;
                 state.view.busy = false;
                 state.view.phase = "error";
                 state.view.message =
                     "The pairing worker could not start. Nothing was connected.".into();
             }
         }
-        Ok(state.view.clone())
+        Ok(())
     }
 
-    pub fn request_network_access(&self, candidate_id: u64) -> Result<PairingView, String> {
-        #[cfg(target_os = "macos")]
-        {
-            self.request_network_access_with(candidate_id, |candidate, cancel| {
-                if cancel.is_revoked() {
-                    return Err("Network access request stopped.".into());
-                }
-                let mut selection = selected_network(&candidate.interface_id)?;
-                if cancel.is_revoked() {
-                    return Err("Network access request stopped.".into());
-                }
-                if selection.local != candidate.local.endpoint() {
-                    return Err("The network address changed. Open pairing again.".into());
-                }
-                selection.peer = candidate.peer.endpoint();
-                GuardedEndpoint::request_local_network_access_after_local_action(selection, cancel)
-                    .map_err(network_preparation_error)
-            })
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = candidate_id;
-            Err("Local Network permission requests are macOS-only.".into())
-        }
-    }
-
-    #[cfg(any(target_os = "macos", test))]
-    fn request_network_access_with(
-        &self,
-        candidate_id: u64,
-        request: impl FnOnce(&Candidate, &RevocationSignal) -> Result<(), String> + Send + 'static,
-    ) -> Result<PairingView, String> {
-        let _operation = lock(&self.operation);
-        self.require_idle()?;
-        let mut state = lock(&self.state);
-        self.require_open_app()?;
-        if state.view.phase != "review" {
-            return Err(
-                "Inspect the other computer's code before requesting network access.".into(),
-            );
-        }
-        let candidate = state
-            .candidate
-            .as_ref()
-            .filter(|candidate| candidate.id == candidate_id)
-            .cloned()
-            .ok_or("That code is no longer current. Inspect it again.")?;
-        let previous_phase = state.view.phase;
-        let control = Arc::new(PairingControl::default());
-        state.control = Some(control.clone());
-        state.view.busy = true;
-        state.view.phase = "requesting-network";
-        state.view.network_access = "requesting";
-        state.view.network_access_message =
-            "Asking macOS using the selected computer. No data is sent and sharing stays off."
-                .into();
-        state.view.message = state.view.network_access_message.clone();
-        let shared = self.state.clone();
-        let spawn = std::thread::Builder::new().name("monhop-network-access".into()).spawn(move || {
-            let _watchdog = watch_deadline(&control, NETWORK_ACCESS_DEADLINE, NETWORK_ACCESS_TIMEOUT_REASON);
-            let result = control.check()
-                .and_then(|_| request(&candidate, &control.cancel))
-                .and_then(|_| control.check());
-            let timed_out = control.reason.load(Ordering::Acquire) == NETWORK_ACCESS_TIMEOUT_REASON;
-            let mut state = lock(&shared);
-            if state.candidate.as_ref().is_some_and(|value| value.id == candidate.id) {
-                state.view.phase = previous_phase;
-                if timed_out {
-                    state.view.network_access = "incomplete";
-                    state.view.network_access_message =
-                        "The network access request did not finish. Try again.".into();
-                } else {
-                    match result {
-                        Ok(()) => {
-                            state.view.network_access = "attempted";
-                            state.view.network_access_message = "Request attempted. If macOS asks, allow MonHop, then connect. macOS does not report the permission choice here.".into();
-                        }
-                        Err(error) => {
-                            state.view.network_access = "incomplete";
-                            state.view.network_access_message = error;
-                        }
-                    }
-                }
-                state.view.message = state.view.network_access_message.clone();
-            } else {
-                state.view.phase = "ready";
-                state.view.network_access = "not-verified";
-                state.view.network_access_message = "Request stopped. Open/reload pairing to continue. No permission result was confirmed.".into();
-                state.view.message = state.view.network_access_message.clone();
-            }
-            state.view.busy = false;
-        });
-        match spawn {
-            Ok(worker) => *lock(&self.worker) = Some(worker),
-            Err(_) => {
-                state.view.busy = false;
-                state.view.phase = previous_phase;
-                state.view.network_access = "incomplete";
-                state.view.network_access_message =
-                    "The request could not start. Try again.".into();
-            }
-        }
-        Ok(state.view.clone())
-    }
-
+    /// Burns any shown code and closes the listener or dial. A running worker reports
+    /// `stopping` until it has let go of the network.
     pub fn cancel(&self) -> PairingView {
         let mut state = lock(&self.state);
         if let Some(control) = &state.control {
-            control.stop(1);
+            control.stop(STOPPED);
         }
         state.generation += 1;
-        state.candidate = None;
-        state.view.candidate_id = None;
-        state.view.phase = if state.view.busy { "stopping" } else { "ready" };
-        state.view.message = if state.view.busy {
-            "Connection stopped. Finish any open system prompt before another pairing action."
-                .into()
-        } else {
-            "Pairing stopped. Open/reload pairing to continue. Sharing is off.".into()
-        };
+        state.attempt = None;
+        state.view.clear_code();
+        if state.view.busy {
+            state.view.phase = "stopping";
+            state.view.message = STOPPING.into();
+        } else if state.local.is_some() {
+            state.view.clear_attempt();
+            state.view.phase = "ready";
+            state.view.message = READY.into();
+        }
         state.view.clone()
     }
 
@@ -550,18 +568,14 @@ impl PairingController {
             forget_peer(&NativePeerStore, identity.fingerprint(), peer)
         })();
         let mut state = lock(&self.state);
-        state.candidate = None;
-        state.view.candidate_id = None;
-        state.view.peer_fingerprint = None;
-        state.view.peer_address = None;
-        state.view.peer_platform = None;
+        state.attempt = None;
+        state.view.clear_attempt();
         state.view.busy = false;
         match &result {
             Ok(()) => {
                 state
                     .saved
                     .retain(|saved| saved.peer().fingerprint() != peer);
-                state.view.storage_outcome = "unchanged";
                 if state.local.is_some() {
                     state.view.phase = "ready";
                     state.view.message =
@@ -588,74 +602,60 @@ impl Drop for PairingController {
     }
 }
 
-fn set_candidate(state: &mut PairingState, peer: PairingOffer) -> Result<(), String> {
-    let local = state
-        .local
-        .clone()
-        .ok_or("Open pairing on the selected network first.")?;
-    let record =
-        ConfirmedPeerRecord::new(local.fingerprint(), peer.clone()).map_err(display_error)?;
-    if local.endpoint().ip() == peer.endpoint().ip() {
-        return Err("The other computer must have a different local address.".into());
-    }
-    if record.encode().len() > monhop_transport::pairing::MAX_PEER_RECORD_BYTES {
-        return Err("That identity is too large to store safely.".into());
+/// Starts an attempt from a settled phase; a running one must end or be cancelled first.
+fn begin_attempt(
+    state: &mut PairingState,
+    role: PairingRole,
+) -> Result<(Attempt, Arc<PairingControl>), String> {
+    let local = state.local.clone().ok_or(OPEN_FIRST)?;
+    let interface_id = state.interface_id.clone().ok_or(OPEN_FIRST)?;
+    if !matches!(state.view.phase, "ready" | "error" | "paired") {
+        return Err(STILL_FINISHING.into());
     }
     state.generation += 1;
-    state.view.network_access = "not-verified";
-    state.view.network_access_message.clear();
-    state.view.peer_fingerprint = Some(peer.fingerprint().full_hex());
-    state.view.peer_address = Some(peer.endpoint().to_string());
-    state.view.peer_platform = peer.platform().map(platform_code);
-    state.view.candidate_id = Some(state.generation);
-    state.view.role = Some(
-        if initiates_connection(
-            local_platform(),
-            local.fingerprint(),
-            peer.platform(),
-            peer.fingerprint(),
-        ) {
-            "connect"
-        } else {
-            "listen"
-        },
-    );
-    state.candidate = Some(Candidate {
+    let attempt = Attempt {
         id: state.generation,
-        interface_id: state
-            .interface_id
-            .clone()
-            .ok_or("Choose a physical network first.")?,
+        role,
+        interface_id,
         local,
-        peer,
-    });
-    Ok(())
+    };
+    let control = Arc::new(PairingControl::new(role));
+    state.attempt = Some(attempt.clone());
+    state.control = Some(control.clone());
+    state.view.clear_attempt();
+    state.view.role = Some(role_code(role));
+    state.view.busy = true;
+    (state.view.phase, state.view.message) = match role {
+        PairingRole::Showing => ("showing", PREPARING.into()),
+        PairingRole::Entering => ("connecting", CONNECTING.into()),
+    };
+    Ok((attempt, control))
 }
 
-/// The exchange's terminal state. A failed exchange drops its candidate so the port goes back to
-/// the supervisor; the peer fields stay for the message. The user inspects a code again to retry.
-fn finish_exchange(state: &mut PairingState, candidate_id: u64, result: Result<(), String>) {
+/// The attempt's terminal state. A failed attempt drops out so the port goes back to the
+/// supervisor; its role and message stay for the window.
+fn finish_attempt(state: &mut PairingState, id: u64, result: Result<(), String>) {
     if state
-        .candidate
+        .attempt
         .as_ref()
-        .is_some_and(|value| value.id == candidate_id)
+        .is_some_and(|attempt| attempt.id == id)
     {
+        state.view.clear_code();
         match result {
             Ok(()) => {
                 state.view.phase = "paired";
-                state.view.message =
-                    "Identity check passed on both computers. MonHop connects to it now.".into();
+                state.view.message = PAIRED.into();
             }
             Err(error) => {
-                state.candidate = None;
-                state.view.candidate_id = None;
+                state.attempt = None;
+                state.view.badge = None;
                 state.view.phase = "error";
                 state.view.message = match state.view.storage_outcome {
                     "unverified" => format!(
                         "Save result not confirmed. Reload or explicitly forget the saved device. {error}"
                     ),
                     "verified" => format!(
-                        "The device is saved here; the connection check did not finish. {error}"
+                        "The other computer is saved here, but it did not confirm saving this one. {error}"
                     ),
                     _ => error,
                 };
@@ -663,13 +663,15 @@ fn finish_exchange(state: &mut PairingState, candidate_id: u64, result: Result<(
         }
     }
     if state.view.phase == "stopping" {
-        state.view.phase = "error";
-        state.view.message = if state.view.storage_outcome == "unverified" {
-            "Pairing stopped. The save result is not confirmed. Reload the saved device before continuing."
+        state.view.clear_code();
+        if state.view.storage_outcome == "unverified" {
+            state.view.phase = "error";
+            state.view.message = "Pairing stopped. The save result is not confirmed. Reload pairing before continuing.".into();
         } else {
-            "Pairing stopped. Open pairing again to continue. Sharing is off."
+            state.view.clear_attempt();
+            state.view.phase = "ready";
+            state.view.message = PAIRING_STOPPED.into();
         }
-        .into();
     }
     state.view.busy = false;
 }
@@ -725,23 +727,6 @@ fn forget_peer(
     Ok(())
 }
 
-/// Stops `control` with `reason` once `deadline` elapses; dropping the guard first disarms it.
-#[cfg(any(target_os = "macos", test))]
-fn watch_deadline(
-    control: &Arc<PairingControl>,
-    deadline: Duration,
-    reason: u8,
-) -> std::sync::mpsc::Sender<()> {
-    let (armed, disarm) = std::sync::mpsc::channel::<()>();
-    let control = control.clone();
-    std::thread::spawn(move || {
-        if disarm.recv_timeout(deadline) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-            control.stop(reason);
-        }
-    });
-    armed
-}
-
 /// Retries `attempt` until it succeeds, each try bounded by `attempt_timeout` and
 /// spaced by `retry_interval`; stops only on `control`'s own cancellation/timeout,
 /// never by revoking anything itself. A failed or timed-out attempt is not an error.
@@ -765,209 +750,236 @@ where
     }
 }
 
-/// Windows dials repeatedly since macOS may not have pressed Connect yet.
-async fn dial_until_connected(
-    endpoint: &GuardedEndpoint,
-    control: &PairingControl,
-) -> Result<quinn::Connection, String> {
-    retry_until_cancelled(
-        control,
-        DIAL_ATTEMPT_TIMEOUT,
-        DIAL_RETRY_INTERVAL,
-        || async { endpoint.connect().map_err(|_| ())?.await.map_err(|_| ()) },
-    )
-    .await
-}
-
 fn run_worker(
-    candidate: &Candidate,
+    attempt: &Attempt,
+    job: Job,
     control: &Arc<PairingControl>,
     state: &Arc<Mutex<PairingState>>,
+    ready: Option<mpsc::Sender<()>>,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .map_err(|_| "The pairing runtime could not start.")?;
+    let expires = SystemTime::now() + PAIRING_WINDOW;
     runtime.block_on(async {
         let deadline_control = control.clone();
         let timer = tokio::spawn(async move {
             tokio::time::sleep(PAIRING_WINDOW).await;
-            deadline_control.stop(2);
+            deadline_control.stop(TIMED_OUT);
         });
-        let result = run_session(candidate, control, state).await;
+        let result = run_session(attempt, job, control, state, ready, expires).await;
         timer.abort();
         result
     })
 }
 
 async fn run_session(
-    candidate: &Candidate,
+    attempt: &Attempt,
+    job: Job,
     control: &Arc<PairingControl>,
     state: &Arc<Mutex<PairingState>>,
+    ready: Option<mpsc::Sender<()>>,
+    expires: SystemTime,
 ) -> Result<(), String> {
     control.check()?;
     let identity = load_identity(&NativeIdentityStore)
         .map_err(display_error)?
         .ok_or("The local identity is missing. Nothing was replaced.")?;
     control.check()?;
-    if identity.fingerprint() != candidate.local.fingerprint() {
-        return Err("This computer's identity changed. Open pairing and compare again.".into());
+    if identity.fingerprint() != attempt.local.fingerprint() {
+        return Err("This computer's identity changed. Open pairing again.".into());
     }
-    update(state, candidate.id, |view| {
-        view.storage_outcome = "unverified";
-    });
-    let saved = find_saved(
-        &NativePeerStore,
-        identity.fingerprint(),
-        candidate.peer.fingerprint(),
-    )?;
-    if saved
-        .as_ref()
-        .is_some_and(|saved| saved.peer() != &candidate.peer)
-    {
-        return Err(
-            "That computer's saved record differs from its code. Forget it, then pair again."
-                .into(),
-        );
-    }
-    update(state, candidate.id, |view| {
-        view.storage_outcome = if saved.is_some() {
-            "verified"
-        } else {
-            "unchanged"
-        };
-    });
-    control.check()?;
-    let mut selection = selected_network(&candidate.interface_id)?;
-    if selection.local != candidate.local.endpoint() {
+    let adapter = selected_adapter(&attempt.interface_id)?;
+    if adapter.local() != attempt.local.endpoint() {
         return Err("The selected network address changed. Open pairing again.".into());
     }
-    selection.peer = candidate.peer.endpoint();
-    let peer = candidate.peer.verified_peer().map_err(display_error)?;
     control.check()?;
-    let endpoint = GuardedEndpoint::bind_after_local_enable(selection, &identity, &peer)
-        .map_err(network_preparation_error)?;
-    control.attach(endpoint.revoker());
-    control.check()?;
-    let initiate = initiates_connection(
-        local_platform(),
-        candidate.local.fingerprint(),
-        candidate.peer.platform(),
-        candidate.peer.fingerprint(),
-    );
-    update(state, candidate.id, |view| {
-        view.phase = if initiate { "connecting" } else { "waiting" };
-        view.message = if initiate {
-            "Connecting to the other computer."
-        } else {
-            "Waiting for the other computer to connect."
+    let (endpoint, connection, code) = match job {
+        Job::Show => {
+            let code = PairingCode::generate(adapter.address).map_err(display_error)?;
+            let (endpoint, connection) = show(
+                attempt, &adapter, &code, &identity, control, state, ready, expires,
+            )
+            .await?;
+            (endpoint, connection, code)
         }
-        .into();
-    });
-    let connection = if initiate {
-        dial_until_connected(&endpoint, control).await?
-    } else {
-        endpoint
-            .accept()
-            .await
-            .map_err(|_| connection_error("waiting for an incoming connection"))?
+        Job::Enter { code, showing } => {
+            let (endpoint, connection) = enter(&adapter, showing, &identity, control).await?;
+            (endpoint, connection, code)
+        }
     };
-    control.check()?;
+    update(state, attempt.id, |view| {
+        view.clear_code();
+        view.phase = "verifying";
+        view.message = VERIFYING.into();
+    });
+    let confirmed = confirm_pairing(
+        &connection,
+        attempt.role,
+        &code,
+        &identity,
+        attempt.local.endpoint(),
+        local_platform(),
+    )
+    .await
+    .map_err(|failure| control.or(failure_message(attempt.role, &failure)))?;
+    drop(code);
+
     let local = identity.fingerprint();
-    let remote = candidate.peer.fingerprint();
-    exchange_pairing(&connection, initiate, local, remote, control, || {
-        update(state, candidate.id, |view| {
-            view.phase = "saving";
-            view.storage_outcome = "unverified";
-            view.message = "Identity verified. Saving this device in OS-protected storage.".into();
-        });
-        let record =
-            ConfirmedPeerRecord::new(local, candidate.peer.clone()).map_err(display_error)?;
-        persist_confirmed(
-            &NativePeerStore,
-            &record,
-            local,
-            || control.check(),
-            || {
-                update(state, candidate.id, |view| {
-                    view.storage_outcome = "unverified";
-                })
-            },
-        )?;
-        update(state, candidate.id, |view| {
-            view.storage_outcome = "verified";
-        });
+    let offer = confirmed.peer().offer().map_err(display_error)?;
+    let peer = offer.fingerprint();
+    let record = ConfirmedPeerRecord::new(local, offer.clone()).map_err(display_error)?;
+    if record.encode().len() > MAX_PEER_RECORD_BYTES {
+        return Err("That identity is too large to store safely.".into());
+    }
+    update(state, attempt.id, |view| {
+        view.phase = "saving";
+        view.message = SAVING.into();
+        view.peer_fingerprint = Some(peer.full_hex().to_ascii_lowercase());
+        view.peer_platform = offer.platform().map(platform_code);
+        view.peer_address = Some(offer.endpoint().to_string());
+    });
+    persist_confirmed(
+        &NativePeerStore,
+        &record,
+        local,
+        || control.check(),
+        || {
+            update(state, attempt.id, |view| {
+                view.storage_outcome = "unverified";
+            })
+        },
+    )?;
+    update(state, attempt.id, |view| {
+        view.storage_outcome = "verified";
+    });
+    {
         let mut locked = lock(state);
         locked.completed.push(CompletedPairing {
-            fingerprint: candidate.peer.fingerprint(),
-            address: candidate.peer.endpoint(),
-            platform: candidate.peer.platform(),
-            interface_id: candidate.interface_id.clone(),
+            fingerprint: peer,
+            address: offer.endpoint(),
+            platform: offer.platform(),
+            interface_id: attempt.interface_id.clone(),
         });
         if locked
-            .candidate
+            .attempt
             .as_ref()
-            .is_some_and(|c| c.id == candidate.id)
+            .is_some_and(|current| current.id == attempt.id)
+            && !locked.saved.contains(&record)
         {
             locked.saved.push(record);
         }
-        Ok(())
-    })
-    .await?;
+    }
+    confirmed
+        .finish_saved()
+        .await
+        .map_err(|failure| control.or(failure.to_string()))?;
+    update(state, attempt.id, |view| {
+        view.badge = Some(BadgeView::between(local, peer));
+    });
     // Both records are already saved and read back; a teardown race must not report failure.
     let _ = endpoint.close_and_wait_idle().await;
     lock(&control.revoker).take();
     Ok(())
 }
 
-async fn exchange_pairing(
-    connection: &quinn::Connection,
-    initiate: bool,
-    local: CertificateFingerprint,
-    remote: CertificateFingerprint,
+/// Listens with `code` shown until one connection arrives; the window then shows it no more.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site, each input distinct"
+)]
+async fn show(
+    attempt: &Attempt,
+    adapter: &SelectedAdapter,
+    code: &PairingCode,
+    identity: &DeviceIdentity,
     control: &PairingControl,
-    persist: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    control.check()?;
-    let (mut send, mut receive) = if initiate {
-        connection
-            .open_bi()
-            .await
-            .map_err(|_| connection_error("opening the identity exchange"))?
-    } else {
-        connection
-            .accept_bi()
-            .await
-            .map_err(|_| connection_error("waiting for the identity exchange"))?
-    };
-    if initiate {
-        send_frame(&mut send, PairFrameKind::Hello, local, remote).await?;
-    }
-    receive_frame(&mut receive, PairFrameKind::Hello, remote, local).await?;
-    control.check()?;
-    if !initiate {
-        send_frame(&mut send, PairFrameKind::Hello, local, remote).await?;
+    state: &Mutex<PairingState>,
+    ready: Option<mpsc::Sender<()>>,
+    expires: SystemTime,
+) -> Result<(PairingEndpoint, quinn::Connection), String> {
+    #[cfg(target_os = "macos")]
+    if let Some(neighbor) =
+        monhop_transport::policy::other_subnet_host(adapter.address, adapter.prefix_len)
+    {
+        request_local_network(adapter.toward(neighbor), control);
     }
     control.check()?;
-    persist()?;
+    let endpoint = PairingEndpoint::listen_after_local_action(adapter.listen(), identity)
+        .map_err(network_preparation_error)?;
+    control.attach(endpoint.revoker());
     control.check()?;
-    send_frame(&mut send, PairFrameKind::Saved, local, remote).await?;
-    send.finish()
-        .map_err(|_| connection_error("finishing the saved-device message"))?;
-    receive_frame(&mut receive, PairFrameKind::Saved, remote, local).await?;
-    let mut extra = [0];
-    reject_if_unexpected_extra_data(receive.read(&mut extra).await)?;
-    let _ = send.stopped().await;
-    Ok(())
+    let shown = code.display();
+    update(state, attempt.id, |view| {
+        view.code = Some(shown);
+        view.code_expires_at_ms = unix_millis(expires);
+        view.message = SHOWING.into();
+    });
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
+    let connection = endpoint
+        .accept()
+        .await
+        .map_err(|_| control.or(LISTENER_STOPPED))?;
+    Ok((endpoint, connection))
 }
 
-/// After Saved, a read error is a benign teardown race; only real extra data is a protocol failure.
-fn reject_if_unexpected_extra_data<E>(read: Result<Option<usize>, E>) -> Result<(), String> {
-    if matches!(read, Ok(Some(_))) {
-        return Err("Unexpected extra pairing data. The connection was closed.".into());
+/// Dials the computer showing the code until it answers or `DIAL_WINDOW` passes.
+async fn enter(
+    adapter: &SelectedAdapter,
+    showing: Ipv4Addr,
+    identity: &DeviceIdentity,
+    control: &PairingControl,
+) -> Result<(PairingEndpoint, quinn::Connection), String> {
+    let selection = adapter.toward(showing);
+    #[cfg(target_os = "macos")]
+    request_local_network(selection.clone(), control);
+    control.check()?;
+    let endpoint = PairingEndpoint::dial_after_local_action(selection, identity)
+        .map_err(network_preparation_error)?;
+    control.attach(endpoint.revoker());
+    control.check()?;
+    let connection = tokio::time::timeout(
+        DIAL_WINDOW,
+        retry_until_cancelled(
+            control,
+            DIAL_ATTEMPT_TIMEOUT,
+            DIAL_RETRY_INTERVAL,
+            || async { endpoint.dial().await.map_err(|_| ()) },
+        ),
+    )
+    .await
+    .map_err(|_| control.or(UNREACHABLE))??;
+    Ok((endpoint, connection))
+}
+
+/// Pairing is an explicit local action, so it may raise the macOS Local Network prompt; it sends
+/// nothing. A failed request only means the bind that follows reports the problem.
+#[cfg(target_os = "macos")]
+fn request_local_network(selection: NetworkSelection, control: &PairingControl) {
+    if let Err(error) =
+        GuardedEndpoint::request_local_network_access_after_local_action(selection, &control.cancel)
+    {
+        log::info!(
+            "pairing: the Local Network request did not complete ({:?})",
+            error.kind()
+        );
     }
-    Ok(())
+}
+
+fn failure_message(role: PairingRole, failure: &PairingFailure) -> String {
+    match (failure, role) {
+        (PairingFailure::NotConfirmed, PairingRole::Showing) => WRONG_CODE_SHOWN.into(),
+        (PairingFailure::NotConfirmed, PairingRole::Entering) => WRONG_CODE_ENTERED.into(),
+        (failure, _) => failure.to_string(),
+    }
+}
+
+fn unix_millis(at: SystemTime) -> Option<u64> {
+    u64::try_from(at.duration_since(UNIX_EPOCH).ok()?.as_millis()).ok()
 }
 
 /// Writes one record per computer and reads it back; an existing record for the same computer
@@ -984,7 +996,7 @@ fn persist_confirmed(
     if let Some(existing) = find_saved(store, local, peer)? {
         if &existing != record {
             return Err(
-                "That computer's saved record differs from its code. Forget it, then pair again."
+                "That computer's saved record differs from this pairing. Forget it, then pair again."
                     .into(),
             );
         }
@@ -1005,43 +1017,49 @@ fn persist_confirmed(
     Ok(())
 }
 
-async fn send_frame(
-    send: &mut quinn::SendStream,
-    kind: PairFrameKind,
-    local: CertificateFingerprint,
-    peer: CertificateFingerprint,
-) -> Result<(), String> {
-    send.write_all(&encode_pair_frame(kind, local, peer))
-        .await
-        .map_err(|_| connection_error("sending the pairing message"))
-}
-
-async fn receive_frame(
-    receive: &mut quinn::RecvStream,
-    kind: PairFrameKind,
-    peer: CertificateFingerprint,
-    local: CertificateFingerprint,
-) -> Result<(), String> {
-    let mut bytes = [0; PAIR_FRAME_BYTES];
-    receive
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|_| connection_error("reading the pairing message"))?;
-    validate_pair_frame(&bytes, kind, peer, local).map_err(display_error)
-}
-
 fn update(state: &Mutex<PairingState>, id: u64, change: impl FnOnce(&mut PairingView)) {
     let mut state = lock(state);
     if state
-        .candidate
+        .attempt
         .as_ref()
-        .is_some_and(|candidate| candidate.id == id)
+        .is_some_and(|attempt| attempt.id == id)
     {
         change(&mut state.view);
     }
 }
 
-fn selected_network(interface_id: &str) -> Result<NetworkSelection, String> {
+/// The selected adapter as pairing binds it.
+struct SelectedAdapter {
+    stable_id: String,
+    index: u32,
+    address: Ipv4Addr,
+    prefix_len: u8,
+}
+
+impl SelectedAdapter {
+    fn local(&self) -> SocketAddrV4 {
+        SocketAddrV4::new(self.address, PAIRING_PORT)
+    }
+
+    fn listen(&self) -> ListenSelection {
+        ListenSelection {
+            stable_id: self.stable_id.clone(),
+            interface_index: self.index,
+            local: self.local(),
+        }
+    }
+
+    fn toward(&self, peer: Ipv4Addr) -> NetworkSelection {
+        NetworkSelection {
+            stable_id: self.stable_id.clone(),
+            interface_index: self.index,
+            local: self.local(),
+            peer: SocketAddrV4::new(peer, PAIRING_PORT),
+        }
+    }
+}
+
+fn selected_adapter(interface_id: &str) -> Result<SelectedAdapter, String> {
     #[cfg(target_os = "macos")]
     let adapters = monhop_platform_macos::network::enumerate_adapters_with_attachment()
         .map_err(display_error)?;
@@ -1061,11 +1079,11 @@ fn selected_network(interface_id: &str) -> Result<NetworkSelection, String> {
     {
         return Err("This network is not recognized as connected physical Wi-Fi or Ethernet. Check its status first.".into());
     }
-    Ok(NetworkSelection {
+    Ok(SelectedAdapter {
         stable_id: adapter.stable_id,
-        interface_index: adapter.index,
-        local: std::net::SocketAddrV4::new(adapter.address, PAIRING_PORT),
-        peer: std::net::SocketAddrV4::new(adapter.address, PAIRING_PORT),
+        index: adapter.index,
+        address: adapter.address,
+        prefix_len: adapter.prefix_len,
     })
 }
 
@@ -1082,7 +1100,7 @@ fn network_preparation_error(error: std::io::Error) -> String {
     {
         return match policy {
             PolicyError::WrongInterface | PolicyError::RoutedPeer => "The route to the other computer uses a different adapter or a gateway. Use a direct route on the selected Wi-Fi or Ethernet, then try again. No fallback was used.".into(),
-            PolicyError::OffLinkPeer => "The other computer is outside this network. Connect both computers to the same local Wi-Fi or Ethernet, then check their connection codes again.".into(),
+            PolicyError::OffLinkPeer => "The other computer is outside this network. Connect both computers to the same local Wi-Fi or Ethernet, then try again.".into(),
             _ => format!("Network check stopped: {policy}. Check the selected network, then try again."),
         };
     }
@@ -1092,11 +1110,6 @@ fn network_preparation_error(error: std::io::Error) -> String {
     )
 }
 
-fn connection_error(stage: &str) -> String {
-    format!(
-        "Pairing stopped while {stage}. Start the waiting computer first. Check Local Network access on macOS and MonHop firewall access on Windows, then retry. This error does not identify which permission or network check failed."
-    )
-}
 fn display_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -1109,6 +1122,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monhop_transport::{
+        crypto::DeviceIdentity,
+        identity_store::{StorageError, StoredPeer},
+    };
+    use std::cell::{Cell, RefCell};
+    use zeroize::Zeroizing;
 
     #[test]
     fn network_messages_identify_route_failures_without_guessing_permissions() {
@@ -1138,12 +1157,6 @@ mod tests {
         assert!(!unknown.contains("VPN"));
         assert!(unknown.contains("does not identify a permission or firewall problem"));
     }
-    use monhop_transport::{
-        crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig},
-        identity_store::{StorageError, StoredPeer},
-    };
-    use std::cell::{Cell, RefCell};
-    use zeroize::Zeroizing;
 
     #[test]
     fn shutdown_rejects_all_mutating_actions_before_native_work() {
@@ -1152,35 +1165,269 @@ mod tests {
         assert!(controller.shutdown_ready());
         assert!(controller.open("physical-network".into(), false).is_err());
         assert!(controller.open("physical-network".into(), true).is_err());
-        assert!(controller.inspect("not-a-code".into()).is_err());
-        assert!(controller.confirm(1).is_err());
+        assert!(controller.show_code().is_err());
+        assert!(controller.check_code("not-a-code").is_err());
         assert!(
             controller
                 .forget(fixtures().2.peer().fingerprint())
-                .is_err()
-        );
-        assert!(
-            controller
-                .request_network_access_with(1, |_, _| panic!("request must not run"))
                 .is_err()
         );
         assert!(lock(&controller.worker).is_none());
     }
 
     #[test]
-    fn queued_confirmation_cannot_outlive_shutdown() {
+    fn a_queued_show_cannot_outlive_shutdown() {
         let controller = Arc::new(PairingController::default());
         let operation = lock(&controller.operation);
         let queued = controller.clone();
         let (send, receive) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            send.send(queued.confirm(1).is_err()).unwrap();
+            send.send(queued.show_code().is_err()).unwrap();
         });
         controller.request_shutdown();
         drop(operation);
         assert!(receive.recv_timeout(Duration::from_secs(1)).unwrap());
         worker.join().unwrap();
         assert!(lock(&controller.worker).is_none());
+    }
+
+    #[test]
+    fn a_typo_is_refused_locally_before_any_network_or_storage_work() {
+        let controller = opened_controller();
+        let before = serde_json::to_value(controller.status()).unwrap();
+        let code = PairingCode::generate(Ipv4Addr::new(192, 168, 1, 2))
+            .unwrap()
+            .display();
+        let mut typo = code.to_string().into_bytes();
+        typo[0] = if typo[0] == b'7' { b'8' } else { b'7' };
+        for (typed, message) in [
+            (
+                String::from_utf8(typo).unwrap(),
+                "That code has a typo. Check each character against the other computer.",
+            ),
+            (
+                "1234-5678".to_owned(),
+                "Enter the 12 letters and digits the other computer shows.",
+            ),
+            (
+                "x".repeat(65),
+                "Enter the 12 letters and digits the other computer shows.",
+            ),
+        ] {
+            assert_eq!(
+                controller.check_code(&typed).err().as_deref(),
+                Some(message)
+            );
+        }
+        assert_eq!(serde_json::to_value(controller.status()).unwrap(), before);
+        assert!(lock(&controller.worker).is_none());
+        assert!(!controller.occupies_port());
+    }
+
+    #[test]
+    fn showing_or_entering_needs_an_opened_identity() {
+        let controller = PairingController::default();
+        assert_eq!(controller.show_code().err().as_deref(), Some(OPEN_FIRST));
+        let code = PairingCode::generate(Ipv4Addr::new(192, 168, 1, 2))
+            .unwrap()
+            .display();
+        assert_eq!(
+            controller.check_code(&code).err().as_deref(),
+            Some(OPEN_FIRST)
+        );
+        assert_eq!(controller.status().phase, "closed");
+        assert!(lock(&controller.worker).is_none());
+        assert!(!controller.occupies_port());
+    }
+
+    #[test]
+    fn the_view_serializes_the_contract_the_window_reads() {
+        let controller = opened_controller();
+        let showing = {
+            let mut state = lock(&controller.state);
+            let (attempt, _) = begin_attempt(&mut state, PairingRole::Showing).unwrap();
+            state.view.code = Some(Zeroizing::new("7KQ4-M9XR-2HTW".to_owned()));
+            state.view.code_expires_at_ms = Some(1_700_000_000_000);
+            attempt
+        };
+        let view = serde_json::to_value(controller.status()).unwrap();
+        let mut keys: Vec<_> = view.as_object().unwrap().keys().cloned().collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "badge",
+                "busy",
+                "code",
+                "codeExpiresAtMs",
+                "localFingerprint",
+                "localPlatform",
+                "message",
+                "peerAddress",
+                "peerFingerprint",
+                "peerPlatform",
+                "phase",
+                "role",
+                "storageOutcome",
+            ]
+        );
+        assert_eq!(view["phase"], "showing");
+        assert_eq!(view["role"], "showing");
+        assert_eq!(view["code"], "7KQ4-M9XR-2HTW");
+        assert_eq!(view["codeExpiresAtMs"], 1_700_000_000_000_u64);
+        assert_eq!(view["busy"], true);
+        assert!(controller.occupies_port());
+
+        let local = lock(&controller.state)
+            .local
+            .as_ref()
+            .unwrap()
+            .fingerprint();
+        let peer = fixtures().1.fingerprint();
+        update(&controller.state, showing.id, |view| {
+            view.badge = Some(BadgeView::between(local, peer));
+            view.peer_fingerprint = Some(peer.full_hex().to_ascii_lowercase());
+        });
+        finish_attempt(&mut lock(&controller.state), showing.id, Ok(()));
+        let view = serde_json::to_value(controller.status()).unwrap();
+        assert_eq!(view["phase"], "paired");
+        assert!(view["code"].is_null());
+        assert!(view["codeExpiresAtMs"].is_null());
+        let badge = pair_badge(peer, local);
+        assert_eq!(
+            view["badge"],
+            serde_json::json!({ "color": badge.color, "symbols": badge.symbols })
+        );
+        assert_eq!(
+            view["peerFingerprint"],
+            peer.full_hex().to_ascii_lowercase()
+        );
+        assert_eq!(view["busy"], false);
+        assert!(!controller.occupies_port());
+    }
+
+    #[test]
+    fn a_wrong_code_spends_the_shown_code_and_releases_the_port_with_the_role_kept() {
+        for (role, message) in [
+            (PairingRole::Showing, WRONG_CODE_SHOWN),
+            (PairingRole::Entering, WRONG_CODE_ENTERED),
+        ] {
+            let controller = opened_controller();
+            let attempt = {
+                let mut state = lock(&controller.state);
+                let (attempt, _) = begin_attempt(&mut state, role).unwrap();
+                state.view.code = Some(Zeroizing::new("7KQ4-M9XR-2HTW".to_owned()));
+                attempt
+            };
+            assert!(controller.occupies_port());
+            // A stale attempt's end changes nothing.
+            finish_attempt(
+                &mut lock(&controller.state),
+                attempt.id + 1,
+                Err("stale".into()),
+            );
+            assert!(controller.occupies_port());
+            finish_attempt(
+                &mut lock(&controller.state),
+                attempt.id,
+                Err(failure_message(role, &PairingFailure::NotConfirmed)),
+            );
+            let view = controller.status();
+            assert_eq!(view.phase, "error");
+            assert_eq!(view.role, Some(role_code(role)));
+            assert_eq!(view.message, message);
+            assert!(view.code.is_none());
+            assert!(view.badge.is_none());
+            assert!(!view.busy);
+            assert!(!controller.occupies_port());
+        }
+    }
+
+    #[test]
+    fn an_expired_or_cancelled_attempt_says_why() {
+        let control = PairingControl::new(PairingRole::Showing);
+        control.stop(TIMED_OUT);
+        assert_eq!(control.check().unwrap_err(), CODE_EXPIRED);
+        // The first reason wins: a later cancel does not rename an expiry.
+        control.stop(STOPPED);
+        assert_eq!(control.stopped().as_deref(), Some(CODE_EXPIRED));
+        let control = PairingControl::new(PairingRole::Entering);
+        control.stop(TIMED_OUT);
+        assert_eq!(control.check().unwrap_err(), ENTERING_TIMED_OUT);
+        let control = PairingControl::new(PairingRole::Entering);
+        assert_eq!(control.or(UNREACHABLE), UNREACHABLE);
+        control.stop(STOPPED);
+        assert_eq!(control.or(UNREACHABLE), PAIRING_STOPPED);
+
+        let controller = opened_controller();
+        let attempt = {
+            let mut state = lock(&controller.state);
+            let (attempt, _) = begin_attempt(&mut state, PairingRole::Showing).unwrap();
+            state.view.code = Some(Zeroizing::new("7KQ4-M9XR-2HTW".to_owned()));
+            attempt
+        };
+        finish_attempt(
+            &mut lock(&controller.state),
+            attempt.id,
+            Err(CODE_EXPIRED.into()),
+        );
+        let view = controller.status();
+        assert_eq!((view.phase, view.role), ("error", Some("showing")));
+        assert_eq!(view.message, CODE_EXPIRED);
+        assert!(view.code.is_none() && view.code_expires_at_ms.is_none());
+        assert!(!controller.occupies_port());
+    }
+
+    #[test]
+    fn cancel_spends_the_code_and_a_running_worker_ends_ready() {
+        let controller = opened_controller();
+        let (attempt, control) = {
+            let mut state = lock(&controller.state);
+            let started = begin_attempt(&mut state, PairingRole::Showing).unwrap();
+            state.view.code = Some(Zeroizing::new("7KQ4-M9XR-2HTW".to_owned()));
+            started
+        };
+        let stopping = controller.cancel();
+        assert_eq!(stopping.phase, "stopping");
+        assert!(stopping.busy);
+        assert!(stopping.code.is_none());
+        assert!(control.check().is_err());
+        assert!(!controller.occupies_port());
+        finish_attempt(
+            &mut lock(&controller.state),
+            attempt.id,
+            Err(control.stopped().unwrap()),
+        );
+        let view = controller.status();
+        assert_eq!(view.phase, "ready");
+        assert_eq!(view.message, PAIRING_STOPPED);
+        assert!(!view.busy);
+        assert!(view.role.is_none());
+
+        // Nothing running: cancel settles at once, and never opens an unopened controller.
+        assert_eq!(controller.cancel().phase, "ready");
+        assert_eq!(PairingController::default().cancel().phase, "closed");
+    }
+
+    #[test]
+    fn an_attempt_starts_only_from_a_settled_phase() {
+        let controller = opened_controller();
+        let mut state = lock(&controller.state);
+        for phase in ["showing", "connecting", "verifying", "saving", "stopping"] {
+            state.view.phase = phase;
+            assert_eq!(
+                begin_attempt(&mut state, PairingRole::Entering)
+                    .err()
+                    .as_deref(),
+                Some(STILL_FINISHING)
+            );
+        }
+        for phase in ["ready", "error", "paired"] {
+            state.view.phase = phase;
+            assert!(begin_attempt(&mut state, PairingRole::Entering).is_ok());
+            assert_eq!(state.view.phase, "connecting");
+            assert_eq!(state.view.role, Some("entering"));
+        }
     }
 
     /// Records by handle; the handle is the key the controller chose, or a legacy name.
@@ -1254,171 +1501,24 @@ mod tests {
         (local, peer, record)
     }
 
-    fn request_controller() -> PairingController {
-        let (local, _, record) = fixtures();
+    /// A controller as `open` leaves it, without native storage or network reads.
+    fn opened_controller() -> PairingController {
+        let (local, _, _) = fixtures();
         let controller = PairingController::default();
         {
             let mut state = lock(&controller.state);
             state.interface_id = Some("fixture-only".into());
-            state.local = Some(
-                PairingOffer::new(
-                    "192.168.1.1:24872".parse().unwrap(),
-                    local.certificate_der(),
-                )
-                .unwrap(),
-            );
-            set_candidate(&mut state, record.peer().clone()).unwrap();
-            state.view.phase = "review";
-        }
-        controller
-    }
-
-    #[test]
-    fn network_request_needs_current_candidate_and_does_not_establish_trust() {
-        let controller = PairingController::default();
-        assert!(
-            controller
-                .request_network_access_with(1, |_, _| panic!("startup request"))
-                .is_err()
-        );
-        let controller = request_controller();
-        let id = controller.status().candidate_id.unwrap();
-        assert!(
-            controller
-                .request_network_access_with(id + 1, |_, _| panic!("stale request"))
-                .is_err()
-        );
-        controller
-            .request_network_access_with(id, |_, cancel| {
-                assert!(!cancel.is_revoked());
-                Ok(())
-            })
+            let offer = PairingOffer::new(
+                "192.168.1.1:24872".parse().unwrap(),
+                local.certificate_der(),
+            )
             .unwrap();
-        lock(&controller.worker).take().unwrap().join().unwrap();
-        let view = controller.status();
-        assert_eq!(view.phase, "review");
-        assert_eq!(view.network_access, "attempted");
-        assert_eq!(view.storage_outcome, "unchanged");
-        assert!(lock(&controller.state).saved.is_empty());
-    }
-
-    #[test]
-    fn cancelling_network_request_blocks_late_success_and_concurrent_actions() {
-        {
-            let controller = request_controller();
-            let id = controller.status().candidate_id.unwrap();
-            assert!(controller.occupies_port());
-            let (started, ready) = std::sync::mpsc::channel();
-            let (finish, released) = std::sync::mpsc::channel();
-            controller
-                .request_network_access_with(id, move |_, cancel| {
-                    started.send(()).unwrap();
-                    released.recv_timeout(Duration::from_secs(2)).unwrap();
-                    assert!(cancel.is_revoked());
-                    Ok(())
-                })
-                .unwrap();
-            ready.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert!(controller.confirm(id).is_err());
-            assert!(controller.open("fixture-only".into(), false).is_err());
-            assert!(
-                controller
-                    .request_network_access_with(id, |_, _| panic!("concurrent request"))
-                    .is_err()
-            );
-            assert_eq!(controller.cancel().phase, "stopping");
-            finish.send(()).unwrap();
-            lock(&controller.worker).take().unwrap().join().unwrap();
-            let view = controller.status();
-            assert_eq!(view.network_access, "not-verified");
-            assert_eq!(view.phase, "ready");
-            assert!(!view.busy);
-            assert!(view.candidate_id.is_none());
-            assert!(!controller.occupies_port());
-        }
-    }
-
-    #[test]
-    fn cancel_after_a_network_request_releases_the_port_and_the_candidate() {
-        let controller = request_controller();
-        let id = controller.status().candidate_id.unwrap();
-        controller
-            .request_network_access_with(id, |_, _| Ok(()))
-            .unwrap();
-        lock(&controller.worker).take().unwrap().join().unwrap();
-        assert_eq!(controller.status().phase, "review");
-        assert!(controller.occupies_port());
-        let stopped = controller.cancel();
-        assert_eq!(stopped.phase, "ready");
-        assert_eq!(stopped.candidate_id, None);
-        assert!(!stopped.busy);
-        assert!(!controller.occupies_port());
-        assert!(controller.confirm(id).is_err());
-    }
-
-    #[test]
-    fn inspect_refuses_this_computers_own_code_and_an_already_paired_computer() {
-        let (local, _, record) = fixtures();
-        let controller = PairingController::default();
-        let own_offer = PairingOffer::new(
-            "192.168.1.1:24872".parse().unwrap(),
-            local.certificate_der(),
-        )
-        .unwrap();
-        {
-            let mut state = lock(&controller.state);
-            state.interface_id = Some("fixture-only".into());
-            state.local = Some(own_offer.clone());
-            state.saved = vec![record.clone()];
+            state.view.local_fingerprint = Some(offer.fingerprint().full_hex());
+            state.local = Some(offer);
             state.view.phase = "ready";
+            state.view.message = READY.into();
         }
-        assert_eq!(
-            controller.inspect(own_offer.to_code()).err().as_deref(),
-            Some("That is this computer's own code. Paste the other computer's code.")
-        );
-        assert_eq!(
-            controller.inspect(record.peer().to_code()).err().as_deref(),
-            Some("That computer is already paired. Choose it on Home to share with it.")
-        );
-        assert!(!controller.occupies_port());
-        let other = DeviceIdentity::generate().unwrap();
-        let fresh = PairingOffer::new(
-            "192.168.1.3:24872".parse().unwrap(),
-            other.certificate_der(),
-        )
-        .unwrap();
-        let review = controller.inspect(fresh.to_code()).unwrap();
-        assert_eq!(review.phase, "review");
-        assert_eq!(
-            review.peer_fingerprint,
-            Some(other.fingerprint().full_hex())
-        );
-        assert!(controller.occupies_port());
-    }
-
-    #[test]
-    fn a_failed_exchange_releases_the_port_and_a_finished_one_keeps_the_candidate() {
-        let controller = request_controller();
-        let id = controller.status().candidate_id.unwrap();
-        assert!(controller.occupies_port());
-        finish_exchange(&mut lock(&controller.state), id + 1, Err("stale".into()));
-        assert!(controller.occupies_port());
-        assert_eq!(controller.status().phase, "review");
-        finish_exchange(&mut lock(&controller.state), id, Err("no route".into()));
-        let view = controller.status();
-        assert_eq!(view.phase, "error");
-        assert_eq!(view.message, "no route");
-        assert!(view.candidate_id.is_none());
-        assert!(view.peer_fingerprint.is_some());
-        assert!(!view.busy);
-        assert!(!controller.occupies_port());
-        assert!(controller.confirm(id).is_err());
-
-        let controller = request_controller();
-        let id = controller.status().candidate_id.unwrap();
-        finish_exchange(&mut lock(&controller.state), id, Ok(()));
-        assert_eq!(controller.status().phase, "paired");
-        assert!(!controller.occupies_port());
+        controller
     }
 
     #[test]
@@ -1470,62 +1570,6 @@ mod tests {
     }
 
     #[test]
-    fn network_request_error_is_not_a_permission_verdict() {
-        let controller = request_controller();
-        let id = controller.status().candidate_id.unwrap();
-        controller
-            .request_network_access_with(id, |_, _| Err("Network changed".into()))
-            .unwrap();
-        lock(&controller.worker).take().unwrap().join().unwrap();
-        let view = controller.status();
-        assert_eq!(view.phase, "review");
-        assert_eq!(view.network_access, "incomplete");
-        assert_eq!(view.network_access_message, "Network changed");
-        assert!(!view.busy);
-    }
-
-    #[test]
-    fn controller_startup_status_and_invalid_confirmation_are_inert() {
-        let controller = PairingController::default();
-        assert_eq!(controller.status().phase, "closed");
-        assert!(controller.confirm(1).is_err());
-        assert!(controller.inspect("not a code".into()).is_err());
-        assert!(lock(&controller.worker).is_none());
-        assert!(!controller.occupies_port());
-    }
-
-    #[test]
-    fn copy_writes_only_the_current_public_offer_without_changing_pairing() {
-        let (identity, _, _) = fixtures();
-        let offer = PairingOffer::new(
-            "192.168.1.1:24872".parse().unwrap(),
-            identity.certificate_der(),
-        )
-        .unwrap();
-        let controller = PairingController::default();
-        lock(&controller.state).view.local_code = Some(offer.to_code());
-        let before = serde_json::to_value(controller.status()).unwrap();
-        let mut writes = Vec::new();
-        crate::public_code_copy::copy(&controller, |text| {
-            writes.push(text);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(writes, [offer.to_code()]);
-        assert!(PairingOffer::parse(&writes[0]).unwrap() == offer);
-        assert_eq!(serde_json::to_value(controller.status()).unwrap(), before);
-        assert!(lock(&controller.worker).is_none());
-
-        assert_eq!(
-            crate::public_code_copy::copy(&controller, |_| Err("busy".into())),
-            Err("busy".into())
-        );
-        assert_eq!(serde_json::to_value(controller.status()).unwrap(), before);
-        lock(&controller.state).view.local_code = None;
-        assert!(crate::public_code_copy::copy(&controller, |_| panic!("stale code")).is_err());
-    }
-
-    #[test]
     fn saved_peer_restart_and_duplicates_preserve_the_record() {
         let (identity, _, record) = fixtures();
         let store = MemoryStore::default();
@@ -1566,6 +1610,31 @@ mod tests {
         .unwrap();
         assert_eq!(store.creates.get(), 2);
         assert_eq!(read_saved(&store, identity.fingerprint()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_saved_record_that_differs_is_never_replaced() {
+        let (identity, peer, record) = fixtures();
+        let store = MemoryStore::default();
+        persist_confirmed(&store, &record, identity.fingerprint(), || Ok(()), || {}).unwrap();
+        let moved = ConfirmedPeerRecord::new(
+            identity.fingerprint(),
+            PairingOffer::new("192.168.1.9:24872".parse().unwrap(), peer.certificate_der())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persist_confirmed(
+                &store,
+                &moved,
+                identity.fingerprint(),
+                || Ok(()),
+                || panic!("must not replace")
+            )
+            .unwrap_err(),
+            "That computer's saved record differs from this pairing. Forget it, then pair again."
+        );
+        assert!(read_saved(&store, identity.fingerprint()).unwrap() == vec![record]);
     }
 
     #[test]
@@ -1636,59 +1705,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_candidate_cannot_start_after_cancel() {
-        let (identity, _, record) = fixtures();
-        let controller = PairingController::default();
-        let id = {
-            let mut state = lock(&controller.state);
-            state.local = Some(
-                PairingOffer::new(
-                    "192.168.1.1:24872".parse().unwrap(),
-                    identity.certificate_der(),
-                )
-                .unwrap(),
-            );
-            state.interface_id = Some("fixture".into());
-            set_candidate(&mut state, record.peer().clone()).unwrap();
-            state.view.candidate_id.unwrap()
-        };
-        controller.cancel();
-        assert!(controller.confirm(id).is_err());
-        assert!(lock(&controller.worker).is_none());
-    }
-
-    #[derive(Debug)]
-    struct ClosingSocket {
-        inner: Arc<dyn quinn::AsyncUdpSocket>,
-        closed: std::sync::atomic::AtomicBool,
-    }
-    impl quinn::AsyncUdpSocket for ClosingSocket {
-        fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
-            self.inner.clone().create_io_poller()
-        }
-        fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(std::io::ErrorKind::ConnectionAborted.into());
-            }
-            self.inner.try_send(transmit)
-        }
-        fn poll_recv(
-            &self,
-            cx: &mut std::task::Context,
-            bufs: &mut [std::io::IoSliceMut<'_>],
-            meta: &mut [quinn::udp::RecvMeta],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            if self.closed.load(Ordering::Acquire) {
-                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionAborted.into()));
-            }
-            self.inner.poll_recv(cx, bufs, meta)
-        }
-        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-            self.inner.local_addr()
-        }
-    }
-
-    #[test]
     fn cancellation_during_a_blocked_store_write_preserves_unknown_outcome() {
         struct BlockedStore {
             entered: Arc<std::sync::Barrier>,
@@ -1723,7 +1739,7 @@ mod tests {
             released: released.clone(),
             bytes: Mutex::new(None),
         });
-        let control = Arc::new(PairingControl::default());
+        let control = Arc::new(PairingControl::new(PairingRole::Entering));
         let writer_store = store.clone();
         let writer_control = control.clone();
         let writer = std::thread::spawn(move || {
@@ -1736,7 +1752,7 @@ mod tests {
             )
         });
         entered.wait();
-        control.stop(1);
+        control.stop(STOPPED);
         assert!(control.check().is_err());
         released.wait();
         assert!(writer.join().unwrap().is_err());
@@ -1745,25 +1761,27 @@ mod tests {
 
     #[test]
     fn canceled_before_worker_starts_does_not_access_native_identity() {
-        let (identity, _, record) = fixtures();
-        let candidate = Candidate {
+        let (identity, _, _) = fixtures();
+        let attempt = Attempt {
             id: 1,
+            role: PairingRole::Showing,
             interface_id: "not a native interface".into(),
             local: PairingOffer::new(
                 "192.168.1.1:24872".parse().unwrap(),
                 identity.certificate_der(),
             )
             .unwrap(),
-            peer: record.peer().clone(),
         };
-        let control = Arc::new(PairingControl::default());
-        control.stop(1);
+        let control = Arc::new(PairingControl::new(PairingRole::Showing));
+        control.stop(STOPPED);
         let result = run_worker(
-            &candidate,
+            &attempt,
+            Job::Show,
             &control,
             &Arc::new(Mutex::new(PairingState::default())),
+            None,
         );
-        assert_eq!(result.unwrap_err(), "Pairing stopped. Sharing is off.");
+        assert_eq!(result.unwrap_err(), PAIRING_STOPPED);
     }
 
     #[test]
@@ -1783,166 +1801,5 @@ mod tests {
             .is_err()
         );
         assert_eq!(store.creates.get(), 1);
-    }
-
-    // Only this opt-in fixture uses loopback; production sockets require GuardedEndpoint.
-    async fn loopback_connections(
-        a: &DeviceIdentity,
-        b: &DeviceIdentity,
-    ) -> (
-        quinn::Endpoint,
-        quinn::Endpoint,
-        quinn::Connection,
-        quinn::Connection,
-        Arc<ClosingSocket>,
-    ) {
-        let ap = PairingOffer::new("192.168.1.1:24872".parse().unwrap(), a.certificate_der())
-            .unwrap()
-            .verified_peer()
-            .unwrap();
-        let bp = PairingOffer::new("192.168.1.2:24872".parse().unwrap(), b.certificate_der())
-            .unwrap()
-            .verified_peer()
-            .unwrap();
-        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(SecureQuicConfig::client(a, &bp).unwrap());
-        use quinn::Runtime;
-        let native = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let socket = Arc::new(ClosingSocket {
-            inner: quinn::TokioRuntime.wrap_udp_socket(native).unwrap(),
-            closed: std::sync::atomic::AtomicBool::new(false),
-        });
-        let server = quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            Some(SecureQuicConfig::server(b, &ap).unwrap()),
-            socket.clone(),
-            Arc::new(quinn::TokioRuntime),
-        )
-        .unwrap();
-        let (left, right) = tokio::join!(
-            client
-                .connect(server.local_addr().unwrap(), LOCAL_TLS_SERVER_NAME)
-                .unwrap(),
-            async { server.accept().await.unwrap().await }
-        );
-        (client, server, left.unwrap(), right.unwrap(), socket)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "explicit bounded localhost TLS pairing probe, no user storage"]
-    async fn native_pairing_exchange_and_one_sided_failure() {
-        tokio::time::timeout(Duration::from_secs(8), async {
-            for iteration in 0..24 {
-                let fail = iteration == 23;
-                let (a, b, record) = fixtures();
-                let (_client, server, left, right, socket) = loopback_connections(&a, &b).await;
-                let saved_a = Cell::new(false);
-                let saved_b = Cell::new(false);
-                let ca = PairingControl::default();
-                let cb = PairingControl::default();
-                let (ra, rb) = tokio::join!(
-                    exchange_pairing(&left, true, a.fingerprint(), b.fingerprint(), &ca, || {
-                        saved_a.set(true);
-                        Ok(())
-                    }),
-                    async {
-                        let result = exchange_pairing(
-                            &right,
-                            false,
-                            b.fingerprint(),
-                            a.fingerprint(),
-                            &cb,
-                            || {
-                                if fail {
-                                    Err("store denied".into())
-                                } else {
-                                    saved_b.set(true);
-                                    Ok(())
-                                }
-                            },
-                        )
-                        .await;
-                        server.close(0_u32.into(), b"fixture finished");
-                        server.wait_idle().await;
-                        socket.closed.store(true, Ordering::Release);
-                        result
-                    }
-                );
-                assert_eq!(ra.is_ok(), !fail);
-                assert_eq!(rb.is_ok(), !fail);
-                assert_eq!(saved_b.get(), !fail);
-                if !fail {
-                    assert!(saved_a.get());
-                    assert!(record.encode().len() < 4096);
-                }
-            }
-        })
-        .await
-        .expect("pairing fixture exceeded bound");
-    }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "explicit bounded localhost negative pairing probe, no user storage"]
-    async fn native_pairing_rejects_wrong_identity_trailing_data_and_late_cancel() {
-        tokio::time::timeout(Duration::from_secs(8), async {
-            for case in ["wrong-identity", "trailing", "cancel"] {
-                let (a, b, _) = fixtures();
-                let (_client, server, left, right, _socket) = loopback_connections(&a, &b).await;
-                let control = PairingControl::default();
-                let saved = Cell::new(false);
-                let (result, _) = tokio::join!(
-                    exchange_pairing(
-                        &left,
-                        true,
-                        a.fingerprint(),
-                        b.fingerprint(),
-                        &control,
-                        || {
-                            saved.set(true);
-                            if case == "cancel" {
-                                control.stop(1);
-                            }
-                            Ok(())
-                        }
-                    ),
-                    async {
-                        let (mut send, mut receive) = right.accept_bi().await.unwrap();
-                        receive_frame(
-                            &mut receive,
-                            PairFrameKind::Hello,
-                            a.fingerprint(),
-                            b.fingerprint(),
-                        )
-                        .await
-                        .unwrap();
-                        let intended = if case == "wrong-identity" {
-                            b.fingerprint()
-                        } else {
-                            a.fingerprint()
-                        };
-                        send_frame(&mut send, PairFrameKind::Hello, b.fingerprint(), intended)
-                            .await
-                            .unwrap();
-                        if case == "trailing" {
-                            send_frame(
-                                &mut send,
-                                PairFrameKind::Saved,
-                                b.fingerprint(),
-                                a.fingerprint(),
-                            )
-                            .await
-                            .unwrap();
-                            send.write_all(b"extra").await.unwrap();
-                        }
-                        send.finish().unwrap();
-                        let _ = send.stopped().await;
-                    }
-                );
-                assert!(result.is_err(), "{case}");
-                assert_eq!(saved.get(), case != "wrong-identity");
-                server.close(0_u32.into(), b"fixture ended");
-            }
-        })
-        .await
-        .expect("negative fixture exceeded bound");
     }
 }

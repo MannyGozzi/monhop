@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::Pin,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -25,7 +25,9 @@ use tokio::{
 use super::{TokenBucket, native::NativeSocket};
 use crate::{
     crypto::MAX_PENDING_INCOMING,
-    policy::{MAX_PINNED_PEERS, NetworkLock},
+    policy::{
+        InterfaceSnapshot, MAX_PINNED_PEERS, NetworkLock, validate_interface, validate_subnet_peer,
+    },
 };
 
 const MAX_DATAGRAM_BYTES: usize = 65_507;
@@ -200,11 +202,57 @@ impl DatagramIo for NativeSocket {
     }
 }
 
+/// Which addresses a socket exchanges datagrams with, each counted in a member slot.
+enum Admission {
+    /// Fixed for the socket's life: exactly the lock's peers, each with its pinned port, in order.
+    Members(Box<[SocketAddrV4]>),
+    /// A pairing listener: any other private host of the selected subnet on `port`, all in one
+    /// slot. Once the listener chooses a host only that host is heard, for the socket's life.
+    Subnet {
+        prefix_len: u8,
+        port: u16,
+        chosen: Arc<OnceLock<SocketAddrV4>>,
+    },
+}
+
+impl Admission {
+    fn slots(&self) -> usize {
+        match self {
+            Self::Members(members) => members.len(),
+            Self::Subnet { .. } => 1,
+        }
+    }
+
+    /// The slot a datagram from `source` counts against, when it is heard at all.
+    fn heard(&self, local: Ipv4Addr, source: SocketAddrV4) -> Option<usize> {
+        let chosen = match self {
+            Self::Subnet { chosen, .. } => chosen.get(),
+            Self::Members(_) => None,
+        };
+        match chosen {
+            Some(chosen) => (*chosen == source).then_some(0),
+            None => self.reached(local, source),
+        }
+    }
+
+    /// The slot a datagram to `destination` counts against, when it may be sent at all. A pairing
+    /// listener may still answer an unchosen host, so Quinn's replies to it never revoke.
+    fn reached(&self, local: Ipv4Addr, destination: SocketAddrV4) -> Option<usize> {
+        match self {
+            Self::Members(members) => members.iter().position(|member| *member == destination),
+            Self::Subnet {
+                prefix_len, port, ..
+            } => (destination.port() == *port
+                && validate_subnet_peer(local, *prefix_len, *destination.ip()).is_ok())
+            .then_some(0),
+        }
+    }
+}
+
 pub(super) struct GuardedSocket<I> {
     io: Arc<I>,
     local: SocketAddrV4,
-    /// Fixed for the socket's life: exactly the lock's peers, each with its pinned port.
-    members: Box<[SocketAddrV4]>,
+    admission: Admission,
     /// In member order, like everything else below indexed by member.
     reachability: Arc<Reachability>,
     first_packets: Mutex<Box<[TokenBucket]>>,
@@ -257,6 +305,43 @@ impl<I: DatagramIo> GuardedSocket<I> {
             signal,
         ))
     }
+
+    /// A pairing listener's socket on `interface`, the selected adapter's checked snapshot. It
+    /// hears other hosts of that subnet on its own port until the listener sets `chosen`.
+    pub(super) fn listening(
+        io: I,
+        interface: &InterfaceSnapshot,
+        local: SocketAddrV4,
+        chosen: Arc<OnceLock<SocketAddrV4>>,
+        signal: RevocationSignal,
+    ) -> io::Result<Self> {
+        if signal.is_revoked() {
+            return Err(revoked_error());
+        }
+        if local.port() == 0
+            || validate_interface(interface).is_err()
+            || *local.ip() != interface.address
+            || io.local_addr()? != local
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket does not match the authorized network",
+            ));
+        }
+        let admission = Admission::Subnet {
+            prefix_len: interface.prefix_len,
+            port: local.port(),
+            chosen,
+        };
+        Ok(Self::admitting(
+            io,
+            local,
+            admission,
+            interface.index,
+            Reachability::new(1),
+            signal,
+        ))
+    }
 }
 
 impl<I> GuardedSocket<I> {
@@ -269,19 +354,31 @@ impl<I> GuardedSocket<I> {
         reachability: Arc<Reachability>,
         signal: RevocationSignal,
     ) -> Self {
+        let admission = Admission::Members(members.into());
+        Self::admitting(io, local, admission, interface_index, reachability, signal)
+    }
+
+    fn admitting(
+        io: I,
+        local: SocketAddrV4,
+        admission: Admission,
+        interface_index: u32,
+        reachability: Arc<Reachability>,
+        signal: RevocationSignal,
+    ) -> Self {
         let now = Instant::now();
+        let slots = admission.slots();
         Self {
             io: Arc::new(io),
             local,
-            members: members.into(),
+            admission,
             reachability,
             first_packets: Mutex::new(
-                members
-                    .iter()
+                (0..slots)
                     .map(|_| TokenBucket::new(FIRST_PACKET_BURST, FIRST_PACKET_REFILL, now))
                     .collect(),
             ),
-            dropped: members.iter().map(|_| Dropped::default()).collect(),
+            dropped: (0..slots).map(|_| Dropped::default()).collect(),
             interface_index,
             signal,
             lifetime: watch::Sender::new(()),
@@ -354,10 +451,7 @@ impl<I: DatagramIo> GuardedSocket<I> {
         {
             return None;
         }
-        let member = self
-            .members
-            .iter()
-            .position(|member| *member == packet.source)?;
+        let member = self.admission.heard(*self.local.ip(), packet.source)?;
         self.reachability.reaches(member).then_some(member)
     }
 
@@ -386,10 +480,7 @@ impl<I: DatagramIo> GuardedSocket<I> {
         let SocketAddr::V4(destination) = transmit.destination else {
             return None;
         };
-        let member = self
-            .members
-            .iter()
-            .position(|member| *member == destination)?;
+        let member = self.admission.reached(*self.local.ip(), destination)?;
         if transmit
             .src_ip
             .is_some_and(|ip| ip != IpAddr::V4(*self.local.ip()))

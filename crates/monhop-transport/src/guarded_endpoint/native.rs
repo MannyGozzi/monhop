@@ -19,7 +19,7 @@ use crate::policy::{
 
 #[cfg(target_os = "macos")]
 use super::NetworkSelection;
-use super::{PinnedNetwork, RouteCheckFailure, socket::Reachability};
+use super::{ListenSelection, PinnedNetwork, RouteCheckFailure, socket::Reachability};
 
 #[cfg(target_os = "macos")]
 use monhop_platform_macos::{
@@ -107,9 +107,7 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
     } = prepare_selection(pinned, None)?;
 
     require_active(&signal, None)?;
-    let socket = UdpSocket::bind(pinned.local).map_err(native_category)?;
-    verify_bound_address(&socket, pinned.local)?;
-    network::restrict_udp_interface(&socket, pinned.interface_index).map_err(native_category)?;
+    let socket = bind_on_interface(pinned.local, pinned.interface_index)?;
     // Wi-Fi queues marked datagrams ahead of bulk traffic; a refusal only costs that priority.
     #[cfg(target_os = "macos")]
     let _ = network::mark_interactive_traffic(&socket).inspect_err(warn_unmarked);
@@ -117,15 +115,11 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
     let traffic = network::mark_interactive_traffic(&socket, &pinned.peers)
         .inspect_err(warn_unmarked)
         .ok();
-    let socket = udp_receive::UdpReceiver::configure(socket).map_err(native_category)?;
     let socket = NativeSocket {
-        receiver: socket.into_async().map_err(native_category)?,
+        receiver: receiver(socket, pinned.local)?,
         #[cfg(windows)]
         _traffic: traffic,
     };
-    if socket.local_addr().map_err(native_category)? != pinned.local {
-        return Err(io::Error::from(io::ErrorKind::InvalidData));
-    }
 
     revalidate_selection(&initial, pinned, &mut lock, &signal, None)?;
     reachability.set(lock.reachable());
@@ -142,6 +136,79 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
 
 fn warn_unmarked(error: &io::Error) {
     log::warn!("session datagrams keep ordinary Wi-Fi priority: {error}");
+}
+
+/// A socket bound to exactly `local` and restricted to the selected interface.
+fn bind_on_interface(local: SocketAddrV4, interface_index: u32) -> io::Result<UdpSocket> {
+    let socket = UdpSocket::bind(local).map_err(native_category)?;
+    verify_bound_address(&socket, local)?;
+    network::restrict_udp_interface(&socket, interface_index).map_err(native_category)?;
+    Ok(socket)
+}
+
+/// The asynchronous receiver that reports each datagram's destination and arrival interface.
+fn receiver(socket: UdpSocket, local: SocketAddrV4) -> io::Result<udp_receive::AsyncUdpReceiver> {
+    let receiver = udp_receive::UdpReceiver::configure(socket)
+        .and_then(udp_receive::UdpReceiver::into_async)
+        .map_err(native_category)?;
+    if receiver.local_addr().map_err(native_category)? != local {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    Ok(receiver)
+}
+
+/// A pairing listener's network: the selected adapter, bound and watched, with no peer. The
+/// adapter or its attachment changing in any way revokes it.
+pub(super) struct PreparedListener {
+    pub socket: NativeSocket,
+    pub interface: InterfaceSnapshot,
+    pub signal: RevocationSignal,
+    pub watch: Watch,
+}
+
+pub(super) fn prepare_listener(selection: &ListenSelection) -> io::Result<PreparedListener> {
+    let key = AdapterKey::of_listener(selection);
+    validate_exact_bind(selection.local)?;
+    let initial = find_exact_adapter(&enumerate_initial().map_err(native_category)?, key)?;
+    validate_initial_adapter(&initial)?;
+
+    let pinned: Arc<Mutex<Option<InterfaceSnapshot>>> = Arc::default();
+    let check: SharedCheck = {
+        let (initial, selection, pinned) = (initial.clone(), selection.clone(), pinned.clone());
+        Arc::new(move || {
+            let current = observe_selected_adapter(&initial, AdapterKey::of_listener(&selection))
+                .and_then(|observed| interface_snapshot(&observed));
+            let Ok(pinned) = pinned.lock() else {
+                return false;
+            };
+            let holds = matches!((pinned.as_ref(), &current), (Some(pinned), Ok(current)) if pinned == current);
+            if !holds {
+                log::warn!("pairing network recheck: the selected adapter changed");
+            }
+            holds
+        })
+    };
+    let watch = start_watch(&initial, &check)?;
+    let signal = watch.revocation_signal();
+    require_active(&signal, None)?;
+    let interface = interface_snapshot(&observe_selected_adapter(&initial, key)?)?;
+    *pinned
+        .lock()
+        .map_err(|_| io::Error::from(io::ErrorKind::Other))? = Some(interface.clone());
+    require_active(&signal, None)?;
+
+    let socket = bind_on_interface(selection.local, selection.interface_index)?;
+    let socket = NativeSocket::from(receiver(socket, selection.local)?);
+    if interface_snapshot(&observe_selected_adapter(&initial, key)?)? != interface {
+        return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
+    }
+    require_active(&signal, None)?;
+    Ok(PreparedListener {
+        socket,
+        interface,
+        signal,
+        watch,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -185,7 +252,10 @@ fn prepare_selection(
 ) -> io::Result<PreparedSelection> {
     validate_exact_bind(pinned.local)?;
     require_cancel_active(cancel)?;
-    let initial = find_exact_adapter(&enumerate_initial().map_err(native_category)?, pinned)?;
+    let initial = find_exact_adapter(
+        &enumerate_initial().map_err(native_category)?,
+        AdapterKey::of(pinned),
+    )?;
     require_cancel_active(cancel)?;
     validate_initial_adapter(&initial)?;
 
@@ -240,7 +310,7 @@ fn current_selection(
     signal: &RevocationSignal,
     cancel: Option<&RevocationSignal>,
 ) -> io::Result<(InterfaceSnapshot, PeerRoutes)> {
-    let observed = observe_selected_adapter(initial, pinned)?;
+    let observed = observe_selected_adapter(initial, AdapterKey::of(pinned))?;
     require_active(signal, cancel)?;
     let selected = interface_snapshot(&observed)?;
     let sole = pinned.peers.len() == 1;
@@ -366,7 +436,7 @@ fn pinned_check(initial: &Adapter, pinned: &PinnedNetwork, watched: &PinnedLock)
 }
 
 fn observe_pinned(initial: &Adapter, pinned: &PinnedNetwork) -> Observation {
-    let current = observe_selected_adapter(initial, pinned)
+    let current = observe_selected_adapter(initial, AdapterKey::of(pinned))
         .and_then(|observed| interface_snapshot(&observed))
         .inspect_err(|error| {
             log::warn!(
@@ -599,9 +669,35 @@ fn pinned_facts_hold(
     false
 }
 
-fn observe_selected_adapter(initial: &Adapter, pinned: &PinnedNetwork) -> io::Result<Adapter> {
+/// What names the selected adapter: its stable id, its index and the address bound on it.
+#[derive(Clone, Copy)]
+struct AdapterKey<'a> {
+    stable_id: &'a str,
+    index: u32,
+    address: Ipv4Addr,
+}
+
+impl<'a> AdapterKey<'a> {
+    fn of(pinned: &'a PinnedNetwork) -> Self {
+        Self {
+            stable_id: &pinned.stable_id,
+            index: pinned.interface_index,
+            address: *pinned.local.ip(),
+        }
+    }
+
+    fn of_listener(selection: &'a ListenSelection) -> Self {
+        Self {
+            stable_id: &selection.stable_id,
+            index: selection.interface_index,
+            address: *selection.local.ip(),
+        }
+    }
+}
+
+fn observe_selected_adapter(initial: &Adapter, key: AdapterKey<'_>) -> io::Result<Adapter> {
     let adapters = enumerate_current().map_err(native_category)?;
-    let observed = find_exact_adapter(&adapters, pinned)?;
+    let observed = find_exact_adapter(&adapters, key)?;
     if !same_adapter_identity(initial, &observed) {
         return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
     }
@@ -609,11 +705,11 @@ fn observe_selected_adapter(initial: &Adapter, pinned: &PinnedNetwork) -> io::Re
     Ok(observed)
 }
 
-fn find_exact_adapter(adapters: &[Adapter], pinned: &PinnedNetwork) -> io::Result<Adapter> {
+fn find_exact_adapter(adapters: &[Adapter], key: AdapterKey<'_>) -> io::Result<Adapter> {
     let mut matches = adapters.iter().filter(|adapter| {
-        adapter.stable_id == pinned.stable_id
-            && adapter.index == pinned.interface_index
-            && adapter.address == *pinned.local.ip()
+        adapter.stable_id == key.stable_id
+            && adapter.index == key.index
+            && adapter.address == key.address
     });
     let adapter = matches
         .next()
@@ -847,7 +943,7 @@ mod tests {
     fn exact_adapter_lookup_rejects_absence_and_ambiguity() {
         let selection = pinned();
         assert_eq!(
-            find_exact_adapter(&[], &selection)
+            find_exact_adapter(&[], AdapterKey::of(&selection))
                 .err()
                 .expect("missing adapter must fail")
                 .kind(),
@@ -855,7 +951,7 @@ mod tests {
         );
         let adapter = adapter();
         assert_eq!(
-            find_exact_adapter(&[adapter.clone(), adapter], &selection)
+            find_exact_adapter(&[adapter.clone(), adapter], AdapterKey::of(&selection))
                 .err()
                 .expect("ambiguous adapter must fail")
                 .kind(),

@@ -67,7 +67,21 @@ test("the code exchange opens on a fresh install, on request, and while an excha
   assert.equal(shouldShowPairing({ pairedCount: 1, requested: true }), true);
   assert.equal(shouldShowPairing({ pairedCount: 1, phase: "ready" }), false);
   assert.equal(shouldShowPairing({ pairedCount: 1, phase: "paired" }), false);
-  for (const phase of ["identity-missing", "review", "waiting", "saving", "error"])
+  for (const phase of [
+    "identity-missing",
+    "showing",
+    "connecting",
+    "verifying",
+    "saving",
+    "stopping",
+    "error",
+  ])
     assert.equal(shouldShowPairing({ pairedCount: 2, phase }), true, phase);
   assert.equal(shouldShowPairing(), true);
+});
+
+test("a fresh pairing keeps its match badge on screen until it is dismissed", () => {
+  assert.equal(shouldShowPairing({ pairedCount: 1, phase: "paired", resultShown: true }), true);
+  assert.equal(shouldShowPairing({ pairedCount: 1, phase: "paired", resultShown: false }), false);
+  assert.equal(shouldShowPairing({ pairedCount: 1, phase: "ready", resultShown: true }), false);
 });

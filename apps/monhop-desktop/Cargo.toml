@@ -30,14 +30,14 @@ objc2-core-graphics = { version = "=0.3.2", default-features = false, features =
 objc2-core-image = { version = "=0.3.2", default-features = false, features = ["std", "CIFilter"] }
 objc2-quartz-core = { version = "=0.3.2", default-features = false, features = ["std", "block2", "CALayer", "CAAnimation", "CAMediaTiming", "CAMediaTimingFunction", "CAShapeLayer", "CATransaction", "objc2-core-foundation", "objc2-core-graphics"] }
 objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWorkspace", "NSScreen", "NSGraphics", "NSWindow", "NSView", "NSEvent", "NSResponder", "NSColor", "NSAnimation", "NSAnimationContext", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSBitmapImageRep", "NSBox", "NSAccessibility", "block2", "objc2-core-graphics", "objc2-quartz-core"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSWorkspace", "NSScreen", "NSGraphics", "NSWindow", "NSView", "NSEvent", "NSResponder", "NSColor", "NSAnimation", "NSAnimationContext", "NSPasteboard", "NSPasteboardItem", "NSImageRep", "NSBitmapImageRep", "NSBox", "NSAccessibility", "NSButton", "NSControl", "NSMenu", "NSMenuItem", "block2", "objc2-core-graphics", "objc2-quartz-core"] }
 objc2-core-location = { version = "=0.3.2", default-features = false, features = ["std", "CLLocationManager", "CLLocationManagerDelegate"] }
 objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSDictionary", "NSValue", "NSProcessInfo", "NSNotification", "NSOperation", "NSError", "NSData", "NSArray", "NSKeyValueCoding", "objc2-core-foundation"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.38.2"
-windows = { version = "=0.61.3", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "=0.61.3", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 tauri-build = { version = "=2.6.3", default-features = false, features = ["config-json"] }

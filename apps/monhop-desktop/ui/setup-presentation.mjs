@@ -1,10 +1,9 @@
 const TITLES = { ready: "Get ready", computers: "Computers", displays: "Displays" };
 const MID_EXCHANGE = new Set([
   "identity-missing",
-  "review",
-  "requesting-network",
-  "waiting",
+  "showing",
   "connecting",
+  "verifying",
   "saving",
   "stopping",
   "error",
@@ -39,10 +38,15 @@ function displaysLockReason(computers, activeName) {
   return `Waiting for ${activeName}`;
 }
 
-// Once a computer is paired the list is the focus: the code exchange opens on request, or by itself
-// while an exchange is under way.
-export function shouldShowPairing({ requested, pairedCount = 0, phase } = {}) {
-  return requested === true || pairedCount === 0 || MID_EXCHANGE.has(phase);
+// Once a computer is paired the list is the focus: the code exchange opens on request, by itself
+// while an exchange is under way, and stays on a fresh pairing until its match badge is dismissed.
+export function shouldShowPairing({ requested, pairedCount = 0, phase, resultShown } = {}) {
+  return (
+    requested === true ||
+    pairedCount === 0 ||
+    MID_EXCHANGE.has(phase) ||
+    (phase === "paired" && resultShown === true)
+  );
 }
 
 function gate(key, index, { done, locked, reason }) {

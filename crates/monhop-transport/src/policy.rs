@@ -301,17 +301,39 @@ pub fn validate_interface(interface: &InterfaceSnapshot) -> Result<(), PolicyErr
 
 pub fn validate_peer(interface: &InterfaceSnapshot, peer: Ipv4Addr) -> Result<(), PolicyError> {
     validate_interface(interface)?;
-    if !is_private_or_link_local(peer) {
+    validate_subnet_peer(interface.address, interface.prefix_len, peer)
+}
+
+/// `peer` is another private or link-local host of the subnet `local`/`prefix_len` names.
+pub fn validate_subnet_peer(
+    local: Ipv4Addr,
+    prefix_len: u8,
+    peer: Ipv4Addr,
+) -> Result<(), PolicyError> {
+    if !(8..=31).contains(&prefix_len) {
+        return Err(PolicyError::InvalidSubnet);
+    }
+    if !is_private_or_link_local(local) || !is_private_or_link_local(peer) {
         return Err(PolicyError::NonPrivateAddress);
     }
-    if interface.address == peer {
+    if local == peer {
         return Err(PolicyError::PeerIsLocal);
     }
-    let mask = u32::MAX << (32 - interface.prefix_len);
-    if u32::from(interface.address) & mask != u32::from(peer) & mask {
+    let mask = u32::MAX << (32 - prefix_len);
+    if u32::from(local) & mask != u32::from(peer) & mask {
         return Err(PolicyError::OffLinkPeer);
     }
-    validate_host(peer, interface.prefix_len)
+    validate_host(peer, prefix_len)
+}
+
+/// Some other valid host of the subnet, for a request that must name one without sending to it.
+pub fn other_subnet_host(local: Ipv4Addr, prefix_len: u8) -> Option<Ipv4Addr> {
+    let network =
+        u32::from(local) & u32::MAX.checked_shl(32_u32.checked_sub(prefix_len.into())?)?;
+    [network | 1, network | 2, network]
+        .into_iter()
+        .map(Ipv4Addr::from)
+        .find(|host| validate_subnet_peer(local, prefix_len, *host).is_ok())
 }
 
 fn validate_host(address: Ipv4Addr, prefix: u8) -> Result<(), PolicyError> {

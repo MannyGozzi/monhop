@@ -541,6 +541,8 @@ impl Updates {
         if !self.begin_shutdown(intent) {
             return;
         }
+        #[cfg(windows)]
+        crate::single_instance::stop_answering();
         let controller = app.state::<Arc<AppController>>().inner().clone();
         controller.request_shutdown();
         let updates = self.clone();
@@ -668,7 +670,12 @@ impl Environment for AppEnvironment {
                         .connect_timeout(CHECK_TIMEOUT)
                         .read_timeout(CHECK_TIMEOUT)
                 })
-                .on_before_exit(move || controller.drain_for_exit());
+                .on_before_exit(move || {
+                    // The installer is already running and relaunches MonHop when it finishes.
+                    #[cfg(windows)]
+                    crate::single_instance::stop_answering();
+                    controller.drain_for_exit();
+                });
             if let Some(endpoint) = endpoint_override(CONFIGURED_ENDPOINT) {
                 builder = builder.endpoints(vec![endpoint]).map_err(describe)?;
             }

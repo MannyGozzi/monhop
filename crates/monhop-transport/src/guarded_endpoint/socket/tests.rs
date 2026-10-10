@@ -907,9 +907,9 @@ const MEMBERS: [SocketAddrV4; 3] = [
     SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 13), 24800),
 ];
 
-/// The lock a bind on the memory link would hold: every member on-link with a direct route.
-fn memory_lock(local: SocketAddrV4, members: &[SocketAddrV4]) -> NetworkLock {
-    let selected = InterfaceSnapshot {
+/// The selected adapter on the memory link, a /24.
+fn memory_interface(local: SocketAddrV4) -> InterfaceSnapshot {
+    InterfaceSnapshot {
         stable_id: "memory-link".into(),
         name: "memory".into(),
         index: INDEX,
@@ -919,26 +919,28 @@ fn memory_lock(local: SocketAddrV4, members: &[SocketAddrV4]) -> NetworkLock {
         is_hardware: true,
         is_up: true,
         network_signature: vec![1; 32],
-    };
+    }
+}
+
+/// The lock a bind on the memory link would hold: every member on-link with a direct route.
+fn memory_lock(local: SocketAddrV4, members: &[SocketAddrV4]) -> NetworkLock {
     let route = RouteSnapshot {
         interface_index: INDEX,
         source: *local.ip(),
         next_hop: Ipv4Addr::UNSPECIFIED,
     };
     let routes: Vec<_> = members.iter().map(|member| (*member.ip(), route)).collect();
-    NetworkLock::new_group(selected, &routes, false).unwrap()
+    NetworkLock::new_group(memory_interface(local), &routes, false).unwrap()
 }
 
 /// One in-memory link shared by every node: a send reaches the inbox of the address it names, or
-/// no one. Each socket is built as a bind builds it, admitting only its own members.
-fn memory_network<const N: usize>(
-    nodes: [(SocketAddrV4, &[SocketAddrV4]); N],
-) -> [GuardedSocket<TestIo>; N] {
-    let inboxes: Vec<(SocketAddrV4, Arc<Mutex<Inbox>>)> = nodes
+/// no one.
+fn memory_link<const N: usize>(addresses: [SocketAddrV4; N]) -> [TestIo; N] {
+    let inboxes: Vec<(SocketAddrV4, Arc<Mutex<Inbox>>)> = addresses
         .iter()
-        .map(|(address, _)| (*address, Arc::default()))
+        .map(|address| (*address, Arc::default()))
         .collect();
-    nodes.map(|(local, members)| {
+    addresses.map(|local| {
         let own = &inboxes
             .iter()
             .find(|(address, _)| *address == local)
@@ -950,8 +952,18 @@ fn memory_network<const N: usize>(
             .filter(|(address, _)| *address != local)
             .cloned()
             .collect();
+        io
+    })
+}
+
+/// A memory link whose sockets are each built as a bind builds it, admitting only its members.
+fn memory_network<const N: usize>(
+    nodes: [(SocketAddrV4, &[SocketAddrV4]); N],
+) -> [GuardedSocket<TestIo>; N] {
+    let mut ios = memory_link(nodes.map(|(local, _)| local)).into_iter();
+    nodes.map(|(local, members)| {
         GuardedSocket::new(
-            io,
+            ios.next().unwrap(),
             &memory_lock(local, members),
             local,
             members,
@@ -2410,4 +2422,320 @@ async fn native_probe_lifts_the_rejection_of_a_member_that_stopped_answering() {
     assert!(probed[0] >= marked + CADENCE.probe, "{report}");
     assert!(readmitted - last <= CADENCE.recheck, "{report}");
     hub.signal.revoke();
+}
+
+mod pairing {
+    use std::sync::OnceLock;
+
+    use monhop_core::Platform;
+
+    use super::*;
+    use crate::{
+        guarded_endpoint::PairingEndpoint,
+        pairing_code::PairingCode,
+        pairing_exchange::{ConfirmedPeer, PairingFailure, PairingRole, confirm_pairing},
+    };
+
+    /// Longer than a handshake on the memory link, far shorter than the idle timeout.
+    const UNANSWERED: Duration = Duration::from_millis(1500);
+    const SHOWING: SocketAddrV4 = LOCAL;
+    const ENTERING: SocketAddrV4 = MEMBERS[0];
+    const OTHER: SocketAddrV4 = MEMBERS[1];
+
+    fn listening_socket(io: TestIo, chosen: &Arc<OnceLock<SocketAddrV4>>) -> GuardedSocket<TestIo> {
+        GuardedSocket::listening(
+            io,
+            &memory_interface(SHOWING),
+            SHOWING,
+            chosen.clone(),
+            RevocationSignal::default(),
+        )
+        .unwrap()
+    }
+
+    fn listener(io: TestIo, identity: &DeviceIdentity) -> PairingEndpoint {
+        let chosen = Arc::new(OnceLock::new());
+        PairingEndpoint::listening_over(listening_socket(io, &chosen), chosen, identity).unwrap()
+    }
+
+    fn dialing_socket(io: TestIo, local: SocketAddrV4) -> GuardedSocket<TestIo> {
+        GuardedSocket::new(
+            io,
+            &memory_lock(local, &[SHOWING]),
+            local,
+            &[SHOWING],
+            Reachability::new(1),
+            RevocationSignal::default(),
+        )
+        .unwrap()
+    }
+
+    fn dialer(io: TestIo, local: SocketAddrV4, identity: &DeviceIdentity) -> PairingEndpoint {
+        PairingEndpoint::dialing_over(dialing_socket(io, local), SHOWING, identity).unwrap()
+    }
+
+    async fn showing_side(
+        endpoint: &PairingEndpoint,
+        code: &PairingCode,
+        identity: &DeviceIdentity,
+    ) -> Result<ConfirmedPeer, PairingFailure> {
+        let connection = endpoint.accept().await.unwrap();
+        let confirmed = confirm_pairing(
+            &connection,
+            PairingRole::Showing,
+            code,
+            identity,
+            SHOWING,
+            Platform::MacOs,
+        )
+        .await?;
+        let peer = confirmed.peer().clone();
+        confirmed.finish_saved().await?;
+        Ok(peer)
+    }
+
+    async fn entering_side(
+        endpoint: &PairingEndpoint,
+        typed: &str,
+        identity: &DeviceIdentity,
+    ) -> Result<ConfirmedPeer, PairingFailure> {
+        let code = PairingCode::parse(typed).unwrap();
+        assert_eq!(
+            code.showing_address(*ENTERING.ip(), 24).unwrap(),
+            *SHOWING.ip()
+        );
+        let connection = endpoint.dial().await.unwrap();
+        let confirmed = confirm_pairing(
+            &connection,
+            PairingRole::Entering,
+            &code,
+            identity,
+            ENTERING,
+            Platform::Windows,
+        )
+        .await?;
+        let peer = confirmed.peer().clone();
+        confirmed.finish_saved().await?;
+        Ok(peer)
+    }
+
+    /// Whether `endpoint` fails to connect, or gets no answer at all.
+    async fn unanswered(endpoint: &PairingEndpoint) -> bool {
+        tokio::time::timeout(UNANSWERED, endpoint.dial())
+            .await
+            .map_or(true, |dialed| dialed.is_err())
+    }
+
+    #[test]
+    fn a_pairing_listener_hears_other_subnet_hosts_until_it_chooses_one() {
+        let chosen = Arc::new(OnceLock::new());
+        let socket = listening_socket(
+            TestIo::new(SHOWING, Arc::default(), Arc::default()),
+            &chosen,
+        );
+        let waker = Waker::from(Arc::new(CountWake::default()));
+        let mut cx = Context::from_waker(&waker);
+        let mut heard = |arrival: Arrival| {
+            socket.io.enqueue(arrival);
+            matches!(receive(&socket, &mut cx).0, Poll::Ready(Ok(1)))
+        };
+        let from = |source: SocketAddrV4| Arrival {
+            source,
+            ..arrival()
+        };
+        assert!(heard(from(ENTERING)));
+        assert!(heard(from(OTHER)));
+        for stranger in [
+            SocketAddrV4::new(*ENTERING.ip(), 24801),
+            "192.168.51.11:24800".parse().unwrap(),
+            "8.8.8.8:24800".parse().unwrap(),
+            "192.168.50.255:24800".parse().unwrap(),
+            "192.168.50.0:24800".parse().unwrap(),
+            SHOWING,
+        ] {
+            assert!(!heard(from(stranger)), "{stranger}");
+        }
+        assert!(!heard(Arrival {
+            interface_index: INDEX + 1,
+            ..from(ENTERING)
+        }));
+        assert!(!heard(Arrival {
+            destination: *OTHER.ip(),
+            ..from(ENTERING)
+        }));
+
+        chosen.set(ENTERING).unwrap();
+        assert!(heard(from(ENTERING)));
+        assert!(!heard(from(OTHER)), "only the chosen host is heard");
+
+        // Replies Quinn queued for another host of the subnet may leave; nothing else may.
+        let to = |destination: SocketAddrV4| Transmit {
+            destination: destination.into(),
+            src_ip: None,
+            ..transmit()
+        };
+        assert!(socket.try_send(&to(OTHER)).is_ok());
+        assert!(!socket.signal.is_revoked());
+        let _ = socket.try_send(&to("192.168.51.11:24800".parse().unwrap()));
+        assert!(socket.signal.is_revoked(), "a send off the subnet revokes");
+    }
+
+    #[test]
+    fn a_pairing_listener_socket_must_match_its_adapter() {
+        let io = || TestIo::new(SHOWING, Arc::default(), Arc::default());
+        let chosen = Arc::new(OnceLock::new());
+        let mut wrong_prefix = memory_interface(SHOWING);
+        wrong_prefix.prefix_len = 32;
+        for (interface, local) in [
+            (wrong_prefix, SHOWING),
+            (memory_interface(OTHER), SHOWING),
+            (
+                memory_interface(SHOWING),
+                SocketAddrV4::new(*SHOWING.ip(), 0),
+            ),
+            (memory_interface(OTHER), OTHER),
+        ] {
+            let signal = RevocationSignal::default();
+            assert!(
+                GuardedSocket::listening(io(), &interface, local, chosen.clone(), signal).is_err()
+            );
+        }
+        let revoked = RevocationSignal::default();
+        revoked.revoke();
+        let interface = memory_interface(SHOWING);
+        assert!(GuardedSocket::listening(io(), &interface, SHOWING, chosen, revoked).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_right_code_pairs_and_each_side_learns_the_other_exactly() {
+        let [at_showing, at_entering] = memory_link([SHOWING, ENTERING]);
+        let showing_id = DeviceIdentity::generate().unwrap();
+        let entering_id = DeviceIdentity::generate().unwrap();
+        let showing = listener(at_showing, &showing_id);
+        let entering = dialer(at_entering, ENTERING, &entering_id);
+        let code = PairingCode::generate(*SHOWING.ip()).unwrap();
+        let typed = code.display().to_ascii_lowercase().replace('-', " ");
+        let (at_showing, at_entering) = tokio::time::timeout(DEADLINE * 5, async {
+            tokio::join!(
+                showing_side(&showing, &code, &showing_id),
+                entering_side(&entering, &typed, &entering_id)
+            )
+        })
+        .await
+        .expect("pairing finished");
+        let at_showing = at_showing.unwrap();
+        let at_entering = at_entering.unwrap();
+        assert_eq!(at_showing.certificate, entering_id.certificate_der());
+        assert_eq!(at_showing.endpoint, ENTERING);
+        assert_eq!(at_showing.platform, Platform::Windows);
+        assert_eq!(at_entering.certificate, showing_id.certificate_der());
+        assert_eq!(at_entering.endpoint, SHOWING);
+        assert_eq!(at_entering.platform, Platform::MacOs);
+        assert!(
+            showing.accept().await.is_err(),
+            "one connection per listener"
+        );
+        showing.revoke();
+        entering.revoke();
+    }
+
+    #[tokio::test]
+    async fn a_wrong_code_fails_both_sides_and_burns_the_shown_code() {
+        let [at_showing, at_entering, at_other] = memory_link([SHOWING, ENTERING, OTHER]);
+        let showing_id = DeviceIdentity::generate().unwrap();
+        let entering_id = DeviceIdentity::generate().unwrap();
+        let showing = listener(at_showing, &showing_id);
+        let entering = dialer(at_entering, ENTERING, &entering_id);
+        let other = dialer(at_other, OTHER, &DeviceIdentity::generate().unwrap());
+        let code = PairingCode::generate(*SHOWING.ip()).unwrap();
+        let wrong = PairingCode::generate(*SHOWING.ip()).unwrap().display();
+        let (at_showing, at_entering) = tokio::time::timeout(DEADLINE * 5, async {
+            tokio::join!(
+                showing_side(&showing, &code, &showing_id),
+                entering_side(&entering, &wrong, &entering_id)
+            )
+        })
+        .await
+        .expect("both sides gave up promptly");
+        assert_eq!(at_showing.unwrap_err(), PairingFailure::NotConfirmed);
+        assert_eq!(at_entering.unwrap_err(), PairingFailure::NotConfirmed);
+
+        // The right code no longer gets anywhere, from the same host or another.
+        assert!(unanswered(&entering).await);
+        assert!(unanswered(&other).await);
+        assert!(showing.accept().await.is_err());
+        for endpoint in [&showing, &entering, &other] {
+            endpoint.revoke();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_handshake_from_another_computer_locks_no_one_out() {
+        let [at_showing, at_entering, at_other] = memory_link([SHOWING, ENTERING, OTHER]);
+        let showing_id = DeviceIdentity::generate().unwrap();
+        let entering_id = DeviceIdentity::generate().unwrap();
+        let showing = listener(at_showing, &showing_id);
+        let entering = dialer(at_entering, ENTERING, &entering_id);
+        // A third paired computer still dialing this one for sharing.
+        let sharing = guarded(
+            dialing_socket(at_other, OTHER),
+            &DeviceIdentity::generate().unwrap(),
+            &[(SHOWING, &showing_id)],
+        );
+        let code = PairingCode::generate(*SHOWING.ip()).unwrap();
+        let typed = code.display();
+        let (at_showing, at_entering) = tokio::time::timeout(DEADLINE * 5, async {
+            tokio::join!(showing_side(&showing, &code, &showing_id), async {
+                let dialed =
+                    tokio::time::timeout(UNANSWERED, async { sharing.connect().unwrap().await })
+                        .await;
+                assert!(dialed.map_or(true, |dialed| dialed.is_err()));
+                entering_side(&entering, &typed, &entering_id).await
+            })
+        })
+        .await
+        .expect("pairing finished");
+        assert_eq!(at_showing.unwrap().endpoint, ENTERING);
+        assert_eq!(
+            at_entering.unwrap().certificate,
+            showing_id.certificate_der()
+        );
+        for endpoint in [&showing, &entering] {
+            endpoint.revoke();
+        }
+        sharing.revoke();
+    }
+
+    #[tokio::test]
+    async fn a_revoked_listener_answers_no_one() {
+        let [at_showing, at_entering] = memory_link([SHOWING, ENTERING]);
+        let showing = listener(at_showing, &DeviceIdentity::generate().unwrap());
+        let entering = dialer(at_entering, ENTERING, &DeviceIdentity::generate().unwrap());
+        showing.revoker().revoke();
+        assert!(showing.is_revoked());
+        assert!(showing.accept().await.is_err());
+        assert!(unanswered(&entering).await);
+        entering.revoke();
+    }
+
+    #[tokio::test]
+    async fn a_sharing_dialer_never_reaches_a_pairing_listener() {
+        let [at_showing, at_entering] = memory_link([SHOWING, ENTERING]);
+        let showing_id = DeviceIdentity::generate().unwrap();
+        let entering_id = DeviceIdentity::generate().unwrap();
+        let showing = listener(at_showing, &showing_id);
+        let sharing = guarded(
+            dialing_socket(at_entering, ENTERING),
+            &entering_id,
+            &[(SHOWING, &showing_id)],
+        );
+        let (dialed, accepted) = tokio::join!(
+            tokio::time::timeout(UNANSWERED, async { sharing.connect().unwrap().await }),
+            tokio::time::timeout(UNANSWERED, showing.accept())
+        );
+        assert!(dialed.map_or(true, |dialed| dialed.is_err()));
+        assert!(accepted.map_or(true, |accepted| accepted.is_err()));
+        showing.revoke();
+        sharing.revoke();
+    }
 }

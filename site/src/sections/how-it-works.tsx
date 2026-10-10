@@ -7,7 +7,7 @@ const steps = [
   {
     art: PairArt,
     title: 'Pair once',
-    body: 'Two computers on the same network show the same short code. Confirm it once and they stay paired, up to 16 per computer.',
+    body: 'One computer shows a short code. Type it on the other and both show the same picture. They stay paired, up to 16 per computer.',
   },
   {
     art: ArrangeArt,

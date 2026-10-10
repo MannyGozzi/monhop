@@ -1,4 +1,5 @@
 import { monitorKey } from "./arrangement-model.mjs";
+import { normalizePairBadge } from "./pair-badge-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
 import { normalizeArrangements, normalizeStoredLayout } from "./sharing-model.mjs";
 
@@ -176,6 +177,7 @@ function normalizeComputer(value) {
     platform,
     name: cleanText(value.name, 48),
     address: cleanText(value.address, 128) || null,
+    badge: normalizePairBadge(value.badge),
     setup: normalizeSetup(value.setup),
   };
 }

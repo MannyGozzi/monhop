@@ -30,6 +30,7 @@ import {
   motionMs,
   motionToken,
   note,
+  pairBadge,
   platformGlyph,
   reducedMotion,
   row,
@@ -103,13 +104,19 @@ export function computerCard(
                 ),
                 el("span", {
                   className: "computer-meta",
-                  text: editing
-                    ? pending
-                      ? "Saving…"
-                      : "Enter to save · Esc to cancel"
-                    : [platformLabel(computer.platform), computer.address]
-                        .filter(Boolean)
-                        .join(" · "),
+                  children: [
+                    el("span", {
+                      text: editing
+                        ? pending
+                          ? "Saving…"
+                          : "Enter to save · Esc to cancel"
+                        : [platformLabel(computer.platform), computer.address]
+                            .filter(Boolean)
+                            .join(" · "),
+                    }),
+                    // The same picture the other computer shows on its card for this one.
+                    !editing && computer.badge ? pairBadge(computer.badge) : null,
+                  ],
                 }),
               ],
             }),

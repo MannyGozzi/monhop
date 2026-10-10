@@ -1,8 +1,11 @@
 //! Explicit, physical-interface-bound QUIC. Pairing never authorizes input.
 
 mod native;
+mod pairing;
 mod runtime;
 mod socket;
+
+pub use pairing::PairingEndpoint;
 
 use std::{
     fmt, io,
@@ -23,7 +26,7 @@ use tokio::{sync::watch, task::JoinSet, time::Instant};
 use crate::{
     crypto::{
         CertificateFingerprint, DeviceIdentity, LOCAL_TLS_SERVER_NAME, RefusedCertificate,
-        SecureQuicConfig, VerifiedPeer,
+        SecureQuicConfig, VerifiedPeer, presented_certificate,
     },
     policy::{MAX_PINNED_PEERS, is_private_or_link_local},
 };
@@ -151,6 +154,31 @@ impl NetworkSelection {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "select an exact physical adapter, distinct private IPv4 addresses and nonzero ports",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The selected adapter and exact local address of a pairing listener, which has no peer yet.
+#[derive(Clone, Debug)]
+pub struct ListenSelection {
+    pub stable_id: String,
+    pub interface_index: u32,
+    pub local: SocketAddrV4,
+}
+
+impl ListenSelection {
+    fn validate(&self) -> io::Result<()> {
+        if self.stable_id.is_empty()
+            || self.stable_id.len() > 256
+            || self.interface_index == 0
+            || self.local.port() == 0
+            || !is_private_or_link_local(*self.local.ip())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "select an exact physical adapter, a private IPv4 address and a nonzero port",
             ));
         }
         Ok(())
@@ -470,16 +498,8 @@ fn unbound(member: &Member) -> MemberHandshakeFailure {
 }
 
 fn observed_fingerprint(connection: &quinn::Connection) -> Option<CertificateFingerprint> {
-    let certificates = connection
-        .peer_identity()?
-        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-        .ok()?;
-    let [certificate] = certificates.as_slice() else {
-        return None;
-    };
-    Some(CertificateFingerprint::from_certificate_der(
-        certificate.as_ref(),
-    ))
+    presented_certificate(connection)
+        .map(|certificate| CertificateFingerprint::from_certificate_der(&certificate))
 }
 
 /// Owns the native watcher on its creating thread and never exposes endpoint rebinding.

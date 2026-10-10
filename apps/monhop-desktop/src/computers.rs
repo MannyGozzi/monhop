@@ -13,7 +13,7 @@ use monhop_transport::{crypto::CertificateFingerprint, session_setup::InspectedP
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    pairing::PairedPeer,
+    pairing::{BadgeView, PairedPeer},
     sharing_preferences::{
         ComputerPlatform, MAX_COMPUTERS, SavedSetupView, SetupFile, fingerprint_key, load_bounded,
         save_metadata,
@@ -65,6 +65,9 @@ pub struct ComputerView {
     enabled: bool,
     /// Named by the active group's record.
     member: bool,
+    /// The picture both computers showed when they paired; null while this computer's identity
+    /// is unknown.
+    badge: Option<BadgeView>,
 }
 
 #[derive(Serialize)]
@@ -94,15 +97,22 @@ impl ComputersView {
     /// A computer with a trust record or a saved layout but no list entry (an older installation,
     /// or a list write that failed) is shown with a default name so it can be used or forgotten;
     /// nothing is written until the user renames or pairs. `live` are the connections running
-    /// now, each drawn on its own computer's card.
+    /// now, each drawn on its own computer's card. `local` is this computer's identity as pairing
+    /// read it; without it the setup file's record of it draws the badges.
     pub fn assemble(
         list: &ComputerList,
         trusted: &[PairedPeer],
+        local: Option<CertificateFingerprint>,
         setup: &SetupFile,
         live: &[LiveInspection<'_>],
         revision: &str,
         arrangements_written_by_newer: bool,
     ) -> Self {
+        let this_computer = local.or_else(|| {
+            setup
+                .local()
+                .and_then(|key| CertificateFingerprint::parse_full(key).ok())
+        });
         let mut computers = list.computers.clone();
         let mut seed = |fingerprint: String, address, platform| {
             let key = fingerprint_key(&fingerprint);
@@ -142,7 +152,10 @@ impl ComputersView {
             .into_iter()
             .map(|computer| {
                 let fingerprint = fingerprint_key(&computer.fingerprint);
+                let badge =
+                    this_computer.zip(CertificateFingerprint::parse_full(&fingerprint).ok());
                 ComputerView {
+                    badge: badge.map(|(local, peer)| BadgeView::between(local, peer)),
                     setup: SavedSetupView::from_group(
                         setup.group_with(&fingerprint),
                         setup.local(),
@@ -377,7 +390,8 @@ mod tests {
     fn first_launch_does_not_create_metadata_or_any_authority() {
         let directory = Directory::new();
         let list = ComputerList::load(&directory.file()).unwrap();
-        let view = ComputersView::assemble(&list, &[], &SetupFile::default(), &[], "0", false);
+        let view =
+            ComputersView::assemble(&list, &[], None, &SetupFile::default(), &[], "0", false);
         assert!(view.computers.is_empty());
         assert!(view.active.is_none());
         assert!(!directory.file().exists());
@@ -419,6 +433,7 @@ mod tests {
         let view = serde_json::to_value(ComputersView::assemble(
             &list,
             &[],
+            None,
             &setup,
             &[live],
             "7",
@@ -483,6 +498,7 @@ mod tests {
         let view = serde_json::to_value(ComputersView::assemble(
             &ComputerList::default(),
             &[],
+            None,
             &setup,
             &[live],
             "2",
@@ -510,6 +526,7 @@ mod tests {
             sorted_keys(card),
             [
                 "address",
+                "badge",
                 "enabled",
                 "fingerprint",
                 "member",
@@ -569,6 +586,7 @@ mod tests {
         let view = serde_json::to_value(ComputersView::assemble(
             &ComputerList::default(),
             &[],
+            None,
             &setup,
             &live,
             "5",
@@ -622,6 +640,7 @@ mod tests {
         let view = serde_json::to_value(ComputersView::assemble(
             &list,
             &trusted,
+            None,
             &SetupFile::default(),
             &[],
             "1",
@@ -635,6 +654,27 @@ mod tests {
         assert_eq!(computers[0]["platform"], "macos");
         assert_eq!(computers[0]["address"], "192.168.1.9:24872");
         assert_eq!(computers[0]["setup"]["saved"], false);
+        assert!(
+            computers[0]["badge"].is_null(),
+            "no badge without this computer's identity"
+        );
+
+        let local = fingerprint('A');
+        let view = serde_json::to_value(ComputersView::assemble(
+            &list,
+            &trusted,
+            Some(local),
+            &SetupFile::default(),
+            &[],
+            "1",
+            false,
+        ))
+        .unwrap();
+        let badge = monhop_transport::pairing::pair_badge(fingerprint('D'), local);
+        assert_eq!(
+            view["computers"][0]["badge"],
+            serde_json::json!({ "color": badge.color, "symbols": badge.symbols })
+        );
     }
 
     #[test]

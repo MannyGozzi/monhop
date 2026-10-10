@@ -134,12 +134,12 @@ Initial pairing should explicitly authenticate the two devices.
 
 A reasonable pairing workflow:
 
-1. User enters the peer's local IP.
-2. Devices establish an unauthenticated pairing connection.
-3. Each generates/exchanges its public identity.
-4. Derive a human-verifiable short authentication string from the complete handshake transcript.
-5. Display the same several-word or fingerprint code on both machines.
-6. User confirms they match.
+1. One computer shows a short one-time code; the user types it on the other.
+2. The code carries the showing computer's local address and a random secret; the devices open a pairing connection on the selected local network.
+3. Each presents its public identity in that connection's handshake.
+4. A password-authenticated key exchange keyed by the code proves both sides typed the same code, bound to the complete handshake (both identities and the TLS session).
+5. A wrong code burns the code; nothing is saved.
+6. Both computers show the same match picture as reassurance.
 7. Persist the peer identity.
 8. Every future connection MUST authenticate against the pinned identity.
 9. Certificate/key mismatch must fail closed and require explicit re-pairing.

@@ -1,6 +1,9 @@
-//! Bounded public certificate exchange. Human confirmation and TLS remain caller obligations.
+//! Paired-computer records, the Saved frame and the match badge. The code confirmation that
+//! establishes a pairing is in `pairing_exchange`.
 
 use std::{fmt, net::SocketAddrV4};
+
+use sha2::{Digest, Sha256};
 
 use crate::{
     crypto::{CertificateFingerprint, VerifiedPeer},
@@ -10,13 +13,14 @@ use monhop_core::Platform;
 
 pub const PAIRING_PORT: u16 = 24872;
 pub const MAX_PAIRING_CERT_BYTES: usize = 3072;
-pub const MAX_PAIRING_CODE_BYTES: usize = 6200;
 pub const MAX_PEER_RECORD_BYTES: usize = 4096;
 pub const PAIR_FRAME_BYTES: usize = 70;
+pub const PAIR_BADGE_COLORS: u8 = 8;
+pub const PAIR_BADGE_SYMBOLS: u8 = 32;
+const PAIR_BADGE_DOMAIN: &[u8] = b"monhop pair badge v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairingError {
-    InvalidCode,
     InvalidAddress,
     InvalidCertificate,
     InvalidRecord,
@@ -28,12 +32,11 @@ pub enum PairingError {
 impl fmt::Display for PairingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InvalidCode => "The connection code is incomplete or unsupported. Copy it again.",
-            Self::InvalidAddress => "Use a connection code from another computer on your local network.",
-            Self::InvalidCertificate => "The connection code contains an invalid public identity.",
+            Self::InvalidAddress => "The other computer's address is not a private address on this network. Nothing was saved.",
+            Self::InvalidCertificate => "The other computer presented an invalid identity. Nothing was saved.",
             Self::InvalidRecord => "The saved pairing is invalid. It was not replaced. Forget it explicitly to pair again.",
             Self::WrongLocalIdentity => "The saved pairing belongs to a different local identity. It was not replaced.",
-            Self::SameIdentity => "This is your own computer's identity. Use the other computer's code.",
+            Self::SameIdentity => "The other computer presented this computer's own identity. Nothing was saved.",
             Self::InvalidMessage => "The other computer sent an invalid pairing message. Nothing was enabled.",
         })
     }
@@ -45,7 +48,7 @@ impl std::error::Error for PairingError {}
 pub struct PairingOffer {
     endpoint: SocketAddrV4,
     certificate: Vec<u8>,
-    // None only for codes and records written before platforms were exchanged (LKM1 / LKMP v1).
+    // None only for records written before platforms were exchanged (LKMP v1).
     platform: Option<Platform>,
 }
 
@@ -74,53 +77,6 @@ impl PairingOffer {
 
     pub fn platform(&self) -> Option<Platform> {
         self.platform
-    }
-
-    pub fn parse(code: &str) -> Result<Self, PairingError> {
-        if code.len() > MAX_PAIRING_CODE_BYTES || !code.is_ascii() {
-            return Err(PairingError::InvalidCode);
-        }
-        let mut parts = code.trim().split(':');
-        let platform = match parts.next() {
-            Some("LKM1") => None,
-            Some("LKM2") => Some(platform_from_code(
-                parts.next().ok_or(PairingError::InvalidCode)?,
-            )?),
-            _ => return Err(PairingError::InvalidCode),
-        };
-        let ip = parts.next().ok_or(PairingError::InvalidCode)?;
-        let port = parts.next().ok_or(PairingError::InvalidCode)?;
-        let certificate = parts.next().ok_or(PairingError::InvalidCode)?;
-        if parts.next().is_some() || certificate.len() > MAX_PAIRING_CERT_BYTES * 2 {
-            return Err(PairingError::InvalidCode);
-        }
-        let endpoint = SocketAddrV4::new(
-            ip.parse().map_err(|_| PairingError::InvalidAddress)?,
-            port.parse().map_err(|_| PairingError::InvalidAddress)?,
-        );
-        let offer = Self::new(endpoint, &decode_hex(certificate)?)?;
-        Ok(match platform {
-            Some(platform) => offer.with_platform(platform),
-            None => offer,
-        })
-    }
-
-    pub fn to_code(&self) -> String {
-        match self.platform {
-            Some(platform) => format!(
-                "LKM2:{}:{}:{}:{}",
-                platform_to_code(platform),
-                self.endpoint.ip(),
-                self.endpoint.port(),
-                hex(&self.certificate)
-            ),
-            None => format!(
-                "LKM1:{}:{}:{}",
-                self.endpoint.ip(),
-                self.endpoint.port(),
-                hex(&self.certificate)
-            ),
-        }
     }
 
     pub fn endpoint(&self) -> SocketAddrV4 {
@@ -210,7 +166,7 @@ impl ConfirmedPeerRecord {
 
 /// Which computer opens the connection. Windows dials macOS; identical platforms fall back to
 /// fingerprint order so exactly one side dials. A peer without a known platform is assumed to be
-/// the other platform (pre-LKM2 pairings are always cross-platform).
+/// the other platform (version 1 records predate same-platform pairing).
 pub fn initiates_connection(
     local_platform: Platform,
     local: CertificateFingerprint,
@@ -232,14 +188,15 @@ pub fn opposite_platform(platform: Platform) -> Platform {
     }
 }
 
-fn platform_to_wire(platform: Platform) -> u8 {
+/// The platform byte of saved records and pairing endpoint frames.
+pub(crate) fn platform_to_wire(platform: Platform) -> u8 {
     match platform {
         Platform::Windows => 1,
         Platform::MacOs => 2,
     }
 }
 
-fn platform_from_wire(value: u8) -> Result<Option<Platform>, PairingError> {
+pub(crate) fn platform_from_wire(value: u8) -> Result<Option<Platform>, PairingError> {
     match value {
         0 => Ok(None),
         1 => Ok(Some(Platform::Windows)),
@@ -248,24 +205,42 @@ fn platform_from_wire(value: u8) -> Result<Option<Platform>, PairingError> {
     }
 }
 
-fn platform_to_code(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Windows => "win",
-        Platform::MacOs => "mac",
-    }
+/// The same picture on both computers' screens after pairing. Reassurance only: the code
+/// confirmation is what authenticates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PairBadge {
+    pub color: u8,
+    pub symbols: [u8; 3],
 }
 
-fn platform_from_code(value: &str) -> Result<Platform, PairingError> {
-    match value {
-        "win" => Ok(Platform::Windows),
-        "mac" => Ok(Platform::MacOs),
-        _ => Err(PairingError::InvalidCode),
+/// Symmetric in its arguments; the three symbols always differ.
+pub fn pair_badge(a: CertificateFingerprint, b: CertificateFingerprint) -> PairBadge {
+    let (low, high) = if a.as_bytes() <= b.as_bytes() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut input = [0; PAIR_BADGE_DOMAIN.len() + 64];
+    input[..PAIR_BADGE_DOMAIN.len()].copy_from_slice(PAIR_BADGE_DOMAIN);
+    input[PAIR_BADGE_DOMAIN.len()..][..32].copy_from_slice(low.as_bytes());
+    input[PAIR_BADGE_DOMAIN.len() + 32..].copy_from_slice(high.as_bytes());
+    let hash = Sha256::digest(input);
+    let mut symbols = [0; 3];
+    for index in 0..symbols.len() {
+        let mut symbol = hash[index + 1] % PAIR_BADGE_SYMBOLS;
+        while symbols[..index].contains(&symbol) {
+            symbol = (symbol + 1) % PAIR_BADGE_SYMBOLS;
+        }
+        symbols[index] = symbol;
+    }
+    PairBadge {
+        color: hash[0] % PAIR_BADGE_COLORS,
+        symbols,
     }
 }
 
 #[derive(Clone, Copy)]
 pub enum PairFrameKind {
-    Hello = 1,
     Saved = 2,
 }
 
@@ -295,36 +270,6 @@ pub fn validate_pair_frame(
     Ok(())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        text.push(char::from(DIGITS[usize::from(byte & 15)]));
-    }
-    text
-}
-
-fn decode_hex(text: &str) -> Result<Vec<u8>, PairingError> {
-    if text.is_empty() || !text.len().is_multiple_of(2) {
-        return Err(PairingError::InvalidCode);
-    }
-    text.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let high = char::from(pair[0])
-                .to_digit(16)
-                .ok_or(PairingError::InvalidCode)?;
-            let low = char::from(pair[1])
-                .to_digit(16)
-                .ok_or(PairingError::InvalidCode)?;
-            Ok(((high << 4) | low) as u8)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,12 +284,10 @@ mod tests {
     }
 
     #[test]
-    fn public_code_and_protected_peer_round_trip() {
+    fn protected_peer_record_round_trips() {
         let local = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
-        let peer = offer(&remote);
-        assert!(PairingOffer::parse(&peer.to_code()).unwrap() == peer);
-        let record = ConfirmedPeerRecord::new(local.fingerprint(), peer).unwrap();
+        let record = ConfirmedPeerRecord::new(local.fingerprint(), offer(&remote)).unwrap();
         assert!(
             ConfirmedPeerRecord::decode(&record.encode(), local.fingerprint()).unwrap() == record
         );
@@ -352,22 +295,15 @@ mod tests {
     }
 
     #[test]
-    fn platform_travels_in_code_and_record_and_legacy_forms_stay_readable() {
+    fn platform_travels_in_the_record_and_legacy_records_stay_readable() {
         let local = DeviceIdentity::generate().unwrap();
         let remote = DeviceIdentity::generate().unwrap();
         let peer = offer(&remote).with_platform(Platform::MacOs);
-        assert!(peer.to_code().starts_with("LKM2:mac:"));
-        let parsed = PairingOffer::parse(&peer.to_code()).unwrap();
-        assert_eq!(parsed.platform(), Some(Platform::MacOs));
-        assert!(parsed == peer);
         let record = ConfirmedPeerRecord::new(local.fingerprint(), peer.clone()).unwrap();
         let decoded = ConfirmedPeerRecord::decode(&record.encode(), local.fingerprint()).unwrap();
         assert_eq!(decoded.peer().platform(), Some(Platform::MacOs));
         assert!(decoded == record);
 
-        let legacy_code = offer(&remote).to_code();
-        assert!(legacy_code.starts_with("LKM1:"));
-        assert_eq!(PairingOffer::parse(&legacy_code).unwrap().platform(), None);
         let mut legacy = Vec::new();
         legacy.extend_from_slice(b"LKMP\x01");
         legacy.extend_from_slice(local.fingerprint().as_bytes());
@@ -406,19 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_public_codes_fail_before_use() {
+    fn an_offer_needs_a_private_pairing_endpoint_and_a_valid_certificate() {
         let identity = DeviceIdentity::generate().unwrap();
-        let valid = offer(&identity).to_code();
-        for value in [
-            "",
-            "LKM2:a:b:c",
-            "LKM2:linux:192.168.1.2:24872:00",
-            "LKM1:192.168.1.2:24872:zz",
-            &"x".repeat(MAX_PAIRING_CODE_BYTES + 1),
-            &format!("{valid}:extra"),
-        ] {
-            assert!(PairingOffer::parse(value).is_err());
-        }
         for address in [
             "0.0.0.0:24872",
             "127.0.0.1:24872",
@@ -469,18 +394,49 @@ mod tests {
     }
 
     #[test]
-    fn pairing_messages_bind_both_complete_identities_and_phase() {
+    fn the_saved_frame_binds_both_complete_identities() {
         let a = CertificateFingerprint::from_certificate_der(b"a");
         let b = CertificateFingerprint::from_certificate_der(b"b");
-        let message = encode_pair_frame(PairFrameKind::Hello, a, b);
-        assert!(validate_pair_frame(&message, PairFrameKind::Hello, a, b).is_ok());
-        assert!(validate_pair_frame(&message, PairFrameKind::Saved, a, b).is_err());
-        assert!(validate_pair_frame(&message, PairFrameKind::Hello, b, a).is_err());
+        let message = encode_pair_frame(PairFrameKind::Saved, a, b);
+        assert!(validate_pair_frame(&message, PairFrameKind::Saved, a, b).is_ok());
+        assert!(validate_pair_frame(&message, PairFrameKind::Saved, b, a).is_err());
         for index in 0..message.len() {
             let mut bad = message;
             bad[index] ^= 1;
-            assert!(validate_pair_frame(&bad, PairFrameKind::Hello, a, b).is_err());
+            assert!(validate_pair_frame(&bad, PairFrameKind::Saved, a, b).is_err());
         }
-        assert!(validate_pair_frame(&message[..69], PairFrameKind::Hello, a, b).is_err());
+        assert!(validate_pair_frame(&message[..69], PairFrameKind::Saved, a, b).is_err());
+    }
+
+    #[test]
+    fn the_badge_is_symmetric_deterministic_and_in_range_with_distinct_symbols() {
+        let mut colors = [false; PAIR_BADGE_COLORS as usize];
+        for index in 0_u16..512 {
+            let a = CertificateFingerprint::from_certificate_der(&index.to_be_bytes());
+            let b = CertificateFingerprint::from_certificate_der(
+                &[index.to_le_bytes(), [9, 9]].concat(),
+            );
+            let badge = pair_badge(a, b);
+            assert_eq!(badge, pair_badge(b, a));
+            assert_eq!(badge, pair_badge(a, b));
+            assert!(badge.color < PAIR_BADGE_COLORS);
+            colors[usize::from(badge.color)] = true;
+            assert!(
+                badge
+                    .symbols
+                    .iter()
+                    .all(|symbol| *symbol < PAIR_BADGE_SYMBOLS)
+            );
+            let [first, second, third] = badge.symbols;
+            assert!(
+                first != second && second != third && first != third,
+                "{badge:?}"
+            );
+        }
+        assert!(colors.iter().all(|seen| *seen), "every color occurs");
+        let a = CertificateFingerprint::from_certificate_der(b"a");
+        let b = CertificateFingerprint::from_certificate_der(b"b");
+        let c = CertificateFingerprint::from_certificate_der(b"c");
+        assert_ne!(pair_badge(a, b), pair_badge(a, c));
     }
 }

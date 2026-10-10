@@ -810,6 +810,30 @@
     },
     {
       "type": "library",
+      "name": "curve25519-dalek",
+      "version": "4.1.3",
+      "bom-ref": "curve25519-dalek@4.1.3",
+      "purl": "pkg:cargo/curve25519-dalek@4.1.3",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "curve25519-dalek-derive",
+      "version": "0.1.1",
+      "bom-ref": "curve25519-dalek-derive@0.1.1",
+      "purl": "pkg:cargo/curve25519-dalek-derive@0.1.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "darling",
       "version": "0.24.1",
       "bom-ref": "darling@0.24.1",
@@ -1237,6 +1261,18 @@
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "fiat-crypto",
+      "version": "0.2.9",
+      "bom-ref": "fiat-crypto@0.2.9",
+      "purl": "pkg:cargo/fiat-crypto@0.2.9",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0 OR BSD-1-Clause"
         }
       ]
     },
@@ -1750,6 +1786,30 @@
       "version": "0.4.3",
       "bom-ref": "hex@0.4.3",
       "purl": "pkg:cargo/hex@0.4.3",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hkdf",
+      "version": "0.12.4",
+      "bom-ref": "hkdf@0.12.4",
+      "purl": "pkg:cargo/hkdf@0.12.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "hmac",
+      "version": "0.12.1",
+      "bom-ref": "hmac@0.12.1",
+      "purl": "pkg:cargo/hmac@0.12.1",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -3473,6 +3533,18 @@
     },
     {
       "type": "library",
+      "name": "rand_core",
+      "version": "0.6.4",
+      "bom-ref": "rand_core@0.6.4",
+      "purl": "pkg:cargo/rand_core@0.6.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "rand_pcg",
       "version": "0.10.2",
       "bom-ref": "rand_pcg@0.10.2",
@@ -4200,6 +4272,18 @@
       "licenses": [
         {
           "expression": "MIT"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "spake2",
+      "version": "0.4.0",
+      "bom-ref": "spake2@0.4.0",
+      "purl": "pkg:cargo/spake2@0.4.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
         }
       ]
     },
@@ -6762,6 +6846,26 @@
       ]
     },
     {
+      "ref": "curve25519-dalek-derive@0.1.1",
+      "dependsOn": [
+        "proc-macro2@1.0.107",
+        "quote@1.0.47",
+        "syn@2.0.119"
+      ]
+    },
+    {
+      "ref": "curve25519-dalek@4.1.3",
+      "dependsOn": [
+        "cfg-if@1.0.4",
+        "cpufeatures@0.2.17",
+        "curve25519-dalek-derive@0.1.1",
+        "fiat-crypto@0.2.9",
+        "rand_core@0.6.4",
+        "rustc_version@0.4.1",
+        "subtle@2.6.1"
+      ]
+    },
+    {
       "ref": "darling@0.24.1",
       "dependsOn": [
         "darling_core@0.24.1",
@@ -6856,7 +6960,8 @@
       "ref": "digest@0.10.7",
       "dependsOn": [
         "block-buffer@0.10.4",
-        "crypto-common@0.1.7"
+        "crypto-common@0.1.7",
+        "subtle@2.6.1"
       ]
     },
     {
@@ -7009,6 +7114,10 @@
       "dependsOn": [
         "simd-adler32@0.3.10"
       ]
+    },
+    {
+      "ref": "fiat-crypto@0.2.9",
+      "dependsOn": []
     },
     {
       "ref": "field-offset@0.3.6",
@@ -7359,6 +7468,18 @@
     {
       "ref": "hex@0.4.3",
       "dependsOn": []
+    },
+    {
+      "ref": "hkdf@0.12.4",
+      "dependsOn": [
+        "hmac@0.12.1"
+      ]
+    },
+    {
+      "ref": "hmac@0.12.1",
+      "dependsOn": [
+        "digest@0.10.7"
+      ]
     },
     {
       "ref": "html5ever@0.38.0",
@@ -7925,8 +8046,10 @@
         "quinn-proto@0.11.18",
         "quinn@0.11.11",
         "rcgen@0.14.10",
+        "ring@0.17.14",
         "rustls@0.23.45",
         "sha2@0.11.0",
+        "spake2@0.4.0",
         "tokio@1.53.1",
         "zeroize@1.9.0"
       ]
@@ -8476,6 +8599,12 @@
       "dependsOn": []
     },
     {
+      "ref": "rand_core@0.6.4",
+      "dependsOn": [
+        "getrandom@0.2.17"
+      ]
+    },
+    {
       "ref": "rand_pcg@0.10.2",
       "dependsOn": [
         "rand_core@0.10.1"
@@ -8985,6 +9114,15 @@
       ]
     },
     {
+      "ref": "spake2@0.4.0",
+      "dependsOn": [
+        "curve25519-dalek@4.1.3",
+        "hkdf@0.12.4",
+        "rand_core@0.6.4",
+        "sha2@0.10.9"
+      ]
+    },
+    {
       "ref": "stable_deref_trait@1.2.1",
       "dependsOn": []
     },
@@ -9374,7 +9512,7 @@
       "ref": "tempfile@3.27.0",
       "dependsOn": [
         "fastrand@2.5.0",
-        "getrandom@0.3.4",
+        "getrandom@0.4.3",
         "once_cell@1.21.4",
         "rustix@1.1.4",
         "windows-sys@0.61.2"

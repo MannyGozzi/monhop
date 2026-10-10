@@ -86,7 +86,7 @@ test("Pair opens once for an explicitly entered eligible selection context", () 
   );
 });
 
-test("network freshness invalidates a pairing review when any selected context field changes", () => {
+test("pairing reopens on a new network when any selected context field changes", () => {
   const selected = {
     id: "en0",
     address: "10.0.0.2",

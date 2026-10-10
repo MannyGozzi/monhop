@@ -18,19 +18,7 @@ export function copyFeedbackFailure(subject, request, message) {
   return { state: "error", message, subject, request };
 }
 
-function sameSubject(a, b) {
-  if (a === b) return true;
-  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
-  const keys = Object.keys(a);
-  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
-}
-
-// The feedback to show for `subject` right now: feedback left over from a since-changed subject is hidden.
-export function copyFeedbackFor(feedback, subject) {
-  return sameSubject(feedback.subject, subject) ? feedback : emptyCopyFeedback();
-}
-
 // Whether a reply or timeout issued for (subject, request) still targets the current subject and slot.
 export function isCopyReplyCurrent(request, currentRequest, subject, currentSubject) {
-  return request === currentRequest && sameSubject(subject, currentSubject);
+  return request === currentRequest && subject === currentSubject;
 }

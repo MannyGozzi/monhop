@@ -469,6 +469,20 @@
     "repository": "https://github.com/mmastrac/rust-ctor"
   },
   {
+    "name": "curve25519-dalek",
+    "version": "4.1.3",
+    "license": "BSD-3-Clause",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "repository": "https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek"
+  },
+  {
+    "name": "curve25519-dalek-derive",
+    "version": "0.1.1",
+    "license": "MIT/Apache-2.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "repository": "https://github.com/dalek-cryptography/curve25519-dalek"
+  },
+  {
     "name": "darling",
     "version": "0.24.1",
     "license": "MIT",
@@ -719,6 +733,13 @@
     "license": "MIT OR Apache-2.0",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://github.com/image-rs/fdeflate"
+  },
+  {
+    "name": "fiat-crypto",
+    "version": "0.2.9",
+    "license": "MIT OR Apache-2.0 OR BSD-1-Clause",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "repository": "https://github.com/mit-plv/fiat-crypto"
   },
   {
     "name": "field-offset",
@@ -1020,6 +1041,20 @@
     "license": "MIT OR Apache-2.0",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://github.com/KokaKiwi/rust-hex"
+  },
+  {
+    "name": "hkdf",
+    "version": "0.12.4",
+    "license": "MIT OR Apache-2.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "repository": "https://github.com/RustCrypto/KDFs/"
+  },
+  {
+    "name": "hmac",
+    "version": "0.12.1",
+    "license": "MIT OR Apache-2.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "repository": "https://github.com/RustCrypto/MACs"
   },
   {
     "name": "html5ever",
@@ -2002,6 +2037,13 @@
     "repository": "https://github.com/rust-random/rand_core"
   },
   {
+    "name": "rand_core",
+    "version": "0.6.4",
+    "license": "MIT OR Apache-2.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "repository": "https://github.com/rust-random/rand"
+  },
+  {
     "name": "rand_pcg",
     "version": "0.10.2",
     "license": "MIT OR Apache-2.0",
@@ -2427,6 +2469,13 @@
     "license": "MIT",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://gitlab.gnome.org/World/Rust/soup3-rs"
+  },
+  {
+    "name": "spake2",
+    "version": "0.4.0",
+    "license": "MIT OR Apache-2.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "repository": "https://github.com/RustCrypto/PAKEs/tree/master/spake2"
   },
   {
     "name": "stable_deref_trait",

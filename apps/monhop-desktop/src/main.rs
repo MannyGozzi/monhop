@@ -20,6 +20,7 @@ mod location;
 #[cfg(windows)]
 mod log_reveal;
 mod logging;
+mod minimize;
 mod page_turn;
 mod pairing;
 mod public_code_copy;
@@ -27,6 +28,8 @@ mod settings;
 mod sharing;
 mod sharing_hub;
 mod sharing_preferences;
+#[cfg(any(windows, test))]
+mod single_instance;
 mod snapshot;
 mod swipe;
 mod switch_preference;
@@ -126,27 +129,22 @@ async fn pairing_create_identity(
     pairing_action(app, move |controller| controller.open(interface_id, true)).await
 }
 #[tauri::command]
-async fn pairing_inspect(app: tauri::AppHandle, code: String) -> Result<PairingView, String> {
+async fn pairing_show_code(app: tauri::AppHandle) -> Result<PairingView, String> {
     let controller = app.state::<Arc<AppController>>().inner().clone();
     spawn_blocking_command(
-        move || controller.pairing_inspect(code),
+        move || controller.pairing_show_code(),
         "The pairing action did not finish. Reload pairing before continuing.",
     )
     .await?
 }
 #[tauri::command]
-async fn pairing_confirm(app: tauri::AppHandle, candidate_id: u64) -> Result<PairingView, String> {
-    pairing_action(app, move |controller| controller.confirm(candidate_id)).await
-}
-#[tauri::command]
-async fn pairing_request_network_access(
-    app: tauri::AppHandle,
-    candidate_id: u64,
-) -> Result<PairingView, String> {
-    pairing_action(app, move |controller| {
-        controller.request_network_access(candidate_id)
-    })
-    .await
+async fn pairing_enter_code(app: tauri::AppHandle, code: String) -> Result<PairingView, String> {
+    let controller = app.state::<Arc<AppController>>().inner().clone();
+    spawn_blocking_command(
+        move || controller.pairing_enter_code(&code),
+        "The pairing action did not finish. Reload pairing before continuing.",
+    )
+    .await?
 }
 #[tauri::command]
 fn pairing_status(controller: tauri::State<'_, Arc<PairingController>>) -> PairingView {
@@ -460,21 +458,6 @@ fn pairing_cancel(controller: tauri::State<'_, Arc<PairingController>>) -> Pairi
 }
 
 #[tauri::command]
-async fn pairing_copy_code(app: tauri::AppHandle) -> Result<(), String> {
-    let controller = app.state::<Arc<PairingController>>().inner().clone();
-    run_on_main_thread_for_result(
-        &app,
-        move || {
-            // Clipboard access is lazy and serialized on the UI thread, including on Windows.
-            public_code_copy::copy(&controller, public_code_copy::write)
-        },
-        "Could not copy the code. Try again.",
-        "Copy did not finish. Try again.",
-    )
-    .await?
-}
-
-#[tauri::command]
 async fn setup_snapshot(app: tauri::AppHandle) -> Result<SetupSnapshot, String> {
     #[cfg(target_os = "macos")]
     let authorization = on_main_thread(&app, |marker| {
@@ -650,6 +633,11 @@ fn main() {
     let check_ui = launch == launch::Launch::CheckUi;
     let login = launch == launch::Launch::Login;
     #[cfg(windows)]
+    let instance = match single_instance::claim(launch) {
+        single_instance::Start::Exit => std::process::exit(0),
+        start => start,
+    };
+    #[cfg(windows)]
     let com_apartment = match MainThreadSta::initialize() {
         Ok(apartment) => apartment,
         Err(error) => {
@@ -671,13 +659,11 @@ fn main() {
             request_wifi_permission,
             pairing_open,
             pairing_create_identity,
-            pairing_inspect,
-            pairing_confirm,
-            pairing_request_network_access,
+            pairing_show_code,
+            pairing_enter_code,
             pairing_status,
             pairing_cancel,
             pairing_forget,
-            pairing_copy_code,
             sharing_edit_begin,
             sharing_edit_end,
             sharing_set_active,
@@ -845,7 +831,7 @@ fn main() {
                     radius: None,
                     color: None,
                 });
-            window.build()?;
+            let window = window.build()?;
             if let Err(error) = tray::install(app) {
                 if check_ui {
                     return Err(error.into());
@@ -855,6 +841,12 @@ fn main() {
                     // No tray to show it from later, so a hidden login launch shows it now.
                     let _ = tray::show_main_window(app.handle());
                 }
+            } else if let Err(message) = minimize::hide_instead(&window) {
+                log::warn!("minimize: stays a plain minimize: {message}");
+            }
+            #[cfg(windows)]
+            if !check_ui {
+                single_instance::answer_later_launches(app.handle(), instance);
             }
             Ok(())
         })
@@ -866,6 +858,13 @@ fn main() {
             ui_smoke::exit_code()
         }
         Ok(app) => {
+            #[cfg(target_os = "macos")]
+            let app = {
+                // A login launch starts hidden, so it starts without a Dock icon.
+                let mut app = app;
+                app.set_activation_policy(tray::dock_policy(!login));
+                app
+            };
             app.run(on_app_event);
             0
         }
@@ -900,6 +899,12 @@ fn on_app_event(handle: &tauri::AppHandle, event: tauri::RunEvent) {
                 request_app_shutdown(handle);
             }
         }
+        #[cfg(windows)]
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Resized(_),
+            ..
+        } => minimize::hide_if_minimized(handle, &label),
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen {
             has_visible_windows: false,
@@ -909,6 +914,8 @@ fn on_app_event(handle: &tauri::AppHandle, event: tauri::RunEvent) {
         }
         tauri::RunEvent::MainEventsCleared => tray::refresh(handle),
         tauri::RunEvent::Exit => {
+            #[cfg(windows)]
+            single_instance::stop_answering();
             // This callback is irreversible. Installation must finish before exit is approved.
             handle.state::<Arc<AppController>>().drain_for_exit();
         }
@@ -1021,13 +1028,11 @@ mod tests {
                 "allow-request-wifi-permission",
                 "allow-pairing-open",
                 "allow-pairing-create-identity",
-                "allow-pairing-inspect",
-                "allow-pairing-confirm",
-                "allow-pairing-request-network-access",
+                "allow-pairing-show-code",
+                "allow-pairing-enter-code",
                 "allow-pairing-status",
                 "allow-pairing-cancel",
                 "allow-pairing-forget",
-                "allow-pairing-copy-code",
                 "allow-sharing-edit-begin",
                 "allow-sharing-edit-end",
                 "allow-sharing-set-active",

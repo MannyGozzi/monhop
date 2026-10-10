@@ -13,16 +13,24 @@ import {
 } from "./model.mjs";
 import {
   applyPairingView,
-  canConfirmPairing,
-  canInspectPairing,
-  editCandidateCode,
+  canStartPairing,
+  canSubmitPairingCode,
+  choosePairingMode as withPairingMode,
+  codeTimeLeft,
+  editPairingEntry,
+  failPairingEntry,
   initialPairingState,
-  invalidatePairingCandidate,
   isBusyPairing,
+  isPairingAttemptLive,
   pairingFailure,
   platformLabel,
-  setFingerprintCompared,
 } from "./pairing-model.mjs";
+import {
+  COUNTDOWN_TEXT_ID,
+  PAIRING_CODE_INPUT_ID,
+  countdownText,
+  renderComputers,
+} from "./screen-computers.mjs";
 import {
   applySharingView,
   arrangementByName,
@@ -57,7 +65,6 @@ import {
 import {
   beginCopyFeedback,
   copyFeedbackFailure,
-  copyFeedbackFor,
   copyFeedbackSuccess,
   emptyCopyFeedback,
   isCopyReplyCurrent,
@@ -128,7 +135,6 @@ import {
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
 import { normalizeAutostartView } from "./autostart-model.mjs";
 import { renderReady } from "./screen-ready.mjs";
-import { renderComputers } from "./screen-computers.mjs";
 import { renderDisplays } from "./screen-displays.mjs";
 import { renderHome } from "./screen-home.mjs";
 import { renderSettings } from "./screen-settings.mjs";
@@ -151,6 +157,7 @@ const THEME_ICONS = { system: "monitor", light: "sun", dark: "moon" };
 const PAGE_TITLES = { home: "Home", setup: "Set up", settings: "Settings" };
 const PAGE_ENTER_CLEANUP_MS = 320;
 const PAIRING_POLL_MS = 500;
+const PAIRING_COUNTDOWN_TICK_MS = 250;
 const SECTION_PIN_MS = 2500;
 const LIST_UNREADABLE = "The computer list was not recognized.";
 
@@ -163,8 +170,9 @@ let pairingPollingAllowed = false;
 let pairingPollTimer = null;
 let pairingRequested = false;
 let pairedKey = null;
-let copyFeedback = emptyCopyFeedback();
-let copyRequest = 0;
+// A pairing this session finished keeps its match badge on screen until the user moves on.
+let pairingResultShown = false;
+let pairingCountdownTimer = null;
 let sharing = initialSharingState();
 let sharingPollTimer = null;
 let sharingStatusPending = false;
@@ -403,11 +411,13 @@ function toggleSettings() {
   }
 }
 
-// A code under review or a running check holds the sharing port; leaving the exchange abandons it
-// so the supervisor can reconnect. Retrying means checking the other computer's code again.
+// A shown code or a running handshake holds the sharing port; leaving the exchange abandons it so
+// the supervisor can reconnect. Pairing again means a new code.
 function leavePairing() {
   pairingRequested = false;
-  if (pairing.view?.candidateId != null) void cancelPairing();
+  pairingResultShown = false;
+  pairing = withPairingMode(pairing, null);
+  if (isPairingAttemptLive(pairing)) void cancelPairing();
 }
 
 function onEnterSetup() {
@@ -533,7 +543,7 @@ function context() {
     renamePending,
     renameDraft,
     forgetConfirmed,
-    copyFeedback: copyFeedbackFor(copyFeedback, pairingCodeSubject()),
+    now: Date.now(),
     dropCopyFeedback,
     dimming,
     clipboard: clipboardContext(clipboardView, clipboardPending),
@@ -557,6 +567,7 @@ function context() {
       requested: pairingRequested,
       pairedCount: computers.items.length,
       phase: pairing.view?.phase,
+      resultShown: pairingResultShown,
     }),
     actions: {
       goToPage,
@@ -569,11 +580,11 @@ function context() {
       beginPairing,
       dismissPairing,
       createPairingIdentity,
-      inspectPairingCode,
-      confirmPairing,
-      requestNetworkAccess,
+      choosePairingMode,
+      showPairingCode,
+      editPairingCode,
+      submitPairingCode,
       cancelPairing,
-      copyPairingCode,
       copyLastDrop,
       setDimmingEnabled,
       previewDimLevel,
@@ -581,8 +592,6 @@ function context() {
       toggleDimming,
       beginDimDrag,
       endDimDrag,
-      editCandidate,
-      toggleCompared,
       useComputer,
       setComputerEnabled,
       setClipboardEnabled,
@@ -656,6 +665,7 @@ function render() {
   if (previousArrangementView && previousArrangementView !== arrangementView)
     previousArrangementView.destroy();
   syncArrangements();
+  syncPairingCountdown();
 }
 
 function renderPageChrome(ctx) {
@@ -751,7 +761,12 @@ function renderSections(ctx) {
     computers: ctx.gates.computers.locked ? ctx.gates.computers.reason : computersLine(ctx),
     displays: displaysLine(ctx),
   };
-  const expanded = setupExpansionChosen ? setupExpandedSection : defaultSetupSection(ctx.gates);
+  // A fresh pairing holds Computers open on its match badge; Done hands over to the next step.
+  const expanded = setupExpansionChosen
+    ? setupExpandedSection
+    : pairingResultShown && ctx.showPairing
+      ? "computers"
+      : defaultSetupSection(ctx.gates);
   for (const section of nodes.sections) {
     const key = section.dataset.section;
     const gate = ctx.gates[key];
@@ -962,19 +977,17 @@ async function requestWifiPermission() {
 }
 
 function applySnapshotCheck(nextState, snapshot, freshness) {
-  const selectedContext = selectedNetworkContextKey(selectedInterface(state));
   state = autoSelectInterface(applySnapshot(nextState, snapshot), computers.interfaceId);
-  if (selectedNetworkContextKey(selectedInterface(state)) !== selectedContext)
-    pairing = invalidatePairingCandidate(pairing);
   snapshotCheck = { pending: false, ...snapshotCheckResult(state.snapshot, freshness) };
 }
 
+// A new network reopens pairing on it, so a code is only ever shown or entered on the network the
+// user selected; a finished snapshot does the same from takeSnapshot.
 function chooseInterface(id) {
   if (controlsBusy() || isSessionActive(sharing)) return;
-  const previous = state.selectedInterfaceId;
   state = selectInterface(state, id);
-  if (state.selectedInterfaceId !== previous) pairing = invalidatePairingCandidate(pairing);
   render();
+  if (page === "setup") openPairingOnExplicitEntry();
 }
 
 async function openSettings(pane) {
@@ -1024,18 +1037,8 @@ async function runNative(command, payload, onSuccess) {
 // ---------- pairing ----------
 
 function pairingEntryContext() {
-  const selected = selectedInterface(state);
-  if (!selected) return "";
-  return JSON.stringify([
-    selected.id,
-    selected.address,
-    selected.prefixLength,
-    selected.networkName,
-    selected.attachmentKnown,
-    selected.up,
-    selected.physical,
-    state.snapshot?.platform,
-  ]);
+  const selected = selectedNetworkContextKey(selectedInterface(state));
+  return selected ? JSON.stringify([selected, state.snapshot?.platform]) : "";
 }
 
 function openPairingOnExplicitEntry() {
@@ -1058,14 +1061,20 @@ async function openPairing() {
   const contextKey = pairingEntryContext();
   if (!pairingOpenGate(state).allowed || !contextKey) return;
   autoPairingContexts = recordPairingOpenContext(autoPairingContexts, contextKey);
+  pairing = withPairingMode(pairing, null);
   await invokePairing("pairing_open", { interfaceId: state.selectedInterfaceId });
 }
 
 // The list stays the focus once a computer is paired; the code exchange opens on request.
 function beginPairing() {
   pairingRequested = true;
-  if (!pairing.view || ["closed", "paired"].includes(pairing.view.phase)) void openPairing();
-  else render();
+  pairingResultShown = false;
+  if (!pairing.view || pairing.view.phase === "closed") {
+    void openPairing();
+    return;
+  }
+  pairing = withPairingMode(pairing, "choose");
+  render();
 }
 
 function dismissPairing() {
@@ -1078,71 +1087,36 @@ async function createPairingIdentity() {
   await invokePairing("pairing_create_identity", { interfaceId: state.selectedInterfaceId });
 }
 
-function editCandidate(value) {
-  pairing = editCandidateCode(pairing, value);
+// Picking a way in ("choose" or "enter") is local until the user shows or submits a code.
+function choosePairingMode(mode) {
+  pairing = withPairingMode(pairing, mode);
+  render();
+  if (mode === "enter") document.getElementById(PAIRING_CODE_INPUT_ID)?.focus();
+}
+
+function editPairingCode(value) {
+  pairing = editPairingEntry(pairing, value);
   render();
 }
 
-function toggleCompared() {
-  pairing = setFingerprintCompared(pairing, !pairing.compared);
-  render();
-}
-
-async function inspectPairingCode() {
-  if (!canInspectPairing(pairing) || controlsBusy()) return;
-  await invokePairing("pairing_inspect", { code: pairing.candidateCode });
-}
-
-async function confirmPairing() {
-  if (!canConfirmPairing(pairing) || controlsBusy()) return;
+// Also the New code action: showing again burns the code on screen and shows a fresh one.
+async function showPairingCode() {
+  if (pairingPending || !(canStartPairing(pairing) || pairing.view?.phase === "showing")) return;
   pairingPollingAllowed = true;
-  await invokePairing("pairing_confirm", { candidateId: pairing.view.candidateId });
+  await invokePairing("pairing_show_code");
 }
 
-async function requestNetworkAccess() {
-  if (state.snapshot?.platform !== "macos" || !canConfirmPairing(pairing) || controlsBusy()) return;
+async function submitPairingCode() {
+  if (pairingPending || !canSubmitPairingCode(pairing)) return;
   pairingPollingAllowed = true;
-  await invokePairing("pairing_request_network_access", { candidateId: pairing.view.candidateId });
+  await invokePairing("pairing_enter_code", { code: pairing.entry });
 }
 
+// Cancelling a running attempt unwinds through `stopping`, which the poll follows back to ready.
 async function cancelPairing() {
+  pairing = withPairingMode(pairing, null);
+  pairingPollingAllowed = true;
   await invokePairing("pairing_cancel");
-}
-
-// The copy subject bundles the code with the pairing generation, so any other pairing operation
-// starting (even one that leaves the code text unchanged) drops this feedback as stale too.
-function pairingCodeSubject() {
-  return { localCode: pairing.view?.localCode, pairingGeneration };
-}
-
-async function copyPairingCode() {
-  const localCode = pairing.view?.localCode;
-  const subject = pairingCodeSubject();
-  if (!localCode || copyFeedbackFor(copyFeedback, subject).state === "pending") return;
-  const request = ++copyRequest;
-  const isCurrent = () => isCopyReplyCurrent(request, copyRequest, subject, pairingCodeSubject());
-  if (!core?.invoke) {
-    copyFeedback = copyFeedbackFailure(subject, request, "Open MonHop to copy this code.");
-    render();
-    return;
-  }
-  copyFeedback = beginCopyFeedback(subject, request);
-  render();
-  try {
-    await core.invoke("pairing_copy_code");
-    if (!isCurrent()) return;
-    copyFeedback = copyFeedbackSuccess(subject, request, "Copied. Paste it on the other computer.");
-    window.setTimeout(() => {
-      if (isCurrent()) {
-        copyFeedback = emptyCopyFeedback();
-        render();
-      }
-    }, 1500);
-  } catch (error) {
-    if (!isCurrent()) return;
-    copyFeedback = copyFeedbackFailure(subject, request, `Could not copy: ${nativeError(error)}`);
-  }
-  render();
 }
 
 async function invokePairing(command, payload) {
@@ -1166,15 +1140,20 @@ async function invokePairing(command, payload) {
     else if (!isBusyPairing(pairing)) pairingPollingAllowed = false;
   } catch (error) {
     if (generation !== pairingGeneration) return;
-    if (["pairing_inspect", "pairing_confirm"].includes(command))
-      pairing = invalidatePairingCandidate(pairing);
-    pairing = pairingFailure(pairing, nativeError(error));
+    // A typo or an address off this network is caught before anything is sent; it belongs under
+    // the field, which keeps what was typed.
+    pairing =
+      command === "pairing_enter_code"
+        ? failPairingEntry(pairing, nativeError(error))
+        : pairingFailure(pairing, nativeError(error));
     pairingPollingAllowed = false;
   } finally {
     if (generation === pairingGeneration) {
       pairingPending = false;
       pairingOperation = null;
       render();
+      if (command === "pairing_enter_code" && pairing.entryError)
+        document.getElementById(PAIRING_CODE_INPUT_ID)?.focus();
     }
   }
 }
@@ -1208,14 +1187,32 @@ function stopPairingPoll() {
   pairingPollTimer = null;
 }
 
+// Between status polls the countdown text ticks on its own, and the code leaves the screen the
+// moment it expires.
+function syncPairingCountdown() {
+  const ticking = pairing.view?.phase === "showing" && codeTimeLeft(pairing.view) > 0;
+  if (!ticking) {
+    if (pairingCountdownTimer !== null) window.clearInterval(pairingCountdownTimer);
+    pairingCountdownTimer = null;
+    return;
+  }
+  if (pairingCountdownTimer !== null) return;
+  pairingCountdownTimer = window.setInterval(() => {
+    const left = codeTimeLeft(pairing.view);
+    if (!left) {
+      window.clearInterval(pairingCountdownTimer);
+      pairingCountdownTimer = null;
+      render();
+      return;
+    }
+    const text = document.getElementById(COUNTDOWN_TEXT_ID);
+    if (text) text.textContent = countdownText(left);
+  }, PAIRING_COUNTDOWN_TICK_MS);
+}
+
 function applyPairingResult(result) {
   const current = pairing;
-  const next = applyPairingView(current, result);
-  if (current.view?.localCode !== next.view?.localCode) {
-    copyRequest += 1;
-    copyFeedback = emptyCopyFeedback();
-  }
-  pairing = next;
+  pairing = applyPairingView(current, result);
   // One exchange ends once: the new computer joins the list and the supervisor connects to it.
   // Leaving `paired` re-arms it, so pairing the same computer again is still a new exchange.
   const key = pairing.view?.phase === "paired" ? pairing.view.peerFingerprint : null;
@@ -1226,6 +1223,8 @@ function applyPairingResult(result) {
   if (key === pairedKey) return;
   pairedKey = key;
   pairingRequested = false;
+  // Only an attempt finishing here shows its badge; a paired state read back on open does not.
+  pairingResultShown = isBusyPairing(current);
   void loadComputers();
   void refreshSharingStatus();
 }
@@ -2089,8 +2088,13 @@ async function hideToTray() {
   }
 }
 
+// Minimize sends MonHop to the tray, the same as the header's hide button.
 async function runWindowAction(action) {
-  const method = { minimize: "minimize", maximize: "toggleMaximize", close: "close" }[action];
+  if (action === "minimize") {
+    await hideToTray();
+    return;
+  }
+  const method = { maximize: "toggleMaximize", close: "close" }[action];
   const currentWindow = nativeWindow?.getCurrentWindow?.();
   if (!method || !currentWindow) return;
   try {

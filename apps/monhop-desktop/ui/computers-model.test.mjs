@@ -86,6 +86,22 @@ test("the computer list is bounded, deduplicated, and lowercased on the way in",
   assert.equal(view.interfaceId, "en0:15:192.168.1.4");
 });
 
+test("each computer carries the match badge both computers show for it, or none", () => {
+  const view = normalizeComputers({
+    computers: [
+      {
+        fingerprint: WINDOWS,
+        name: "Office Windows PC",
+        platform: "windows",
+        badge: { color: 3, symbols: [4, 8, 30] },
+      },
+      { fingerprint: MAC, name: "Studio Mac", platform: "macos", badge: { color: 9, symbols: [] } },
+    ],
+  });
+  assert.deepEqual(view.items[0].badge, { color: 3, symbols: [4, 8, 30] });
+  assert.equal(view.items[1].badge, null);
+});
+
 test("a computer nobody is paired with is never the one in use", () => {
   const view = normalizeComputers({
     computers: [{ fingerprint: WINDOWS, name: "Office Windows PC", platform: "windows" }],

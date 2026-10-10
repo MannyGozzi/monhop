@@ -9,6 +9,8 @@ pub mod policy;
 
 pub mod native_storage;
 pub mod pairing;
+pub mod pairing_code;
+pub mod pairing_exchange;
 pub mod session;
 pub mod session_actor;
 #[cfg(any(target_os = "macos", all(windows, test)))]

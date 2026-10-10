@@ -1,108 +1,199 @@
-const MAX_PAIRING_CODE_LENGTH = 6200;
+import { normalizePairBadge } from "./pair-badge-model.mjs";
 
 const PHASES = new Set([
   "closed",
   "identity-missing",
   "ready",
-  "review",
-  "requesting-network",
-  "waiting",
+  "showing",
   "connecting",
+  "verifying",
   "saving",
   "paired",
-  "stopping",
   "error",
+  "stopping",
 ]);
-const ROLES = new Set(["listen", "connect"]);
+// Phases with a code out or a handshake running; the backend reports busy in exactly these.
+const LIVE_PHASES = new Set(["showing", "connecting", "verifying", "saving", "stopping"]);
+// Phases from which a new code can be shown or entered.
+const IDLE_PHASES = new Set(["ready", "error", "paired"]);
+const ROLES = new Set(["showing", "entering"]);
 const PLATFORMS = new Set(["macos", "windows"]);
 const STORAGE_OUTCOMES = new Set(["unchanged", "unverified", "verified"]);
 const FINGERPRINT = /^[0-9a-fA-F]{64}$/;
 
+// Crockford base32 as the backend parses it: no I, L, O or U, which read as 1, 1, 0 and nothing.
+const CODE_SYMBOLS = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const CODE_ALIASES = { O: "0", I: "1", L: "1" };
+export const CODE_LENGTH = 12;
+const CODE_GROUP = 4;
+const CODE_FORMAT = /^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/;
+const MAX_CODE_INPUT = 64;
+
+// `mode` is the step the user picked while no attempt runs: "choose" (the two options) or "enter"
+// (typing a code). `codeShownAt` is when this screen first saw the code it shows.
 export function initialPairingState() {
   return {
-    candidateCode: "",
-    candidateStale: false,
-    compared: false,
+    mode: null,
+    entry: "",
+    entryError: "",
+    codeShownAt: null,
     message: "",
     view: null,
   };
 }
 
-export function applyPairingView(state, value) {
+export function applyPairingView(state, value, now = Date.now()) {
   const view = normalizePairingView(value);
-  const changedCandidate = state.view?.candidateId !== view.candidateId;
+  const sameCode = view.code !== null && view.code === state.view?.code;
+  const attempt = LIVE_PHASES.has(view.phase) || view.phase === "paired";
   return {
     ...state,
-    candidateStale: changedCandidate ? false : state.candidateStale,
-    compared: changedCandidate ? false : state.compared,
+    // A running or finished attempt replaces whatever the user had picked before it.
+    mode: attempt ? null : state.mode,
+    entry: view.phase === "paired" ? "" : state.entry,
+    entryError: attempt ? "" : state.entryError,
+    codeShownAt: view.code === null ? null : sameCode ? (state.codeShownAt ?? now) : now,
     message: "",
     view,
   };
 }
 
-export function editCandidateCode(state, value) {
-  const candidateCode = boundedText(value, MAX_PAIRING_CODE_LENGTH);
+// Switching steps starts the field over; a code that just failed is never offered again.
+export function choosePairingMode(state, mode) {
+  const next = mode === "enter" || mode === "choose" ? mode : null;
   return {
     ...state,
-    candidateCode,
-    candidateStale: state.view?.candidateId !== null && state.view?.candidateId !== undefined,
-    compared: false,
+    mode: next,
+    entry: next === "enter" && state.mode === "enter" ? state.entry : "",
+    entryError: "",
     message: "",
   };
 }
 
-export function invalidatePairingCandidate(state) {
-  return {
-    ...state,
-    candidateStale: state.view?.candidateId !== null && state.view?.candidateId !== undefined,
-    compared: false,
-  };
+export function editPairingEntry(state, value) {
+  return { ...state, entry: formatCodeInput(value).value, entryError: "" };
 }
 
-export function setFingerprintCompared(state, compared) {
-  return { ...state, compared: compared === true };
+export function failPairingEntry(state, message) {
+  return {
+    ...state,
+    entryError: boundedText(message, 1000) || "That code did not work. Check it and try again.",
+  };
 }
 
 export function pairingFailure(state, message) {
   return { ...state, message: boundedText(message, 1000) || "Pairing did not finish. Try again." };
 }
 
-export function canInspectPairing(state) {
-  return (
-    ["ready", "review"].includes(state.view?.phase) &&
-    state.candidateCode.trim().length > 0 &&
-    !state.view.busy
-  );
+// Which screen the exchange shows. Expiry is judged locally too, so the code never sits on screen
+// past its deadline while the next status poll is on its way.
+export function pairingStep(state, now = Date.now()) {
+  const view = state.view;
+  if (!view || view.phase === "closed") return "closed";
+  if (view.phase === "identity-missing") return "identity";
+  if (IDLE_PHASES.has(view.phase) && state.mode === "enter") return "enter";
+  if (IDLE_PHASES.has(view.phase) && (state.mode === "choose" || view.phase === "ready"))
+    return "choose";
+  if (view.phase === "showing") return codeTimeLeft(view, now) === 0 ? "expired" : "show";
+  if (LIVE_PHASES.has(view.phase)) return "progress";
+  if (view.phase === "paired") return "paired";
+  return "error";
 }
 
-export function canConfirmPairing(state) {
-  const view = state.view;
-  if (
-    !view ||
-    view.busy ||
-    !Number.isSafeInteger(view.candidateId) ||
-    state.candidateStale ||
-    !ROLES.has(view.role) ||
-    !hasFullFingerprint(view.localFingerprint) ||
-    !hasFullFingerprint(view.peerFingerprint)
-  )
-    return false;
-  return view.phase === "review" && state.compared;
+export function canStartPairing(state) {
+  return IDLE_PHASES.has(state.view?.phase) && !state.view.busy;
+}
+
+export function canSubmitPairingCode(state) {
+  return canStartPairing(state) && codeSymbols(state.entry).length === CODE_LENGTH;
 }
 
 export function isBusyPairing(state) {
-  return (
-    state.view?.busy === true ||
-    ["requesting-network", "waiting", "connecting", "saving", "stopping"].includes(
-      state.view?.phase,
-    )
-  );
+  return state.view?.busy === true || LIVE_PHASES.has(state.view?.phase);
 }
 
-export function formatFingerprint(value) {
-  if (!hasFullFingerprint(value)) return "Not reported";
-  return value.match(/.{1,4}/g).join(" ");
+// A code on screen or a handshake under way; leaving the exchange cancels it.
+export function isPairingAttemptLive(state) {
+  return ["showing", "connecting", "verifying", "saving"].includes(state.view?.phase);
 }
+
+// --- the short code ---------------------------------------------------------------------------
+
+export function codeSymbols(value) {
+  let symbols = "";
+  for (const raw of String(value ?? "")
+    .slice(0, MAX_CODE_INPUT)
+    .toUpperCase()) {
+    const symbol = CODE_ALIASES[raw] ?? raw;
+    if (CODE_SYMBOLS.includes(symbol)) symbols += symbol;
+    if (symbols.length === CODE_LENGTH) break;
+  }
+  return symbols;
+}
+
+function groupSymbols(symbols) {
+  return (symbols.match(new RegExp(`.{1,${CODE_GROUP}}`, "g")) ?? []).join("-");
+}
+
+// Typing or pasting reformats the field: case, spaces and dashes never matter, dashes come back
+// between groups, and the caret stays after the same symbol it followed.
+export function formatCodeInput(raw, caret = String(raw ?? "").length) {
+  const text = String(raw ?? "");
+  const symbols = codeSymbols(text);
+  const before = Math.min(codeSymbols(text.slice(0, caret)).length, symbols.length);
+  return {
+    value: groupSymbols(symbols),
+    caret: before + Math.floor(Math.max(before - 1, 0) / CODE_GROUP),
+    symbols,
+  };
+}
+
+// The three groups a shown code is drawn in, and the label that reads it one symbol at a time.
+export function codeGroups(code) {
+  return CODE_FORMAT.test(code ?? "") ? code.split("-") : [];
+}
+
+export function spokenCode(code) {
+  return codeGroups(code)
+    .map((group) => group.split("").join(" "))
+    .join(", ");
+}
+
+export function codeTimeLeft(view, now = Date.now()) {
+  if (!Number.isFinite(view?.codeExpiresAtMs)) return null;
+  return Math.max(0, view.codeExpiresAtMs - now);
+}
+
+export function formatCountdown(ms) {
+  const seconds = Math.ceil(Math.max(0, ms) / 1000);
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+// How far the countdown bar has drained: the whole window counts from when this screen first saw
+// the code, since the view only carries its deadline.
+export function countdownProgress(state, now = Date.now()) {
+  const left = codeTimeLeft(state.view, now);
+  const shownAt = state.codeShownAt;
+  if (left === null || !Number.isFinite(shownAt)) return null;
+  const total = Math.max(state.view.codeExpiresAtMs - shownAt, 1);
+  return { total, elapsed: Math.min(Math.max(now - shownAt, 0), total), left: left / total };
+}
+
+// --- errors -----------------------------------------------------------------------------------
+
+// The backend's sentence names what went wrong; the role decides the way forward.
+export function pairingErrorPresentation(view) {
+  const retry =
+    view?.role === "showing" ? "new-code" : view?.role === "entering" ? "enter-again" : "reopen";
+  const fallback = {
+    "new-code": "This code no longer works. Show a new code.",
+    "enter-again": "That code didn't work. Ask for a new code on the other computer.",
+    reopen: "The pairing did not finish.",
+  }[retry];
+  return { title: "Pairing did not finish", detail: view?.message || fallback, retry };
+}
+
+// --- the native view --------------------------------------------------------------------------
 
 function hasFullFingerprint(value) {
   return typeof value === "string" && FINGERPRINT.test(value);
@@ -119,28 +210,30 @@ export function normalizePairingView(value) {
   const message = incompleteTrust
     ? "The saved pairing is incomplete. Reload pairing before continuing."
     : boundedText(source.message, 1000);
+  const code =
+    phase === "showing" && typeof source.code === "string" && CODE_FORMAT.test(source.code)
+      ? source.code
+      : null;
   return {
     phase,
-    localCode: nullableText(source.localCode, MAX_PAIRING_CODE_LENGTH),
-    localFingerprint: fingerprintText(source.localFingerprint),
-    peerFingerprint: fingerprintText(source.peerFingerprint),
-    peerAddress: nullableText(source.peerAddress, 256),
-    candidateId: positiveIntegerOrNull(source.candidateId),
     role: ROLES.has(source.role) ? source.role : null,
-    storageOutcome: STORAGE_OUTCOMES.has(source.storageOutcome)
-      ? source.storageOutcome
-      : "unverified",
+    code,
+    codeExpiresAtMs:
+      code !== null && Number.isFinite(source.codeExpiresAtMs) && source.codeExpiresAtMs > 0
+        ? source.codeExpiresAtMs
+        : null,
     message:
       message || (phase === "error" ? "The pairing state was not recognized. Reload pairing." : ""),
     busy: source.busy === true,
-    networkAccess: ["not-verified", "requesting", "attempted", "incomplete"].includes(
-      source.networkAccess,
-    )
-      ? source.networkAccess
-      : "not-verified",
-    networkAccessMessage: boundedText(source.networkAccessMessage, 1000),
+    localFingerprint: fingerprintText(source.localFingerprint),
+    peerFingerprint: fingerprintText(source.peerFingerprint),
+    peerAddress: nullableText(source.peerAddress, 256),
     localPlatform: PLATFORMS.has(source.localPlatform) ? source.localPlatform : null,
     peerPlatform: PLATFORMS.has(source.peerPlatform) ? source.peerPlatform : null,
+    badge: phase === "paired" ? normalizePairBadge(source.badge) : null,
+    storageOutcome: STORAGE_OUTCOMES.has(source.storageOutcome)
+      ? source.storageOutcome
+      : "unverified",
   };
 }
 
@@ -169,33 +262,4 @@ function fingerprintText(value) {
 function nullableText(value, maximum) {
   const normalized = boundedText(value, maximum);
   return normalized || null;
-}
-
-function positiveIntegerOrNull(value) {
-  return Number.isSafeInteger(value) && value > 0 ? value : null;
-}
-
-export function localNetworkStatus(state) {
-  const view = state.view;
-  if (view?.phase === "paired" && !state.candidateStale) {
-    return {
-      label: "Pairing verified",
-      detail: "The last pairing exchange worked. This is not a live permission check.",
-    };
-  }
-  if (state.candidateStale)
-    return {
-      label: "Checked when pairing",
-      detail: "Inspect the updated code before requesting access.",
-    };
-  const label =
-    { requesting: "Requesting", attempted: "Request attempted", incomplete: "Request incomplete" }[
-      view?.networkAccess
-    ] || "Checked when pairing";
-  return {
-    label,
-    detail:
-      view?.networkAccessMessage ||
-      "Choose a network, then compare fingerprints while pairing to request access. Waiting alone may not show a macOS prompt.",
-  };
 }
