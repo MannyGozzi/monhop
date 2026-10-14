@@ -12,23 +12,26 @@ Every release is signed three ways. Release signing happens only in GitHub Actio
 
 ## The one key that cannot be replaced
 
-If the **updater key** is lost, no installed copy of MonHop can ever update itself again. Every user would have to download a new version by hand. GitHub never shows a stored secret again, so the copy in GitHub cannot be retrieved. Keep the 1Password copy current, and never generate a replacement "just for CI".
+If the **updater key** is lost, no installed copy of MonHop can ever update itself again. Every user would have to download a new version by hand. GitHub never shows a stored secret again, so the copy in GitHub cannot be retrieved. Keep the Bitwarden copy current, and never generate a replacement "just for CI".
 
 The other keys can be replaced in minutes (see [Replacing one secret](#replacing-one-secret)).
 
 ## Where every secret lives
 
-**Master copies: 1Password**, in one Secure Note named `MonHop release signing`:
+**Master copies: Bitwarden**, in one Secure Note named `MonHop release signing`. Everything is stored as text, because file attachments need Bitwarden Premium:
 
-| Kind | Name | Contents |
+| Where in the note | Contents | Needed? |
 |---|---|---|
-| Password field | `p12 password` | the password chosen when exporting `Certificates.p12` |
-| Text field | `API Key ID` | the 10-character ID in the `.p8` file name, such as `DH45Z766Z9` |
-| Text field | `API Issuer ID` | the team's Issuer ID (see below) |
-| Text field | `Team ID` | `2CU4CSTZWR` |
-| File | `Certificates.p12` | Developer ID certificate and private key, exported together with Apple's G2 intermediate |
-| File | `AuthKey_<KEYID>.p8` | notarization API key; Apple allows only one download |
-| File | `monhop-updater.key`, `monhop-updater.key.pub` | updater key pair from `~/.tauri` (hidden folder: press Cmd+Shift+G in a file picker and type `~/.tauri`) |
+| Hidden field `updater private key` | the one line in `~/.tauri/monhop-updater.key` (copy it with `pbcopy < ~/.tauri/monhop-updater.key`) | **Required.** This is the only copy outside GitHub. |
+| Notes | the Developer ID `.p12` as base64 (`base64 -i Certificates.p12 \| pbcopy`), exported together with Apple's G2 intermediate | Recommended. Without it, a lost Mac means creating a new certificate. |
+| Hidden field `p12 password` | the password chosen when exporting the `.p12` | With the `.p12` |
+
+Not stored, on purpose:
+- **The `.p8` notarization key.** A lost Mac means revoking it and generating a new one anyway, which takes two minutes.
+- **The updater public key.** It is in `tauri.conf.json`.
+- **The Key ID and Issuer ID.** Both are shown on Apple's Team Keys page.
+
+After pasting a key into Bitwarden, clear the clipboard with `pbcopy < /dev/null`.
 
 The **Issuer ID** identifies the Gozzi LLC team to Apple. A request needs the `.p8`, its Key ID and the Issuer ID together. Find it at appstoreconnect.apple.com → Users and Access → Integrations tab → App Store Connect API → Team Keys tab. It is the value labeled "Issuer ID" above the keys table: 36 characters in five dash-separated groups, such as `57246542-96fe-1a63-e053-0824d011072a`. It is the same for every key on the team.
 
@@ -54,7 +57,7 @@ To make a new notarization key on the same page, click **+** next to Active. Nam
 **On the maintainer's Mac**, which is FileVault-encrypted:
 - `~/.tauri/monhop-updater.key` stays on disk for local builds (`scripts/build-macos-app.sh`)
 - the Developer ID identity lives in the login keychain
-- the `.p12` and `.p8` files are deleted once they are in 1Password
+- the `.p12` and `.p8` files are deleted once the upload succeeds and the `.p12` is in Bitwarden
 
 ## What a release build does
 
@@ -91,12 +94,13 @@ Do these in order, the same day:
 1. Install the tools:
    - Xcode and Homebrew
    - `brew install gh openssl@3`, then `gh auth login`
-   - 1Password with its CLI
+   - Bitwarden
    - Rust through rustup, then `cargo install tauri-cli --version 2.11.4 --locked`
-2. Restore the updater key: save `monhop-updater.key` and `monhop-updater.key.pub` from 1Password into `~/.tauri/`, then run `chmod 600 ~/.tauri/monhop-updater.key`.
+2. Restore the updater key: copy the `updater private key` field from Bitwarden, then run `mkdir -p ~/.tauri && pbpaste > ~/.tauri/monhop-updater.key && chmod 600 ~/.tauri/monhop-updater.key && pbcopy < /dev/null`.
 3. Create a fresh local development identity with `bash scripts/macos-signing.sh setup` (see README). Reinstall MonHop and re-grant its permissions once.
 4. Only if GitHub's copies need replacing:
-   - save the `.p12` and `.p8` from 1Password to files
+   - restore the `.p12`: copy the note's base64 text from Bitwarden, then run `pbpaste | base64 -d > Certificates.p12 && pbcopy < /dev/null`
+   - generate and download a new `.p8` on the Team Keys page (revoke the old key there too)
    - run `scripts/store-release-secrets.sh <file.p12> <AuthKey_KEYID.p8>`
    - delete both files
 5. Prove the setup without publishing anything:
@@ -107,14 +111,14 @@ The Developer ID certificate only needs to be in this Mac's keychain to export a
 
 ## Replacing one secret
 
-Upload replacements with `scripts/store-release-secrets.sh`, update 1Password, then run a `build` workflow from `main`.
+Upload replacements with `scripts/store-release-secrets.sh`, update Bitwarden, then run a `build` workflow from `main`.
 
 | Situation | What to do | Effect on users |
 |---|---|---|
 | Developer ID certificate expiring (current one: 2027-11-12) | developer.apple.com → Certificates → **+** → Developer ID Application → G2 Sub-CA, using a request made in Keychain Access → Certificate Assistant. Install it in the **login** keychain. Export it with the G2 intermediate as a `.p12`. | None. macOS ties permissions to the team ID, not the certificate, and notarized builds keep working after their certificate expires. |
 | `.p12` password forgotten | Export a new `.p12` from the keychain that still holds the key. Otherwise create a new certificate as above. | None |
 | API key lost or leaked | On the Team Keys page, revoke it, then generate and download a new one as described above | None |
-| Updater key leaked | Release a version that builds in a new public key, signed one last time with the old key. Then switch the secret and 1Password to the new key. | One extra update |
+| Updater key leaked | Release a version that builds in a new public key, signed one last time with the old key. Then switch the secret and Bitwarden to the new key. | One extra update |
 | Updater key lost | Generate a new key, put its public half in `tauri.conf.json`, and release. Installed copies cannot verify it, so tell users to download the new version by hand once. | Everyone reinstalls manually |
 
 ## Checking a build by hand
