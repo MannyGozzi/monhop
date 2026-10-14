@@ -127,7 +127,7 @@ Upload replacements with `scripts/store-release-secrets.sh`, update Bitwarden, t
 |---|---|---|
 | `failed to notarize app: ... The Internet connection appears to be offline` | GitHub's Mac runner lost its network while waiting for Apple. `notarytool` stops on the first network error. | Re-run the failed jobs |
 | `Notarizing .../MonHop.app` with no output for a long time | Apple is still reviewing the upload. A new team's first submissions took about three hours in October 2026; later ones take minutes. | Wait. The job gives up after GitHub's 6-hour limit, and Apple keeps reviewing either way. |
-| `Configure TAURI_SIGNING_PRIVATE_KEY in the release environment` | The run cannot see the environment's secrets | Check that the run started from `main` or a `v*` tag and that the secret exists |
+| `Configure TAURI_SIGNING_PRIVATE_KEY in the release environment` | The run cannot see the environment's secrets | Check that the run started from `main` or a `v*` tag, that the secret exists, and that `release.yml` still calls the build with `secrets: inherit` |
 | `... is not allowed to deploy to release due to environment protection rules` | The run started from another branch | Expected. Only `main` and `v*` tags may sign. |
 | `signed by key ..., expected 73B03A45DB934B17` | `TAURI_SIGNING_PRIVATE_KEY` holds the wrong key | Re-run `scripts/store-release-secrets.sh` with the key from Bitwarden |
 | `tauri CI configuration error` | Apple secrets are missing or retired | The message names them. Run `scripts/store-release-secrets.sh` again. |

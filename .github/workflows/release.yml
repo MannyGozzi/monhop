@@ -52,10 +52,12 @@ jobs:
     needs: preflight
     uses: ./.github/workflows/ci.yml
 
-  # Build reads its secrets from the release environment, so nothing is passed down.
+  # A called workflow sees its environment's secrets only when the caller inherits secrets.
+  # The repository holds none of its own, so only the release environment's reach the build.
   build:
     needs: verify
     uses: ./.github/workflows/build.yml
+    secrets: inherit
 
   publish:
     needs: [preflight, build]
