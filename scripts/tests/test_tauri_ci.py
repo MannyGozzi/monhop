@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -36,6 +37,9 @@ class TauriCiTests(unittest.TestCase):
             "APPLE_CERTIFICATE": "",
             "APPLE_CERTIFICATE_PASSWORD": "",
             "APPLE_SIGNING_IDENTITY": "",
+            "APPLE_API_KEY": "",
+            "APPLE_API_ISSUER": "",
+            "APPLE_API_KEY_PATH": "",
             "APPLE_ID": "",
             "APPLE_PASSWORD": "",
             "APPLE_TEAM_ID": "",
@@ -68,26 +72,68 @@ class TauriCiTests(unittest.TestCase):
         self.assertEqual(tauri_ci.tauri_environment(without_password)["APPLE_CERTIFICATE_PASSWORD"], "")
 
     def test_complete_apple_settings_are_preserved(self):
+        with tempfile.NamedTemporaryFile(suffix=".p8") as key:
+            environment = {
+                "TAURI_SIGNING_PRIVATE_KEY": "updater-key",
+                "APPLE_CERTIFICATE": "certificate",
+                "APPLE_CERTIFICATE_PASSWORD": "certificate-password",
+                "APPLE_SIGNING_IDENTITY": "Developer ID Application: Example",
+                "APPLE_API_KEY": "KEYID12345",
+                "APPLE_API_ISSUER": "issuer-uuid",
+                "APPLE_API_KEY_PATH": key.name,
+                "APPLE_PROVIDER_SHORT_NAME": "provider",
+            }
+
+            self.assertEqual(tauri_ci.tauri_environment(environment), environment)
+
+    def test_retired_apple_id_notarization_fails_without_values_in_errors(self):
+        with tempfile.NamedTemporaryFile(suffix=".p8") as key:
+            api_key = {
+                "APPLE_CERTIFICATE": "certificate",
+                "APPLE_SIGNING_IDENTITY": "Developer ID Application: Example",
+                "APPLE_API_KEY": "KEYID12345",
+                "APPLE_API_ISSUER": "issuer-uuid",
+                "APPLE_API_KEY_PATH": key.name,
+            }
+            for name, value in (
+                ("APPLE_ID", "build@example.invalid"),
+                ("APPLE_PASSWORD", "app-password"),
+                ("APPLE_TEAM_ID", "TEAMID"),
+            ):
+                with self.subTest(name=name):
+                    with self.assertRaises(tauri_ci.ConfigurationError) as error:
+                        tauri_ci.tauri_environment({**api_key, name: value})
+                    self.assertIn("API key", str(error.exception))
+                    self.assertNotIn(value, str(error.exception))
+
+    def test_notarization_without_a_signing_certificate_fails_before_tauri(self):
+        with tempfile.NamedTemporaryFile(suffix=".p8") as key:
+            environment = {"APPLE_API_KEY": "KEYID12345", "APPLE_API_ISSUER": "issuer-uuid", "APPLE_API_KEY_PATH": key.name}
+
+            with self.assertRaises(tauri_ci.ConfigurationError) as error:
+                tauri_ci.tauri_environment(environment)
+            self.assertIn("APPLE_CERTIFICATE", str(error.exception))
+
+    def test_missing_notarization_key_file_fails_before_tauri(self):
         environment = {
-            "TAURI_SIGNING_PRIVATE_KEY": "updater-key",
             "APPLE_CERTIFICATE": "certificate",
-            "APPLE_CERTIFICATE_PASSWORD": "certificate-password",
             "APPLE_SIGNING_IDENTITY": "Developer ID Application: Example",
-            "APPLE_ID": "build@example.invalid",
-            "APPLE_PASSWORD": "app-password",
-            "APPLE_TEAM_ID": "TEAMID",
-            "APPLE_PROVIDER_SHORT_NAME": "provider",
+            "APPLE_API_KEY": "KEYID12345",
+            "APPLE_API_ISSUER": "issuer-uuid",
+            "APPLE_API_KEY_PATH": "/nonexistent/AuthKey.p8",
         }
 
-        self.assertEqual(tauri_ci.tauri_environment(environment), environment)
+        with self.assertRaises(tauri_ci.ConfigurationError) as error:
+            tauri_ci.tauri_environment(environment)
+        self.assertIn("APPLE_API_KEY_PATH", str(error.exception))
 
     def test_partial_certificate_and_notarization_settings_fail_without_values_in_errors(self):
         cases = (
             {"APPLE_CERTIFICATE": "certificate"},
             {"APPLE_SIGNING_IDENTITY": "identity"},
             {"APPLE_CERTIFICATE_PASSWORD": "password"},
-            {"APPLE_ID": "build@example.invalid"},
-            {"APPLE_ID": "build@example.invalid", "APPLE_PASSWORD": "app-password"},
+            {"APPLE_API_KEY": "KEYID12345"},
+            {"APPLE_API_KEY": "KEYID12345", "APPLE_API_ISSUER": "issuer-uuid"},
         )
         for environment in cases:
             with self.subTest(environment=environment):
@@ -131,12 +177,12 @@ class TauriCiTests(unittest.TestCase):
         runner = RecordingRunner()
         errors = io.StringIO()
         with contextlib.redirect_stderr(errors):
-            code = tauri_ci.main(["build"], {"APPLE_ID": "build@example.invalid"}, runner)
+            code = tauri_ci.main(["build"], {"APPLE_API_KEY": "KEYID12345"}, runner)
 
         self.assertEqual(code, 1)
         self.assertEqual(runner.calls, [])
-        self.assertIn("APPLE_PASSWORD", errors.getvalue())
-        self.assertNotIn("build@example.invalid", errors.getvalue())
+        self.assertIn("APPLE_API_ISSUER", errors.getvalue())
+        self.assertNotIn("KEYID12345", errors.getvalue())
 
 
 if __name__ == "__main__":

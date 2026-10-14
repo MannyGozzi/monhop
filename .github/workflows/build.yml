@@ -27,6 +27,8 @@ jobs:
             target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc --bundles nsis
     runs-on: ${{ matrix.platform }}
+    # Signing secrets live only in this environment, which admits main and v* tags.
+    environment: release
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -37,15 +39,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo 'Configure TAURI_SIGNING_PRIVATE_KEY in repository Actions secrets before building.' >&2
+            echo 'Configure TAURI_SIGNING_PRIVATE_KEY in the release environment before building.' >&2
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
-      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: ${{ matrix.target }}
+      # No build cache here: main CI runs can write caches, and this job holds the signing secrets.
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
@@ -53,17 +54,29 @@ jobs:
         run: cargo install tauri-cli --version 2.11.4 --locked
       - name: Check the dependency reports
         run: python3 scripts/dependencies.py --check
+      - name: Write the notarization key
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [ -n "$APPLE_API_KEY_P8" ]; then
+            key_dir="$RUNNER_TEMP/notarization"
+            mkdir -m 700 "$key_dir"
+            (umask 077 && printf '%s\n' "$APPLE_API_KEY_P8" > "$key_dir/AuthKey.p8")
+            echo "APPLE_API_KEY_PATH=$key_dir/AuthKey.p8" >> "$GITHUB_ENV"
+          fi
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         id: tauri
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Apple credentials reach only the macOS builds; the notarization key file exists only there.
+          APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_API_KEY: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_ISSUER: ${{ runner.os == 'macOS' && secrets.APPLE_API_ISSUER || '' }}
         with:
           projectPath: apps/monhop-desktop
           tauriScript: python3 ../../scripts/tauri_ci.py
@@ -85,6 +98,35 @@ jobs:
               raise SystemExit('Expected exactly one macOS app bundle to verify before upload.')
           subprocess.run(['python3', 'scripts/verify_macos_bundle.py', bundles[0]], check=True)
           PY
+      - name: Notarize the disk image and check Gatekeeper
+        # Tauri notarizes and staples the app but only signs the disk image.
+        if: runner.os == 'macOS' && env.APPLE_API_KEY_PATH != ''
+        shell: bash
+        env:
+          BUNDLES: ${{ steps.tauri.outputs.artifactPaths }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          app=$(jq -er '[.[] | select(endswith(".app"))] | if length == 1 then .[0] else error("expected one app") end' <<<"$BUNDLES")
+          dmg=$(jq -er '[.[] | select(endswith(".dmg"))] | if length == 1 then .[0] else error("expected one disk image") end' <<<"$BUNDLES")
+          auth=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          result="$RUNNER_TEMP/dmg-notarization.json"
+          xcrun notarytool submit "$dmg" "${auth[@]}" --wait --output-format json > "$result" || true
+          if ! jq -e '.status == "Accepted"' "$result" > /dev/null; then
+            cat "$result" >&2
+            if id=$(jq -er '.id' "$result"); then
+              xcrun notarytool log "$id" "${auth[@]}" >&2 || true
+            fi
+            exit 1
+          fi
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose "$app"
+          spctl --assess --type open --context context:primary-signature --verbose "$dmg"
+      - name: Remove the notarization key
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/notarization"
       - name: Collect the bundle paths
         id: bundles
         shell: bash

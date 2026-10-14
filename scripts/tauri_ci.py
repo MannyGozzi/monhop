@@ -12,12 +12,14 @@ from typing import Callable, Mapping, MutableMapping, Optional, Sequence
 CERTIFICATE = "APPLE_CERTIFICATE"
 CERTIFICATE_PASSWORD = "APPLE_CERTIFICATE_PASSWORD"
 SIGNING_IDENTITY = "APPLE_SIGNING_IDENTITY"
-NOTARIZATION = ("APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID")
+NOTARIZATION = ("APPLE_API_KEY", "APPLE_API_ISSUER", "APPLE_API_KEY_PATH")
+# Tauri prefers these over the API key, and an app-specific password also opens the account's iCloud data.
+RETIRED = ("APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID")
 APPLE_CREDENTIALS = (CERTIFICATE, CERTIFICATE_PASSWORD, SIGNING_IDENTITY, *NOTARIZATION)
 
 
 class ConfigurationError(RuntimeError):
-    """Raised when optional Apple credentials are only partly configured."""
+    """Raised when optional Apple credentials are only partly configured or use a retired method."""
 
 
 def configured(environment: Mapping[str, str], name: str) -> bool:
@@ -46,10 +48,16 @@ def tauri_environment(environment: Mapping[str, str]) -> MutableMapping[str, str
         cleaned[CERTIFICATE_PASSWORD] = password
         cleaned[SIGNING_IDENTITY] = environment[SIGNING_IDENTITY]
 
+    if any(configured(environment, name) for name in RETIRED):
+        raise ConfigurationError("notarize with the App Store Connect API key; remove APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID")
     notarization = [configured(environment, name) for name in NOTARIZATION]
     if any(notarization) and not all(notarization):
-        raise ConfigurationError("APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID must be set together")
+        raise ConfigurationError("APPLE_API_KEY, APPLE_API_ISSUER, and APPLE_API_KEY_PATH must be set together")
     if all(notarization):
+        if not certificate:
+            raise ConfigurationError("notarization requires APPLE_CERTIFICATE and APPLE_SIGNING_IDENTITY")
+        if not os.path.isfile(environment["APPLE_API_KEY_PATH"]):
+            raise ConfigurationError("APPLE_API_KEY_PATH must name the notarization key file")
         for name in NOTARIZATION:
             cleaned[name] = environment[name]
     return cleaned
