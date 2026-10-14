@@ -18,13 +18,21 @@ The other keys can be replaced in minutes (see [Replacing one secret](#replacing
 
 ## Where every secret lives
 
-**Master copies: 1Password**, in one item named `MonHop release signing`:
+**Master copies: 1Password**, in one Secure Note named `MonHop release signing`:
 
-| Field or attachment | Used for |
-|---|---|
-| `Certificates.p12` and its export password | Developer ID certificate and private key, exported together with Apple's G2 intermediate |
-| `AuthKey_<KEYID>.p8`, its Key ID and the Issuer ID | Notarization API key (Apple lets you download it only once) |
-| `monhop-updater.key` and `monhop-updater.key.pub` | Updater key pair |
+| Kind | Name | Contents |
+|---|---|---|
+| Password field | `p12 password` | the password chosen when exporting `Certificates.p12` |
+| Text field | `API Key ID` | the 10-character ID in the `.p8` file name, such as `DH45Z766Z9` |
+| Text field | `API Issuer ID` | the team's Issuer ID (see below) |
+| Text field | `Team ID` | `2CU4CSTZWR` |
+| File | `Certificates.p12` | Developer ID certificate and private key, exported together with Apple's G2 intermediate |
+| File | `AuthKey_<KEYID>.p8` | notarization API key; Apple allows only one download |
+| File | `monhop-updater.key`, `monhop-updater.key.pub` | updater key pair from `~/.tauri` (hidden folder: press Cmd+Shift+G in a file picker and type `~/.tauri`) |
+
+The **Issuer ID** identifies the Gozzi LLC team to Apple. A request needs the `.p8`, its Key ID and the Issuer ID together. Find it at appstoreconnect.apple.com → Users and Access → Integrations tab → App Store Connect API → Team Keys tab. It is the value labeled "Issuer ID" above the keys table: 36 characters in five dash-separated groups, such as `57246542-96fe-1a63-e053-0824d011072a`. It is the same for every key on the team.
+
+To make a new notarization key on the same page, click **+** next to Active. Name it `MonHop notarization`, set Access to **Developer** and click **Generate**. Then click **Download API Key** right away, because Apple allows only one download.
 
 **Working copies: the `release` environment on GitHub** (Settings → Environments → release). It accepts only the `main` branch and `v*` tags, so a workflow pushed on any other branch cannot read these secrets. Pull requests never receive them. No signing secret may exist at repository level, where every branch could read it.
 
@@ -105,7 +113,7 @@ Upload replacements with `scripts/store-release-secrets.sh`, update 1Password, t
 |---|---|---|
 | Developer ID certificate expiring (current one: 2027-11-12) | developer.apple.com → Certificates → **+** → Developer ID Application → G2 Sub-CA, using a request made in Keychain Access → Certificate Assistant. Install it in the **login** keychain. Export it with the G2 intermediate as a `.p12`. | None. macOS ties permissions to the team ID, not the certificate, and notarized builds keep working after their certificate expires. |
 | `.p12` password forgotten | Export a new `.p12` from the keychain that still holds the key. Otherwise create a new certificate as above. | None |
-| API key lost or leaked | Revoke it in App Store Connect and generate a new one with the Developer role | None |
+| API key lost or leaked | On the Team Keys page, revoke it, then generate and download a new one as described above | None |
 | Updater key leaked | Release a version that builds in a new public key, signed one last time with the old key. Then switch the secret and 1Password to the new key. | One extra update |
 | Updater key lost | Generate a new key, put its public half in `tauri.conf.json`, and release. Installed copies cannot verify it, so tell users to download the new version by hand once. | Everyone reinstalls manually |
 

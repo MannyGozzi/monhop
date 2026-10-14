@@ -57,15 +57,25 @@ for attempt in 1 2 3; do
   echo "  OpenSSL: $(head -1 <<<"$error")" >&2
   [[ $attempt == 3 ]] && fail 'Could not open the .p12.'
 done
-leaf=$("$openssl" pkcs12 -legacy -in "$p12" -passin env:P12_PASS -nokeys -clcerts 2>/dev/null || true)
-identity=$("$openssl" x509 -noout -subject -nameopt multiline <<<"$leaf" 2>/dev/null | sed -n 's/^ *commonName *= //p' || true)
-[[ $identity == 'Developer ID Application: '* ]] || fail 'The .p12 does not hold a Developer ID Application certificate.'
+# Keychain Access tags every exported certificate as the key's, so match certificates by public key instead.
 key_half=$("$openssl" pkcs12 -legacy -in "$p12" -passin env:P12_PASS -nocerts -nodes 2>/dev/null \
   | "$openssl" pkey -pubout 2>/dev/null | shasum -a 256 | cut -d' ' -f1 || true)
-cert_half=$("$openssl" x509 -pubkey -noout <<<"$leaf" 2>/dev/null | shasum -a 256 | cut -d' ' -f1 || true)
-[[ $key_half != "$empty_sha256" && $key_half == "$cert_half" ]] || fail 'The .p12 private key is missing or does not match its certificate.'
-"$openssl" pkcs12 -legacy -in "$p12" -passin env:P12_PASS -nokeys -cacerts 2>/dev/null | grep -q 'OU *= *G2\|OU=G2' \
-  || echo "Warning: the .p12 lacks Apple's G2 intermediate; export it together with the identity (docs/SIGNING.md)." >&2
+[[ $key_half != "$empty_sha256" ]] || fail 'The .p12 has no private key.'
+"$openssl" pkcs12 -legacy -in "$p12" -passin env:P12_PASS -nokeys 2>/dev/null \
+  | awk -v dir="$scratch" '/-----BEGIN CERTIFICATE-----/ { n++; out = dir "/cert-" n ".pem" } out { print > out } /-----END CERTIFICATE-----/ { close(out); out = "" }'
+identity=
+has_g2=false
+for cert in "$scratch"/cert-*.pem; do
+  [[ -f $cert ]] || continue
+  subject=$("$openssl" x509 -in "$cert" -noout -subject -nameopt multiline 2>/dev/null || true)
+  if [[ $("$openssl" x509 -in "$cert" -pubkey -noout 2>/dev/null | shasum -a 256 | cut -d' ' -f1) == "$key_half" ]]; then
+    identity=$(sed -n 's/^ *commonName *= //p' <<<"$subject")
+  elif grep -q 'commonName *= Developer ID Certification Authority' <<<"$subject" && grep -q 'organizationalUnitName *= G2' <<<"$subject"; then
+    has_g2=true
+  fi
+done
+[[ $identity == 'Developer ID Application: '* ]] || fail 'The .p12 private key does not belong to a Developer ID Application certificate in it.'
+$has_g2 || echo "Warning: the .p12 lacks Apple's G2 intermediate; export it together with the identity (docs/SIGNING.md)." >&2
 echo "Certificate: $identity"
 
 set_secret() { gh secret set "$1" --env "$env_name" --repo "$repo" >/dev/null; echo "  set $1"; }
