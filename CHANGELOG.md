@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Changed
+
+- MonHop for Mac is now signed by Gozzi LLC and notarized by Apple, so it opens with a double-click instead of the "unidentified developer" block. After updating to this version, macOS may ask once more for Accessibility, Input Monitoring and Keychain access, because earlier versions were not signed with a stable identity. Later updates keep those permissions.
+
 ## [0.2.7] - 2026-10-09
 
 ### Added
