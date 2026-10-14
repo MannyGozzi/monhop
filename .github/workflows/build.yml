@@ -82,6 +82,23 @@ jobs:
           tauriScript: python3 ../../scripts/tauri_ci.py
           args: ${{ matrix.args }} --ci -- --locked
           includeUpdaterJson: false
+      - name: Verify the updater signatures
+        # Installed copies reject updates not signed by the key built into the app.
+        shell: bash
+        env:
+          BUNDLES: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          signatures = [path for path in json.loads(os.environ['BUNDLES']) if path.endswith('.sig')]
+          if not signatures:
+              raise SystemExit('The build produced no updater signatures.')
+          subprocess.run([sys.executable, 'scripts/verify_updater_signature.py', *signatures], check=True)
+          PY
       - name: Verify macOS permission packaging
         if: runner.os == 'macOS'
         shell: bash

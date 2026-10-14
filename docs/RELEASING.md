@@ -32,19 +32,7 @@ The final check requests the latest-release API and every download without authe
 
 ## Secrets the workflow needs
 
-Every signing secret lives in the `release` environment (Settings → Environments), which admits only `main` and `v*` tags. A workflow pushed on any other branch cannot read them, and pull requests never receive them. Keep no signing secret at repository level, where every branch could read it. The build job also keeps no build cache, because caches written by ordinary `main` CI runs could otherwise reach the job that holds these secrets.
-
-`TAURI_SIGNING_PRIVATE_KEY` must contain the existing updater private key, not its path. Its public half is built into the app. Do not generate a replacement key for CI: existing installations would reject updates signed with it. Builds check for the key before installing the toolchain and fail instead of producing unsigned updater artifacts.
-
-The maintainer's local key is at `~/.tauri/monhop-updater.key`. With explicit authorization to send it to this repository's GitHub Actions secrets, configure it without printing it:
-
-```sh
-gh secret set TAURI_SIGNING_PRIVATE_KEY --env release --repo MannyGozzi/monhop < "$HOME/.tauri/monhop-updater.key"
-```
-
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is optional for the current unencrypted key. An absent secret resolves to an empty value. For an encrypted key, set the matching password separately and never commit either value. Keep a separate encrypted backup in a password manager: GitHub can use a saved secret but does not provide its value for recovery.
-
-Apple signing and notarization are optional. To sign, set `APPLE_CERTIFICATE` (the base64 Developer ID Application `.p12`, exported together with Apple's G2 intermediate), `APPLE_CERTIFICATE_PASSWORD` and `APPLE_SIGNING_IDENTITY`. To notarize, set `APPLE_API_KEY` (key ID), `APPLE_API_ISSUER` (issuer ID) and `APPLE_API_KEY_P8` (the `.p8` file's contents) from an App Store Connect team key with the Developer role. The key can notarize but cannot open the account's iCloud data the way an app-specific password can, so the CI wrapper refuses `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID`. The build notarizes and staples the app and then the disk image, and fails unless Gatekeeper accepts both. Until the Apple secrets exist the Mac app is ad hoc signed and macOS asks the person installing it to allow the app by hand. The CI wrapper omits absent Apple credentials instead of passing empty certificate values to Tauri; partially configured credentials fail with a setup error.
+Builds sign with secrets stored in the repository's `release` environment, which admits only `main` and `v*` tags. [SIGNING.md](SIGNING.md) explains each key, where its master copy lives, how to upload it with `scripts/store-release-secrets.sh`, how to check a build by hand, and how to recover from a lost Mac. Builds stop before installing the toolchain when the updater key is missing, and fail when an updater signature does not match the key built into the app. The updater key is the one secret that can never be regenerated.
 
 ## Rolling back
 
