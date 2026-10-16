@@ -61,8 +61,8 @@ fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid autostart preference")
 }
 
-/// The OS registration outcomes `sync` reconciles against; `NotRegistered` is the only status a
-/// registration call runs from, and any other status is the only one an unregistration runs from.
+/// The OS registration outcomes `sync` reconciles against. `NotRegistered` and `NotFound` are the
+/// statuses a registration call runs from; any other status is one an unregistration runs from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     NotRegistered,
@@ -153,7 +153,8 @@ impl Autostart {
             Status::Enabled => State::On,
             Status::RequiresApproval => State::RequiresApproval,
             Status::DisabledBySystem => State::DisabledBySystem,
-            Status::NotFound => State::NotFound,
+            Status::NotFound if enabled => State::NotFound,
+            Status::NotFound => State::Off,
         };
         AutostartView {
             enabled,
@@ -191,10 +192,12 @@ impl Autostart {
         let paired = Self::paired(setup_path);
         let desired = enabled && paired;
         let outcome = self.registration.status().and_then(|current| {
-            if desired && current == Status::NotRegistered {
+            // macOS reports an agent it never registered as NotFound, not only one that moved.
+            let registered = !matches!(current, Status::NotRegistered | Status::NotFound);
+            if desired && !registered {
                 self.registration.register()?;
                 self.registration.status()
-            } else if !desired && current != Status::NotRegistered {
+            } else if !desired && registered {
                 self.registration.unregister()?;
                 self.registration.status()
             } else {
@@ -543,11 +546,7 @@ mod tests {
     fn statuses_that_are_already_registered_are_left_alone_when_still_wanted() {
         let dir = temp_dir();
         let setup_path = paired_setup_path(&dir);
-        for status in [
-            Status::RequiresApproval,
-            Status::DisabledBySystem,
-            Status::NotFound,
-        ] {
+        for status in [Status::RequiresApproval, Status::DisabledBySystem] {
             let fake = Fake::new(status);
             let instance = autostart(true, &fake);
             let view = instance.sync(Some(&setup_path));
@@ -556,9 +555,29 @@ mod tests {
             match status {
                 Status::RequiresApproval => assert_eq!(view.state, State::RequiresApproval),
                 Status::DisabledBySystem => assert_eq!(view.state, State::DisabledBySystem),
-                Status::NotFound => assert_eq!(view.state, State::NotFound),
                 _ => unreachable!(),
             }
+        }
+    }
+
+    #[test]
+    fn a_never_registered_agent_reported_as_not_found_registers_and_is_never_unregistered() {
+        let dir = temp_dir();
+        let setup_path = paired_setup_path(&dir);
+        let fake = Fake::new(Status::NotFound);
+        let view = autostart(true, &fake).view(Some(&setup_path));
+        assert_eq!(view.state, State::NotFound);
+
+        let view = autostart(true, &fake).sync(Some(&setup_path));
+        assert_eq!(view.state, State::On);
+        assert_eq!(fake.register_calls.load(Ordering::Relaxed), 1);
+
+        for setup in [Some(setup_path.as_path()), None] {
+            let fake = Fake::new(Status::NotFound);
+            let view = autostart(false, &fake).sync(setup);
+            assert_eq!(view.state, State::Off);
+            assert_eq!(fake.unregister_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(fake.register_calls.load(Ordering::Relaxed), 0);
         }
     }
 
