@@ -5,7 +5,8 @@ import {
   autostartStatusText,
   showAutostartOpenSettings,
 } from "./autostart-model.mjs";
-import { button, card, clear, el, note, rows, switchRow } from "./dom.mjs";
+import { presence } from "./accordion.mjs";
+import { button, card, clear, el, note, progressBar, rows, switchRow } from "./dom.mjs";
 
 export function renderSettings(nodes, ctx) {
   clear(nodes.settingsContent);
@@ -30,22 +31,16 @@ function updatesCard(ctx) {
         onChange: actions.setUpdatesAutomatic,
       }),
     ]),
-    el("p", { className: "note", id: "settings-updates-status", text: updatesStatusText(view) }),
+    note(updatesStatusText(view)),
+    // Both come and go with the phase; each glides its own height so the cards below never jump.
+    presence(
+      "settings-updates-progress",
+      view.phase === "downloading"
+        ? progressBar("settings-updates-progress", (view.progressPercent ?? 0) / 100)
+        : null,
+    ),
+    presence("settings-updates-hint", hint ? note(hint, "danger") : null),
   ];
-  if (view.phase === "downloading")
-    children.push(
-      el("div", {
-        className: "progress-bar",
-        id: "settings-updates-progress",
-        children: [
-          el("div", {
-            className: "progress-bar-fill",
-            attrs: { style: `width: ${view.progressPercent ?? 0}%` },
-          }),
-        ],
-      }),
-    );
-  if (hint) children.push(note(hint, "danger"));
   return card({
     id: "settings-updates",
     title: "Updates",
@@ -81,29 +76,26 @@ function startupCard(ctx) {
         onChange: actions.setAutostart,
       }),
     ]),
-    el("p", {
-      className: "note",
-      id: "settings-autostart-status",
-      text: autostartStatusText(view),
-    }),
+    note(autostartStatusText(view)),
+    presence(
+      "settings-autostart-open",
+      showAutostartOpenSettings(view)
+        ? el("div", {
+            className: "card-actions",
+            children: [
+              button(autostartOpenLabel(platform), {
+                id: "settings-autostart-open",
+                variant: "outline",
+                disabled: pending,
+                busy: pending,
+                onClick: actions.openAutostartSettings,
+              }),
+            ],
+          })
+        : null,
+    ),
   ];
-  const actionButtons = [];
-  if (showAutostartOpenSettings(view))
-    actionButtons.push(
-      button(autostartOpenLabel(platform), {
-        id: "settings-autostart-open",
-        variant: "outline",
-        disabled: pending,
-        busy: pending,
-        onClick: actions.openAutostartSettings,
-      }),
-    );
-  return card({
-    id: "settings-startup",
-    title: "Startup",
-    children,
-    actions: actionButtons,
-  });
+  return card({ id: "settings-startup", title: "Startup", children });
 }
 
 function aboutCard(ctx) {

@@ -1,5 +1,6 @@
 import {
   changedAgo,
+  copyAnimation,
   ghostOf,
   handOffFocus,
   motionEase,
@@ -10,7 +11,6 @@ import {
 } from "./dom.mjs";
 import {
   contentMove,
-  copyPlacement,
   gapMargin,
   gapShare,
   moved,
@@ -48,6 +48,8 @@ const turns = new Set();
 reducedMotion.addEventListener("change", () => {
   for (const [node, entry] of glides) endGlide(node, entry.settle);
   for (const turn of turns) turn.finish();
+  for (const animation of widthGlides.values()) animation.cancel();
+  widthGlides.clear();
 });
 
 // Fired on the accordion element when the user toggles it, never when a render reopens it.
@@ -276,6 +278,27 @@ export function glideResize(node, from) {
   if (moved(to, from)) glideHeight(node, from, to);
 }
 
+// Running width glides, apart from `glides` so a box can slide and resize at once.
+const widthGlides = new Map();
+
+// A box whose content changed its width (a label that grew or shrank) eases from the width it was
+// drawn at (`from`, read before the change, so a glide still running retargets from where it is).
+export function glideWidth(node, from) {
+  widthGlides.get(node)?.cancel();
+  widthGlides.delete(node);
+  if (!canGlide(node)) return;
+  const to = node.getBoundingClientRect().width;
+  if (!moved(to, from)) return;
+  const animation = node.animate(
+    { width: [`${from}px`, `${to}px`] },
+    { duration: motionMs("--motion-slow"), easing: motionEase("--ease-glide") },
+  );
+  widthGlides.set(node, animation);
+  animation.onfinish = () => {
+    if (widthGlides.get(node) === animation) widthGlides.delete(node);
+  };
+}
+
 // A node that moved within the layout slides over from the client rect it was drawn in (`from`).
 export function glideMove(node, from) {
   stopGlide(node);
@@ -321,14 +344,6 @@ function transplant(from, to) {
   to.dataset.gliding = "true";
   const settle = () => land(to, entry.target);
   track(to, { ...entry, animation, fade, settle });
-}
-
-function copyAnimation(animation, node) {
-  const copy = node.animate(animation.effect.getKeyframes(), animation.effect.getTiming());
-  const placement = copyPlacement(animation);
-  if ("startTime" in placement) copy.startTime = placement.startTime;
-  else copy.currentTime = placement.currentTime;
-  return copy;
 }
 
 // Turns a chevron from the transform it showed (`from`, null when its state did not change, so a

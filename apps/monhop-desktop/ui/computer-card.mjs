@@ -37,6 +37,7 @@ import {
   rows,
   settle,
   sinceChanged,
+  stableLabel,
   statusChip,
   swap,
   switchRow,
@@ -495,6 +496,8 @@ function stepOrbit(pill, now) {
   else if (!next.done) spin.frame = requestAnimationFrame((time) => stepOrbit(pill, time));
 }
 
+// The angle was read at this frame's time, so the loop starts on it now; left pending, it would
+// hold the pair still for a frame on every render.
 function startSpin(pill) {
   const spin = pill.spin;
   spin.from = spin.angle % (2 * Math.PI);
@@ -502,6 +505,7 @@ function startSpin(pill) {
     { transform: [`rotate(${spin.from}rad)`, `rotate(${spin.from + 2 * Math.PI}rad)`] },
     { duration: spin.lap, iterations: Infinity },
   );
+  spin.loop.startTime = document.timeline.currentTime;
 }
 
 function drawOrbit(pill) {
@@ -833,17 +837,24 @@ function layoutRow(ctx, fingerprint, item, index) {
     leading: layoutChipStrip(`layout-${key}`, entry),
     actions: [
       loadButton(actions, fingerprint, entry, key, load, disabled),
-      button(armed ? "Confirm forget" : "Forget", {
-        variant: armed ? "destructive" : "ghost",
-        size: "sm",
-        disabled,
-        pressed: armed,
-        focusKey: `layout-forget-${key}`,
-        onClick: () => actions.pressLayoutForget(fingerprint, entry.name),
-      }),
+      forgetButton(actions, fingerprint, entry, key, armed, disabled),
     ],
   });
   node.style.setProperty("--row-index", String(index));
+  return node;
+}
+
+// Arming keeps the button's width, so Load beside it stays put while the label turns into the question.
+function forgetButton(actions, fingerprint, entry, key, armed, disabled) {
+  const node = button("", {
+    variant: armed ? "destructive" : "ghost",
+    size: "sm",
+    disabled,
+    pressed: armed,
+    focusKey: `layout-forget-${key}`,
+    onClick: () => actions.pressLayoutForget(fingerprint, entry.name),
+  });
+  node.append(stableLabel(`layout-forget-${key}`, ["Forget", "Confirm forget"], armed ? 1 : 0));
   return node;
 }
 

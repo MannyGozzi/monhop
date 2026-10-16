@@ -34,6 +34,7 @@ import {
   note,
   row,
   rows,
+  stableLabel,
   stateCard,
   switchRow,
 } from "./dom.mjs";
@@ -370,7 +371,10 @@ function arrangementRow(ctx, entry) {
   const detail = `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`;
   const key = rowKey(entry.name);
   const deleting = pendingDelete === entry.name;
-  const remove = button(deleting ? "Confirm delete" : "Delete", {
+  // Arming keeps the button's width, so Load and Overwrite beside it stay put.
+  const label = (armed) =>
+    stableLabel(`${key}-delete`, ["Delete", "Confirm delete"], armed ? 1 : 0);
+  const remove = button("", {
     variant: deleting ? "destructive" : "ghost",
     size: "sm",
     disabled: busy,
@@ -379,7 +383,7 @@ function arrangementRow(ctx, entry) {
     onClick: () => {
       if (pendingDelete !== entry.name) {
         pendingDelete = entry.name;
-        remove.textContent = "Confirm delete";
+        remove.querySelector(".stable-label").replaceWith(label(true));
         remove.dataset.variant = "destructive";
         remove.setAttribute("aria-pressed", "true");
         return;
@@ -388,6 +392,7 @@ function arrangementRow(ctx, entry) {
       void actions.deleteArrangement(entry.name);
     },
   });
+  remove.append(label(deleting));
   return row({
     title: entry.name,
     detail,

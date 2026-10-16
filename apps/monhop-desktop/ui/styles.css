@@ -454,7 +454,9 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .row-leading:has(.row-leading-chips[data-empty="true"]) { gap: 0; }
 .row-leading-chips { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--gap-1); min-width: 0; }
 .row-leading-chips .status-pill { height: var(--badge-height); padding: 0 var(--gap-2); background: var(--control-fill); font-size: var(--text-xs); }
-.chip-slot { display: inline-block; width: 0; }
+/* Holds a status chip's place while it is gone, as tall as the chip, so its coming and going moves nothing. */
+.chip-slot { display: inline-block; width: 0; height: var(--status-pill-height); }
+.row-leading-chips .chip-slot { height: var(--badge-height); }
 .radio-mark { width: var(--radio-size); height: var(--radio-size); border-radius: var(--radius-circle); background: var(--card); box-shadow: inset 0 0 0 var(--hairline-width) var(--hairline-strong); transition: var(--transition-control); }
 .row[aria-checked="true"] .radio-mark { background: var(--thumb); box-shadow: inset 0 0 0 var(--radio-ring) var(--primary-fill); }
 
@@ -484,6 +486,10 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 :is(.icon-button, .pair-picture):is(:hover, :focus-visible) .tooltip { opacity: 1; transform: none; }
 :is(.icon-button, .pair-picture)[data-tooltip-dismissed="true"] .tooltip { opacity: 0; transform: scale(var(--scale-enter)); }
 .pair-picture .tooltip { right: auto; left: 0; transform-origin: top left; }
+/* dom.mjs stableLabel: every label in one cell, so the widest sets the control's width. */
+.stable-label { display: inline-grid; }
+.stable-label > span { grid-area: 1 / 1; text-align: center; }
+.stable-label > [data-current="false"] { opacity: 0; }
 .spin { animation: spin var(--loop-spin) linear infinite; }
 .theme-toggle[data-changed="true"] svg { animation: theme-pop var(--motion-spring) var(--ease-spring) both; }
 
@@ -626,7 +632,8 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .spinner { width: var(--icon-size); height: var(--icon-size); flex: none; border: var(--stroke-bold) solid color-mix(in oklab, currentColor var(--mix-edge), transparent); border-top-color: currentColor; border-radius: var(--radius-circle); animation: spin var(--loop-spin) linear infinite; }
 .progress-line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap-2); color: var(--muted-foreground); font-size: var(--text-sm); }
 .progress-bar { position: relative; height: var(--slider-track); overflow: hidden; border-radius: var(--radius-pill); background: var(--hairline-strong); }
-.progress-bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--primary); transition: width var(--motion-slow) var(--ease-out); }
+/* dom.mjs progressBar sets --progress and glides the scale between renders. */
+.progress-bar-fill { position: absolute; inset: 0; border-radius: inherit; background: var(--primary); transform: scaleX(var(--progress, 0)); transform-origin: left center; }
 
 /* Computer card */
 .computer-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--gap-3); }
@@ -653,7 +660,8 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .computer-name:hover svg, .computer-name:focus-visible svg { opacity: 1; }
 .computer-name-input { width: 100%; min-width: 0; border: var(--hairline-width) solid var(--primary); background: var(--surface-inset); box-shadow: var(--shadow-focus); }
 .computer-name-input:disabled { opacity: var(--opacity-disabled); }
-.computer-meta { display: flex; align-items: center; gap: var(--gap-2); min-width: 0; color: var(--muted-foreground); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+/* As tall as the pairing badge it carries, so the rename hint that replaces both never shifts the card. */
+.computer-meta { display: flex; align-items: center; gap: var(--gap-2); min-width: 0; min-height: var(--badge-height); color: var(--muted-foreground); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
 .computer-meta > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .computer-actions { display: flex; flex: none; align-items: center; gap: var(--gap-2); }
 .card-extras { display: grid; gap: var(--card-gap); min-width: 0; }
@@ -749,6 +757,8 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
   /* The step to do next breathes; the marker persists across renders, so the loop never restarts. */
   .setup-section[data-locked="false"][data-done="false"] .section-index::after { animation: step-breathe var(--loop-breathe) var(--ease-in-out) infinite alternate; }
   .pair-countdown-fill[data-running="true"] { animation: countdown-drain var(--countdown-total) linear var(--countdown-delay, 0ms) both; }
+  .stable-label[data-enter="true"] > [data-current="true"] { animation: fade-in var(--motion-base) var(--ease-out) var(--motion-delay, 0ms) both; }
+  .stable-label[data-enter="true"] > [data-current="false"] { animation: fade-out var(--motion-fast) var(--ease-out) var(--motion-delay, 0ms) both; }
   .pair-badge[data-enter="true"] { animation: pop-in var(--motion-spring) var(--ease-spring) var(--motion-delay, 0ms) both; }
   .pair-badge[data-enter="true"] .pair-badge-symbol { animation: pop-in var(--motion-spring) var(--ease-spring) calc(var(--motion-delay, 0ms) + (var(--symbol-index, 0) + 1) * var(--motion-stagger)) both; }
 }
@@ -918,6 +928,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 @keyframes fade-up { from { opacity: 0; transform: translateY(var(--motion-rise)); } }
 /* In/out pairs end on the element's own resting style, so one keyframe serves every state. */
 @keyframes fade-in { from { opacity: 0; } }
+@keyframes fade-out { from { opacity: 1; } }
 @keyframes pop-in { from { opacity: 0; transform: scale(var(--scale-pop)); } }
 @keyframes tile-in { from { opacity: 0; transform: scale(var(--scale-enter)); } }
 @keyframes tile-out { to { opacity: 0; transform: scale(var(--scale-pop)); } }
@@ -937,9 +948,11 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 @keyframes guide-track { 0%, 30% { background-color: var(--switch-track-off); } 70%, 100% { background-color: var(--primary-fill); } }
 @keyframes guide-switch { 0%, 30% { transform: none; } 70%, 100% { transform: translateX(calc(var(--mock-switch-width) - var(--mock-knob) - var(--gap-half) * 2)); } }
 
+/* Every change lands at once. The tokens keep their values: JS reads them once and checks the query itself. */
 @media (prefers-reduced-motion: reduce) {
-  :root { --motion-spring: 0ms; }
   *, *::before, *::after, ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; scroll-behavior: auto !important; }
+  *, *::before, *::after { transition: none !important; }
+  .slider::-webkit-slider-thumb { transition: none !important; }
   .spinner { border-top-color: transparent; }
 }
 @media (max-width: 760px) { .window-product { display: none; } .content-region { padding-inline: var(--gap-4); } .window-header-end .status-pill { max-width: var(--status-pill-max-narrow); } }

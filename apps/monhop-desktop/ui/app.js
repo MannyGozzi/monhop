@@ -73,6 +73,7 @@ import {
   accordionManager,
   glideMove,
   glideResize,
+  glideWidth,
   setPanelOpen,
   setRevealOpen,
 } from "./accordion.mjs";
@@ -122,15 +123,22 @@ import {
 } from "./dimming-model.mjs";
 import { setupSectionGates, shouldShowPairing } from "./setup-presentation.mjs";
 import { setSlotPresent } from "./header-motion.mjs";
+import { followStep } from "./motion-model.mjs";
 import {
+  captureDims,
   clear,
   el,
+  followDims,
   handedOffFocus,
   icon,
   iconButton,
+  motionEnabled,
+  motionMs,
   nativeError,
+  phaseLoops,
   reducedMotion,
   setLabel,
+  turnGlyph,
 } from "./dom.mjs";
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
 import { normalizeAutostartView, trayPlace } from "./autostart-model.mjs";
@@ -233,12 +241,15 @@ let arrangementView = null;
 let arrangementsRevision = null;
 let arrangementsRetry = { at: 0, delay: 0 };
 let pendingSection = null;
+// The frame easing the page toward the pinned section, and when it last stepped.
+const sectionScroll = { frame: 0, at: null, waiting: false };
 let pageTransition = null;
 // Session-only choice: a completed setup returns to the last step the user opened.
 let setupExpandedSection = null;
 let setupExpansionChosen = false;
 
 const nodes = {
+  shell: document.querySelector(".shell"),
   sections: [...document.querySelectorAll("[data-section]")],
   pageLinks: [...document.querySelectorAll("[data-page]")],
   nativeState: document.querySelector("#native-state"),
@@ -282,6 +293,7 @@ for (const button of nodes.windowControls.querySelectorAll("[data-window-action]
 }
 nodes.windowControls.hidden = platform !== "windows";
 accordionManager.mount();
+const headerControls = createHeaderControls();
 
 for (const section of nodes.sections) {
   section.querySelector(".section-toggle").addEventListener("click", () => {
@@ -292,7 +304,7 @@ for (const section of nodes.sections) {
   });
 }
 
-for (const event of ["wheel", "touchstart", "pointerdown"])
+for (const event of ["wheel", "touchstart", "pointerdown", "keydown"])
   document.querySelector(".content-region").addEventListener(
     event,
     () => {
@@ -433,15 +445,51 @@ function scrollToSection(key) {
 
 // The section's content arrives over the next few status polls and changes height under the user, so
 // the request is re-applied after every render until it settles or the user scrolls somewhere else.
+// With motion the page eases there frame by frame, following the section as panels glide around it.
 function pinPendingSection() {
-  if (!pendingSection) return;
+  const offset = pendingSectionOffset();
+  if (offset === null) return;
+  const content = document.querySelector(".content-region");
+  if (!motionEnabled()) {
+    content.scrollTop += offset;
+    return;
+  }
+  // The panels this render changed start gliding after the next frame's callbacks, so that frame waits.
+  sectionScroll.waiting = true;
+  if (sectionScroll.frame) return;
+  sectionScroll.at = null;
+  sectionScroll.frame = requestAnimationFrame(followPendingSection);
+}
+
+// How far the pinned section's top sits below the page's, or null once there is nothing to pin.
+function pendingSectionOffset() {
+  if (!pendingSection) return null;
   const section = nodes.sections.find((node) => node.dataset.section === pendingSection.key);
   const content = document.querySelector(".content-region");
   if (!section || !content || Date.now() > pendingSection.until) {
     pendingSection = null;
-    return;
+    return null;
   }
-  content.scrollTop += section.getBoundingClientRect().top - content.getBoundingClientRect().top;
+  return section.getBoundingClientRect().top - content.getBoundingClientRect().top;
+}
+
+function followPendingSection(now) {
+  sectionScroll.frame = 0;
+  const offset = pendingSectionOffset();
+  if (offset === null || !motionEnabled()) return;
+  const content = document.querySelector(".content-region");
+  const dt = sectionScroll.at === null ? 1000 / 60 : now - sectionScroll.at;
+  sectionScroll.at = now;
+  // While a panel glides the page is still changing height under the section, and a scroll begun
+  // then would be clamped back as the page shrinks; it waits for the layout to settle instead.
+  const settling = sectionScroll.waiting || content.querySelector("[data-gliding]") !== null;
+  sectionScroll.waiting = false;
+  if (!settling) {
+    const from = content.scrollTop;
+    const pixel = 1 / (window.devicePixelRatio || 1);
+    content.scrollTop = followStep(from, from + offset, dt, motionMs("--motion-slow"), pixel);
+  }
+  if (Math.abs(offset) >= 0.5) sectionScroll.frame = requestAnimationFrame(followPendingSection);
 }
 
 // ---------- render ----------
@@ -644,14 +692,17 @@ function render() {
     return;
   }
   const interaction = captureInteraction();
+  const dims = captureDims(nodes.shell);
   // The Displays section hands back the same editor across polls; only a view it dropped is torn down.
   const previousArrangementView = arrangementView;
   arrangementView = null;
   const ctx = context();
   nodes.nativeState.dataset.checkState = nativeCheckState(state);
+  const pillWidth = nodes.headerConnection.getBoundingClientRect().width;
   setLabel(nodes.nativeState, ctx.status.label);
+  glideWidth(nodes.headerConnection, pillWidth);
   nodes.headerConnection.dataset.tone = ctx.status.tone;
-  renderPageChrome(ctx);
+  renderPageChrome();
   renderPageAlert(ctx);
   renderSections(ctx);
   renderReady(nodes, ctx);
@@ -660,6 +711,8 @@ function render() {
   renderHome(nodes, ctx);
   renderSettings(nodes, ctx);
   applySharedTransitionNames();
+  followDims(nodes.shell, dims);
+  phaseLoops();
   restoreInteraction(interaction);
   pinPendingSection();
   if (previousArrangementView && previousArrangementView !== arrangementView)
@@ -668,44 +721,46 @@ function render() {
   syncPairingCountdown();
 }
 
-function renderPageChrome(ctx) {
-  renderPageVisibility();
-  clear(nodes.headerButtons);
-  nodes.headerButtons.append(
-    iconButton({
-      id: "settings-gear",
-      label: "Settings",
-      iconName: "settings",
-      variant: "ghost",
-      size: "sm",
-      onClick: toggleSettings,
-    }),
+function headerButton(id, label, iconName, onClick) {
+  return iconButton({ id, label, iconName, variant: "ghost", size: "sm", onClick });
+}
+
+// The header's buttons outlive renders, so hover, focus, tooltips and a glyph mid-change carry on.
+function createHeaderControls() {
+  const themeToggle = headerButton(
+    "theme-toggle",
+    THEME_LABELS[theme],
+    THEME_ICONS[theme],
+    cycleTheme,
   );
-  const themeToggle = iconButton({
-    id: "theme-toggle",
-    label: THEME_LABELS[theme],
-    iconName: THEME_ICONS[theme],
-    variant: "ghost",
-    size: "sm",
-    onClick: cycleTheme,
-  });
   themeToggle.classList.add("theme-toggle");
-  if (themeChanged) {
-    themeToggle.dataset.changed = "true";
-    themeChanged = false;
-  }
-  nodes.headerButtons.append(themeToggle);
-  if (ctx.core)
-    nodes.headerButtons.append(
-      iconButton({
-        id: "hide-to-tray",
-        label: `Hide to ${trayPlace(platform)}`,
-        iconName: "x",
-        variant: "ghost",
-        size: "sm",
-        onClick: hideToTray,
-      }),
-    );
+  const hide = core?.invoke
+    ? headerButton("hide-to-tray", `Hide to ${trayPlace(platform)}`, "x", hideToTray)
+    : null;
+  const settings = headerButton("settings-gear", "Settings", "settings", toggleSettings);
+  nodes.headerButtons.replaceChildren(...[settings, themeToggle, hide].filter(Boolean));
+  const refresh = headerButton(
+    "computers-refresh",
+    "Check the paired computers again",
+    "refresh-cw",
+    loadComputers,
+  );
+  nodes.headerRefresh.replaceChildren(refresh);
+  return { themeToggle, theme, refresh };
+}
+
+// The theme glyph is swapped only when the theme changes; after a press the new one pops in.
+function renderPageChrome() {
+  renderPageVisibility();
+  const pop = themeChanged;
+  themeChanged = false;
+  const toggle = headerControls.themeToggle;
+  if (headerControls.theme === theme) return;
+  headerControls.theme = theme;
+  toggle.dataset.changed = String(pop);
+  toggle.setAttribute("aria-label", THEME_LABELS[theme]);
+  toggle.querySelector(".tooltip").textContent = THEME_LABELS[theme];
+  toggle.querySelector(":scope > svg").replaceWith(icon(THEME_ICONS[theme]));
 }
 
 // The transition callback only flips page visibility, the named tab marker and the header's page
@@ -729,18 +784,12 @@ function renderPageVisibility() {
 // renders, so it pops in and out while the status pill glides aside.
 function renderHeaderRefresh() {
   const home = page === "home";
-  if (home)
-    nodes.headerRefresh.replaceChildren(
-      iconButton({
-        id: "computers-refresh",
-        label: "Check the paired computers again",
-        variant: "ghost",
-        size: "sm",
-        disabled: computersLoad.running,
-        busy: computersLoad.running,
-        onClick: loadComputers,
-      }),
-    );
+  if (home) {
+    const refresh = headerControls.refresh;
+    refresh.disabled = computersLoad.running;
+    refresh.toggleAttribute("aria-busy", computersLoad.running);
+    turnGlyph(refresh.querySelector(":scope > svg"), "computers-refresh", computersLoad.running);
+  }
   setSlotPresent(nodes.headerRefresh, home, [nodes.headerConnection], {
     focusTarget: home ? null : pageFocusAnchor(),
   });

@@ -1,6 +1,7 @@
 // Small DOM helpers and the shared component vocabulary (button, badge, card, row, icon button with tooltip).
+import { copyPlacement } from "./glide-model.mjs";
 import { icon } from "./icons.mjs";
-import { usableEasing } from "./motion-model.mjs";
+import { dimFollow, spinTurn, tweenValue, usableEasing } from "./motion-model.mjs";
 import { pairBadgeLabel, pairBadgeParts } from "./pair-badge-model.mjs";
 
 export { icon };
@@ -72,9 +73,52 @@ export function iconButton({
   node.classList.add("icon-button");
   node.setAttribute("aria-label", label);
   const glyph = art ?? icon(iconName);
-  if (busy) glyph.classList.add("spin");
+  turnGlyph(glyph, id, busy);
   node.append(glyph);
   return withTooltip(node, `${id}-tooltip`, label);
+}
+
+// Each busy glyph's turn, by key, so a rebuilt glyph keeps its phase and an idle one finishes its turn.
+const spins = new Map();
+
+// Spins `glyph` while `busy` and for the rest of its turn after; phaseLoops places the CSS loop.
+export function turnGlyph(glyph, key, busy) {
+  const last = spins.get(key) ?? null;
+  const turn = spinTurn(last, { busy, now: performance.now(), period: motionMs("--loop-spin") });
+  spins.set(key, turn);
+  // A kept glyph whose last loop already finished needs a fresh one; reading the style drops the old.
+  if (turn.turning && turn.startedAt !== last?.startedAt && glyph.classList.contains("spin")) {
+    glyph.classList.remove("spin");
+    void getComputedStyle(glyph).animationName;
+  }
+  glyph.classList.toggle("spin", turn.turning);
+  if (!turn.turning) {
+    delete glyph.dataset.spinStart;
+    delete glyph.dataset.spinEnd;
+    return;
+  }
+  glyph.dataset.spinStart = String(turn.startedAt);
+  glyph.dataset.spinEnd = String(turn.endsAt);
+}
+
+// Loops on nodes a render rebuilds run on the document clock, so a rebuild never restarts one: a busy
+// glyph from when its work started (turnGlyph), any other spinner or pulse from the clock's origin.
+const CLOCK_LOOPS = new Set(["spin", "notice-dot"]);
+
+export function phaseLoops(root = document) {
+  if (typeof root.getAnimations !== "function") return;
+  const period = motionMs("--loop-spin");
+  for (const animation of root.getAnimations()) {
+    if (!CLOCK_LOOPS.has(animation.animationName)) continue;
+    const { spinStart, spinEnd } = animation.effect?.target?.dataset ?? {};
+    const start = spinStart === undefined ? 0 : Number(spinStart);
+    if (animation.startTime !== start) animation.startTime = start;
+    if (spinStart === undefined || !(period > 0)) continue;
+    const end = Number(spinEnd);
+    const iterations = Number.isFinite(end) ? Math.max(1, (end - start) / period) : Infinity;
+    if (animation.effect.getTiming().iterations !== iterations)
+      animation.effect.updateTiming({ iterations });
+  }
 }
 
 // Shows `label` while `node` is hovered or focused. Escape hides it until the next hover or focus.
@@ -338,6 +382,103 @@ export async function settle(animation, after) {
   after?.();
 }
 
+// The same animation on `node`, at the same point in its timing.
+export function copyAnimation(animation, node) {
+  const copy = node.animate(animation.effect.getKeyframes(), animation.effect.getTiming());
+  const placement = copyPlacement(animation);
+  if ("startTime" in placement) copy.startTime = placement.startTime;
+  else copy.currentTime = placement.currentTime;
+  return copy;
+}
+
+// What a running tween of one number draws now; animations outlive their detached targets.
+function tweenNow(tween) {
+  if (tween?.animation?.playState !== "running") return null;
+  return tweenValue(tween.from, tween.to, tween.animation.effect.getComputedTiming().progress);
+}
+
+// Controls a render rebuilt cannot transition their own disabled look, so each keyed control's drawn
+// opacity is read before the render (captureDims) and its new node fades from there (followDims).
+const DIMMABLE = "button[data-focus-key], button[id], input[data-focus-key], input[id]";
+const dimFades = new Map();
+
+function dimKey(node) {
+  return node.dataset.focusKey || node.id || null;
+}
+
+function fadesOpacity(animation) {
+  return animation.effect?.getKeyframes().some((frame) => "opacity" in frame) ?? false;
+}
+
+// A slider dims its whole row, every other control itself.
+function dimTarget(node) {
+  return node.closest(".slider-row") ?? node;
+}
+
+export function captureDims(root) {
+  const drawn = new Map();
+  if (!motionEnabled()) return drawn;
+  for (const node of root.querySelectorAll(DIMMABLE)) {
+    const key = dimKey(node);
+    if (key && node.getClientRects().length)
+      drawn.set(key, { node, opacity: Number(getComputedStyle(dimTarget(node)).opacity) });
+  }
+  return drawn;
+}
+
+export function followDims(root, drawn) {
+  if (!drawn.size || !motionEnabled()) return;
+  for (const node of root.querySelectorAll(DIMMABLE)) {
+    const last = drawn.get(dimKey(node));
+    const target = dimTarget(node);
+    // A kept node transitions on its own; one already fading in some other way keeps that motion.
+    if (!last || last.node === node || target.getAnimations().some(fadesOpacity)) continue;
+    const key = dimKey(node);
+    const running = dimFades.get(key) ?? null;
+    const resting = Number(getComputedStyle(target).opacity);
+    const follow = dimFollow({
+      drawn: last.opacity,
+      resting,
+      running: tweenNow(running) === null ? null : running.to,
+    });
+    if (follow === "carry") {
+      dimFades.set(key, { ...running, animation: copyAnimation(running.animation, target) });
+      continue;
+    }
+    dimFades.delete(key);
+    if (follow !== "fade") continue;
+    const animation = target.animate(
+      { opacity: [last.opacity, resting] },
+      { duration: motionMs("--motion-fast"), easing: motionEase() },
+    );
+    dimFades.set(key, { animation, from: last.opacity, to: resting });
+  }
+}
+
+// A determinate bar whose fill scales on the compositor. A render rebuilds the bar, so the fill
+// glides from what the last one drew, or carries its glide on when the value did not change.
+const progressFills = new Map();
+
+export function progressBar(key, fraction) {
+  const value = Math.min(Math.max(fraction, 0), 1);
+  const fill = el("div", { className: "progress-bar-fill" });
+  fill.style.setProperty("--progress", String(value));
+  const last = progressFills.get(key) ?? null;
+  const shown = tweenNow(last) ?? last?.to ?? null;
+  let tween = null;
+  if (motionEnabled() && last && last.to === value && tweenNow(last) !== null)
+    tween = { ...last, animation: copyAnimation(last.animation, fill) };
+  else if (motionEnabled() && shown !== null && shown !== value) {
+    const animation = fill.animate(
+      { transform: [`scaleX(${shown})`, `scaleX(${value})`] },
+      { duration: motionMs("--motion-slow"), easing: motionEase() },
+    );
+    tween = { animation, from: shown, to: value };
+  }
+  progressFills.set(key, tween ?? { animation: null, from: value, to: value });
+  return el("div", { className: "progress-bar", children: [fill] });
+}
+
 // A visual copy of a node that left: never focusable, never announced, never a duplicate id.
 export function ghostOf(node) {
   const ghost = node.cloneNode(true);
@@ -393,6 +534,27 @@ export function changedAgo(key, signature) {
 export function sinceChanged(key, signature) {
   const elapsed = changedAgo(key, signature);
   return motionEnabled() ? elapsed : Infinity;
+}
+
+// A label that switches between `labels` without changing its control's width, so nothing beside the
+// control jumps: every label shares one cell, only `current` shows, and a change cross-fades.
+export function stableLabel(key, labels, current) {
+  const node = el("span", {
+    className: "stable-label",
+    children: labels.map((label, index) =>
+      el("span", {
+        text: label,
+        dataset: { current: String(index === current) },
+        attrs: { "aria-hidden": index === current ? null : "true" },
+      }),
+    ),
+  });
+  const elapsed = sinceChanged(`label-${key}`, current);
+  if (elapsed < motionMs("--motion-base")) {
+    node.dataset.enter = "true";
+    node.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+  }
+  return node;
 }
 
 // A live label fades in place. Its container keeps normal layout rather than animating width.

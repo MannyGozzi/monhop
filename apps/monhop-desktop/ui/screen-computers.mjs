@@ -98,8 +98,12 @@ function renderExchange(nodes, ctx) {
   );
   const content = stepContent(step, { ...ctx, badgeElapsed });
   const signature = step === "expired" ? "error" : step;
-  if (content)
-    nodes.computersContent.append(swap("pairing-step", content, signature, { block: true }));
+  // The panel glides between the steps' heights while the swap cross-fades them.
+  const panel = presence(
+    "pairing-step-panel",
+    content ? swap("pairing-step", content, signature, { block: true }) : null,
+  );
+  if (panel) nodes.computersContent.append(panel);
   const message = presence(
     "pairing-message",
     pairing.message ? note(pairing.message, "danger") : null,
