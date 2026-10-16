@@ -146,6 +146,39 @@ impl Reachability {
     }
 }
 
+/// Per member, whether the OS refused the latest datagram to it with "no route to host", as macOS
+/// does while Local Network privacy blocks the app. QUIC still sees such a send as a drop.
+pub(super) struct SendRefusals(Box<[AtomicBool]>);
+
+impl SendRefusals {
+    pub(super) fn new(members: usize) -> Arc<Self> {
+        Arc::new(Self((0..members).map(|_| AtomicBool::new(false)).collect()))
+    }
+
+    pub(super) fn refused(&self, member: usize) -> bool {
+        self.0
+            .get(member)
+            .is_some_and(|refused| refused.load(Ordering::Acquire))
+    }
+
+    fn refuse(&self, member: usize) {
+        if let Some(refused) = self.0.get(member) {
+            refused.store(true, Ordering::Release);
+        }
+    }
+
+    /// Writes only a member marked refused, so a healthy send path never stores.
+    fn clear(&self, member: usize) {
+        if let Some(refused) = self
+            .0
+            .get(member)
+            .filter(|refused| refused.load(Ordering::Relaxed))
+        {
+            refused.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Datagrams one member lost at this socket without a revocation, for diagnostics.
 #[derive(Default)]
 struct Dropped {
@@ -282,6 +315,7 @@ pub(super) struct GuardedSocket<I> {
     admission: Admission,
     /// In member order, like everything else below indexed by member.
     reachability: Arc<Reachability>,
+    refusals: Arc<SendRefusals>,
     first_packets: Mutex<Box<[TokenBucket]>>,
     dropped: Box<[Dropped]>,
     /// From any source, so counted apart from the member slots.
@@ -402,6 +436,7 @@ impl<I> GuardedSocket<I> {
             local,
             admission,
             reachability,
+            refusals: SendRefusals::new(slots),
             first_packets: Mutex::new(
                 (0..slots)
                     .map(|_| TokenBucket::new(FIRST_PACKET_BURST, FIRST_PACKET_REFILL, now))
@@ -442,6 +477,10 @@ impl<I> GuardedSocket<I> {
 
     pub(super) fn reachability(&self) -> Arc<Reachability> {
         self.reachability.clone()
+    }
+
+    pub(super) fn refusals(&self) -> Arc<SendRefusals> {
+        self.refusals.clone()
     }
 }
 
@@ -597,9 +636,16 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         match result {
-            Ok(length) if length == transmit.contents.len() => Ok(()),
+            Ok(length) if length == transmit.contents.len() => {
+                self.refusals.clear(member);
+                Ok(())
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(error),
             Err(error) if destination_unreachable(&error) => {
+                // EHOSTUNREACH alone; EHOSTDOWN is a host that stopped answering, not a refusal.
+                if error.kind() == io::ErrorKind::HostUnreachable {
+                    self.refusals.refuse(member);
+                }
                 count_drop(&self.dropped[member].sends, member, "datagrams", &error);
                 Ok(())
             }

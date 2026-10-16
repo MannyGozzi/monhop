@@ -925,10 +925,10 @@ impl AppController {
         }
     }
 
-    /// Lists each newly paired computer and makes it the active one unless several computers
-    /// already share. A failed write hands the pairings back so the next tick records them; a
-    /// full list drops the entry, and the trust record still shows as a computer so it can be
-    /// forgotten.
+    /// Lists each paired computer. A first pairing becomes the active one unless several
+    /// computers already share; pairing again leaves its switch as the user set it. A failed
+    /// write hands the pairings back so the next tick records them; a full list drops the entry,
+    /// and the trust record still shows as a computer so it can be forgotten.
     fn adopt_completed_pairings(&self) -> Result<(), String> {
         let completed = self.pairing.take_completed();
         if completed.is_empty() {
@@ -940,7 +940,11 @@ impl AppController {
             let mut list = ComputerList::load(&list_path)?;
             for pairing in &completed {
                 match list.remember(pairing.fingerprint, pairing.address, pairing.platform) {
-                    Ok(()) => log::info!("pairing: {} paired", short(pairing.fingerprint)),
+                    Ok(()) => log::info!(
+                        "pairing: {} paired{}",
+                        short(pairing.fingerprint),
+                        if pairing.known { " again" } else { "" }
+                    ),
                     Err(message) => log::warn!(
                         "pairing: {} paired but not listed: {message}",
                         short(pairing.fingerprint)
@@ -950,7 +954,7 @@ impl AppController {
             list.save(&list_path)?;
             self.sharing.update_setup_file(&setup_path, |file| {
                 for pairing in &completed {
-                    if file.enabled().len() <= 1 {
+                    if !pairing.known && file.enabled().len() <= 1 {
                         file.choose(&pairing.fingerprint);
                         log::info!("pairing: {} made active", short(pairing.fingerprint));
                     }
@@ -2083,6 +2087,37 @@ mod tests {
             computers["group"]["recordRevision"],
             serde_json::json!(active.revision())
         );
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn pairing_again_keeps_the_switch_and_only_a_first_pairing_turns_a_computer_on() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let folder = folder("pairing-again");
+        let path = folder.join("sharing.json");
+        let controller = AppController::default();
+        controller.use_setup_path(path.clone());
+        // Either side of the exchange, showing or entering, hands over the same completion.
+        let paired = |letter: char, known: bool| {
+            controller
+                .pairing
+                .requeue_completed(vec![crate::pairing::CompletedPairing {
+                    fingerprint: fingerprint(letter),
+                    address: "192.168.1.9:24872".parse().unwrap(),
+                    platform: Some(Platform::Windows),
+                    interface_id: "en0:4:192.168.1.4".into(),
+                    known,
+                }]);
+            controller.computers_load().unwrap();
+            SetupFile::load(&path).unwrap().enabled().to_vec()
+        };
+        let (b, c) = ("b".repeat(64), "c".repeat(64));
+        assert_eq!(paired('B', false), std::slice::from_ref(&b));
+        controller.set_enabled(&b, false, None).unwrap();
+        assert!(paired('B', true).is_empty());
+        assert_eq!(paired('C', false), std::slice::from_ref(&c));
+        assert_eq!(paired('C', true), std::slice::from_ref(&c));
+        assert_eq!(paired('B', true), std::slice::from_ref(&c));
         let _ = std::fs::remove_dir_all(folder);
     }
 

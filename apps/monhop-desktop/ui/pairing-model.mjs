@@ -19,6 +19,8 @@ const IDLE_PHASES = new Set(["ready", "error", "paired"]);
 const ROLES = new Set(["showing", "entering"]);
 const PLATFORMS = new Set(["macos", "windows"]);
 const STORAGE_OUTCOMES = new Set(["unchanged", "unverified", "verified"]);
+// The one failure cause the backend names, also the settings pane that fixes it.
+const LOCAL_NETWORK = "local-network";
 const FINGERPRINT = /^[0-9a-fA-F]{64}$/;
 
 // Crockford base32 as the backend parses it: no I, L, O or U, which read as 1, 1, 0 and nothing.
@@ -181,7 +183,8 @@ export function countdownProgress(state, now = Date.now()) {
 
 // --- errors -----------------------------------------------------------------------------------
 
-// The backend's sentence names what went wrong; the role decides the way forward.
+// The backend's sentence names what went wrong; the role decides the way forward, and `settings`
+// names the settings pane that fixes the cause, when there is one.
 export function pairingErrorPresentation(view) {
   const retry =
     view?.role === "showing" ? "new-code" : view?.role === "entering" ? "enter-again" : "reopen";
@@ -190,7 +193,12 @@ export function pairingErrorPresentation(view) {
     "enter-again": "That code didn't work. Ask for a new code on the other computer.",
     reopen: "The pairing did not finish.",
   }[retry];
-  return { title: "Pairing did not finish", detail: view?.message || fallback, retry };
+  return {
+    title: "Pairing did not finish",
+    detail: view?.message || fallback,
+    retry,
+    settings: view?.failure === LOCAL_NETWORK ? LOCAL_NETWORK : null,
+  };
 }
 
 // --- the native view --------------------------------------------------------------------------
@@ -224,6 +232,7 @@ export function normalizePairingView(value) {
         : null,
     message:
       message || (phase === "error" ? "The pairing state was not recognized. Reload pairing." : ""),
+    failure: phase === "error" && source.failure === LOCAL_NETWORK ? LOCAL_NETWORK : null,
     busy: source.busy === true,
     localFingerprint: fingerprintText(source.localFingerprint),
     peerFingerprint: fingerprintText(source.peerFingerprint),

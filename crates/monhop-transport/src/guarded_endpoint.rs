@@ -31,7 +31,7 @@ use crate::{
     policy::{MAX_PINNED_PEERS, is_private_or_link_local},
 };
 use runtime::HandleRuntime;
-use socket::{DatagramIo, GuardedSocket, Reachability};
+use socket::{DatagramIo, GuardedSocket, Reachability, SendRefusals};
 
 /// Incoming handshakes one member may have running at once; more are refused until one ends.
 const MAX_MEMBER_HANDSHAKES: usize = 2;
@@ -812,13 +812,14 @@ impl EndpointHandle {
     }
 }
 
-/// What carries QUIC for one endpoint: the socket, its revocation, its lifetime and its members'
-/// reachability.
+/// What carries QUIC for one endpoint: the socket, its revocation, its lifetime, its members'
+/// reachability and the sends the OS refused them.
 struct Carrier {
     socket: Arc<dyn AsyncUdpSocket>,
     signal: RevocationSignal,
     lifetime: watch::Receiver<()>,
     reachability: Arc<Reachability>,
+    refusals: Arc<SendRefusals>,
 }
 
 impl Carrier {
@@ -827,6 +828,7 @@ impl Carrier {
             signal: socket.revocation(),
             lifetime: socket.lifetime(),
             reachability: socket.reachability(),
+            refusals: socket.refusals(),
             socket,
         }
     }
@@ -941,6 +943,7 @@ impl GuardedEndpoint {
             signal,
             lifetime,
             reachability,
+            refusals: _,
         } = carrier;
         if reachability.len() != members.len() {
             return Err(io::Error::new(
@@ -1315,6 +1318,7 @@ pub(crate) mod loopback {
                 }),
                 signal,
                 reachability: Reachability::new(members.len()),
+                refusals: SendRefusals::new(members.len()),
             };
             Self::assemble(
                 carrier,

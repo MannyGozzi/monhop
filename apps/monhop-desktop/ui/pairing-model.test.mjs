@@ -45,6 +45,7 @@ test("unknown native results become visible errors and unverified storage stays 
     code: null,
     codeExpiresAtMs: null,
     message: "The pairing state was not recognized. Reload pairing.",
+    failure: null,
     busy: false,
     localFingerprint: null,
     peerFingerprint: null,
@@ -260,10 +261,44 @@ test("errors use the backend's sentence, and the role picks the way forward", ()
     title: "Pairing did not finish",
     detail: "Someone entered a wrong code. This code no longer works.",
     retry: "new-code",
+    settings: null,
   });
   assert.equal(
     pairingErrorPresentation(normalizePairingView({ phase: "error", role: "entering" })).retry,
     "enter-again",
   );
   assert.equal(pairingErrorPresentation(normalizePairingView({ phase: "error" })).retry, "reopen");
+});
+
+test("a Mac blocked from the local network says so and points at its settings", () => {
+  const message =
+    "macOS may be blocking MonHop from the local network. In System Settings, open Privacy & Security, then Local Network, and turn MonHop on. Then try again.";
+  for (const [role, retry] of [
+    ["entering", "enter-again"],
+    ["showing", "new-code"],
+  ]) {
+    const blocked = normalizePairingView({
+      phase: "error",
+      role,
+      message,
+      failure: "local-network",
+    });
+    assert.equal(blocked.failure, "local-network");
+    assert.deepEqual(pairingErrorPresentation(blocked), {
+      title: "Pairing did not finish",
+      detail: message,
+      retry,
+      settings: "local-network",
+    });
+  }
+  // Only that kind, and only on a failed attempt, is ever read.
+  for (const failure of ["Local-Network", "accessibility", "", 1, true, {}, null])
+    assert.equal(normalizePairingView({ phase: "error", failure }).failure, null, String(failure));
+  for (const phase of ["ready", "connecting", "verifying"])
+    assert.equal(normalizePairingView({ phase, failure: "local-network" }).failure, null, phase);
+  assert.equal(pairingErrorPresentation(normalizePairingView({ phase: "error" })).settings, null);
+  assert.equal(
+    pairingErrorPresentation({ role: "showing", message: "This code expired." }).settings,
+    null,
+  );
 });

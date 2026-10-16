@@ -4,6 +4,12 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- Start MonHop when you log in now works on a Mac. macOS reports a login item that was never registered as "not found", and MonHop read that as already registered, so it never registered one. If the switch is on, turn it off and on once after updating.
+- Pairing again with a computer you already paired keeps its sharing switch as you left it. Before, pairing again switched a computer you had turned off back on and started sharing with it.
+- When macOS's Local Network privacy setting blocks MonHop, a failed pairing on a Mac now says so and points to System Settings, instead of blaming the code or the network.
+
 ## [0.2.8] - 2026-10-13
 
 ### Changed

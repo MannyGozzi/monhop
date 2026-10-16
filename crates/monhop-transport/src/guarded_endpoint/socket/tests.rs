@@ -1494,6 +1494,51 @@ const HOST_DOWN: SendFailure = SendFailure::Os(64);
 #[cfg(not(any(windows, target_os = "macos")))]
 const HOST_DOWN: SendFailure = SendFailure::Kind(io::ErrorKind::HostUnreachable);
 
+/// How a send fails with "no route to host", the refusal of macOS Local Network privacy.
+fn no_route_to_host() -> SendFailure {
+    match unreachable_codes()[..] {
+        [_, host_unreachable, ..] => SendFailure::Os(host_unreachable),
+        _ => SendFailure::Kind(io::ErrorKind::HostUnreachable),
+    }
+}
+
+#[test]
+fn a_no_route_to_host_refusal_is_recorded_until_a_later_send_succeeds() {
+    let [hub, down, _up] = two_member_network();
+    let refusals = hub.refusals();
+    hub.io.fail_sends_to(MEMBERS[0], no_route_to_host());
+    hub.try_send(&to(MEMBERS[0])).unwrap();
+    hub.try_send(&to(MEMBERS[1])).unwrap();
+    // QUIC still sees a dropped datagram: counted, never revoking.
+    assert!(!hub.signal.is_revoked());
+    assert_eq!(hub.dropped[0].sends.load(Ordering::SeqCst), 1);
+    assert_eq!(down.io.inbox.lock().unwrap().arrivals, 0);
+    assert!(refusals.refused(0));
+    assert!(!refusals.refused(1));
+
+    hub.io.heal_sends();
+    hub.try_send(&to(MEMBERS[0])).unwrap();
+    assert_eq!(down.io.inbox.lock().unwrap().arrivals, 1);
+    assert!(!refusals.refused(0));
+
+    // Every other unreachable send is still only a drop.
+    let others = [SendFailure::Kind(io::ErrorKind::NetworkUnreachable)]
+        .into_iter()
+        .chain(
+            unreachable_codes()
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, code)| (index != 1).then_some(SendFailure::Os(code))),
+        );
+    for failure in others {
+        hub.io.fail_sends_to(MEMBERS[0], failure);
+        hub.try_send(&to(MEMBERS[0])).unwrap();
+        hub.io.heal_sends();
+        assert!(!refusals.refused(0));
+    }
+    assert!(!hub.signal.is_revoked());
+}
+
 fn to(member: SocketAddrV4) -> Transmit<'static> {
     Transmit {
         destination: member.into(),
@@ -2547,6 +2592,18 @@ mod pairing {
         tokio::time::timeout(UNANSWERED, endpoint.dial())
             .await
             .map_or(true, |dialed| dialed.is_err())
+    }
+
+    #[tokio::test]
+    async fn a_dial_refused_as_no_route_to_host_is_reported_by_the_endpoint() {
+        let identity = DeviceIdentity::generate().unwrap();
+        let io = TestIo::new(ENTERING, Arc::default(), Arc::default());
+        io.fail_sends_to(SHOWING, no_route_to_host());
+        let endpoint = dialer(io, ENTERING, &identity);
+        assert!(!endpoint.send_refused());
+        assert!(unanswered(&endpoint).await);
+        assert!(endpoint.send_refused());
+        assert!(!endpoint.is_revoked());
     }
 
     #[test]

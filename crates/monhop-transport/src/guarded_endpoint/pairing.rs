@@ -16,7 +16,7 @@ use super::{
     Carrier, EndpointRevoker, INCOMING_HANDSHAKE_DEADLINE, ListenSelection, NetworkSelection,
     PinnedNetwork, Shared, TokenBucket, handshake_budget, native, register_incoming,
     runtime::HandleRuntime,
-    socket::{self, GuardedSocket},
+    socket::{self, GuardedSocket, SendRefusals},
     wait_idle_or_revoked,
 };
 use crate::crypto::{
@@ -28,6 +28,8 @@ pub struct PairingEndpoint {
     endpoint: quinn::Endpoint,
     shared: Arc<Shared>,
     role: Role,
+    /// One slot: the computer dialed, or every host a listener answers.
+    refusals: Arc<SendRefusals>,
     socket_lifetime: watch::Receiver<()>,
     _watch: Option<native::Watch>,
     _owner_thread: PhantomData<Rc<()>>,
@@ -125,6 +127,7 @@ impl PairingEndpoint {
             signal,
             lifetime,
             reachability,
+            refusals,
         } = carrier;
         let refusing = SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?;
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
@@ -147,6 +150,7 @@ impl PairingEndpoint {
             endpoint,
             shared,
             role,
+            refusals,
             socket_lifetime: lifetime,
             _watch: watch,
             _owner_thread: PhantomData,
@@ -284,6 +288,12 @@ impl PairingEndpoint {
 
     pub fn is_revoked(&self) -> bool {
         self.shared.signal.is_revoked()
+    }
+
+    /// Whether this computer's OS refused the latest datagram to the other computer with "no
+    /// route to host", as macOS does while Local Network privacy blocks the app.
+    pub fn send_refused(&self) -> bool {
+        self.refusals.refused(0)
     }
 
     /// Cross-thread cancellation only.

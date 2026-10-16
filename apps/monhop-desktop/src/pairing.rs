@@ -58,6 +58,9 @@ const WRONG_CODE_SHOWN: &str = "Someone entered a wrong code. This code no longe
 const WRONG_CODE_ENTERED: &str =
     "That code didn't match. Ask for a new code on the other computer.";
 const UNREACHABLE: &str = "Could not reach the other computer. Check that it still shows the code and that both are on the same network.";
+const LOCAL_NETWORK_BLOCKED: &str = "macOS may be blocking MonHop from the local network. In System Settings, open Privacy & Security, then Local Network, and turn MonHop on. Then try again.";
+/// The view's stable name for that cause, for which the window offers the settings pane.
+const LOCAL_NETWORK: &str = "local-network";
 const LISTENER_STOPPED: &str = "This code stopped working. Show a new code.";
 const NETWORK_CHANGED: &str =
     "The network changed. Pairing stopped. Choose the physical network and try again.";
@@ -121,6 +124,8 @@ pub struct PairingView {
     code: Option<ShownCode>,
     code_expires_at_ms: Option<u64>,
     message: String,
+    /// A failed attempt's cause when the window offers a fix for it; null otherwise.
+    failure: Option<&'static str>,
     busy: bool,
     peer_fingerprint: Option<String>,
     peer_platform: Option<&'static str>,
@@ -140,6 +145,7 @@ impl Default for PairingView {
             code_expires_at_ms: None,
             message: "Open pairing to read this computer's saved identity. Sharing stays off."
                 .into(),
+            failure: None,
             busy: false,
             peer_fingerprint: None,
             peer_platform: None,
@@ -157,6 +163,7 @@ impl PairingView {
     fn clear_attempt(&mut self) {
         self.clear_code();
         self.role = None;
+        self.failure = None;
         self.peer_fingerprint = None;
         self.peer_platform = None;
         self.peer_address = None;
@@ -174,6 +181,27 @@ fn shown_code<S: Serializer>(code: &Option<ShownCode>, serializer: S) -> Result<
     code.as_ref()
         .map(|code| code.as_str())
         .serialize(serializer)
+}
+
+/// How an attempt failed: the sentence the window shows and the view's `failure` for it.
+struct Failure {
+    message: String,
+    kind: Option<&'static str>,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            kind: None,
+        }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
 }
 
 /// One pairing attempt: this computer showing a code, or entering one.
@@ -207,6 +235,8 @@ pub struct CompletedPairing {
     pub address: SocketAddrV4,
     pub platform: Option<Platform>,
     pub interface_id: String,
+    /// Protected storage already held this computer's record: a pairing again, not a first one.
+    pub known: bool,
 }
 
 /// A computer protected storage trusts, as its record describes it.
@@ -244,6 +274,8 @@ struct PairingControl {
     reason: AtomicU8,
     cancel: RevocationSignal,
     revoker: Mutex<Option<EndpointRevoker>>,
+    /// The latest datagram was refused as "no route to host" when the dial or code ran out.
+    refused: AtomicBool,
 }
 
 impl PairingControl {
@@ -253,7 +285,30 @@ impl PairingControl {
             reason: AtomicU8::new(0),
             cancel: RevocationSignal::default(),
             revoker: Mutex::new(None),
+            refused: AtomicBool::new(false),
         }
+    }
+
+    fn expired(&self) -> bool {
+        self.reason.load(Ordering::Acquire) == TIMED_OUT
+    }
+
+    /// Only macOS refuses that way for Local Network privacy; elsewhere it is never noted.
+    fn note_refused(&self, refused: bool) {
+        self.refused
+            .store(cfg!(target_os = "macos") && refused, Ordering::Release);
+    }
+
+    /// A failed attempt's end: the user's cancel wins, then a refusal noted as time ran out,
+    /// then the window's own stop reason, then `error`.
+    fn ended(&self, error: String) -> Failure {
+        if self.reason.load(Ordering::Acquire) != STOPPED && self.refused.load(Ordering::Acquire) {
+            return Failure {
+                message: LOCAL_NETWORK_BLOCKED.into(),
+                kind: Some(LOCAL_NETWORK),
+            };
+        }
+        self.stopped().unwrap_or(error).into()
     }
 
     fn stop(&self, reason: u8) {
@@ -509,7 +564,7 @@ impl PairingController {
             .spawn(move || {
                 // Success means both records are saved, so only a failure takes the stop reason.
                 let result = run_worker(&attempt, job, &control, &shared, ready)
-                    .map_err(|error| control.stopped().unwrap_or(error));
+                    .map_err(|error| control.ended(error));
                 finish_attempt(&mut lock(&shared), attempt.id, result);
                 if let Some(revoker) = lock(&control.revoker).take() {
                     revoker.revoke();
@@ -634,7 +689,7 @@ fn begin_attempt(
 
 /// The attempt's terminal state. A failed attempt drops out so the port goes back to the
 /// supervisor; its role and message stay for the window.
-fn finish_attempt(state: &mut PairingState, id: u64, result: Result<(), String>) {
+fn finish_attempt(state: &mut PairingState, id: u64, result: Result<(), Failure>) {
     if state
         .attempt
         .as_ref()
@@ -646,10 +701,14 @@ fn finish_attempt(state: &mut PairingState, id: u64, result: Result<(), String>)
                 state.view.phase = "paired";
                 state.view.message = PAIRED.into();
             }
-            Err(error) => {
+            Err(Failure {
+                message: error,
+                kind,
+            }) => {
                 state.attempt = None;
                 state.view.badge = None;
                 state.view.phase = "error";
+                state.view.failure = kind;
                 state.view.message = match state.view.storage_outcome {
                     "unverified" => format!(
                         "Save result not confirmed. Reload or explicitly forget the saved device. {error}"
@@ -841,7 +900,7 @@ async fn run_session(
         view.peer_platform = offer.platform().map(platform_code);
         view.peer_address = Some(offer.endpoint().to_string());
     });
-    persist_confirmed(
+    let known = persist_confirmed(
         &NativePeerStore,
         &record,
         local,
@@ -862,6 +921,7 @@ async fn run_session(
             address: offer.endpoint(),
             platform: offer.platform(),
             interface_id: attempt.interface_id.clone(),
+            known,
         });
         if locked
             .attempt
@@ -920,10 +980,12 @@ async fn show(
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
-    let connection = endpoint
-        .accept()
-        .await
-        .map_err(|_| control.or(LISTENER_STOPPED))?;
+    let connection = endpoint.accept().await.map_err(|_| {
+        if control.expired() {
+            control.note_refused(endpoint.send_refused());
+        }
+        control.or(LISTENER_STOPPED)
+    })?;
     Ok((endpoint, connection))
 }
 
@@ -942,7 +1004,7 @@ async fn enter(
         .map_err(network_preparation_error)?;
     control.attach(endpoint.revoker());
     control.check()?;
-    let connection = tokio::time::timeout(
+    let Ok(dialed) = tokio::time::timeout(
         DIAL_WINDOW,
         retry_until_cancelled(
             control,
@@ -952,8 +1014,11 @@ async fn enter(
         ),
     )
     .await
-    .map_err(|_| control.or(UNREACHABLE))??;
-    Ok((endpoint, connection))
+    else {
+        control.note_refused(endpoint.send_refused());
+        return Err(control.or(UNREACHABLE));
+    };
+    Ok((endpoint, dialed?))
 }
 
 /// Pairing is an explicit local action, so it may raise the macOS Local Network prompt; it sends
@@ -983,30 +1048,33 @@ fn unix_millis(at: SystemTime) -> Option<u64> {
 }
 
 /// Writes one record per computer and reads it back; an existing record for the same computer
-/// is kept as it is, never replaced.
+/// is kept as it is, never replaced. Ok(true) when that record was already saved.
 fn persist_confirmed(
     store: &impl ProtectedPeerStore,
     record: &ConfirmedPeerRecord,
     local: CertificateFingerprint,
     check: impl Fn() -> Result<(), String>,
     write_attempted: impl FnOnce(),
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let peer = record.peer().fingerprint();
     check()?;
-    if let Some(existing) = find_saved(store, local, peer)? {
-        if &existing != record {
+    let known = match find_saved(store, local, peer)? {
+        Some(existing) if &existing != record => {
             return Err(
                 "That computer's saved record differs from this pairing. Forget it, then pair again."
                     .into(),
             );
         }
-    } else {
-        check()?;
-        write_attempted();
-        store
-            .create_new(&peer.full_hex().to_ascii_lowercase(), &record.encode())
-            .map_err(display_error)?;
-    }
+        Some(_) => true,
+        None => {
+            check()?;
+            write_attempted();
+            store
+                .create_new(&peer.full_hex().to_ascii_lowercase(), &record.encode())
+                .map_err(display_error)?;
+            false
+        }
+    };
     check()?;
     let readback = find_saved(store, local, peer)?
         .ok_or("The saved device was missing during verification.")?;
@@ -1014,7 +1082,7 @@ fn persist_confirmed(
     if &readback != record {
         return Err("The saved device did not match. No pairing was confirmed.".into());
     }
-    Ok(())
+    Ok(known)
 }
 
 fn update(state: &Mutex<PairingState>, id: u64, change: impl FnOnce(&mut PairingView)) {
@@ -1260,6 +1328,7 @@ mod tests {
                 "busy",
                 "code",
                 "codeExpiresAtMs",
+                "failure",
                 "localFingerprint",
                 "localPlatform",
                 "message",
@@ -1275,6 +1344,7 @@ mod tests {
         assert_eq!(view["role"], "showing");
         assert_eq!(view["code"], "7KQ4-M9XR-2HTW");
         assert_eq!(view["codeExpiresAtMs"], 1_700_000_000_000_u64);
+        assert!(view["failure"].is_null());
         assert_eq!(view["busy"], true);
         assert!(controller.occupies_port());
 
@@ -1330,7 +1400,7 @@ mod tests {
             finish_attempt(
                 &mut lock(&controller.state),
                 attempt.id,
-                Err(failure_message(role, &PairingFailure::NotConfirmed)),
+                Err(failure_message(role, &PairingFailure::NotConfirmed).into()),
             );
             let view = controller.status();
             assert_eq!(view.phase, "error");
@@ -1379,6 +1449,56 @@ mod tests {
     }
 
     #[test]
+    fn only_a_mac_refused_as_time_ran_out_blames_local_network() {
+        let blocked = (LOCAL_NETWORK_BLOCKED, Some(LOCAL_NETWORK));
+        let ended = |control: &PairingControl, error: &str| {
+            let failure = control.ended(error.into());
+            (failure.message, failure.kind)
+        };
+        let entering = PairingControl::new(PairingRole::Entering);
+        entering.note_refused(true);
+        let showing = PairingControl::new(PairingRole::Showing);
+        showing.stop(TIMED_OUT);
+        showing.note_refused(true);
+        for (control, otherwise) in [(&entering, UNREACHABLE), (&showing, CODE_EXPIRED)] {
+            let (message, kind) = ended(control, otherwise);
+            if cfg!(target_os = "macos") {
+                assert_eq!((message.as_str(), kind), blocked);
+            } else {
+                assert_eq!((message.as_str(), kind), (otherwise, None));
+            }
+        }
+        let unrefused = PairingControl::new(PairingRole::Entering);
+        unrefused.note_refused(false);
+        let (message, kind) = ended(&unrefused, UNREACHABLE);
+        assert_eq!((message.as_str(), kind), (UNREACHABLE, None));
+        // The user's own cancel always says so.
+        entering.stop(STOPPED);
+        let (message, kind) = ended(&entering, UNREACHABLE);
+        assert_eq!((message.as_str(), kind), (PAIRING_STOPPED, None));
+
+        // The view carries the kind on the failed attempt only.
+        let controller = opened_controller();
+        let attempt = begin_attempt(&mut lock(&controller.state), PairingRole::Entering)
+            .unwrap()
+            .0;
+        finish_attempt(
+            &mut lock(&controller.state),
+            attempt.id,
+            Err(Failure {
+                message: LOCAL_NETWORK_BLOCKED.into(),
+                kind: Some(LOCAL_NETWORK),
+            }),
+        );
+        let view = serde_json::to_value(controller.status()).unwrap();
+        assert_eq!(view["phase"], "error");
+        assert_eq!(view["message"], LOCAL_NETWORK_BLOCKED);
+        assert_eq!(view["failure"], "local-network");
+        begin_attempt(&mut lock(&controller.state), PairingRole::Entering).unwrap();
+        assert!(serde_json::to_value(controller.status()).unwrap()["failure"].is_null());
+    }
+
+    #[test]
     fn cancel_spends_the_code_and_a_running_worker_ends_ready() {
         let controller = opened_controller();
         let (attempt, control) = {
@@ -1396,7 +1516,7 @@ mod tests {
         finish_attempt(
             &mut lock(&controller.state),
             attempt.id,
-            Err(control.stopped().unwrap()),
+            Err(control.stopped().unwrap().into()),
         );
         let view = controller.status();
         assert_eq!(view.phase, "ready");
@@ -1531,6 +1651,7 @@ mod tests {
             address: record.peer().endpoint(),
             platform: record.peer().platform(),
             interface_id: "fixture-only".into(),
+            known: false,
         };
         lock(&controller.state).completed.push(completed.clone());
         assert!(controller.take_completed() == vec![completed]);
@@ -1573,16 +1694,21 @@ mod tests {
     fn saved_peer_restart_and_duplicates_preserve_the_record() {
         let (identity, _, record) = fixtures();
         let store = MemoryStore::default();
-        persist_confirmed(&store, &record, identity.fingerprint(), || Ok(()), || {}).unwrap();
+        // The first save is a first pairing; the same record saved again is a pairing again.
+        assert!(
+            !persist_confirmed(&store, &record, identity.fingerprint(), || Ok(()), || {}).unwrap()
+        );
         let before = store.records.borrow().clone();
-        persist_confirmed(
-            &store,
-            &record,
-            identity.fingerprint(),
-            || Ok(()),
-            || panic!("must not overwrite"),
-        )
-        .unwrap();
+        assert!(
+            persist_confirmed(
+                &store,
+                &record,
+                identity.fingerprint(),
+                || Ok(()),
+                || panic!("must not overwrite"),
+            )
+            .unwrap()
+        );
         assert_eq!(store.creates.get(), 1);
         assert!(read_saved(&store, identity.fingerprint()).unwrap() == vec![record.clone()]);
         assert_eq!(*store.records.borrow(), before);
