@@ -486,8 +486,18 @@ function pairedCard(ctx) {
   return node;
 }
 
-function errorCard(ctx, { title, detail, retry }) {
+function errorCard(ctx, { title, detail, retry, settings = null }) {
   const { pairing, actions, pairingPending, gate, busy } = ctx;
+  const settingsButton =
+    settings === "local-network"
+      ? button("Open Local Network settings", {
+          variant: "outline",
+          size: "sm",
+          disabled: busy,
+          focusKey: "pairing-local-network",
+          onClick: () => actions.openSettings("local-network"),
+        })
+      : null;
   const retryButton = {
     "new-code": () =>
       button("New code", {
@@ -518,7 +528,11 @@ function errorCard(ctx, { title, detail, retry }) {
     iconName: "triangle-alert",
     title,
     detail,
-    actions: [retry === "reopen" ? null : cancelPairingButton(ctx), retryButton].filter(Boolean),
+    actions: [
+      retry === "reopen" ? null : cancelPairingButton(ctx),
+      settingsButton,
+      retryButton,
+    ].filter(Boolean),
   });
   if (pairing.view?.phase !== "error" || pairing.view.storageOutcome !== "unverified") return node;
   return el("div", {

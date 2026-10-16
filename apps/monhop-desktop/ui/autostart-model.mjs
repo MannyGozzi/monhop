@@ -18,7 +18,7 @@ const STATUS_TEXT = {
   pending: "Registers after you apply a layout.",
   requiresApproval: "Waiting for your approval in System Settings > General > Login Items.",
   disabledBySystem: "Turned off in Windows Settings > Apps > Startup.",
-  notFound: "MonHop moved since it was registered. Turn the switch off and on again.",
+  notFound: "macOS has no login item for MonHop yet. Turn the switch off and on again.",
 };
 
 function text(value, fallback = "") {

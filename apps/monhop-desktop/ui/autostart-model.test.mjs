@@ -49,7 +49,7 @@ test("status text follows the state, word for word", () => {
   );
   assert.equal(
     autostartStatusText({ ...base, state: "notFound" }),
-    "MonHop moved since it was registered. Turn the switch off and on again.",
+    "macOS has no login item for MonHop yet. Turn the switch off and on again.",
   );
   assert.equal(
     autostartStatusText({ ...base, state: "failed", message: "The OS refused the request." }),
