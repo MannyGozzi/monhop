@@ -130,7 +130,7 @@ regex-syntax v0.8.11 MIT OR Apache-2.0
 reqwest v0.13.5 MIT OR Apache-2.0
 ring v0.17.14 Apache-2.0 AND ISC
 rustc-hash v2.1.3 Apache-2.0 OR MIT
-rustls v0.23.45 Apache-2.0 OR ISC OR MIT
+rustls v0.23.46 Apache-2.0 OR ISC OR MIT
 rustls-pki-types v1.15.1 MIT OR Apache-2.0
 rustls-platform-verifier v0.7.0 MIT OR Apache-2.0
 rustls-webpki v0.103.15 ISC
@@ -234,5 +234,4 @@ zerofrom v0.1.8 Unicode-3.0
 zeroize v1.9.0 Apache-2.0 OR MIT
 zerotrie v0.2.5 Unicode-3.0
 zerovec v0.11.8 Unicode-3.0
-zip v4.6.1 MIT
 zmij v1.0.23 MIT

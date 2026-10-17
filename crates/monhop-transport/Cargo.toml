@@ -12,7 +12,7 @@ monhop-protocol = { path = "../monhop-protocol", version = "=0.2.8" }
 bytes = { version = "=1.12.1", default-features = false }
 log = "=0.4.34"
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "zeroize"] }
 sha2 = "=0.11.0"
 spake2 = "=0.4.0"

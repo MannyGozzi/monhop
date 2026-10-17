@@ -42,13 +42,6 @@
     "repository": "https://github.com/dtolnay/anyhow"
   },
   {
-    "name": "arbitrary",
-    "version": "1.4.2",
-    "license": "MIT OR Apache-2.0",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "repository": "https://github.com/rust-fuzz/arbitrary/"
-  },
-  {
     "name": "arboard",
     "version": "3.6.1",
     "license": "MIT OR Apache-2.0",
@@ -544,13 +537,6 @@
     "license": "MIT OR Apache-2.0",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://github.com/jhpratt/deranged"
-  },
-  {
-    "name": "derive_arbitrary",
-    "version": "1.4.2",
-    "license": "MIT OR Apache-2.0",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "repository": "https://github.com/rust-fuzz/arbitrary"
   },
   {
     "name": "derive_more",
@@ -2157,7 +2143,7 @@
   },
   {
     "name": "rustls",
-    "version": "0.23.45",
+    "version": "0.23.46",
     "license": "Apache-2.0 OR ISC OR MIT",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://github.com/rustls/rustls"
@@ -3687,13 +3673,6 @@
     "license": "Unicode-3.0",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://github.com/unicode-org/icu4x"
-  },
-  {
-    "name": "zip",
-    "version": "4.6.1",
-    "license": "MIT",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "repository": "https://github.com/zip-rs/zip2.git"
   },
   {
     "name": "zlib-rs",

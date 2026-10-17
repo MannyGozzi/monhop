@@ -10,7 +10,6 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | alloc-stdlib | 0.2.4 | BSD-3-Clause |
 | android_system_properties | 0.1.6 | MIT OR Apache-2.0 |
 | anyhow | 1.0.104 | MIT OR Apache-2.0 |
-| arbitrary | 1.4.2 | MIT OR Apache-2.0 |
 | arboard | 3.6.1 | MIT OR Apache-2.0 |
 | asn1-rs | 0.7.2 | MIT OR Apache-2.0 |
 | asn1-rs-derive | 0.6.0 | MIT OR Apache-2.0 |
@@ -82,7 +81,6 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | defmt-parser | 1.0.0 | MIT OR Apache-2.0 |
 | der-parser | 10.0.0 | MIT OR Apache-2.0 |
 | deranged | 0.5.8 | MIT OR Apache-2.0 |
-| derive_arbitrary | 1.4.2 | MIT OR Apache-2.0 |
 | derive_more | 2.1.1 | MIT |
 | derive_more-impl | 2.1.1 | MIT |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
@@ -312,7 +310,7 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 |
 | rusticata-macros | 4.1.0 | MIT/Apache-2.0 |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT |
 | rustls-native-certs | 0.8.4 | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 |
 | rustls-platform-verifier | 0.7.0 | MIT OR Apache-2.0 |
@@ -531,6 +529,5 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | zerotrie | 0.2.5 | Unicode-3.0 |
 | zerovec | 0.11.8 | Unicode-3.0 |
 | zerovec-derive | 0.11.6 | Unicode-3.0 |
-| zip | 4.6.1 | MIT |
 | zlib-rs | 0.6.7 | Zlib |
 | zmij | 1.0.23 | MIT |

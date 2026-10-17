@@ -78,18 +78,6 @@
     },
     {
       "type": "library",
-      "name": "arbitrary",
-      "version": "1.4.2",
-      "bom-ref": "arbitrary@1.4.2",
-      "purl": "pkg:cargo/arbitrary@1.4.2",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "name": "arboard",
       "version": "3.6.1",
       "bom-ref": "arboard@3.6.1",
@@ -934,18 +922,6 @@
       "version": "0.5.8",
       "bom-ref": "deranged@0.5.8",
       "purl": "pkg:cargo/deranged@0.5.8",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "name": "derive_arbitrary",
-      "version": "1.4.2",
-      "bom-ref": "derive_arbitrary@1.4.2",
-      "purl": "pkg:cargo/derive_arbitrary@1.4.2",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -3738,9 +3714,9 @@
     {
       "type": "library",
       "name": "rustls",
-      "version": "0.23.45",
-      "bom-ref": "rustls@0.23.45",
-      "purl": "pkg:cargo/rustls@0.23.45",
+      "version": "0.23.46",
+      "bom-ref": "rustls@0.23.46",
+      "purl": "pkg:cargo/rustls@0.23.46",
       "licenses": [
         {
           "expression": "Apache-2.0 OR ISC OR MIT"
@@ -6380,18 +6356,6 @@
     },
     {
       "type": "library",
-      "name": "zip",
-      "version": "4.6.1",
-      "bom-ref": "zip@4.6.1",
-      "purl": "pkg:cargo/zip@4.6.1",
-      "licenses": [
-        {
-          "expression": "MIT"
-        }
-      ]
-    },
-    {
-      "type": "library",
       "name": "zlib-rs",
       "version": "0.6.7",
       "bom-ref": "zlib-rs@0.6.7",
@@ -6445,12 +6409,6 @@
     {
       "ref": "anyhow@1.0.104",
       "dependsOn": []
-    },
-    {
-      "ref": "arbitrary@1.4.2",
-      "dependsOn": [
-        "derive_arbitrary@1.4.2"
-      ]
     },
     {
       "ref": "arboard@3.6.1",
@@ -6931,14 +6889,6 @@
       "ref": "deranged@0.5.8",
       "dependsOn": [
         "serde_core@1.0.229"
-      ]
-    },
-    {
-      "ref": "derive_arbitrary@1.4.2",
-      "dependsOn": [
-        "proc-macro2@1.0.107",
-        "quote@1.0.47",
-        "syn@2.0.119"
       ]
     },
     {
@@ -7528,7 +7478,7 @@
         "http@1.5.0",
         "hyper-util@0.1.20",
         "hyper@1.11.1",
-        "rustls@0.23.45",
+        "rustls@0.23.46",
         "tokio-rustls@0.26.5",
         "tokio@1.53.1",
         "tower-service@0.3.3"
@@ -8047,7 +7997,7 @@
         "quinn@0.11.11",
         "rcgen@0.14.10",
         "ring@0.17.14",
-        "rustls@0.23.45",
+        "rustls@0.23.46",
         "sha2@0.11.0",
         "spake2@0.4.0",
         "tokio@1.53.1",
@@ -8536,7 +8486,7 @@
         "ring@0.17.14",
         "rustc-hash@2.1.3",
         "rustls-pki-types@1.15.1",
-        "rustls@0.23.45",
+        "rustls@0.23.46",
         "slab@0.4.12",
         "thiserror@2.0.20",
         "tinyvec@1.13.2",
@@ -8564,7 +8514,7 @@
         "quinn-proto@0.11.18",
         "quinn-udp@0.5.15",
         "rustc-hash@2.1.3",
-        "rustls@0.23.45",
+        "rustls@0.23.46",
         "socket2@0.6.5",
         "thiserror@2.0.20",
         "tokio@1.53.1",
@@ -8693,7 +8643,7 @@
         "pin-project-lite@0.2.17",
         "rustls-pki-types@1.15.1",
         "rustls-platform-verifier@0.7.0",
-        "rustls@0.23.45",
+        "rustls@0.23.46",
         "serde@1.0.229",
         "serde_json@1.0.151",
         "sync_wrapper@1.0.2",
@@ -8778,7 +8728,7 @@
         "rustls-native-certs@0.8.4",
         "rustls-platform-verifier-android@0.1.1",
         "rustls-webpki@0.103.15",
-        "rustls@0.23.45",
+        "rustls@0.23.46",
         "security-framework-sys@2.17.0",
         "security-framework@3.7.0",
         "webpki-root-certs@1.0.9",
@@ -8794,7 +8744,7 @@
       ]
     },
     {
-      "ref": "rustls@0.23.45",
+      "ref": "rustls@0.23.46",
       "dependsOn": [
         "once_cell@1.21.4",
         "ring@0.17.14",
@@ -9343,7 +9293,7 @@
         "minisign-verify@0.2.5",
         "percent-encoding@2.3.2",
         "reqwest@0.13.5",
-        "rustls@0.23.45",
+        "rustls@0.23.46",
         "semver@1.0.28",
         "serde@1.0.229",
         "serde_json@1.0.151",
@@ -9355,8 +9305,7 @@
         "time@0.3.55",
         "tokio@1.53.1",
         "url@2.5.8",
-        "windows-sys@0.60.2",
-        "zip@4.6.1"
+        "windows-sys@0.60.2"
       ]
     },
     {
@@ -9602,7 +9551,7 @@
     {
       "ref": "tokio-rustls@0.26.5",
       "dependsOn": [
-        "rustls@0.23.45",
+        "rustls@0.23.46",
         "tokio@1.53.1"
       ]
     },
@@ -10538,15 +10487,6 @@
         "yoke@0.8.3",
         "zerofrom@0.1.8",
         "zerovec-derive@0.11.6"
-      ]
-    },
-    {
-      "ref": "zip@4.6.1",
-      "dependsOn": [
-        "arbitrary@1.4.2",
-        "crc32fast@1.5.1",
-        "indexmap@2.14.2",
-        "memchr@2.8.3"
       ]
     },
     {

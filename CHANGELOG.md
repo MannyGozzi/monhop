@@ -10,6 +10,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 - Pairing again with a computer you already paired keeps its sharing switch as you left it. Before, pairing again switched a computer you had turned off back on and started sharing with it.
 - When macOS's Local Network privacy setting blocks MonHop, a failed pairing on a Mac now says so and points to System Settings, instead of blaming the code or the network.
 
+### Security
+
+- The TLS library behind sharing and update checks is updated to rustls 0.23.46 (RUSTSEC-2026-0346 to 0349), and the updater no longer includes zip extraction, which MonHop's own updates never used (RUSTSEC-2026-0367 to 0369).
+
 ## [0.2.8] - 2026-10-13
 
 ### Changed
