@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-17
+
 ### Added
 
 - A notch island on Macs with a camera notch. MonHop's status sits around the camera. Connections, dimming and clipboard transfers show beside it, and pointing at it opens sharing, dimming and clipboard controls without taking focus from the app you are in. It is on by default and can be turned off in Settings. It shows only while the notched display is in use, so a closed laptop on an external display or a Mac without a notch shows nothing and has no setting for it. Windows is unchanged.
@@ -249,7 +251,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.8...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.9
 [0.2.8]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.8
 [0.2.7]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.7
 [0.2.6]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.6
