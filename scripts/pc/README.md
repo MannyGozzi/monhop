@@ -11,7 +11,9 @@ including messages that later get pasted into commits. The Mac keeps the connect
 under a host alias. `scripts/pc/pc.conf` (git-ignored) names that alias and the PC's checkout path.
 Mailbox files live under `.claude/state/mail/` on the PC, which is git-ignored. The PC's SSH server was
 set up by hand, outside the repository. It is key-only, accepts only the Mac's key, answers only the
-Mac's LAN address, and listens on IPv4 only.
+home subnet, and listens on IPv4 only. No PC rule names one address or one network adapter, because DHCP
+and Windows change both. The Mac's SSH entry finds the PC again by its hardware address when its address
+moves.
 
 ## When the PC changes code
 
