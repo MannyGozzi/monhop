@@ -4,6 +4,11 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- Automatic updates now arrive when you share all the time. Before, a scheduled check only ran when sharing happened to let go of the network, which a working setup almost never does, and a missed check waited six hours. Now MonHop looks every minute for a moment when no computer is connected: while sharing is paused, no computer is switched on, or the other computer has not answered for two minutes. It never checks while a computer is connected. Time the computer slept counts toward the six hours, and a check that fails, such as one at login before Wi-Fi is up, is tried again after 30 minutes.
+- Check now and Restart to update work while MonHop is still waiting for the other computer, instead of asking you to pause sharing first. Sharing resumes a moment later.
+
 ## [0.2.9] - 2026-10-17
 
 ### Added

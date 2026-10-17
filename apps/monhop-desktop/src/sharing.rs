@@ -713,6 +713,9 @@ struct PeerState {
     worker_failed_at: Option<(Instant, Duration)>,
     /// The least wait the failing worker asks for; taken when it ends.
     failure_floor: Duration,
+    /// When this computer last connected or dropped, or its first worker started: how long
+    /// sharing has heard nothing from it.
+    heard_at: Option<Instant>,
 }
 
 /// The key `State::peers` files a computer under.
@@ -1214,24 +1217,7 @@ impl SharingController {
         let cleanup = self.cleanup_pending();
         let _operation = lock(&self.operation);
         let mut state = lock(&self.state);
-        for peer in scoped(&mut state.peers, scope) {
-            let busy = peer.view.as_ref().is_some_and(|view| view.busy);
-            if peer.running.is_some() && (busy || peer.link.is_some()) {
-                peer.close_message = Some(idle_message.to_owned());
-            }
-        }
-        begin_close(
-            &mut state,
-            scope,
-            "Stopping the connection and releasing held input.",
-            control_change,
-        );
-        let idle = idle_message.to_owned();
-        settle_idle_with(&mut state, scope, false, cleanup, |view| {
-            if !cleanup {
-                view.message.clone_from(&idle);
-            }
-        });
+        close_all(&mut state, scope, idle_message, control_change, cleanup);
         view_of(&state)
     }
 
@@ -1307,6 +1293,25 @@ impl SharingController {
             .iter()
             .filter_map(|key| state.peers.get(key).and_then(|peer| peer.running))
             .collect()
+    }
+
+    /// True while workers run and every one is still dialing or waiting for a computer it has
+    /// not heard from for `quiet`: stopping them interrupts no connection.
+    pub fn only_waiting(&self, quiet: Duration) -> bool {
+        only_waiting(&lock(&self.state), quiet)
+    }
+
+    /// [`Self::stop_with`] while [`Self::only_waiting`] holds, decided under the same locks so
+    /// no connection can come up in between; true when it stopped.
+    pub fn stop_if_only_waiting(&self, quiet: Duration, idle_message: &str) -> bool {
+        let cleanup = self.cleanup_pending();
+        let _operation = lock(&self.operation);
+        let mut state = lock(&self.state);
+        if !only_waiting(&state, quiet) {
+            return false;
+        }
+        close_all(&mut state, None, idle_message, false, cleanup);
+        true
     }
 
     /// Whether `peer`'s link or session worker is alive.
@@ -2267,7 +2272,9 @@ impl SharingController {
                         {
                             let mut guard = lock(&state);
                             guard.displays_unreadable_since = None;
-                            peer_entry(&mut guard.peers, &key).not_paired = false;
+                            let entry = peer_entry(&mut guard.peers, &key);
+                            entry.not_paired = false;
+                            entry.heard_at = Some(Instant::now());
                         }
                         attempts = AttemptLog::default();
                         log::info!("sharing: attempt {attempt} connected, starting the session");
@@ -2324,6 +2331,7 @@ impl SharingController {
                             entry.native_cancel = None;
                             entry.inspection = None;
                             entry.share_started = None;
+                            entry.heard_at = Some(Instant::now());
                             // A cleared progress stops status() from reporting the reconnect
                             // wait as sharing; the ended session's counters stay visible.
                             entry.progress = None;
@@ -2632,6 +2640,7 @@ impl SharingController {
         entry.close_message = None;
         entry.failure_floor = Duration::ZERO;
         entry.running = Some(peer);
+        entry.heard_at.get_or_insert_with(Instant::now);
         entry.authorized = (!is_link).then_some(authorization_revision);
         // Claimed now, not when the worker starts: a Stop or switch-off from here on spends it.
         let link_epoch = if is_link {
@@ -2859,6 +2868,53 @@ fn forget_choice(peer: &mut PeerState) {
     peer.last_failure_at = None;
     peer.worker_failed_at = None;
     peer.not_paired = false;
+}
+
+/// The body of [`SharingController::stop_with_reason`], under its locks.
+fn close_all(
+    state: &mut State,
+    scope: Option<&str>,
+    idle_message: &str,
+    control_change: bool,
+    cleanup: bool,
+) {
+    for peer in scoped(&mut state.peers, scope) {
+        let busy = peer.view.as_ref().is_some_and(|view| view.busy);
+        if peer.running.is_some() && (busy || peer.link.is_some()) {
+            peer.close_message = Some(idle_message.to_owned());
+        }
+    }
+    begin_close(
+        state,
+        scope,
+        "Stopping the connection and releasing held input.",
+        control_change,
+    );
+    let idle = idle_message.to_owned();
+    settle_idle_with(state, scope, false, cleanup, |view| {
+        if !cleanup {
+            view.message.clone_from(&idle);
+        }
+    });
+}
+
+/// See [`SharingController::only_waiting`].
+fn only_waiting(state: &State, quiet: Duration) -> bool {
+    if NativeSessionClaim::is_claimed() || state.shutdown {
+        return false;
+    }
+    let mut running = state
+        .peers
+        .values()
+        .filter(|peer| peer.running.is_some())
+        .peekable();
+    running.peek().is_some()
+        && running.all(|peer| {
+            let view = shown_view(state, peer, true);
+            !view.sharing_active
+                && matches!(view.phase, "starting" | "connecting")
+                && peer.heard_at.is_some_and(|at| at.elapsed() >= quiet)
+        })
 }
 
 /// The phases in which a link is up or ending.
@@ -3654,6 +3710,12 @@ fn apply_link_event(
     let state = &mut *guard;
     if generation_of(state, key) != generation || state.shutdown {
         return matches!(event, LinkEvent::Closed);
+    }
+    if matches!(
+        event,
+        LinkEvent::Connected { .. } | LinkEvent::Disconnected { .. }
+    ) {
+        peer_entry(&mut state.peers, key).heard_at = Some(Instant::now());
     }
     match event {
         LinkEvent::Connecting { attempt } => {

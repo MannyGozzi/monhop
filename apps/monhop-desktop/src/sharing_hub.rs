@@ -1537,7 +1537,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::group_record::{GroupMember, shared_group_bytes};
-    use crate::lifecycle::AppController;
+    use crate::lifecycle::{AppController, UpdateRoom};
     use crate::sharing::{
         LayoutRequest, LinkRequest, NOT_CONNECTED, PAUSED, SharingController, SharingView,
         tests::{expect_fake_links, fake_link},
@@ -2860,6 +2860,68 @@ mod tests {
         eventually(|| fake.connects('B') == 3);
         assert_eq!(hub_starts(&fake), 1);
         assert!(app.sharing.worker_alive(fingerprint('B')));
+        finish(&app, &path);
+    }
+
+    #[test]
+    fn an_update_stops_only_sharing_that_waits_and_never_a_connected_computer() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let saved = preferences();
+        let record = crate::sharing_preferences::tests::group(&saved);
+        let path = setup_holding("update-room", &record);
+        let fake = Fake::default();
+        let app = app(&fake, &path);
+        let away = Duration::from_secs(60);
+        // Unanswered, the dial waits as it does for a computer that is switched off.
+        supervise_until(&app, || fake.connects('B') == 1);
+        assert_eq!(peer_json(&app, 'B')["phase"], "starting");
+        assert_eq!(app.update_room(Duration::ZERO), UpdateRoom::Waiting);
+        // Just started, so not yet away.
+        assert_eq!(app.update_room(away), UpdateRoom::Taken);
+        assert!(app.begin_update(false, Some(away)).is_err());
+        assert!(app.begin_update(false, None).is_err());
+        assert!(app.sharing.worker_alive(fingerprint('B')));
+
+        let lease = app.begin_update(false, Some(Duration::ZERO)).unwrap();
+        assert!(app.sharing.shutdown_ready());
+        assert_eq!(app.update_room(Duration::ZERO), UpdateRoom::Free);
+        supervise_idle(&app);
+        assert_eq!(fake.connects('B'), 1);
+        assert!(!app.sharing.worker_alive(fingerprint('B')));
+
+        // The supervisor reconnects once the lease ends, and a connected computer is never stopped.
+        fake.answer('B', Answer::Accept(Box::new(inspection(&saved))));
+        drop(lease);
+        supervise_until(&app, || sharing_with(&app, 'B'));
+        assert_eq!(fake.connects('B'), 2);
+        assert_eq!(app.update_room(Duration::ZERO), UpdateRoom::Taken);
+        assert!(app.begin_update(false, Some(Duration::ZERO)).is_err());
+        assert!(app.begin_update(true, Some(Duration::ZERO)).is_err());
+        supervise_idle(&app);
+        assert!(sharing_with(&app, 'B'));
+
+        // A computer that just dropped is waited for again, but counts as heard from.
+        fake.end('B', Err(SessionFailure::Wire), LinkClose::Transport);
+        eventually(|| fake.connects('B') == 3);
+        assert_eq!(app.update_room(Duration::ZERO), UpdateRoom::Waiting);
+        assert_eq!(app.update_room(away), UpdateRoom::Taken);
+        finish(&app, &path);
+    }
+
+    #[test]
+    fn an_update_never_stops_a_group_while_one_computer_shares() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let record = trio(3, true);
+        let path = setup_holding("update-room-group", &record);
+        let fake = Fake::default();
+        fake.accept('B', &record);
+        let app = app(&fake, &path);
+        supervise_until(&app, || sharing_with(&app, 'B') && fake.connects('C') >= 1);
+        assert_eq!(app.update_room(Duration::ZERO), UpdateRoom::Taken);
+        assert!(app.begin_update(false, Some(Duration::ZERO)).is_err());
+        supervise_idle(&app);
+        assert!(sharing_with(&app, 'B'));
+        assert!(app.sharing.worker_alive(fingerprint('C')));
         finish(&app, &path);
     }
 

@@ -41,6 +41,16 @@ struct ActionLease<'a>(&'a ActionGate);
 
 pub struct UpdateLease(Arc<ActionGate>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateRoom {
+    /// Nothing holds the sharing port.
+    Free,
+    /// Only workers still waiting for computers that have been silent hold it.
+    Waiting,
+    /// A computer is connected, or sharing, input cleanup or pairing is busy.
+    Taken,
+}
+
 impl ActionGate {
     fn begin(&self) -> Result<ActionLease<'_>, String> {
         let mut state = lock(&self.0);
@@ -123,6 +133,7 @@ const SUPERVISOR_BACKOFF: Duration = Duration::from_secs(10);
 /// the window's one-second poll, a change reaches its cards within about two seconds.
 const DISPLAYS_WATCH: Duration = Duration::from_secs(1);
 const PAIRING_HOLDS_PORT: &str = "Pairing in progress. Sharing resumes afterwards.";
+const UPDATE_HOLDS_PORT: &str = "Checking for a MonHop update. Sharing resumes in a moment.";
 const SWITCHING_NETWORK: &str = "Switching to the chosen network.";
 const SETUP_UNREADABLE: &str = "The saved setup could not be read. Apply a layout again.";
 
@@ -136,21 +147,55 @@ impl AppController {
     }
 
     /// The same gate reserves sharing starts and update work, including across async downloads.
-    pub fn begin_update(&self, installing: bool) -> Result<UpdateLease, String> {
-        let mut state = lock(&self.gate.0);
-        if state.action_running || state.updating || (state.shutting_down && !installing) {
-            return Err("Finish the current action before updating MonHop.".into());
-        }
-        if !self.sharing.shutdown_ready()
-            || !self.pairing.shutdown_ready()
-            || self.pairing.occupies_port()
+    /// Update networking never runs beside a connected computer. With `make_room`, workers only
+    /// waiting for computers silent at least that long stop for it; no supervisor pass can
+    /// restart them before the lease ends, because it holds the gate.
+    pub fn begin_update(
+        &self,
+        installing: bool,
+        make_room: Option<Duration>,
+    ) -> Result<UpdateLease, String> {
         {
+            let mut state = lock(&self.gate.0);
+            if state.action_running || state.updating || (state.shutting_down && !installing) {
+                return Err("Finish the current action before updating MonHop.".into());
+            }
+            state.updating = true;
+        }
+        let lease = UpdateLease(self.gate.clone());
+        if let Some(quiet) = make_room
+            && self.pairing_idle()
+            && self.sharing.stop_if_only_waiting(quiet, UPDATE_HOLDS_PORT)
+        {
+            let deadline = Instant::now() + SESSION_PAUSE_WINDOW;
+            while !self.sharing.shutdown_ready() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        if !self.pairing_idle() || !self.sharing.shutdown_ready() {
             return Err(
                 "Pause sharing and finish pairing before checking or installing updates.".into(),
             );
         }
-        state.updating = true;
-        Ok(UpdateLease(self.gate.clone()))
+        Ok(lease)
+    }
+
+    /// What sharing and pairing leave for update networking right now; sharing counts as
+    /// waiting only for computers silent at least `quiet`.
+    pub fn update_room(&self, quiet: Duration) -> UpdateRoom {
+        if !self.pairing_idle() {
+            UpdateRoom::Taken
+        } else if self.sharing.shutdown_ready() {
+            UpdateRoom::Free
+        } else if self.sharing.only_waiting(quiet) {
+            UpdateRoom::Waiting
+        } else {
+            UpdateRoom::Taken
+        }
+    }
+
+    fn pairing_idle(&self) -> bool {
+        self.pairing.shutdown_ready() && !self.pairing.occupies_port()
     }
 
     /// Trust changes use the sharing port, so the live connection ends first; the supervisor
@@ -2293,16 +2338,16 @@ mod tests {
     fn update_work_and_sharing_actions_exclude_each_other_in_both_orders() {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let controller = AppController::default();
-        let update = controller.begin_update(false).unwrap();
+        let update = controller.begin_update(false, None).unwrap();
         assert!(controller.gate.begin().is_err());
-        assert!(controller.begin_update(true).is_err());
+        assert!(controller.begin_update(true, None).is_err());
         drop(update);
         {
             let _lease = controller.gate.begin().unwrap();
-            assert!(controller.begin_update(false).is_err());
-            assert!(controller.begin_update(true).is_err());
+            assert!(controller.begin_update(false, None).is_err());
+            assert!(controller.begin_update(true, None).is_err());
         }
-        assert!(controller.begin_update(false).is_ok());
+        assert!(controller.begin_update(false, None).is_ok());
     }
 
     #[test]
@@ -2311,10 +2356,10 @@ mod tests {
         let controller = AppController::default();
         let ownership = monhop_core::NativeSessionClaim::claim().unwrap();
         assert!(!controller.sharing.status().sharing_active);
-        assert!(controller.begin_update(false).is_err());
-        assert!(controller.begin_update(true).is_err());
+        assert!(controller.begin_update(false, None).is_err());
+        assert!(controller.begin_update(true, None).is_err());
         drop(ownership);
-        assert!(controller.begin_update(false).is_ok());
+        assert!(controller.begin_update(false, None).is_ok());
     }
 
     #[test]
@@ -2322,8 +2367,8 @@ mod tests {
         let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let controller = AppController::default();
         controller.request_shutdown();
-        assert!(controller.begin_update(false).is_err());
-        let install = controller.begin_update(true).unwrap();
+        assert!(controller.begin_update(false, None).is_err());
+        let install = controller.begin_update(true, None).unwrap();
         assert!(controller.gate.begin().is_err());
         drop(install);
         assert!(controller.shutdown_ready());
