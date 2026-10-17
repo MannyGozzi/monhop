@@ -9,6 +9,7 @@ mod draw;
 
 use std::{
     cell::{Cell, RefCell},
+    iter,
     ptr::NonNull,
     rc::Rc,
     time::{Duration, Instant},
@@ -285,26 +286,6 @@ struct Outbox {
     actions: Vec<Action>,
 }
 
-/// A blur radius in motion, tracked so an interruption starts from the radius on screen.
-#[derive(Clone, Copy)]
-struct Veil {
-    from: f64,
-    to: f64,
-    begin: f64,
-    duration: f64,
-    easing: [f64; 4],
-}
-
-impl Veil {
-    fn at(&self, time: f64) -> f64 {
-        if self.duration <= 0.0 {
-            return self.to;
-        }
-        let share = ((time - self.begin) / self.duration).clamp(0.0, 1.0);
-        self.from + (self.to - self.from) * tokens::ease_at(self.easing, share)
-    }
-}
-
 enum Content {
     /// At rest the island is the notch's own black, with nothing inside.
     Idle,
@@ -313,11 +294,21 @@ enum Content {
 }
 
 impl Content {
+    /// Leaves and comes back as one.
     fn group(&self) -> Option<&CALayer> {
         match self {
             Self::Idle => None,
             Self::Compact(_, parts) => Some(&parts.group),
             Self::Open(parts) => Some(&parts.group),
+        }
+    }
+
+    /// Arrive one after another, top to bottom.
+    fn bands(&self) -> Vec<&CALayer> {
+        match self {
+            Self::Idle => Vec::new(),
+            Self::Compact(_, parts) => parts.bands(),
+            Self::Open(parts) => parts.bands(),
         }
     }
 }
@@ -326,7 +317,6 @@ impl Content {
 struct Piece {
     id: u64,
     content: Content,
-    veil: Option<Veil>,
 }
 
 /// The running shape motion, kept so a retarget carries its speed on.
@@ -835,18 +825,25 @@ impl Island {
     fn show_open(&mut self, expanded: &Expanded, animate: bool) {
         let now = Instant::now();
         let dragging = self.dragging();
-        if let Some(Piece {
-            content: Content::Open(parts),
-            ..
-        }) = &mut self.shown
-            && content::update_open(&self.look, parts, expanded, dragging, now)
-        {
+        let held = self.held();
+        let mtm = self.mtm;
+        let updated = match &mut self.shown {
+            Some(Piece {
+                content: Content::Open(parts),
+                ..
+            }) => content::update_open(&self.look, parts, expanded, dragging, now, mtm)
+                .then_some(parts.size),
+            _ => None,
+        };
+        if let Some(size) = updated {
+            self.hold(held);
+            self.set_shape(self.look.place.outline(size), animate);
             return;
         }
         let mut revived = None;
         for (index, piece) in self.leaving.iter_mut().enumerate() {
             if let Content::Open(parts) = &mut piece.content
-                && content::update_open(&self.look, parts, expanded, false, now)
+                && content::update_open(&self.look, parts, expanded, false, now, mtm)
             {
                 revived = Some(index);
                 break;
@@ -857,7 +854,7 @@ impl Island {
         let piece = match revived {
             Some(index) => {
                 let mut piece = self.leaving.remove(index);
-                self.revive(&mut piece);
+                self.revive(&mut piece, animate);
                 piece
             }
             None => {
@@ -866,7 +863,6 @@ impl Island {
                 let mut piece = Piece {
                     id: 0,
                     content: Content::Open(parts),
-                    veil: None,
                 };
                 self.reveal(&mut piece, animate);
                 piece
@@ -905,7 +901,7 @@ impl Island {
                 if let Content::Compact(_, parts) = &mut piece.content {
                     content::update_compact(&self.look, parts, activity, wing);
                 }
-                self.revive(&mut piece);
+                self.revive(&mut piece, animate);
                 piece
             }
             None => {
@@ -914,7 +910,6 @@ impl Island {
                 let mut piece = Piece {
                     id: 0,
                     content: Content::Compact(activity.id, parts),
-                    veil: None,
                 };
                 self.reveal(&mut piece, animate);
                 piece
@@ -938,102 +933,40 @@ impl Island {
             self.shown = Some(Piece {
                 id: self.next(),
                 content: Content::Idle,
-                veil: None,
             });
         }
         self.set_shape(place.outline(place.idle), animate);
     }
 
-    /// Fades, blurs and scales a new group in, starting a stagger after the shape.
+    /// Materializes new content band by band, top to bottom, each a stagger after the last and
+    /// the first a stagger after the shape starts.
     fn reveal(&mut self, piece: &mut Piece, animate: bool) {
         piece.id = self.next();
-        let Some(group) = piece.content.group() else {
-            return;
-        };
-        group.setOpacity(1.0);
-        draw::set_number(group, "transform.scale", 1.0);
         if !animate {
-            draw::set_blur(group, None);
-            piece.veil = None;
             return;
         }
-        let tokens = self.tokens;
-        let (delay, duration, easing) = (tokens.stagger, tokens.base, tokens.ease_out);
-        draw::set_blur(group, Some(0.0));
-        for (key, from, to) in [
-            ("opacity", 0.0, 1.0),
-            (draw::BLUR_RADIUS, tokens.blur_deep, 0.0),
-            ("transform.scale", tokens.scale_defocus, 1.0),
-        ] {
-            let animation = draw::tween(
-                key,
-                &draw::number(from),
-                &draw::number(to),
-                duration,
-                easing,
-                delay,
-            );
-            draw::add(group, key, &animation);
+        let stagger = self.tokens.stagger;
+        for (index, band) in piece.content.bands().into_iter().enumerate() {
+            content::materialize(&self.look, band, stagger * (index as f64 + 1.0));
         }
-        piece.veil = Some(Veil {
-            from: tokens.blur_deep,
-            to: 0.0,
-            begin: draw::now() + delay,
-            duration,
-            easing,
-        });
-        self.clear_veil_later(piece.id, delay + duration);
     }
 
-    /// Brings a leaving group back from wherever its dismissal had taken it.
-    fn revive(&mut self, piece: &mut Piece) {
+    /// Brings leaving content back from wherever its exit had taken it.
+    fn revive(&mut self, piece: &mut Piece, animate: bool) {
         piece.id = self.next();
         let Some(group) = piece.content.group() else {
             return;
         };
-        let tokens = self.tokens;
-        let now = draw::now();
-        let radius = piece.veil.map_or(0.0, |veil| veil.at(now));
-        let scale = draw::shown_number(group, "transform.scale", 1.0);
-        draw::fade_to(group, 1.0, tokens.base, tokens.ease_out, 0.0);
-        draw::set_blur(group, Some(radius));
-        for (key, from) in [(draw::BLUR_RADIUS, radius), ("transform.scale", scale)] {
-            let to = if key == draw::BLUR_RADIUS { 0.0 } else { 1.0 };
-            draw::set_number(group, key, to);
-            let animation = draw::tween(
-                key,
-                &draw::number(from),
-                &draw::number(to),
-                tokens.base,
-                tokens.ease_out,
-                0.0,
-            );
-            draw::add(group, key, &animation);
-        }
-        piece.veil = Some(Veil {
-            from: radius,
-            to: 0.0,
-            begin: now,
-            duration: tokens.base,
-            easing: tokens.ease_out,
-        });
-        self.clear_veil_later(piece.id, tokens.base);
-    }
-
-    fn clear_veil_later(&self, id: u64, seconds: f64) {
-        let _ = self.later(seconds, move |island| {
-            if let Some(piece) = &mut island.shown
-                && piece.id == id
-            {
-                if let Some(group) = piece.content.group() {
-                    draw::set_blur(group, None);
-                }
-                piece.veil = None;
+        if animate {
+            content::refocus(&self.look, group);
+        } else {
+            for layer in iter::once(group).chain(piece.content.bands()) {
+                content::rest(layer);
             }
-        });
+        }
     }
 
-    /// Fades and blurs the shown group out at once, ahead of the shape closing over it.
+    /// Blurs, fades and sinks the shown content at once, ahead of the shape closing over it.
     fn dismiss_shown(&mut self, animate: bool) {
         let Some(mut piece) = self.shown.take() else {
             return;
@@ -1046,27 +979,7 @@ impl Island {
             return;
         }
         let tokens = self.tokens;
-        let now = draw::now();
-        let radius = piece.veil.map_or(0.0, |veil| veil.at(now));
-        draw::set_blur(&group, Some(radius));
-        draw::set_number(&group, draw::BLUR_RADIUS, tokens.blur);
-        let blur = draw::tween(
-            draw::BLUR_RADIUS,
-            &draw::number(radius),
-            &draw::number(tokens.blur),
-            tokens.fast,
-            tokens.ease_out,
-            0.0,
-        );
-        draw::add(&group, draw::BLUR_RADIUS, &blur);
-        draw::fade_to(&group, 0.0, tokens.fast, tokens.ease_out, 0.0);
-        piece.veil = Some(Veil {
-            from: radius,
-            to: tokens.blur,
-            begin: now,
-            duration: tokens.fast,
-            easing: tokens.ease_out,
-        });
+        content::dissolve(&self.look, &group);
         piece.id = self.next();
         let id = piece.id;
         self.leaving.push(piece);
@@ -1122,10 +1035,22 @@ impl Island {
             return;
         }
         let tokens = self.tokens;
-        let spring = if size_of(&target).area() > size_of(&shown).area() {
+        let growing = size_of(&target).area() > size_of(&shown).area();
+        let spring = if growing {
             tokens.grow_spring()
         } else {
             tokens.shrink_spring()
+        };
+        // Closing from rest, the shape trails the content leaving inside it; a moving shape
+        // retargets at once so it never stalls.
+        let resting = self
+            .swing
+            .as_ref()
+            .is_none_or(|swing| now - swing.start >= swing.duration);
+        let lead = if !growing && resting && !self.leaving.is_empty() {
+            tokens.stagger
+        } else {
+            0.0
         };
         let duration = spring.settle_time(travel, SETTLE_TOLERANCE, carried);
         let (low, high) = spring.excursion(carried, duration);
@@ -1144,6 +1069,7 @@ impl Island {
             carried,
             duration,
         );
+        draw::delayed(&animation, lead);
         for shape in [&self.fill, &self.mask] {
             draw::add(shape, "path", &animation);
         }
@@ -1152,14 +1078,15 @@ impl Island {
             id,
             from: shown,
             to: target,
-            start: now,
+            start: now + lead,
             spring,
             velocity: carried,
             duration,
             peak: spring.peak_speed(carried) * travel,
         });
-        self.timers.settle =
-            Some(self.later(duration + 1.0 / 60.0, move |island| island.settle(id)));
+        self.timers.settle = Some(self.later(lead + duration + 1.0 / 60.0, move |island| {
+            island.settle(id)
+        }));
         self.update_tracking();
     }
 
@@ -1484,6 +1411,35 @@ impl Island {
         self.close_soon();
     }
 
+    /// The pressed and the hovered control, by what they change, to find again once rows move.
+    fn held(&self) -> (Option<ControlId>, Option<ControlId>) {
+        let id = |index: usize| {
+            self.open_parts()
+                .and_then(|parts| parts.controls.get(index))
+                .map(|control| control.id.clone())
+        };
+        (
+            self.press.as_ref().and_then(|press| id(press.index)),
+            self.hovered.and_then(id),
+        )
+    }
+
+    fn hold(&mut self, (pressed, hovered): (Option<ControlId>, Option<ControlId>)) {
+        let find = |id: Option<ControlId>| {
+            let id = id?;
+            self.open_parts()?
+                .controls
+                .iter()
+                .position(|control| control.id == id)
+        };
+        let (pressed, hovered) = (find(pressed), find(hovered));
+        match (&mut self.press, pressed) {
+            (Some(press), Some(index)) => press.index = index,
+            (press, _) => *press = None,
+        }
+        self.hovered = hovered;
+    }
+
     /// A drag that the island stops tracking (it closed or rebuilt) still saves its level.
     fn end_press(&mut self) {
         let dragged = self
@@ -1605,12 +1561,14 @@ impl Island {
             && bounds.max_y() <= slack;
         let size = size_of(&self.target);
         let place = self.look.place;
+        let still = |layer: &CALayer| layer.animationKeys().is_none_or(|keys| keys.count() == 0);
         let content_rest = self.leaving.is_empty()
             && self.shown.as_ref().is_none_or(|piece| {
-                piece.content.group().is_none_or(|group| {
-                    group.opacity() == 1.0
-                        && group.animationKeys().is_none_or(|keys| keys.count() == 0)
-                })
+                piece
+                    .content
+                    .group()
+                    .is_none_or(|group| group.opacity() == 1.0 && still(group))
+                    && piece.content.bands().into_iter().all(still)
             });
         Probe {
             shown,

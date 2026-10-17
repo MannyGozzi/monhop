@@ -491,6 +491,7 @@ impl Spring {
 }
 
 /// A CSS `cubic-bezier()` easing's output at input `x` (0..=1); x(t) is monotonic for valid easings.
+#[cfg(test)]
 pub fn ease_at(points: [f64; 4], x: f64) -> f64 {
     let [x1, y1, x2, y2] = points;
     let curve = |a: f64, b: f64, t: f64| {
@@ -592,7 +593,9 @@ pub struct IslandTokens {
     pub loop_spin: f64,
     pub blur: f64,
     pub blur_deep: f64,
+    pub focus: f64,
     pub ease_out: [f64; 4],
+    pub ease_focus: [f64; 4],
     pub spring_overshoot: f64,
     pub spring_peak_at: f64,
     pub scale_defocus: f64,
@@ -678,7 +681,9 @@ impl IslandTokens {
             loop_spin: sheet.ms("--loop-spin")?,
             blur: sheet.px("--motion-blur")?,
             blur_deep: sheet.px("--motion-blur-deep")?,
+            focus: sheet.ms("--motion-focus")?,
             ease_out: sheet.bezier("--ease-out")?,
+            ease_focus: sheet.bezier("--ease-focus")?,
             spring_overshoot: sheet.linear_peak("--ease-spring")?.0 - 1.0,
             spring_peak_at: sheet.linear_peak("--ease-spring")?.1,
             scale_defocus: sheet.number("--scale-defocus")?,
@@ -726,7 +731,9 @@ mod tests {
         assert_eq!(tokens.instant, 0.09);
         assert_eq!(tokens.stagger, 0.04);
         assert_eq!((tokens.blur, tokens.blur_deep), (3.0, 14.0));
+        assert_eq!(tokens.focus, 0.36);
         assert_eq!(tokens.ease_out, [0.22, 1.0, 0.36, 1.0]);
+        assert_eq!(tokens.ease_focus, [0.3, 0.0, 0.2, 1.0]);
         assert!(close(tokens.spring_overshoot, 0.038, 1e-9));
         assert!(close(tokens.spring_peak_at, 0.44, 1e-9));
         assert_eq!((tokens.scale_defocus, tokens.scale_press), (0.94, 0.97));
@@ -893,6 +900,21 @@ mod tests {
             assert!(value >= previous - 1e-12);
             previous = value;
         }
+    }
+
+    /// Arriving content must be seen soft before it sharpens: once its fade-in is nine tenths
+    /// done, more than half the blur is still on, and the blur still clears by the end.
+    #[test]
+    fn the_fade_in_leads_the_focus() {
+        let tokens = tokens().unwrap();
+        assert!(tokens.focus > tokens.base);
+        let faded_in = (0..=1000)
+            .map(|step| f64::from(step) / 1000.0 * tokens.base)
+            .find(|time| ease_at(tokens.ease_out, time / tokens.base) >= 0.9)
+            .unwrap();
+        let blur_left = 1.0 - ease_at(tokens.ease_focus, faded_in / tokens.focus);
+        assert!(blur_left > 0.5, "blur left {blur_left} at {faded_in} s");
+        assert!(close(ease_at(tokens.ease_focus, 1.0), 1.0, 1e-9));
     }
 
     #[test]

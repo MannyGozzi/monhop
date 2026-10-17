@@ -4,7 +4,7 @@
 use std::{cell::Cell, ffi::c_void, ops::Deref, ptr::NonNull};
 
 use block2::RcBlock;
-use objc2::{AnyThread, rc::Retained, runtime::AnyObject};
+use objc2::{AnyThread, Message, rc::Retained, runtime::AnyObject};
 use objc2_app_kit::{
     NSAttributedStringNSStringDrawing, NSFont, NSFontAttributeName, NSFontWeight,
     NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold, NSImage,
@@ -18,9 +18,9 @@ use objc2_foundation::{
     ns_string,
 };
 use objc2_quartz_core::{
-    CABasicAnimation, CACurrentMediaTime, CALayer, CAMediaTiming, CAMediaTimingFunction,
-    CASpringAnimation, CATextLayer, CATransaction, CATransition, kCAAlignmentLeft,
-    kCAAlignmentRight, kCAFillModeBackwards, kCATransitionFade, kCATruncationEnd,
+    CAAnimation, CABasicAnimation, CACurrentMediaTime, CALayer, CAMediaTiming,
+    CAMediaTimingFunction, CASpringAnimation, CATextLayer, CATransaction, kCAAlignmentLeft,
+    kCAAlignmentRight, kCAFillModeBackwards, kCATruncationEnd,
 };
 
 use super::super::{
@@ -31,6 +31,10 @@ use super::super::{
 /// The blur filter's name, and the key path of its radius.
 pub const BLUR: &str = "blur";
 pub const BLUR_RADIUS: &str = "filters.blur.inputRadius";
+/// A layer's own key (CALayer stores any key) for when its blur has cleared and may be dropped.
+const SHARP_AT: &str = "monhopSharpAt";
+/// Timers may fire a hair before the media clock reads the time they were set for.
+const CLOCK_SLACK: f64 = 1e-3;
 
 pub fn cg(color: Color) -> impl Deref<Target = CGColor> {
     let [r, g, b, a] = color.srgb();
@@ -55,14 +59,25 @@ pub fn share_space(layer: &CALayer, area: Rect) {
 /// center, its (0, 0).
 pub fn group(area: Rect) -> Retained<CALayer> {
     let layer = CALayer::new();
+    span(&layer, area);
+    layer.setPosition(NSPoint::new(0.0, 0.0));
+    layer
+}
+
+/// Gives a group new bounds without moving its content or the point it scales about.
+pub fn span(layer: &CALayer, area: Rect) {
     let (width, height) = (area.width.max(1.0), area.height.max(1.0));
     layer.setBounds(NSRect::new(
         NSPoint::new(area.x, area.y),
         NSSize::new(width, height),
     ));
     layer.setAnchorPoint(NSPoint::new(-area.x / width, -area.y / height));
-    layer.setPosition(NSPoint::new(0.0, 0.0));
-    layer
+}
+
+/// Takes a layer out of the tree once its exit has played.
+pub fn remove_later(layer: &CALayer, seconds: f64) {
+    let leaving = layer.retain();
+    let _ = after(seconds, move || quietly(|| leaving.removeFromSuperlayer()));
 }
 
 /// The outline as a path: a move, then four line-and-curve pairs, closed.
@@ -223,12 +238,17 @@ pub fn tween(
     }
     animation.setDuration(duration);
     animation.setTimingFunction(Some(&ease(easing)));
+    delayed(&animation, delay);
+    animation
+}
+
+/// Starts `animation` `delay` seconds from now, holding its first value until then.
+pub fn delayed(animation: &CAAnimation, delay: f64) {
     if delay > 0.0 {
         animation.setBeginTime(now() + delay);
         // SAFETY: a constant QuartzCore exports.
         animation.setFillMode(unsafe { kCAFillModeBackwards });
     }
-    animation
 }
 
 pub fn number(value: f64) -> Retained<NSNumber> {
@@ -270,16 +290,6 @@ pub fn quietly<R>(change: impl FnOnce() -> R) -> R {
     result
 }
 
-/// A crossfade of whatever `layer` draws next, over `duration`.
-pub fn crossfade(layer: &CALayer, duration: f64, easing: [f64; 4]) {
-    let fade = CATransition::new();
-    // SAFETY: a constant QuartzCore exports.
-    fade.setType(unsafe { kCATransitionFade });
-    fade.setDuration(duration);
-    fade.setTimingFunction(Some(&ease(easing)));
-    add(layer, "contents", &fade);
-}
-
 /// A `filters` array holding one Gaussian blur named [`BLUR`].
 pub fn blur_filters(radius: f64) -> Option<Retained<NSArray>> {
     // SAFETY: CIGaussianBlur is a built-in filter.
@@ -297,6 +307,137 @@ pub fn blur_filters(radius: f64) -> Option<Retained<NSArray>> {
 pub fn set_blur(layer: &CALayer, radius: Option<f64>) {
     // SAFETY: an array of CIFilter, the type macOS layer filters take, or none.
     unsafe { layer.setFilters(radius.and_then(blur_filters).as_deref()) };
+}
+
+/// The blur radius on screen now; zero without a filter.
+pub fn shown_blur(layer: &CALayer) -> f64 {
+    shown_number(layer, BLUR_RADIUS, 0.0)
+}
+
+fn own_number(layer: &CALayer, key: &str) -> Option<f64> {
+    layer
+        .valueForKey(&NSString::from_str(key))
+        .and_then(|value| value.downcast::<NSNumber>().ok())
+        .map(|value| value.as_f64())
+}
+
+/// Clears a blur from `from` to sharp after `delay`, then drops the filter unless a later blur
+/// change took the layer over, so nothing filters a still island.
+pub fn focus(layer: &CALayer, from: f64, duration: f64, easing: [f64; 4], delay: f64) {
+    set_blur(layer, Some(0.0));
+    let clear = tween(
+        BLUR_RADIUS,
+        &number(from),
+        &number(0.0),
+        duration,
+        easing,
+        delay,
+    );
+    add(layer, BLUR_RADIUS, &clear);
+    let sharp_at = now() + delay + duration;
+    set_number(layer, SHARP_AT, sharp_at);
+    let layer = layer.retain();
+    let _ = after(delay + duration, move || {
+        if own_number(&layer, SHARP_AT).is_some_and(|at| at <= now() + CLOCK_SLACK) {
+            quietly(|| set_blur(&layer, None));
+        }
+    });
+}
+
+/// Blurs a layer from `from` to `to` and holds it there; the layer is on its way out.
+pub fn blur_to(layer: &CALayer, from: f64, to: f64, duration: f64, easing: [f64; 4]) {
+    set_blur(layer, Some(to));
+    add(
+        layer,
+        BLUR_RADIUS,
+        &tween(
+            BLUR_RADIUS,
+            &number(from),
+            &number(to),
+            duration,
+            easing,
+            0.0,
+        ),
+    );
+    set_number(layer, SHARP_AT, f64::INFINITY);
+}
+
+/// Where a layer is drawn now, which an animated move may have taken from its model position.
+fn shown_position(layer: &CALayer) -> NSPoint {
+    // SAFETY: the presentation layer is a read-only copy of this one.
+    unsafe { layer.presentationLayer() }.map_or(layer.position(), |shown| shown.position())
+}
+
+/// A copy of a line of text as it shows now, to carry its old words out while it takes new ones.
+pub fn text_ghost(layer: &CATextLayer) -> Retained<CATextLayer> {
+    let ghost = CATextLayer::new();
+    // SAFETY: the font, string and color come from a layer of the same class.
+    unsafe {
+        ghost.setFont(layer.font().as_deref());
+        ghost.setString(layer.string().as_deref());
+    }
+    ghost.setFontSize(layer.fontSize());
+    ghost.setForegroundColor(layer.foregroundColor().as_deref());
+    ghost.setAlignmentMode(&layer.alignmentMode());
+    ghost.setTruncationMode(&layer.truncationMode());
+    ghost.setContentsScale(layer.contentsScale());
+    ghost.setBounds(layer.bounds());
+    ghost.setAnchorPoint(layer.anchorPoint());
+    ghost.setPosition(shown_position(layer));
+    ghost.setOpacity(shown_number(layer, "opacity", f64::from(layer.opacity())) as f32);
+    ghost
+}
+
+/// A copy of a plain layer as it shows now: its size, place, fill, corners and opacity.
+pub fn ghost(layer: &CALayer) -> Retained<CALayer> {
+    let ghost = CALayer::new();
+    ghost.setBounds(layer.bounds());
+    ghost.setAnchorPoint(layer.anchorPoint());
+    ghost.setPosition(shown_position(layer));
+    ghost.setCornerRadius(layer.cornerRadius());
+    // SAFETY: the presentation layer is a read-only copy of this one.
+    let color = unsafe { layer.presentationLayer() }
+        .and_then(|shown| shown.backgroundColor())
+        .or_else(|| layer.backgroundColor());
+    ghost.setBackgroundColor(color.as_deref());
+    ghost.setOpacity(shown_number(layer, "opacity", f64::from(layer.opacity())) as f32);
+    ghost
+}
+
+/// Gives a glyph the symbol `image` and returns a copy of it as it showed, keeping the old symbol.
+pub fn hand_over_glyph(layer: &CALayer, image: &NSImage, scale: f64) -> Retained<CALayer> {
+    let ghost = ghost(layer);
+    let old = layer.mask();
+    let size = image.size();
+    layer.setBounds(NSRect::new(NSPoint::new(0.0, 0.0), size));
+    // SAFETY: each mask is a plain layer only its own glyph uses; the old one moves to the ghost.
+    unsafe {
+        layer.setMask(Some(&glyph_mask(image, scale)));
+        ghost.setMask(old.as_deref());
+    }
+    ghost
+}
+
+/// Recolors a line of text from the color it shows now, over `duration`.
+pub fn retint(layer: &CATextLayer, to: Color, duration: f64, easing: [f64; 4]) {
+    // SAFETY: the presentation layer is a read-only copy of this one.
+    let from = unsafe { layer.presentationLayer() }
+        .and_then(|shown| shown.downcast::<CATextLayer>().ok())
+        .and_then(|shown| shown.foregroundColor())
+        .or_else(|| layer.foregroundColor());
+    let target = cg(to);
+    layer.setForegroundColor(Some(&target));
+    if let Some(from) = from {
+        let change = tween(
+            "foregroundColor",
+            color_value(&from),
+            color_value(&target),
+            duration,
+            easing,
+            0.0,
+        );
+        add(layer, "foregroundColor", &change);
+    }
 }
 
 /// A system font at a CSS weight (400, 500 or 600).
@@ -368,11 +509,7 @@ pub fn line_height(font: &NSFont) -> f64 {
     (font.ascender() - font.descender() + font.leading()).ceil()
 }
 
-/// Replaces a text layer's words with a crossfade, or at once under reduced motion.
-pub fn set_text(layer: &CATextLayer, text: &str, fade: Option<(f64, [f64; 4])>) {
-    if let Some((duration, easing)) = fade {
-        crossfade(layer, duration, easing);
-    }
+pub fn set_string(layer: &CATextLayer, text: &str) {
     // SAFETY: CATextLayer takes an NSString.
     unsafe { layer.setString(Some(&NSString::from_str(text))) };
 }
@@ -418,13 +555,9 @@ pub fn glyph_mask(image: &NSImage, scale: f64) -> Retained<CALayer> {
     mask
 }
 
-/// Swaps a glyph layer's symbol, crossfading unless `fade` is None.
-pub fn set_glyph(layer: &CALayer, image: &NSImage, scale: f64, fade: Option<(f64, [f64; 4])>) {
-    let size = image.size();
-    if let Some((duration, easing)) = fade {
-        crossfade(layer, duration, easing);
-    }
-    layer.setBounds(NSRect::new(NSPoint::new(0.0, 0.0), size));
+/// Swaps a glyph layer's symbol at once.
+pub fn set_glyph(layer: &CALayer, image: &NSImage, scale: f64) {
+    layer.setBounds(NSRect::new(NSPoint::new(0.0, 0.0), image.size()));
     // SAFETY: the mask is a plain layer this glyph owns.
     unsafe { layer.setMask(Some(&glyph_mask(image, scale))) };
 }
@@ -485,9 +618,7 @@ pub fn recolor(layer: &CALayer, to: Color, duration: f64, easing: [f64; 4]) {
 
 /// Moves a layer from where it shows now to `to` along `spring`.
 pub fn spring_position(layer: &CALayer, to: NSPoint, curve: Spring) {
-    // SAFETY: the presentation layer is a read-only copy of this one.
-    let from =
-        unsafe { layer.presentationLayer() }.map_or(layer.position(), |shown| shown.position());
+    let from = shown_position(layer);
     layer.setPosition(to);
     let travel = (to.x - from.x).hypot(to.y - from.y);
     if travel < 0.01 {

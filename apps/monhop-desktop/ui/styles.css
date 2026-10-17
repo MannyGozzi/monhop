@@ -277,6 +277,8 @@
   --motion-rise-page: 6px;
   --motion-blur: 3px;
   --motion-blur-deep: 14px;
+  /* Materializing content fades in still soft, then comes into focus over this. */
+  --motion-focus: 360ms;
   --motion-demo: 1100ms;
   --motion-bloom: 760ms;
   --motion-inhale: 620ms;
@@ -293,6 +295,8 @@
   --ease-in-out: cubic-bezier(.65, 0, .35, 1);
   /* Height glides: --ease-out would cover a fifth of a tall panel in the first frame. No overshoot. */
   --ease-glide: cubic-bezier(.33, 1, .68, 1);
+  /* A blur clearing: it holds through the fade-in, then sharpens and lands softly. */
+  --ease-focus: cubic-bezier(.3, 0, .2, 1);
   /* Damping .72, 3.8% overshoot. */
   --ease-spring: linear(0, 0.106 5%, 0.325 10%, 0.556 15%, 0.748 20%, 0.886 25%, 0.972 30%, 1.018 35%, 1.036 40%, 1.038 44%, 1.031 50%, 1.018 57%, 1.007 65%, 1.001 72%, 0.999 80%, 1);
   --transition-control: background-color var(--motion-fast) var(--ease-out), color var(--motion-fast) var(--ease-out), border-color var(--motion-fast) var(--ease-out), box-shadow var(--motion-base) var(--ease-out), opacity var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring);

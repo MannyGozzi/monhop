@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Changed
+
+- The notch island now opens like macOS does. Its rows come into focus one after another from a soft blur, its content blurs away before it closes, and status changes cross through a light blur instead of popping. When the rows change while it is open, rows that stay glide into place instead of the whole island redrawing.
+
 ### Fixed
 
 - Automatic updates now arrive when you share all the time. Before, a scheduled check only ran when sharing happened to let go of the network, which a working setup almost never does, and a missed check waited six hours. Now MonHop looks every minute for a moment when no computer is connected: while sharing is paused, no computer is switched on, or the other computer has not answered for two minutes. It never checks while a computer is connected. Time the computer slept counts toward the six hours, and a check that fails, such as one at login before Wi-Fi is up, is tried again after 30 minutes.

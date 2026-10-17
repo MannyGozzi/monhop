@@ -307,9 +307,14 @@ impl ControlElement {
         unsafe { msg_send![super(this), init] }
     }
 
-    /// The index of its control among the open island's controls when it was made.
+    /// The index of its control among the open island's controls.
     pub fn control(&self) -> usize {
         self.ivars().control.get()
+    }
+
+    /// Rows came or went, so its control now has another place among the controls.
+    pub fn set_control(&self, control: usize) {
+        self.ivars().control.set(control);
     }
 }
 
