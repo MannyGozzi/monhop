@@ -29,6 +29,17 @@ impl Launch {
     }
 }
 
+/// `--check-island` alone runs only the notch island's check; elsewhere it stays a normal launch.
+#[cfg(any(target_os = "macos", test))]
+pub fn island_check(arguments: impl IntoIterator<Item = OsString>) -> bool {
+    let mut arguments = arguments.into_iter();
+    cfg!(target_os = "macos")
+        && arguments
+            .next()
+            .is_some_and(|first| first == "--check-island")
+        && arguments.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,8 +62,25 @@ mod tests {
             vec!["--login".into(), "extra".into()],
             vec!["--check-ui=yes".into()],
             vec!["--unknown".into()],
+            vec!["--check-island".into()],
         ] {
             assert_eq!(Launch::parse(arguments), Launch::Normal);
+        }
+    }
+
+    #[test]
+    fn the_island_check_is_one_exact_argument_and_macos_only() {
+        assert_eq!(
+            island_check(["--check-island".into()]),
+            cfg!(target_os = "macos")
+        );
+        for arguments in [
+            vec![],
+            vec!["--check-island".into(), "extra".into()],
+            vec!["--check-island=yes".into()],
+            vec!["--check-ui".into()],
+        ] {
+            assert!(!island_check(arguments));
         }
     }
 }

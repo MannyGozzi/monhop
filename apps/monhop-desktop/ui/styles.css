@@ -176,6 +176,13 @@
   --slider-track: 4px;
   --slider-thumb: 18px;
   --slider-value-width: 40px;
+  /* Notch island: its fill (the camera housing's black), open width, how narrow or wide a compact
+     activity's wing may be, and a wing's level bar. */
+  --island-fill: rgb(0 0 0);
+  --island-width: 440px;
+  --island-wing-min: 44px;
+  --island-wing-max: 160px;
+  --island-level-width: 48px;
   /* Link capsule: two computer dots on one orbit, its radius per state, and Pause's bars. */
   --sharing-mark-size: 14px;
   --sharing-dot-size: 5px;
@@ -273,6 +280,9 @@
   --motion-demo: 1100ms;
   --motion-bloom: 760ms;
   --motion-inhale: 620ms;
+  /* Notch island: pointer rest before it opens, and grace before it closes once the pointer leaves. */
+  --island-hover-delay: 250ms;
+  --island-close-delay: 180ms;
   --loop-spin: 800ms;
   --loop-pulse: 1500ms;
   --loop-live: 2400ms;

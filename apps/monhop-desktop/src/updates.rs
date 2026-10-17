@@ -768,6 +768,7 @@ impl Environment for AppEnvironment {
 
     fn announce(&self, view: &UpdatesView) {
         let _ = self.app.emit(EVENT, view);
+        crate::island::notify();
     }
 }
 

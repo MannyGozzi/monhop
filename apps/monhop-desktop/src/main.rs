@@ -11,6 +11,7 @@ mod dimming;
 #[cfg(target_os = "macos")]
 mod display_labels;
 mod group_record;
+mod island;
 mod key_names;
 mod launch;
 mod lifecycle;
@@ -38,6 +39,8 @@ mod timer_resolution;
 mod tray;
 mod ui_smoke;
 mod updates;
+#[cfg(target_os = "macos")]
+mod web_recovery;
 
 use lifecycle::AppController;
 use pairing::{PairingController, PairingView};
@@ -629,6 +632,10 @@ fn constrained_webview2_environment(
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if launch::island_check(std::env::args_os().skip(1)) {
+        island::check::run();
+    }
     let launch = launch::Launch::parse(std::env::args_os().skip(1));
     let check_ui = launch == launch::Launch::CheckUi;
     let login = launch == launch::Launch::Login;
@@ -647,7 +654,10 @@ fn main() {
     };
 
     let controller = Arc::new(AppController::default());
-    let result = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(web_recovery::reload);
+    let result = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .device_event_filter(tauri::DeviceEventFilter::Always)
         .manage(controller.pairing.clone())
@@ -705,7 +715,9 @@ fn main() {
             links::app_open_link,
             autostart::autostart_status,
             autostart::autostart_set,
-            autostart::autostart_open_settings
+            autostart::autostart_open_settings,
+            island::island_status,
+            island::island_set_enabled
         ])
         .setup(move |app| {
             if check_ui {
@@ -748,6 +760,8 @@ fn main() {
             app.manage(swipe::Swipe::start(app.handle()));
             app.manage(control_as_command::ControlAsCommand::start(app.handle()));
             app.manage(updates::Updates::start(app.handle(), !check_ui));
+            #[cfg(target_os = "macos")]
+            app.manage(island::Island::start(app.handle(), !check_ui));
             let appearance = appearance::Appearance::start(app.handle());
             app.manage(appearance.clone());
             if !check_ui {
@@ -1082,7 +1096,9 @@ mod tests {
                 "allow-app-open-link",
                 "allow-autostart-status",
                 "allow-autostart-set",
-                "allow-autostart-open-settings"
+                "allow-autostart-open-settings",
+                "allow-island-status",
+                "allow-island-set-enabled"
             ])
         );
         let config: serde_json::Value =

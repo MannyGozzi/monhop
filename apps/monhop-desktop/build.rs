@@ -67,6 +67,8 @@ fn main() {
             "autostart_status",
             "autostart_set",
             "autostart_open_settings",
+            "island_status",
+            "island_set_enabled",
         ]),
     ))
     .expect("could not build the local setup app");

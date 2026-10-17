@@ -51,6 +51,7 @@ pub trait ViewEmitter: Send + Sync + 'static {
 impl ViewEmitter for tauri::AppHandle {
     fn view_changed(&self, view: &ClipboardView) {
         let _ = tauri::Emitter::emit(self, EVENT, view.clone());
+        crate::island::notify();
     }
 }
 

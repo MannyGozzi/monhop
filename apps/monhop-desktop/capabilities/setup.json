@@ -66,6 +66,8 @@
     "allow-app-open-link",
     "allow-autostart-status",
     "allow-autostart-set",
-    "allow-autostart-open-settings"
+    "allow-autostart-open-settings",
+    "allow-island-status",
+    "allow-island-set-enabled"
   ]
 }

@@ -5,13 +5,14 @@ import {
   autostartStatusText,
   showAutostartOpenSettings,
 } from "./autostart-model.mjs";
+import { ISLAND_TITLE, islandDescription, islandSwitchLabel } from "./island-model.mjs";
 import { presence } from "./accordion.mjs";
 import { button, card, clear, el, note, progressBar, rows, switchRow } from "./dom.mjs";
 
 export function renderSettings(nodes, ctx) {
   clear(nodes.settingsContent);
   nodes.settingsContent.append(
-    ...[updatesCard(ctx), startupCard(ctx), aboutCard(ctx)].filter(Boolean),
+    ...[updatesCard(ctx), startupCard(ctx), islandCard(ctx), aboutCard(ctx)].filter(Boolean),
   );
 }
 
@@ -96,6 +97,29 @@ function startupCard(ctx) {
     ),
   ];
   return card({ id: "settings-startup", title: "Startup", children });
+}
+
+// Mac only: the context is undefined everywhere the backend cannot draw the island.
+function islandCard(ctx) {
+  const { core, island, actions } = ctx;
+  if (!island) return null;
+  const { view, pending } = island;
+  return card({
+    id: "settings-island",
+    title: ISLAND_TITLE,
+    children: [
+      rows([
+        switchRow(islandSwitchLabel(view.notched), {
+          checked: view.enabled,
+          description: islandDescription(view.notched),
+          disabled: pending || !core,
+          id: "settings-island-enabled",
+          onChange: actions.setIslandEnabled,
+        }),
+      ]),
+      presence("settings-island-error", view.error ? note(view.error, "danger") : null),
+    ],
+  });
 }
 
 function aboutCard(ctx) {

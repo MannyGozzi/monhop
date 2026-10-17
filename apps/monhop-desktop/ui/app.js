@@ -142,6 +142,7 @@ import {
 } from "./dom.mjs";
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
 import { normalizeAutostartView, trayPlace } from "./autostart-model.mjs";
+import { islandContext, normalizeIslandView } from "./island-model.mjs";
 import { renderReady } from "./screen-ready.mjs";
 import { renderDisplays } from "./screen-displays.mjs";
 import { renderHome } from "./screen-home.mjs";
@@ -217,6 +218,9 @@ let updates = normalizeUpdatesView(null);
 let updatesPending = false;
 let autostart = normalizeAutostartView(null);
 let autostartPending = false;
+// Undefined until the Mac answers, so the card never shows on a platform that has no island.
+let island;
+let islandPending = false;
 let computers = initialComputers();
 let computersRequest = 0;
 let computersLoad = initialComputersLoad();
@@ -341,6 +345,7 @@ if (!uiCheck) {
   // The initial page never runs through goToPage's entry hooks, so this covers a fresh
   // launch landing straight on Setup or Settings; the hooks below cover later visits.
   void loadAutostartStatus();
+  if (platform === "macos") void loadIslandStatus();
   listenUpdates();
 }
 
@@ -407,6 +412,7 @@ function onPageEntered(nextPage) {
   else if (nextPage === "settings") {
     void loadUpdatesStatus();
     void loadAutostartStatus();
+    if (platform === "macos") void loadIslandStatus();
   } else {
     leavePairing();
     if (isEditingLayout(sharing)) void endLayoutEdit();
@@ -608,6 +614,7 @@ function context() {
     ),
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
+    island: islandContext(platform, island, islandPending),
     busy: controlsBusy(),
     peerName: peerName(activeComputer),
     gate: pairingOpenGate(state),
@@ -677,6 +684,7 @@ function context() {
       installUpdate,
       setAutostart,
       openAutostartSettings,
+      setIslandEnabled,
       openLink,
       setArrangementView(view) {
         arrangementView = view;
@@ -1762,6 +1770,32 @@ function setAutostart(enabled) {
 
 function openAutostartSettings() {
   void runAutostartCommand(() => core.invoke("autostart_open_settings"));
+}
+
+// ---------- notch island ----------
+
+async function loadIslandStatus() {
+  if (!core?.invoke || islandPending) return;
+  try {
+    island = normalizeIslandView(await core.invoke("island_status"));
+    render();
+  } catch {
+    // The card keeps what it last showed; the next Settings visit asks again.
+  }
+}
+
+async function setIslandEnabled(enabled) {
+  if (!core?.invoke || islandPending) return;
+  islandPending = true;
+  render();
+  try {
+    island = normalizeIslandView(await core.invoke("island_set_enabled", { enabled }));
+  } catch (error) {
+    state = { ...state, messages: [nativeError(error)] };
+  } finally {
+    islandPending = false;
+    render();
+  }
 }
 
 async function openLink(target) {
