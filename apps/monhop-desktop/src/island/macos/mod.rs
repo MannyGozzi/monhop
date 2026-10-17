@@ -1,7 +1,7 @@
-//! The island on screen: one non-activating panel at the top of the chosen display, drawn with
-//! Core Animation. Main thread only. Its state lives in one thread-local that AppKit callbacks
-//! reach through `with_island`; the app's actions and hover changes leave only after that borrow
-//! ends, so nothing the app does can re-enter it.
+//! The island on screen: one non-activating panel around the camera notch, drawn with Core
+//! Animation, and hidden while no display has a notch. Main thread only. Its state lives in one
+//! thread-local that AppKit callbacks reach through `with_island`; the app's actions and hover
+//! changes leave only after that borrow ends, so nothing the app does can re-enter it.
 
 mod classes;
 mod content;
@@ -23,7 +23,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSAccessibilityGroupRole, NSApplicationDidChangeScreenParametersNotification,
-    NSColor, NSEvent, NSScreen, NSStatusBar, NSStatusWindowLevel, NSWindowAnimationBehavior,
+    NSColor, NSEvent, NSScreen, NSStatusWindowLevel, NSWindowAnimationBehavior,
     NSWindowCollectionBehavior, NSWorkspace,
     NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification, NSWorkspaceDidWakeNotification,
     NSWorkspaceScreensDidSleepNotification, NSWorkspaceScreensDidWakeNotification,
@@ -81,6 +81,8 @@ pub struct Context {
     pub motion: Motion,
     pub hover: Box<dyn Fn(bool) + Send>,
     pub act: Box<dyn Fn(Action) + Send>,
+    /// Whether the island is on screen, so the feed rests while nothing shows it.
+    pub showing: Box<dyn Fn(bool) + Send>,
 }
 
 /// What the island check reads each frame.
@@ -161,24 +163,20 @@ pub fn probe(mtm: MainThreadMarker) -> Option<Probe> {
     with_island(|island| island.probe())
 }
 
-/// The display the island would use has a camera housing.
-pub fn chosen_display_is_notched() -> bool {
-    MainThreadMarker::new()
-        .and_then(chosen_display)
-        .is_some_and(|display| display.notched())
+/// Some connected display has a camera notch, the only place the island shows.
+pub fn has_notch() -> bool {
+    MainThreadMarker::new().and_then(notch_placement).is_some()
 }
 
-fn display_info(screen: &NSScreen, status_bar: f64) -> DisplayInfo {
+fn display_info(screen: &NSScreen) -> DisplayInfo {
     let area =
         |rect: NSRect| (rect.size.width > 0.0 && rect.size.height > 0.0).then(|| to_rect(rect));
     DisplayInfo {
         frame: to_rect(screen.frame()),
-        visible: to_rect(screen.visibleFrame()),
         safe_top: screen.safeAreaInsets().top,
         aux_left: area(screen.auxiliaryTopLeftArea()),
         aux_right: area(screen.auxiliaryTopRightArea()),
         scale: screen.backingScaleFactor(),
-        status_bar,
     }
 }
 
@@ -191,18 +189,11 @@ fn to_rect(rect: NSRect) -> Rect {
     )
 }
 
-/// The first display with a camera housing (only a built-in panel has one), else the menu-bar one.
-fn chosen_display(mtm: MainThreadMarker) -> Option<DisplayInfo> {
-    let status_bar = NSStatusBar::systemStatusBar().thickness();
-    let displays: Vec<DisplayInfo> = NSScreen::screens(mtm)
+/// Around the camera of the first display that has one; only a built-in panel does.
+fn notch_placement(mtm: MainThreadMarker) -> Option<Placement> {
+    NSScreen::screens(mtm)
         .iter()
-        .map(|screen| display_info(&screen, status_bar))
-        .collect();
-    displays
-        .iter()
-        .copied()
-        .find(DisplayInfo::notched)
-        .or_else(|| displays.first().copied())
+        .find_map(|screen| geometry::placement(&display_info(&screen)))
 }
 
 fn reduce_motion(motion: Motion) -> bool {
@@ -237,6 +228,9 @@ fn with_island<R>(work: impl FnOnce(&mut Island) -> R) -> Option<R> {
             std::mem::take(&mut island.outbox),
         ))
     })?;
+    if let Some(showing) = outbox.showing {
+        (context.showing)(showing);
+    }
     if let Some(hovering) = outbox.hover {
         (context.hover)(hovering);
     }
@@ -287,6 +281,7 @@ fn screen_locked(generation: u64, locked: bool) {
 #[derive(Default)]
 struct Outbox {
     hover: Option<bool>,
+    showing: Option<bool>,
     actions: Vec<Action>,
 }
 
@@ -311,8 +306,8 @@ impl Veil {
 }
 
 enum Content {
-    /// A notched island rests empty; a simulated one shows the link mark.
-    Idle(Option<Retained<CALayer>>),
+    /// At rest the island is the notch's own black, with nothing inside.
+    Idle,
     Compact(ActivityId, CompactParts),
     Open(OpenParts),
 }
@@ -320,7 +315,7 @@ enum Content {
 impl Content {
     fn group(&self) -> Option<&CALayer> {
         match self {
-            Self::Idle(group) => group.as_deref(),
+            Self::Idle => None,
             Self::Compact(_, parts) => Some(&parts.group),
             Self::Open(parts) => Some(&parts.group),
         }
@@ -424,18 +419,10 @@ impl Island {
         tokens: &'static IslandTokens,
         context: Context,
     ) -> Self {
-        let display = chosen_display(mtm);
-        let place = geometry::placement(&display.unwrap_or(DisplayInfo {
-            frame: Rect::new(0.0, 0.0, 0.0, 0.0),
-            visible: Rect::new(0.0, 0.0, 0.0, 0.0),
-            safe_top: 0.0,
-            aux_left: None,
-            aux_right: None,
-            scale: 1.0,
-            status_bar: 0.0,
-        }));
+        let found = notch_placement(mtm);
+        let place = found.unwrap_or(Placement::NOWHERE);
         let look = Look::new(tokens, place, reduce_motion(context.motion));
-        let target = place.outline(place.idle, false);
+        let target = place.outline(place.idle);
         let envelope = place.envelope(place.idle, place.idle, 0.0);
 
         let root = CALayer::new();
@@ -508,7 +495,7 @@ impl Island {
             hovered: None,
             press: None,
             hidden: Hidden {
-                no_display: display.is_none(),
+                no_display: found.is_none(),
                 ..Hidden::default()
             },
             next_id: 0,
@@ -723,15 +710,14 @@ impl Island {
         }));
     }
 
-    /// Finds the display again; a new place is laid out at once, never animated across.
+    /// Finds the notch again; a new place is laid out at once, never animated across.
     fn replace(&mut self) {
-        let display = chosen_display(self.mtm);
-        self.hidden.no_display = display.is_none();
-        if let Some(display) = display {
-            let place = geometry::placement(&display);
-            if place != self.look.place {
-                self.relayout(place);
-            }
+        let found = notch_placement(self.mtm);
+        self.hidden.no_display = found.is_none();
+        if let Some(place) = found
+            && place != self.look.place
+        {
+            self.relayout(place);
         }
         self.update_visibility();
     }
@@ -755,7 +741,7 @@ impl Island {
         self.hovered = None;
         self.swing = None;
         cancel(&mut self.timers.settle);
-        let target = place.outline(place.idle, false);
+        let target = place.outline(place.idle);
         let path = draw::path(&target);
         for shape in [&self.fill, &self.mask] {
             draw::remove(shape, "path");
@@ -770,6 +756,7 @@ impl Island {
     }
 
     fn update_visibility(&mut self) {
+        self.outbox.showing = Some(!self.hidden.any());
         if self.hidden.any() {
             if self.expanded {
                 self.end_press();
@@ -888,7 +875,7 @@ impl Island {
         self.shown = Some(piece);
         let place = self.look.place;
         self.set_shape(
-            place.outline(content::open_size(&self.look, expanded), true),
+            place.outline(content::open_size(&self.look, expanded)),
             animate,
         );
     }
@@ -896,7 +883,7 @@ impl Island {
     fn show_compact(&mut self, activity: &Activity, animate: bool) {
         let place = self.look.place;
         let wing = content::compact_wing(&self.look, activity);
-        let target = place.outline(place.compact(wing), false);
+        let target = place.outline(place.compact(wing));
         if let Some(Piece {
             content: Content::Compact(id, parts),
             ..
@@ -939,45 +926,22 @@ impl Island {
 
     fn show_idle(&mut self, animate: bool) {
         let place = self.look.place;
-        let target = place.outline(place.idle, false);
-        if matches!(
+        if !matches!(
             &self.shown,
             Some(Piece {
-                content: Content::Idle(_),
+                content: Content::Idle,
                 ..
             })
         ) {
-            self.set_shape(target, animate);
-            return;
+            self.end_press();
+            self.dismiss_shown(animate);
+            self.shown = Some(Piece {
+                id: self.next(),
+                content: Content::Idle,
+                veil: None,
+            });
         }
-        let revived = self
-            .leaving
-            .iter()
-            .position(|piece| matches!(piece.content, Content::Idle(_)));
-        self.end_press();
-        self.dismiss_shown(animate);
-        let piece = match revived {
-            Some(index) => {
-                let mut piece = self.leaving.remove(index);
-                self.revive(&mut piece);
-                piece
-            }
-            None => {
-                let group = content::idle(&self.look);
-                if let Some(group) = &group {
-                    self.content.addSublayer(group);
-                }
-                let mut piece = Piece {
-                    id: 0,
-                    content: Content::Idle(group),
-                    veil: None,
-                };
-                self.reveal(&mut piece, animate);
-                piece
-            }
-        };
-        self.shown = Some(piece);
-        self.set_shape(target, animate);
+        self.set_shape(place.outline(place.idle), animate);
     }
 
     /// Fades, blurs and scales a new group in, starting a stagger after the shape.
@@ -1121,7 +1085,7 @@ impl Island {
         unsafe { self.fill.presentationLayer() }
             .and_then(|layer| layer.downcast::<CAShapeLayer>().ok())
             .and_then(|layer| layer.path())
-            .and_then(|path| draw::read_outline(&path, &self.target))
+            .and_then(|path| draw::read_outline(&path))
             .unwrap_or(self.target)
     }
 
@@ -1150,7 +1114,7 @@ impl Island {
         }
         let travel = shown.travel(&target);
         cancel(&mut self.timers.settle);
-        if !animate || shown.silhouette != target.silhouette || travel <= SETTLE_TOLERANCE {
+        if !animate || travel <= SETTLE_TOLERANCE {
             self.swing = None;
             let size = size_of(&target);
             self.set_envelope(place.envelope(size, size, 0.0));
@@ -1651,7 +1615,7 @@ impl Island {
         Probe {
             shown,
             target: self.target,
-            idle: place.outline(place.idle, false),
+            idle: place.outline(place.idle),
             moving,
             at_rest: !moving
                 && self.swing.is_none()

@@ -6,7 +6,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ### Added
 
-- A notch island on a Mac. MonHop's status sits around the camera, or in a small capsule in the menu bar on a display without a notch. Connections, dimming and clipboard transfers show beside it, and pointing at it opens sharing, dimming and clipboard controls without taking focus from the app you are in. It is on by default and can be turned off in Settings. Windows is unchanged.
+- A notch island on Macs with a camera notch. MonHop's status sits around the camera. Connections, dimming and clipboard transfers show beside it, and pointing at it opens sharing, dimming and clipboard controls without taking focus from the app you are in. It is on by default and can be turned off in Settings. It shows only while the notched display is in use, so a closed laptop on an external display or a Mac without a notch shows nothing and has no setting for it. Windows is unchanged.
 
 ### Changed
 

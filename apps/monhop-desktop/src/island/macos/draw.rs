@@ -117,7 +117,7 @@ unsafe extern "C-unwind" fn collect_element(info: *mut c_void, element: NonNull<
 
 /// Reads a path built by [`path`] back into an outline, as a presentation layer draws it now.
 /// An interpolated path may carry a line as a curve, so each segment is read by its end points.
-pub fn read_outline(path: &CGPath, like: &Outline) -> Option<Outline> {
+pub fn read_outline(path: &CGPath) -> Option<Outline> {
     let mut elements: Vec<Vec<Point>> = Vec::with_capacity(9);
     // SAFETY: the callback only appends to `elements`, which outlives the synchronous apply.
     unsafe {
@@ -130,7 +130,7 @@ pub fn read_outline(path: &CGPath, like: &Outline) -> Option<Outline> {
     if elements.len() != 9 {
         return None;
     }
-    let mut points = like.points;
+    let mut points = [Point { x: 0.0, y: 0.0 }; 17];
     points[0] = *elements[0].last()?;
     for pair in 0..4 {
         let at = 1 + pair * 4;
@@ -157,10 +157,7 @@ pub fn read_outline(path: &CGPath, like: &Outline) -> Option<Outline> {
         points[at + 2] = second;
         points[at + 3] = end;
     }
-    Some(Outline {
-        silhouette: like.silhouette,
-        points,
-    })
+    Some(Outline { points })
 }
 
 /// A color as the `id` Core Animation values take.

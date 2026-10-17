@@ -1,6 +1,7 @@
 //! The island's feed: one thread, alive only while the island is on, that reads the app's views
 //! when something changes (or on a short tick while a session shares input), runs the model, and
-//! hands the main thread a presentation only when it changed.
+//! hands the main thread a presentation only when it changed. While nothing shows the island, as on
+//! a Mac without a notch, it keeps no tick and wakes only for a change.
 
 use std::{
     path::PathBuf,
@@ -31,6 +32,8 @@ struct Signal {
     stop: bool,
     woken: bool,
     hovering: Option<bool>,
+    /// The island is off screen: no tick and no deadline wakes the feed.
+    resting: bool,
 }
 
 struct Shared {
@@ -138,15 +141,59 @@ fn hovered(shared: &Shared, hovering: bool) {
     shared.wake.notify_all();
 }
 
+/// Coming back on screen reads the app's views at once, since nothing was ticking meanwhile.
+fn showing(shared: &Shared, showing: bool) {
+    let resting = !showing;
+    let mut signal = shared.signal();
+    if signal.resting == resting {
+        return;
+    }
+    signal.resting = resting;
+    signal.woken |= showing;
+    drop(signal);
+    shared.wake.notify_all();
+}
+
+/// Waits for a change, a hover, or `deadline` unless resting; returns the hover to apply, or None
+/// once the feed should stop.
+fn wait(shared: &Shared, deadline: Instant) -> Option<Option<bool>> {
+    let mut signal = shared.signal();
+    while !signal.stop && !signal.woken && signal.hovering.is_none() {
+        if signal.resting {
+            signal = shared
+                .wake
+                .wait(signal)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            continue;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        signal = shared
+            .wake
+            .wait_timeout(signal, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+    if signal.stop {
+        return None;
+    }
+    signal.woken = false;
+    Some(signal.hovering.take())
+}
+
 /// What the main thread may ask of the feed: hover changes and the island's own controls.
 fn context(app: &AppHandle, shared: &Arc<Shared>) -> macos::Context {
     let hover_shared = Arc::clone(shared);
+    let showing_shared = Arc::clone(shared);
     let action_app = app.clone();
     macos::Context {
         interactive: true,
         motion: macos::Motion::FollowSystem,
         hover: Box::new(move |hovering| hovered(&hover_shared, hovering)),
         act: Box::new(move |action| perform(&action_app, action)),
+        showing: Box::new(move |shown| showing(&showing_shared, shown)),
     }
 }
 
@@ -289,24 +336,8 @@ fn run(app: AppHandle, shared: Arc<Shared>, generation: u64) {
         let deadline = model
             .next_deadline()
             .map_or(now + tick, |deadline| deadline.min(now + tick));
-        let hovering = {
-            let mut signal = shared.signal();
-            while !signal.stop && !signal.woken && signal.hovering.is_none() {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                signal = shared
-                    .wake
-                    .wait_timeout(signal, left)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .0;
-            }
-            if signal.stop {
-                return;
-            }
-            signal.woken = false;
-            signal.hovering.take()
+        let Some(hovering) = wait(&shared, deadline) else {
+            return;
         };
         let now = Instant::now();
         if let Some(hovering) = hovering {
@@ -389,6 +420,59 @@ mod tests {
             tick_for(&input(&[Phase::Connecting, Phase::Sharing])),
             LIVE_TICK
         );
+    }
+
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            signal: Mutex::new(Signal::default()),
+            wake: Condvar::new(),
+        })
+    }
+
+    #[test]
+    fn an_island_off_screen_waits_for_a_change_instead_of_its_deadline() {
+        let shared = shared();
+        assert_eq!(
+            wait(&shared, Instant::now()),
+            Some(None),
+            "on screen, a deadline wakes it"
+        );
+        showing(&shared, false);
+        let back = Duration::from_millis(60);
+        let shower = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                std::thread::sleep(back);
+                showing(&shared, true);
+            })
+        };
+        let start = Instant::now();
+        assert_eq!(wait(&shared, start), Some(None));
+        assert!(
+            start.elapsed() >= back,
+            "the passed deadline did not wake it"
+        );
+        shower.join().unwrap();
+        let signal = shared.signal();
+        assert!(!signal.resting && !signal.woken);
+        drop(signal);
+        showing(&shared, true);
+        assert!(!shared.signal().woken, "staying on screen is no change");
+    }
+
+    #[test]
+    fn a_change_or_stop_still_reaches_an_island_off_screen() {
+        let shared = shared();
+        showing(&shared, false);
+        assert!(!shared.signal().woken, "leaving the screen reads nothing");
+        shared.signal().woken = true;
+        assert_eq!(wait(&shared, Instant::now()), Some(None));
+        assert!(
+            shared.signal().resting,
+            "a change does not bring it back on screen"
+        );
+        shared.signal().stop = true;
+        assert_eq!(wait(&shared, Instant::now()), None);
     }
 
     #[test]

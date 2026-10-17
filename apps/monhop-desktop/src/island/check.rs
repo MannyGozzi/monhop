@@ -45,6 +45,11 @@ pub fn run() -> ! {
     if let Err(error) = tokens::tokens() {
         finish(Err(error.to_string()));
     }
+    if !macos::has_notch() {
+        finish(Err(
+            "no display has a camera notch, the only place the island shows".to_owned(),
+        ));
+    }
     let steps = match script() {
         Ok(steps) => steps,
         Err(reason) => finish(Err(format!("script: {reason}"))),
@@ -59,6 +64,7 @@ pub fn run() -> ! {
             motion: Motion::Always,
             hover: Box::new(|_| {}),
             act: Box::new(|_| {}),
+            showing: Box::new(|_| {}),
         },
     );
     let check = RefCell::new(Check::new(steps));
@@ -383,9 +389,6 @@ impl Check {
         let Some((then, previous)) = &self.last else {
             return Ok(());
         };
-        if previous.shown.silhouette != probe.shown.silhouette {
-            return Err("the outline changed shape kind".to_owned());
-        }
         let elapsed = now.duration_since(*then).as_secs_f64();
         let speed = previous.peak_speed.max(probe.peak_speed);
         let allowed = speed * elapsed + JUMP_SLACK;

@@ -1,6 +1,6 @@
-//! What the island shows inside its outline: the resting mark, a compact activity's wings, and
-//! the open island's header, rows and controls. Layout is in island coordinates (origin at the
-//! top center, y up); every value comes from the stylesheet's tokens.
+//! What the island shows inside its outline: a compact activity's wings, and the open island's
+//! header, rows and controls. Layout is in island coordinates (origin at the top center, y up);
+//! every value comes from the stylesheet's tokens.
 
 use std::time::Instant;
 
@@ -93,19 +93,14 @@ impl Look {
         }
     }
 
-    /// The vertical middle of the band a compact island and the notch header occupy.
+    /// The vertical middle of the notch's band, where a compact island and the open header sit.
     fn band_middle(&self) -> f64 {
-        -(self.place.float + self.place.idle.height / 2.0)
+        -self.place.idle.height / 2.0
     }
 
-    /// From the outline's side to the first content, for a compact island.
+    /// From the outline's side, past its shoulder, to the first content of a compact island.
     fn compact_outer(&self) -> f64 {
-        let edge = if self.place.notched {
-            shoulder(self.place.idle.height)
-        } else {
-            0.0
-        };
-        edge + self.tokens.gap_3
+        shoulder(self.place.idle.height) + self.tokens.gap_3
     }
 }
 
@@ -135,21 +130,6 @@ fn link_mark(look: &Look, local: Color, peer: Color) -> Retained<CALayer> {
         mark.addSublayer(&piece);
     }
     mark
-}
-
-/// The resting content: the mark inside a simulated capsule; a notched island rests empty.
-pub fn idle(look: &Look) -> Option<Retained<CALayer>> {
-    if look.place.notched {
-        return None;
-    }
-    let place = look.place;
-    let group = draw::group(place.outline(place.idle, false).bounds());
-    let tone = look.tokens.subtle;
-    let mark = link_mark(look, tone, tone);
-    let size = look.tokens.sharing_mark_size;
-    frame_centered(&mark, 0.0, look.band_middle(), size, size);
-    group.addSublayer(&mark);
-    Some(group)
 }
 
 enum TrailingParts {
@@ -420,7 +400,7 @@ fn lay_out_compact(
 
 pub fn build_compact(look: &Look, activity: &Activity, wing: f64) -> CompactParts {
     let place = look.place;
-    let group = draw::group(place.outline(place.compact(wing), false).bounds());
+    let group = draw::group(place.outline(place.compact(wing)).bounds());
     let leading = make_leading(look, &activity.leading);
     let trailing = make_trailing(look, &activity.trailing);
     group.addSublayer(&leading);
@@ -923,26 +903,14 @@ fn open_layout(look: &Look, expanded: &Expanded) -> OpenLayout {
     let row_height = tokens.avatar_size + tokens.gap_3;
     let rows = expanded.rows.len() as f64;
     let (left, right) = header_widths(look);
-    let (header_middle, rows_top) = if place.notched {
-        (-place.idle.height / 2.0, -place.idle.height - tokens.gap_2)
-    } else {
-        let top = place.float + tokens.gap_2;
-        (
-            -(top + tokens.icon_button_size / 2.0),
-            -(top + tokens.icon_button_size + tokens.gap_2),
-        )
-    };
-    let height = -(rows_top - rows * row_height - tokens.gap_3) - place.float;
-    // A hanging outline curves in at the top; content keeps clear of its shoulders.
-    let edge = if place.notched { shoulder(height) } else { 0.0 };
-    let pad = edge + tokens.gap_4;
-    let width = if place.notched {
-        // The header wraps the camera: each side keeps its own half beside it.
-        let side = left.max(right) + tokens.gap_3;
-        place.core + 2.0 * (side + pad)
-    } else {
-        left + right + tokens.gap_4 + 2.0 * pad
-    };
+    let header_middle = look.band_middle();
+    let rows_top = -place.idle.height - tokens.gap_2;
+    let height = -(rows_top - rows * row_height - tokens.gap_3);
+    // The outline curves in at the top; content keeps clear of its shoulders.
+    let pad = shoulder(height) + tokens.gap_4;
+    // The header wraps the camera: each side keeps its own half beside it.
+    let side = left.max(right) + tokens.gap_3;
+    let width = place.core + 2.0 * (side + pad);
     let size = place.open(width.max(tokens.island_width), height);
     OpenLayout {
         size,
@@ -1015,7 +983,7 @@ pub fn build_open(look: &Look, expanded: &Expanded, mtm: MainThreadMarker) -> Op
     let layout = open_layout(look, expanded);
     let half = layout.size.width / 2.0;
     let (left_edge, right_edge) = (-half + layout.pad, half - layout.pad);
-    let group = draw::group(look.place.outline(layout.size, true).bounds());
+    let group = draw::group(look.place.outline(layout.size).bounds());
 
     let mark = link_mark(look, tokens.orbit_local, tokens.orbit_peer);
     let mark_size = tokens.sharing_mark_size;

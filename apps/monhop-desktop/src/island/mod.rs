@@ -1,6 +1,6 @@
-//! The notch island: MonHop's status and quick controls around the MacBook camera, or in a capsule in
-//! the menu bar on a display without one. macOS only and on until the user turns it off; while off,
-//! nothing of it runs. Elsewhere the commands report it as unsupported.
+//! The notch island: MonHop's status and quick controls around the MacBook camera. macOS only,
+//! shown only on a display with a camera notch, and on until the user turns it off; while off,
+//! nothing of it runs. Without a notch the commands report it as unsupported.
 
 #[cfg(target_os = "macos")]
 pub mod check;
@@ -31,10 +31,9 @@ use tauri::AppHandle;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IslandView {
+    /// A display with a camera notch is connected; the card shows only then.
     supported: bool,
     enabled: bool,
-    /// The display it shows on has a camera notch; false while it would float in the menu bar.
-    notched: bool,
     error: Option<String>,
 }
 
@@ -119,9 +118,9 @@ mod enabled {
         let switch: Switch = serde_json::to_value(&switch)
             .and_then(serde_json::from_value)
             .map_err(|_| NAMES.not_saved())?;
-        let notched = crate::run_on_main_thread_for_result(
+        let supported = crate::run_on_main_thread_for_result(
             app,
-            super::macos::chosen_display_is_notched,
+            super::macos::has_notch,
             "The notch island could not read the displays. Try again.",
             "The notch island could not read the displays. Try again.",
         )
@@ -131,9 +130,8 @@ mod enabled {
                 .then(|| "The notch island could not start.".to_owned())
         });
         Ok(IslandView {
-            supported: true,
+            supported,
             enabled: switch.enabled,
-            notched,
             error,
         })
     }
@@ -156,7 +154,6 @@ mod enabled {
 const UNSUPPORTED: IslandView = IslandView {
     supported: false,
     enabled: false,
-    notched: false,
     error: None,
 };
 
@@ -183,12 +180,11 @@ mod tests {
         let view = IslandView {
             supported: true,
             enabled: false,
-            notched: true,
             error: None,
         };
         assert_eq!(
             serde_json::to_value(view).unwrap(),
-            serde_json::json!({ "supported": true, "enabled": false, "notched": true, "error": null })
+            serde_json::json!({ "supported": true, "enabled": false, "error": null })
         );
     }
 }

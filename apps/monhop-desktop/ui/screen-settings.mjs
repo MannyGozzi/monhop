@@ -5,7 +5,7 @@ import {
   autostartStatusText,
   showAutostartOpenSettings,
 } from "./autostart-model.mjs";
-import { ISLAND_TITLE, islandDescription, islandSwitchLabel } from "./island-model.mjs";
+import { ISLAND_DESCRIPTION, ISLAND_SWITCH_LABEL, ISLAND_TITLE } from "./island-model.mjs";
 import { presence } from "./accordion.mjs";
 import { button, card, clear, el, note, progressBar, rows, switchRow } from "./dom.mjs";
 
@@ -99,7 +99,7 @@ function startupCard(ctx) {
   return card({ id: "settings-startup", title: "Startup", children });
 }
 
-// Mac only: the context is undefined everywhere the backend cannot draw the island.
+// Notched Macs only: the context is undefined wherever no display can show the island.
 function islandCard(ctx) {
   const { core, island, actions } = ctx;
   if (!island) return null;
@@ -109,9 +109,9 @@ function islandCard(ctx) {
     title: ISLAND_TITLE,
     children: [
       rows([
-        switchRow(islandSwitchLabel(view.notched), {
+        switchRow(ISLAND_SWITCH_LABEL, {
           checked: view.enabled,
-          description: islandDescription(view.notched),
+          description: ISLAND_DESCRIPTION,
           disabled: pending || !core,
           id: "settings-island-enabled",
           onChange: actions.setIslandEnabled,
