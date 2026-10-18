@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-10-17
+
 ### Fixed
 
 - A computer that joins or leaves while the notch island is open now fades in or out in its own row instead of sliding toward the notch.
@@ -269,7 +271,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.10...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.11...HEAD
+[0.2.11]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.11
 [0.2.10]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.10
 [0.2.9]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.9
 [0.2.8]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.8
