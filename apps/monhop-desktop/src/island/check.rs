@@ -1,6 +1,7 @@
 //! `--check-island`: the island alone on the real screen, playing a fixed script of synthetic
-//! snapshots through the real model while the drawn outline is sampled every frame. It starts
-//! nothing else MonHop runs, reads no saved state and saves nothing.
+//! snapshots through the real model, plus a few hand-made changes the model never makes, while
+//! the drawn outline is sampled every frame. It starts nothing else MonHop runs, reads no saved
+//! state and saves nothing.
 
 use std::{
     cell::RefCell,
@@ -15,8 +16,8 @@ use super::{
     geometry::Outline,
     macos::{self, Context, Motion, Probe},
     model::{
-        ActivityId, ClipboardInput, ComputerInput, DimmingInput, Direction, IslandInput, Model,
-        Phase, Platform, Presentation, Row, Transfer, TransferKind,
+        Activity, ActivityId, ClipboardInput, ComputerInput, DimmingInput, Direction, IslandInput,
+        Model, Phase, Platform, Presentation, Row, Tone, Trailing, Transfer, TransferKind,
     },
     tokens,
 };
@@ -26,7 +27,7 @@ const GENERATION: u64 = 1;
 const HOLD: f64 = 1.2;
 /// A step that has not come to rest by then fails.
 const SETTLE_LIMIT: f64 = 3.0;
-const DEADLINE: f64 = 29.0;
+const DEADLINE: f64 = 40.0;
 const SAMPLE: f64 = 1.0 / 240.0;
 /// Presentation values are evaluated at the time they are read, so between two samples no point
 /// moves farther than the motion's peak speed allows, plus this rounding.
@@ -105,8 +106,16 @@ struct Step {
     /// Seconds after the step starts, in order.
     orders: VecDeque<(f64, Order)>,
     expanded: bool,
-    /// The content on show updates where it is: never rebuilt, and an open island never resized.
+    /// The content on show updates where it is: never rebuilt, and an open island never resized
+    /// unless the step `resizes` it.
     in_place: bool,
+    /// A row comes or goes, so the open island must change height in place.
+    resizes: bool,
+    /// The header's status dot keeps its place: never drawn away from it, and in the same place
+    /// at the end.
+    dot_stays: bool,
+    /// That dot changes color through a transition, seen on some frame, never at once.
+    dot_recolors: bool,
 }
 
 fn step(name: &'static str, order: Order, expanded: bool) -> Step {
@@ -115,6 +124,9 @@ fn step(name: &'static str, order: Order, expanded: bool) -> Step {
         orders: VecDeque::from([(0.0, order)]),
         expanded,
         in_place: false,
+        resizes: false,
+        dot_stays: false,
+        dot_recolors: false,
     }
 }
 
@@ -163,9 +175,10 @@ fn shows(presentation: &Presentation, expected: Option<ActivityId>) -> Result<()
     }
 }
 
-/// Idle, every compact activity (dimming and control of another computer also updating in place),
-/// the open island with two computers, dimming and clipboard, its header taking the widest status
-/// in place, closing, and an open interrupted mid-flight by a close.
+/// Idle, every compact activity (dimming and control of another computer also updating in place,
+/// and that control restyled by hand), the open island with two computers, dimming and clipboard,
+/// its header taking the widest status in place and then hand-made words as wide, a computer
+/// joining and leaving it, closing, and an open interrupted mid-flight by a close.
 fn script() -> Result<Vec<Step>, String> {
     let mut feed = Feed {
         model: Model::default(),
@@ -279,11 +292,40 @@ fn script() -> Result<Vec<Step>, String> {
         studio(input).pointer_here = Some(true);
         desk(input).pointer_here = Some(false);
     });
+    let labeled = other.clone();
     steps.push(Step {
         in_place: true,
         ..show(
             "controlling a computer of the other kind, in place",
             other,
+            Some(ActivityId::Controlling),
+        )?
+    });
+    // The model never restyles a compact activity in place; by hand, its label becomes words.
+    let Some(Activity {
+        trailing: Trailing::Labeled(_, name),
+        ..
+    }) = &labeled.compact
+    else {
+        return Err("controlling must label the computer with its kind".to_owned());
+    };
+    let mut worded = labeled.clone();
+    if let Some(activity) = &mut worded.compact {
+        activity.trailing = Trailing::Text(name.clone());
+    }
+    steps.push(Step {
+        in_place: true,
+        ..show(
+            "controlling, its label turned to words in place",
+            worded,
+            Some(ActivityId::Controlling),
+        )?
+    });
+    steps.push(Step {
+        in_place: true,
+        ..show(
+            "controlling, its label back in place",
+            labeled,
             Some(ActivityId::Controlling),
         )?
     });
@@ -310,13 +352,49 @@ fn script() -> Result<Vec<Step>, String> {
     if attention.expanded.status != "Needs attention" || attention.expanded.rows != back_rows {
         return Err("the status step must change only the header's status".to_owned());
     }
-    steps.push(Step {
+    let open_in_place = |name, presentation| Step {
         in_place: true,
-        ..step(
-            "open, status changes in place",
-            Order::Show(attention),
-            true,
-        )
+        ..step(name, Order::Show(presentation), true)
+    };
+    steps.push(open_in_place(
+        "open, status changes in place",
+        attention.clone(),
+    ));
+    // By hand: other words exactly as wide, so the dot stays put and only changes color.
+    let mut reworded = attention.clone();
+    reworded.expanded.status.push('\u{200B}');
+    reworded.expanded.status_tone = Tone::Warning;
+    steps.push(Step {
+        dot_stays: true,
+        dot_recolors: true,
+        ..open_in_place("open, status reworded at the same width in place", reworded)
+    });
+    steps.push(Step {
+        dot_stays: true,
+        dot_recolors: true,
+        ..open_in_place("open, status back in place", attention.clone())
+    });
+    let joined = feed.next(BETWEEN, |input| {
+        input.computers.push(computer("Laptop", Platform::Mac, 2));
+    });
+    if joined.expanded.status != attention.expanded.status
+        || joined.expanded.rows.len() != back_rows.len() + 1
+    {
+        return Err("the join step must only add a row".to_owned());
+    }
+    steps.push(Step {
+        resizes: true,
+        ..open_in_place("open, a computer joins in place", joined)
+    });
+    let left = feed.next(BETWEEN, |input| {
+        input.computers.pop();
+    });
+    if left.expanded.rows != back_rows {
+        return Err("the leave step must only take that row away".to_owned());
+    }
+    steps.push(Step {
+        resizes: true,
+        ..open_in_place("open, the computer leaves in place", left)
     });
     steps.push(step("close", Order::Expand(false), false));
     steps.push(Step {
@@ -327,6 +405,9 @@ fn script() -> Result<Vec<Step>, String> {
         ]),
         expanded: false,
         in_place: false,
+        resizes: false,
+        dot_stays: false,
+        dot_recolors: false,
     });
     Ok(steps)
 }
@@ -337,8 +418,10 @@ struct Running {
     /// When the last order went out.
     ordered: f64,
     rested_since: Option<Instant>,
-    /// The content and target on show before the first order.
-    before: Option<(Option<u64>, Outline)>,
+    /// The content, target and status dot place on show before the first order.
+    before: Option<(Option<u64>, Outline, Option<f64>)>,
+    /// The status dot was seen changing color.
+    recolored: bool,
 }
 
 struct Check {
@@ -373,11 +456,17 @@ impl Check {
             .running
             .as_ref()
             .map_or("start", |running| running.step.name);
-        if let Err(reason) = self.continuous(now, &probe) {
+        if let Err(reason) = self
+            .continuous(now, &probe)
+            .and_then(|()| self.during(&probe))
+        {
             return Some(Err(format!("{name}: {reason}")));
         }
         if !probe.fits {
             return Some(Err(format!("{name}: the outline left its window")));
+        }
+        if let Some(running) = &mut self.running {
+            running.recolored |= probe.status_recoloring;
         }
         let verdict = self.advance(mtm, now, &probe);
         self.last = Some((now, probe));
@@ -402,6 +491,26 @@ impl Check {
         Ok(())
     }
 
+    /// What must hold on every frame of the running step.
+    fn during(&self, probe: &Probe) -> Result<(), String> {
+        let Some(step) = self.running.as_ref().map(|running| &running.step) else {
+            return Ok(());
+        };
+        if step.in_place && probe.bands_scaling {
+            return Err("a band grew or shrank while the content updated in place".to_owned());
+        }
+        if step.dot_stays
+            && let Some(drift) = probe
+                .status_drift
+                .filter(|drift| drift.abs() > REST_TOLERANCE)
+        {
+            return Err(format!(
+                "the status dot was drawn {drift:.1} pt from its place"
+            ));
+        }
+        Ok(())
+    }
+
     fn advance(
         &mut self,
         mtm: MainThreadMarker,
@@ -417,6 +526,7 @@ impl Check {
                         ordered: 0.0,
                         rested_since: None,
                         before: None,
+                        recolored: false,
                     });
                     self.advance(mtm, now, probe)
                 }
@@ -434,7 +544,9 @@ impl Check {
         {
             running.ordered = at;
             running.rested_since = None;
-            running.before.get_or_insert((probe.content, probe.target));
+            running
+                .before
+                .get_or_insert((probe.content, probe.target, probe.status_place));
             match order {
                 Order::Show(presentation) => macos::render(mtm, GENERATION, presentation),
                 Order::Expand(expanded) => macos::set_expanded(mtm, expanded),
@@ -497,14 +609,33 @@ impl Check {
             }
         }
         if running.step.in_place
-            && let Some((content, target)) = running.before
+            && let Some((content, target, place)) = running.before
         {
             if probe.content != content {
                 return Some(Err(format!("{name}: the content was rebuilt")));
             }
-            if running.step.expanded && probe.target != target {
-                return Some(Err(format!("{name}: the open island changed size")));
+            let resized = probe.target != target;
+            if running.step.expanded && resized != running.step.resizes {
+                return Some(Err(format!(
+                    "{name}: the open island {}",
+                    if resized {
+                        "changed size"
+                    } else {
+                        "kept its size"
+                    }
+                )));
             }
+            if running.step.dot_stays && probe.status_place != place {
+                return Some(Err(format!("{name}: the status dot moved")));
+            }
+            if running.step.dot_recolors && !running.recolored {
+                return Some(Err(format!("{name}: the status dot changed color at once")));
+            }
+        }
+        match macos::audit(mtm) {
+            Some(Ok(())) => {}
+            Some(Err(reason)) => return Some(Err(format!("{name}: {reason}"))),
+            None => return Some(Err(format!("{name}: the island is not on screen"))),
         }
         println!("  {name}: settled");
         self.running = None;

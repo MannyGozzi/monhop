@@ -28,6 +28,8 @@ use super::{
 const SCALE: &str = "transform.scale";
 /// A Gaussian blur shows out to about this many radii; a band leaves that room around its content.
 const BLUR_REACH: f64 = 3.0;
+/// A kept layer at rest matches a fresh one to within this, in points or as a share.
+const STANDING_SLACK: f64 = 0.01;
 
 /// Everything layout reads: tokens, where the island sits, the backing scale, and the fonts.
 pub struct Look {
@@ -167,14 +169,18 @@ fn grow_to_size(look: &Look, layer: &CALayer, from: f64, delay: f64) {
     draw::add(layer, SCALE, &grow);
 }
 
-/// Gives `live` its new look through a light blur while `ghost`, showing the old one, leaves;
-/// `blur` is what the old look shows now.
-fn crossblur(look: &Look, live: &CALayer, ghost: &CALayer, blur: f64) {
+/// Fades a layer out through a light blur from `blur`, what it shows now, then drops it.
+fn blur_away(look: &Look, layer: &CALayer, blur: f64) {
     let tokens = look.tokens;
-    draw::blur_to(ghost, blur, tokens.blur, tokens.fast, tokens.ease_out);
-    draw::fade_to(ghost, 0.0, tokens.fast, tokens.ease_out, 0.0);
-    draw::remove_later(ghost, tokens.fast);
-    live.setOpacity(1.0);
+    draw::blur_to(layer, blur, tokens.blur, tokens.fast, tokens.ease_out);
+    draw::fade_to(layer, 0.0, tokens.fast, tokens.ease_out, 0.0);
+    draw::remove_later(layer, tokens.fast);
+}
+
+/// Fades a layer in through a light blur.
+fn blur_in(look: &Look, layer: &CALayer) {
+    let tokens = look.tokens;
+    layer.setOpacity(1.0);
     let fade = draw::tween(
         "opacity",
         &draw::number(0.0),
@@ -183,8 +189,36 @@ fn crossblur(look: &Look, live: &CALayer, ghost: &CALayer, blur: f64) {
         tokens.ease_out,
         0.0,
     );
-    draw::add(live, "opacity", &fade);
-    draw::focus(live, tokens.blur, tokens.base, tokens.ease_focus, 0.0);
+    draw::add(layer, "opacity", &fade);
+    draw::focus(layer, tokens.blur, tokens.base, tokens.ease_focus, 0.0);
+}
+
+/// Gives `live` its new look through a light blur while `ghost`, showing the old one, leaves;
+/// `blur` is what the old look shows now.
+fn crossblur(look: &Look, live: &CALayer, ghost: &CALayer, blur: f64) {
+    blur_away(look, ghost, blur);
+    blur_in(look, live);
+}
+
+/// `layer` joins `holder` through a light blur, or at once under reduced motion. It goes just
+/// above the layer it `replaces`, so once that leaves it holds the place a fresh build gives it.
+fn arrive(look: &Look, holder: &CALayer, layer: &CALayer, replaces: Option<&CALayer>) {
+    match replaces {
+        Some(old) => holder.insertSublayer_above(layer, Some(old)),
+        None => holder.addSublayer(layer),
+    }
+    if !look.reduce {
+        blur_in(look, layer);
+    }
+}
+
+/// `layer` leaves through a light blur from what it shows now, or at once under reduced motion.
+fn leave(look: &Look, layer: &CALayer) {
+    if look.reduce {
+        layer.removeFromSuperlayer();
+    } else {
+        blur_away(look, layer, draw::shown_blur(layer));
+    }
 }
 
 /// New words through a light blur, or at once under reduced motion.
@@ -213,14 +247,14 @@ fn swap_glyph(look: &Look, layer: &CALayer, image: &NSImage) {
 }
 
 /// Moves a dot through a light blur, leaving where it was and arriving at `center`, so it never
-/// slides across the words beside it.
-fn swap_dot(look: &Look, dot: &CALayer, center: NSPoint) {
+/// slides across the words beside it. False when it stayed, already at `center`, or moved at once.
+fn swap_dot(look: &Look, dot: &CALayer, center: NSPoint) -> bool {
     let Some(parent) = dot
         .superlayer()
         .filter(|_| !look.reduce && dot.position() != center)
     else {
         dot.setPosition(center);
-        return;
+        return false;
     };
     let blur = draw::shown_blur(dot);
     let ghost = draw::ghost(dot);
@@ -228,22 +262,13 @@ fn swap_dot(look: &Look, dot: &CALayer, center: NSPoint) {
     draw::remove(dot, "position");
     dot.setPosition(center);
     crossblur(look, dot, &ghost, blur);
-}
-
-/// Puts `next` where `old` was, crossing through a light blur.
-fn swap_in(look: &Look, holder: &CALayer, old: &CALayer, next: &CALayer) {
-    holder.addSublayer(next);
-    if look.reduce {
-        old.removeFromSuperlayer();
-        return;
-    }
-    crossblur(look, next, old, draw::shown_blur(old));
+    true
 }
 
 /// A layer's fill takes `color` over the base time, or at once under reduced motion.
 fn recolor(look: &Look, layer: &CALayer, color: Color) {
     if look.reduce {
-        layer.setBackgroundColor(Some(&cg(color)));
+        draw::paint(layer, color);
     } else {
         draw::recolor(layer, color, look.tokens.base, look.tokens.ease_out);
     }
@@ -605,14 +630,15 @@ pub fn update_compact(look: &Look, parts: &mut CompactParts, activity: &Activity
                 match image {
                     Some(image) => {
                         swap_glyph(look, &parts.leading, &image);
-                        parts.leading.setBackgroundColor(Some(&cg(color)));
+                        draw::paint(&parts.leading, color);
                     }
                     None => recolor(look, &parts.leading, color),
                 }
             }
             _ => {
                 let next = make_leading(look, &activity.leading);
-                swap_in(look, &parts.band, &parts.leading, &next);
+                arrive(look, &parts.band, &next, Some(&parts.leading));
+                leave(look, &parts.leading);
                 fresh.push(next.clone());
                 parts.leading = next;
             }
@@ -639,29 +665,13 @@ pub fn update_compact(look: &Look, parts: &mut CompactParts, activity: &Activity
             _ => {
                 let next = make_trailing(look, &activity.trailing);
                 let old = std::mem::replace(&mut parts.trailing, next);
-                for (old, new) in trailing_layers(&old)
-                    .into_iter()
-                    .zip(trailing_layers(&parts.trailing))
-                {
-                    swap_in(look, &parts.band, old, new);
+                for layer in trailing_layers(&parts.trailing) {
+                    arrive(look, &parts.band, layer, None);
+                    fresh.push(layer.retain());
                 }
-                for extra in trailing_layers(&old)
-                    .into_iter()
-                    .skip(trailing_layers(&parts.trailing).len())
-                {
-                    extra.removeFromSuperlayer();
+                for layer in trailing_layers(&old) {
+                    leave(look, layer);
                 }
-                for extra in trailing_layers(&parts.trailing)
-                    .into_iter()
-                    .skip(trailing_layers(&old).len())
-                {
-                    parts.band.addSublayer(extra);
-                }
-                fresh.extend(
-                    trailing_layers(&parts.trailing)
-                        .into_iter()
-                        .map(CALayer::retain),
-                );
             }
         }
         parts.trailing_now = activity.trailing.clone();
@@ -718,9 +728,12 @@ pub struct Control {
     pub label: String,
     pub pending: Option<Pending>,
     pub element: Option<Retained<ControlElement>>,
-    /// The row it sits in; none in the header.
-    row: Option<RowKey>,
+    /// The index of the row it sits in; none in the header.
+    row: Option<usize>,
 }
+
+/// A control the pointer presses or hovers, found again by identity after rows move.
+pub struct Grip(Retained<CALayer>);
 
 impl Control {
     pub fn value(&self) -> u8 {
@@ -1031,7 +1044,10 @@ struct RowTexts {
 /// One row of the open island, in a band of its own.
 struct RowParts {
     key: RowKey,
+    /// Moves with the row, and materializes with the island about its top center.
     band: Retained<CALayer>,
+    /// The row's content inside its band; a row that comes or goes alone does so about its middle.
+    body: Retained<CALayer>,
     /// Where the row was built and where it stands now; its band is moved by the difference.
     built_middle: f64,
     middle: f64,
@@ -1064,6 +1080,24 @@ impl OpenParts {
         iter::once(&*self.header.band)
             .chain(self.rows.iter().map(|row| &*row.band))
             .collect()
+    }
+
+    /// Each row's content inside its band.
+    pub fn bodies(&self) -> Vec<&CALayer> {
+        self.rows.iter().map(|row| &*row.body).collect()
+    }
+
+    pub fn grip(&self, index: usize) -> Option<Grip> {
+        self.controls
+            .get(index)
+            .map(|control| Grip(control.root.clone()))
+    }
+
+    /// Where a gripped control is now; none once its row left.
+    pub fn find(&self, grip: &Grip) -> Option<usize> {
+        self.controls
+            .iter()
+            .position(|control| std::ptr::eq(&*control.root, &*grip.0))
     }
 }
 
@@ -1300,15 +1334,15 @@ fn build_row(
     let half = layout.half();
     let middle = layout.row_middle(index);
     let key = row_key(row);
-    let band = band(
-        look,
-        Rect::new(
-            -half,
-            middle - layout.row_height / 2.0,
-            layout.size.width,
-            layout.row_height,
-        ),
+    let area = Rect::new(
+        -half,
+        middle - layout.row_height / 2.0,
+        layout.size.width,
+        layout.row_height,
     );
+    let band = band(look, area);
+    let body = draw::group_about(padded(look, area), NSPoint::new(0.0, middle));
+    band.addSublayer(&body);
     let button_size = tokens.icon_button_size;
     let mut controls = Vec::new();
 
@@ -1321,7 +1355,7 @@ fn build_row(
         tile_size,
         tile_size,
     );
-    band.addSublayer(&plate);
+    body.addSublayer(&plate);
     let text_left = left_edge + tile_size + tokens.gap_3;
 
     let (control_root, widget, id, label, hit_whole_row) = match row {
@@ -1369,16 +1403,11 @@ fn build_row(
     let (control_w, control_h) = layer_size(&control_root);
     let control_x = right_edge - control_w / 2.0;
     frame_centered(&control_root, control_x, middle, control_w, control_h);
-    band.addSublayer(&control_root);
+    body.addSublayer(&control_root);
     let control_left = right_edge - control_w;
     let text_width = (control_left - tokens.gap_3 - text_left).max(0.0);
     let hit = if hit_whole_row {
-        Rect::new(
-            -half,
-            middle - layout.row_height / 2.0,
-            layout.size.width,
-            layout.row_height,
-        )
+        area
     } else {
         let height = control_h.max(button_size);
         Rect::new(control_left, middle - height / 2.0, control_w, height)
@@ -1391,7 +1420,7 @@ fn build_row(
         label,
         pending: None,
         element: None,
-        row: Some(key.clone()),
+        row: Some(index),
     });
 
     let (title_text, detail_text) = row_texts(row);
@@ -1418,7 +1447,7 @@ fn build_row(
         NSPoint::new(text_left, top - title_h),
         NSSize::new(text_width, title_h),
     ));
-    band.addSublayer(&title);
+    body.addSublayer(&title);
     let second_middle = top - title_h - tokens.gap_half - second_h / 2.0;
     let detail = detail_text.as_ref().map(|text| {
         let layer = draw::text_layer(text, &look.detail, tokens.muted, false, look.scale());
@@ -1426,7 +1455,7 @@ fn build_row(
             NSPoint::new(text_left, second_middle - second_h / 2.0),
             NSSize::new(text_width, second_h),
         ));
-        band.addSublayer(&layer);
+        body.addSublayer(&layer);
         layer
     });
     if let Row::Dimming(dimming) = row {
@@ -1441,7 +1470,7 @@ fn build_row(
             NSPoint::new(text_left, second_middle - tokens.slider_thumb / 2.0),
             NSSize::new(text_width, tokens.slider_thumb),
         ));
-        band.addSublayer(&root);
+        body.addSublayer(&root);
         let height = tokens.slider_thumb.max(button_size);
         controls.push(Control {
             id: ControlId::Level,
@@ -1451,12 +1480,13 @@ fn build_row(
             label: "Darkness".to_owned(),
             pending: None,
             element: None,
-            row: Some(key.clone()),
+            row: Some(index),
         });
     }
     let parts = RowParts {
         key,
         band,
+        body,
         built_middle: middle,
         middle,
         texts: RowTexts {
@@ -1470,6 +1500,13 @@ fn build_row(
 }
 
 pub fn build_open(look: &Look, expanded: &Expanded, mtm: MainThreadMarker) -> OpenParts {
+    let mut parts = assemble_open(look, expanded);
+    number_controls(&mut parts.controls, mtm);
+    parts
+}
+
+/// The open island's layers and controls, before the controls have accessibility elements.
+fn assemble_open(look: &Look, expanded: &Expanded) -> OpenParts {
     let layout = open_layout(look, expanded);
     let group = draw::group(look.place.outline(layout.size).bounds());
     let (header, open) = build_header(look, &layout, expanded);
@@ -1482,7 +1519,6 @@ pub fn build_open(look: &Look, expanded: &Expanded, mtm: MainThreadMarker) -> Op
         controls.extend(row_controls);
         rows.push(parts);
     }
-    number_controls(&mut controls, mtm);
     OpenParts {
         group,
         size: layout.size,
@@ -1505,11 +1541,10 @@ fn number_controls(controls: &mut [Control], mtm: MainThreadMarker) {
 
 /// How far the status dot is drawn from its place beside the current word; zero at rest.
 pub fn status_drift(look: &Look, parts: &OpenParts) -> f64 {
-    let header = &parts.header;
-    let dot = &header.status_dot;
+    let dot = &parts.header.status_dot;
     // SAFETY: the presentation layer is a read-only copy of this one.
     let drawn = unsafe { dot.presentationLayer() }.map_or(dot.position(), |shown| shown.position());
-    drawn.x - status_dot_x(look, header.status_right, &header.status_now.0)
+    drawn.x - status_place(look, parts)
 }
 
 fn status_text_color(look: &Look, tone: Tone) -> Color {
@@ -1571,18 +1606,13 @@ fn move_row(look: &Look, row: &mut RowParts, middle: f64) {
     }
 }
 
-/// New rows materialize in turn, rows that stay glide to their places, and rows that went
-/// away dissolve where they were. Nothing happens while the rows are the same.
-fn restack(
-    look: &Look,
-    parts: &mut OpenParts,
-    expanded: &Expanded,
-    layout: &OpenLayout,
-    mtm: MainThreadMarker,
-) {
+/// New rows materialize in turn and rows that went away dissolve where they were, each about its
+/// own middle; rows that stay glide to their places, bringing their controls. False, changing
+/// nothing, while the rows are the same; otherwise the controls need numbering again.
+fn restack(look: &Look, parts: &mut OpenParts, expanded: &Expanded, layout: &OpenLayout) -> bool {
     let keys: Vec<RowKey> = expanded.rows.iter().map(row_key).collect();
     if parts.rows.iter().map(|row| &row.key).eq(keys.iter()) {
-        return;
+        return false;
     }
     let tokens = look.tokens;
     let old_keys: Vec<RowKey> = parts.rows.iter().map(|row| row.key.clone()).collect();
@@ -1602,13 +1632,12 @@ fn restack(
         .enumerate()
     {
         let middle = layout.row_middle(index);
-        match from.and_then(|old| old_rows[old].take()) {
-            Some(mut kept) => {
+        match from.and_then(|old| Some((old, old_rows[old].take()?))) {
+            Some((old, mut kept)) => {
                 let shift = middle - kept.middle;
                 move_row(look, &mut kept, middle);
-                for mut control in
-                    row_controls.extract_if(.., |control| control.row.as_ref() == Some(&kept.key))
-                {
+                for mut control in row_controls.extract_if(.., |control| control.row == Some(old)) {
+                    control.row = Some(index);
                     control.hit.y += shift;
                     controls.push(control);
                 }
@@ -1619,7 +1648,7 @@ fn restack(
                 parts.group.addSublayer(&built.band);
                 if !look.reduce {
                     arriving += 1.0;
-                    materialize(look, &built.band, tokens.stagger * arriving);
+                    materialize(look, &built.body, tokens.stagger * arriving);
                 }
                 controls.extend(built_controls);
                 parts.rows.push(built);
@@ -1630,13 +1659,13 @@ fn restack(
         if look.reduce {
             gone.band.removeFromSuperlayer();
         } else {
-            dissolve(look, &gone.band);
+            dissolve(look, &gone.body);
             draw::remove_later(&gone.band, tokens.fast);
         }
     }
-    number_controls(&mut controls, mtm);
     parts.controls = controls;
     draw::span(&parts.group, look.place.outline(layout.size).bounds());
+    true
 }
 
 /// New values in place: rows come, go or move, texts cross through a light blur, switches and
@@ -1653,11 +1682,14 @@ pub fn update_open(
     if layout.size.width != parts.size.width || layout.pad != parts.pad {
         return false;
     }
-    restack(look, parts, expanded, &layout, mtm);
+    if restack(look, parts, expanded, &layout) {
+        number_controls(&mut parts.controls, mtm);
+    }
     parts.size = layout.size;
     let tokens = look.tokens;
     let header = &mut parts.header;
     let words_changed = header.status_now.0 != expanded.status;
+    let mut dot_crossed = false;
     if words_changed {
         swap_text(look, &header.status_text, &expanded.status);
         let dot = &header.status_dot;
@@ -1665,19 +1697,22 @@ pub fn update_open(
             status_dot_x(look, header.status_right, &expanded.status),
             dot.position().y,
         );
-        swap_dot(look, dot, center);
+        dot_crossed = swap_dot(look, dot, center);
     }
     if header.status_now.1 != expanded.status_tone {
         let (dot, text) = (
             look.tone(expanded.status_tone),
             status_text_color(look, expanded.status_tone),
         );
-        // New words arrive from nothing in their new color; standing ones change color.
-        if words_changed || look.reduce {
-            header.status_dot.setBackgroundColor(Some(&cg(dot)));
-            header.status_text.setForegroundColor(Some(&cg(text)));
+        // What crosses arrives from nothing in its new color; what stands changes color.
+        if dot_crossed {
+            draw::paint(&header.status_dot, dot);
         } else {
             recolor(look, &header.status_dot, dot);
+        }
+        if words_changed || look.reduce {
+            draw::tint(&header.status_text, text);
+        } else {
             draw::retint(&header.status_text, text, tokens.base, tokens.ease_out);
         }
     }
@@ -1696,16 +1731,26 @@ pub fn update_open(
         }
         texts.detail_now = detail;
     }
-    for control in &mut parts.controls {
-        let reported = match (
-            &control.id,
-            expanded
-                .rows
-                .iter()
-                .find_map(|row| control_value(&control.id, row)),
-        ) {
-            (_, Some(value)) => value,
-            _ => continue,
+    apply_reports(look, &mut parts.controls, expanded, dragging, now);
+    true
+}
+
+/// Each row control takes what the app reports for its own row, unless the user's change is
+/// still pending; a level being dragged stays under the pointer.
+fn apply_reports(
+    look: &Look,
+    controls: &mut [Control],
+    expanded: &Expanded,
+    dragging: bool,
+    now: Instant,
+) {
+    for control in controls {
+        let Some(reported) = control
+            .row
+            .and_then(|row| expanded.rows.get(row))
+            .and_then(|row| control_value(&control.id, row))
+        else {
+            continue;
         };
         if let Some(pending) = &control.pending {
             if pending.value == reported || pending.until <= now {
@@ -1726,7 +1771,6 @@ pub fn update_open(
             refresh_element_value(control, element);
         }
     }
-    true
 }
 
 /// What the app reports for a control, from the row that holds it.
@@ -1742,6 +1786,82 @@ fn control_value(id: &ControlId, row: &Row) -> Option<u8> {
         (ControlId::Clipboard, Row::Clipboard { enabled, .. }) => Some(u8::from(*enabled)),
         _ => None,
     }
+}
+
+/// Whether a layer is growing or shrinking now.
+pub fn scaling(layer: &CALayer) -> bool {
+    draw::animating(layer, SCALE)
+}
+
+/// The open island at rest holds the same layers a fresh build of `expanded` would, with no
+/// filter left on any; for the island check.
+pub fn audit_open(look: &Look, parts: &OpenParts, expanded: &Expanded) -> Result<(), String> {
+    let fresh = assemble_open(look, expanded);
+    let count = |group: &CALayer| draw::shape(group).first().copied().unwrap_or(0);
+    let (shown, built) = (count(&parts.group), count(&fresh.group));
+    if shown != built {
+        return Err(format!(
+            "the open island holds {shown} bands where a fresh one holds {built}"
+        ));
+    }
+    for (index, (band, fresh)) in parts.bands().into_iter().zip(fresh.bands()).enumerate() {
+        if draw::shape(band) != draw::shape(fresh) {
+            return Err(format!("band {index} holds other layers than a fresh one"));
+        }
+    }
+    let bands = parts.bands().len();
+    let shown = parts.bands().into_iter().chain(parts.bodies());
+    let built = fresh.bands().into_iter().chain(fresh.bodies());
+    for (index, (shown, built)) in shown.zip(built).enumerate() {
+        let (at, want) = (standing(&parts.group, shown), standing(&fresh.group, built));
+        if at
+            .iter()
+            .zip(want)
+            .any(|(a, b)| (a - b).abs() > STANDING_SLACK)
+        {
+            let name = match index.checked_sub(bands) {
+                None => format!("band {index}"),
+                Some(row) => format!("row {row}'s body"),
+            };
+            return Err(format!(
+                "{name} rests at {at:?} where a fresh one rests at {want:?}"
+            ));
+        }
+    }
+    draw::unfiltered(&parts.group)
+}
+
+/// A layer at rest: where it lands in `group`, the island's space, then its opacity and scale.
+fn standing(group: &CALayer, layer: &CALayer) -> [f64; 6] {
+    let frame = group.convertRect_fromLayer(layer.bounds(), Some(layer));
+    [
+        frame.origin.x,
+        frame.origin.y,
+        frame.size.width,
+        frame.size.height,
+        f64::from(layer.opacity()),
+        draw::number_at(layer, SCALE).unwrap_or(1.0),
+    ]
+}
+
+/// Like [`audit_open`], for a compact activity.
+pub fn audit_compact(look: &Look, parts: &CompactParts, activity: &Activity) -> Result<(), String> {
+    let fresh = build_compact(look, activity, compact_wing(look, activity));
+    if draw::shape(&parts.group) != draw::shape(&fresh.group) {
+        return Err("the compact island holds other layers than a fresh one".to_owned());
+    }
+    draw::unfiltered(&parts.group)
+}
+
+/// Whether the status dot is changing color now.
+pub fn status_recoloring(parts: &OpenParts) -> bool {
+    draw::animating(&parts.header.status_dot, draw::BACKGROUND_COLOR)
+}
+
+/// Where the status dot rests beside the header's current word.
+pub fn status_place(look: &Look, parts: &OpenParts) -> f64 {
+    let header = &parts.header;
+    status_dot_x(look, header.status_right, &header.status_now.0)
 }
 
 /// Positions each control's accessibility element in the view, `origin` being the island's top
@@ -1763,10 +1883,285 @@ pub fn place_elements(parts: &OpenParts, origin: NSPoint, view: &objc2::runtime:
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    use objc2_quartz_core::CATransaction;
+
+    use super::{
+        super::super::{
+            model::{ActivityId, ComputerRow, DimmingInput, Platform},
+            tokens,
+        },
+        *,
+    };
 
     fn computer(name: &str) -> RowKey {
         RowKey::Computer(name.to_owned())
+    }
+
+    /// A transaction committed on any thread ends the animations of every layer outside a
+    /// window, so layer tests take turns and commit their own before handing over.
+    struct Turn {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            CATransaction::flush();
+        }
+    }
+
+    fn turn() -> Turn {
+        static LAYERS: Mutex<()> = Mutex::new(());
+        Turn {
+            _lock: LAYERS.lock().unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    /// No window is needed: off the main thread the island's timers never fire.
+    fn look(reduce: bool) -> Look {
+        let place = Placement {
+            center_x: 0.0,
+            top: 0.0,
+            core: 200.0,
+            idle: Size::new(200.0, 32.0),
+            scale: 2.0,
+        };
+        Look::new(tokens::tokens().expect("the tokens parse"), place, reduce)
+    }
+
+    /// Reduced motion lays out and restacks without animations.
+    fn still_look() -> Look {
+        look(true)
+    }
+
+    fn computer_row(fingerprint: &str, enabled: bool) -> Row {
+        Row::Computer(ComputerRow {
+            fingerprint: fingerprint.to_owned(),
+            name: fingerprint.to_owned(),
+            platform: Platform::Mac,
+            tone: 0,
+            status: "Connected".to_owned(),
+            enabled,
+        })
+    }
+
+    fn dimming_row() -> Row {
+        Row::Dimming(DimmingInput {
+            dimmed: false,
+            level: 40,
+            min_level: 10,
+            max_level: 99,
+        })
+    }
+
+    fn open(rows: Vec<Row>) -> Expanded {
+        Expanded {
+            status: "Connected".to_owned(),
+            status_tone: Tone::Success,
+            rows,
+        }
+    }
+
+    /// Row `row`'s controls by their layers, so a kept control is known by identity.
+    fn roots(parts: &OpenParts, row: usize) -> Vec<*const CALayer> {
+        parts
+            .controls
+            .iter()
+            .filter(|control| control.row == Some(row))
+            .map(|control| Retained::as_ptr(&control.root))
+            .collect()
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// Where a layer scales about, in its own bounds.
+    fn pivot(layer: &CALayer) -> (f64, f64) {
+        let (bounds, anchor) = (layer.bounds(), layer.anchorPoint());
+        (
+            bounds.origin.x + anchor.x * bounds.size.width,
+            bounds.origin.y + anchor.y * bounds.size.height,
+        )
+    }
+
+    #[test]
+    fn restacked_controls_answer_where_freshly_built_ones_would() {
+        let _turn = turn();
+        let look = still_look();
+        let mut parts = assemble_open(
+            &look,
+            &open(vec![
+                computer_row("a", true),
+                computer_row("b", true),
+                dimming_row(),
+            ]),
+        );
+        let (b, dimming) = (roots(&parts, 1), roots(&parts, 2));
+        let held = parts
+            .controls
+            .iter_mut()
+            .find(|control| control.row == Some(1))
+            .expect("row b has a switch");
+        held.pending = Some(Pending {
+            value: 0,
+            until: Instant::now(),
+        });
+        // "a" leaves: "b" and dimming move up one place, bringing their controls.
+        let after = open(vec![computer_row("b", true), dimming_row()]);
+        assert!(restack(
+            &look,
+            &mut parts,
+            &after,
+            &open_layout(&look, &after)
+        ));
+        let fresh = assemble_open(&look, &after);
+        assert_eq!(parts.controls.len(), fresh.controls.len());
+        for (kept, built) in parts.controls.iter().zip(&fresh.controls) {
+            assert_eq!((&kept.id, kept.row), (&built.id, built.row));
+            let (hit, want) = (kept.hit, built.hit);
+            assert!(
+                close(hit.x, want.x) && close(hit.y, want.y),
+                "{hit:?} != {want:?}"
+            );
+            assert!(close(hit.width, want.width) && close(hit.height, want.height));
+        }
+        assert_eq!(roots(&parts, 0), b);
+        assert_eq!(roots(&parts, 1), dimming);
+        assert!(
+            parts.controls[1].pending.is_some(),
+            "a kept control keeps its state"
+        );
+        // The same rows again change nothing.
+        assert!(!restack(
+            &look,
+            &mut parts,
+            &after,
+            &open_layout(&look, &after)
+        ));
+    }
+
+    #[test]
+    fn rows_that_share_a_key_keep_their_own_controls_presses_and_values() {
+        let _turn = turn();
+        let look = still_look();
+        let mut parts = assemble_open(
+            &look,
+            &open(vec![
+                computer_row("a", true),
+                dimming_row(),
+                computer_row("a", false),
+            ]),
+        );
+        let (first, second) = (roots(&parts, 0), roots(&parts, 2));
+        let pressed = parts
+            .controls
+            .iter()
+            .position(|control| control.row == Some(2))
+            .and_then(|index| parts.grip(index))
+            .expect("the last row has a switch");
+        // The middle row leaves and each "a" reports the other's old state.
+        let after = open(vec![computer_row("a", false), computer_row("a", true)]);
+        assert!(restack(
+            &look,
+            &mut parts,
+            &after,
+            &open_layout(&look, &after)
+        ));
+        assert_eq!((roots(&parts, 0), roots(&parts, 1)), (first, second));
+        assert_eq!(parts.controls.len(), 3);
+        let found = parts.find(&pressed).expect("the pressed switch stays");
+        assert_eq!(parts.controls[found].row, Some(1));
+        apply_reports(&look, &mut parts.controls, &after, false, Instant::now());
+        let values: Vec<u8> = parts.controls[1..].iter().map(Control::value).collect();
+        assert_eq!(values, [0, 1], "each switch shows its own row's state");
+    }
+
+    #[test]
+    fn a_row_that_comes_or_goes_alone_scales_its_body_not_its_band() {
+        let _turn = turn();
+        let look = look(false);
+        let mut parts = assemble_open(&look, &open(vec![computer_row("a", true), dimming_row()]));
+        let gone = (parts.rows[0].band.clone(), parts.rows[0].body.clone());
+        let after = open(vec![computer_row("b", true), dimming_row()]);
+        assert!(restack(
+            &look,
+            &mut parts,
+            &after,
+            &open_layout(&look, &after)
+        ));
+        let came = (parts.rows[0].band.clone(), parts.rows[0].body.clone());
+        for (band, body) in [came, gone] {
+            assert!(scaling(&body), "the body grows or shrinks");
+            assert!(!scaling(&band), "the band, pivoted on the notch, stays");
+        }
+    }
+
+    #[test]
+    fn a_row_alone_scales_about_its_own_middle() {
+        let _turn = turn();
+        let look = still_look();
+        let shown = open(vec![
+            computer_row("a", true),
+            computer_row("b", true),
+            dimming_row(),
+        ]);
+        let layout = open_layout(&look, &shown);
+        let (row, _) = build_row(&look, &layout, 2, &shown.rows[2]);
+        // The band, in island space, scales about its top center; the body, in the band's
+        // space, about the row's middle.
+        for (layer, at) in [(&row.band, 0.0), (&row.body, layout.row_middle(2))] {
+            let ((x, y), position) = (pivot(layer), layer.position());
+            assert!(
+                close(x, 0.0) && close(y, at),
+                "pivot ({x}, {y}), expected (0, {at})"
+            );
+            assert!(close(position.x, x) && close(position.y, y));
+        }
+    }
+
+    #[test]
+    fn a_restacked_island_audits_as_a_fresh_one_until_a_row_is_misplaced() {
+        let _turn = turn();
+        let look = still_look();
+        let mut parts = assemble_open(&look, &open(vec![computer_row("b", true), dimming_row()]));
+        // "a" arrives first, so "b" and dimming glide down one place in bands built higher up.
+        let after = open(vec![
+            computer_row("a", true),
+            computer_row("b", true),
+            dimming_row(),
+        ]);
+        let layout = open_layout(&look, &after);
+        assert!(restack(&look, &mut parts, &after, &layout));
+        assert_eq!(audit_open(&look, &parts, &after), Ok(()));
+        let (band, body) = (&parts.rows[2].band, &parts.rows[2].body);
+        let place = band.position();
+        let row = layout.row_middle(1) - layout.row_middle(2);
+        band.setPosition(NSPoint::new(place.x, place.y + row));
+        assert!(
+            audit_open(&look, &parts, &after).is_err(),
+            "a row one too high"
+        );
+        band.setPosition(place);
+        body.setOpacity(0.0);
+        assert!(audit_open(&look, &parts, &after).is_err(), "a row hidden");
+    }
+
+    #[test]
+    fn a_new_kind_of_leading_takes_the_old_ones_place() {
+        let _turn = turn();
+        let look = still_look();
+        let level = |leading| Activity {
+            id: ActivityId::Dimming,
+            leading,
+            trailing: Trailing::Level(0.5),
+        };
+        let before = level(Leading::Dot(Tone::Success));
+        let after = level(Leading::Symbol(Symbol::MoonFill, Tone::Foreground));
+        let mut parts = build_compact(&look, &before, compact_wing(&look, &before));
+        update_compact(&look, &mut parts, &after, compact_wing(&look, &after));
+        assert_eq!(audit_compact(&look, &parts, &after), Ok(()));
     }
 
     #[test]

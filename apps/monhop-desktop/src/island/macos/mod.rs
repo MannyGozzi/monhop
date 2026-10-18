@@ -41,7 +41,7 @@ use objc2_quartz_core::{CALayer, CAShapeLayer};
 pub use self::draw::every;
 use self::{
     classes::{Assist, ControlElement, IslandPanel, IslandView, LockObserver},
-    content::{CompactParts, ControlId, Look, OpenParts, Pending, Widget},
+    content::{CompactParts, ControlId, Grip, Look, OpenParts, Pending, Widget},
 };
 use super::{
     geometry::{self, DisplayInfo, Outline, Placement, Rect, Size},
@@ -105,6 +105,12 @@ pub struct Probe {
     pub content: Option<u64>,
     /// How far the open header's status dot is drawn from its place beside the word.
     pub status_drift: Option<f64>,
+    /// Where that dot rests beside its current word.
+    pub status_place: Option<f64>,
+    /// That dot is changing color.
+    pub status_recoloring: bool,
+    /// Some band of the content on show is growing or shrinking.
+    pub bands_scaling: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,6 +168,13 @@ pub fn set_expanded(mtm: MainThreadMarker, expanded: bool) {
 pub fn probe(mtm: MainThreadMarker) -> Option<Probe> {
     let _ = mtm;
     with_island(|island| island.probe())
+}
+
+/// The content at rest holds exactly the layers a fresh build of what it shows would, and no
+/// filters; for the island check.
+pub fn audit(mtm: MainThreadMarker) -> Option<Result<(), String>> {
+    let _ = mtm;
+    with_island(|island| island.audit())
 }
 
 /// Some connected display has a camera notch, the only place the island shows.
@@ -311,6 +324,15 @@ impl Content {
             Self::Open(parts) => parts.bands(),
         }
     }
+
+    /// Every layer an entrance or exit animates: the bands, and the open rows' bodies in theirs.
+    fn animated(&self) -> Vec<&CALayer> {
+        let mut layers = self.bands();
+        if let Self::Open(parts) = self {
+            layers.extend(parts.bodies());
+        }
+        layers
+    }
 }
 
 /// One content tree; each reveal or dismissal gives it a new id, so a stale timer finds nothing.
@@ -334,6 +356,14 @@ struct Swing {
 struct Press {
     index: usize,
     over: bool,
+}
+
+/// What the pointer holds before an update that may move rows.
+struct Held {
+    pressed: Option<Grip>,
+    hovered: Option<Grip>,
+    /// The level a slider drag has reached.
+    level: Option<u8>,
 }
 
 #[derive(Default)]
@@ -960,7 +990,7 @@ impl Island {
         if animate {
             content::refocus(&self.look, group);
         } else {
-            for layer in iter::once(group).chain(piece.content.bands()) {
+            for layer in iter::once(group).chain(piece.content.animated()) {
                 content::rest(layer);
             }
         }
@@ -1411,44 +1441,47 @@ impl Island {
         self.close_soon();
     }
 
-    /// The pressed and the hovered control, by what they change, to find again once rows move.
-    fn held(&self) -> (Option<ControlId>, Option<ControlId>) {
-        let id = |index: usize| {
-            self.open_parts()
-                .and_then(|parts| parts.controls.get(index))
-                .map(|control| control.id.clone())
-        };
-        (
-            self.press.as_ref().and_then(|press| id(press.index)),
-            self.hovered.and_then(id),
-        )
+    /// What the pointer holds, to find again once rows move.
+    fn held(&self) -> Held {
+        let grip = |index: usize| self.open_parts()?.grip(index);
+        Held {
+            pressed: self.press.as_ref().and_then(|press| grip(press.index)),
+            hovered: self.hovered.and_then(grip),
+            level: self.dragged_level(),
+        }
     }
 
-    fn hold(&mut self, (pressed, hovered): (Option<ControlId>, Option<ControlId>)) {
-        let find = |id: Option<ControlId>| {
-            let id = id?;
-            self.open_parts()?
-                .controls
-                .iter()
-                .position(|control| control.id == id)
-        };
-        let (pressed, hovered) = (find(pressed), find(hovered));
-        match (&mut self.press, pressed) {
-            (Some(press), Some(index)) => press.index = index,
-            (press, _) => *press = None,
-        }
+    /// A press whose control left with its row ends as a release away from it would: a drag
+    /// saves its level, and an island the pointer already left closes.
+    fn hold(&mut self, held: Held) {
+        let find = |grip: Option<Grip>| self.open_parts()?.find(&grip?);
+        let (pressed, hovered) = (find(held.pressed), find(held.hovered));
         self.hovered = hovered;
+        match (pressed, &mut self.press) {
+            (Some(index), Some(press)) => press.index = index,
+            (None, Some(_)) => {
+                self.outbox.actions.extend(held.level.map(Action::SetLevel));
+                self.press = None;
+                self.close_soon();
+            }
+            (_, None) => {}
+        }
+    }
+
+    /// The level a slider drag has reached, while one is under way.
+    fn dragged_level(&self) -> Option<u8> {
+        self.press
+            .as_ref()
+            .filter(|_| self.dragging())
+            .and_then(|press| self.open_parts()?.controls.get(press.index))
+            .map(|control| control.value())
     }
 
     /// A drag that the island stops tracking (it closed or rebuilt) still saves its level.
     fn end_press(&mut self) {
-        let dragged = self
-            .press
-            .as_ref()
-            .filter(|_| self.dragging())
-            .and_then(|press| self.open_parts()?.controls.get(press.index))
-            .map(|control| control.value());
-        self.outbox.actions.extend(dragged.map(Action::SetLevel));
+        self.outbox
+            .actions
+            .extend(self.dragged_level().map(Action::SetLevel));
         self.press = None;
         self.hovered = None;
     }
@@ -1568,8 +1601,15 @@ impl Island {
                     .content
                     .group()
                     .is_none_or(|group| group.opacity() == 1.0 && still(group))
-                    && piece.content.bands().into_iter().all(still)
+                    && piece.content.animated().into_iter().all(still)
             });
+        let open = match &self.shown {
+            Some(Piece {
+                content: Content::Open(parts),
+                ..
+            }) => Some(parts),
+            _ => None,
+        };
         Probe {
             shown,
             target: self.target,
@@ -1583,13 +1623,38 @@ impl Island {
             expanded: self.expanded,
             peak_speed: self.swing.as_ref().map_or(0.0, |swing| swing.peak),
             content: self.shown.as_ref().map(|piece| piece.id),
-            status_drift: match &self.shown {
-                Some(Piece {
-                    content: Content::Open(parts),
-                    ..
-                }) => Some(content::status_drift(&self.look, parts)),
-                _ => None,
-            },
+            status_drift: open.map(|parts| content::status_drift(&self.look, parts)),
+            status_place: open.map(|parts| content::status_place(&self.look, parts)),
+            status_recoloring: open.is_some_and(content::status_recoloring),
+            bands_scaling: self
+                .shown
+                .as_ref()
+                .is_some_and(|piece| piece.content.bands().into_iter().any(content::scaling)),
+        }
+    }
+
+    fn audit(&self) -> Result<(), String> {
+        let groups = usize::from(
+            self.shown
+                .as_ref()
+                .is_some_and(|piece| piece.content.group().is_some()),
+        );
+        // SAFETY: an array of the layer's sublayers, counted at once.
+        let held = unsafe { self.content.sublayers() }.map_or(0, |layers| layers.count());
+        if held != groups {
+            return Err(format!(
+                "the island holds {held} content groups, not {groups}"
+            ));
+        }
+        match (self.shown.as_ref().map(|piece| &piece.content), self.want()) {
+            (Some(Content::Open(parts)), Want::Open(expanded)) => {
+                content::audit_open(&self.look, parts, &expanded)
+            }
+            (Some(Content::Compact(_, parts)), Want::Compact(activity)) => {
+                content::audit_compact(&self.look, parts, &activity)
+            }
+            (Some(Content::Idle), Want::Idle) => Ok(()),
+            _ => Err("the content on show is not what the island wants".to_owned()),
         }
     }
 }

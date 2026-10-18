@@ -1,10 +1,10 @@
 //! Core Animation and AppKit building blocks for the island: colors, outlines as paths, text,
 //! symbols, animations and timers. Main thread only.
 
-use std::{cell::Cell, ffi::c_void, ops::Deref, ptr::NonNull};
+use std::{cell::Cell, ffi::c_void, iter, ops::Deref, ptr::NonNull};
 
 use block2::RcBlock;
-use objc2::{AnyThread, Message, rc::Retained, runtime::AnyObject};
+use objc2::{AnyThread, MainThreadMarker, Message, rc::Retained, runtime::AnyObject};
 use objc2_app_kit::{
     NSAttributedStringNSStringDrawing, NSFont, NSFontAttributeName, NSFontWeight,
     NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold, NSImage,
@@ -31,6 +31,9 @@ use super::super::{
 /// The blur filter's name, and the key path of its radius.
 pub const BLUR: &str = "blur";
 pub const BLUR_RADIUS: &str = "filters.blur.inputRadius";
+/// The key paths of a layer's fill and of a line of text's color.
+pub const BACKGROUND_COLOR: &str = "backgroundColor";
+const FOREGROUND_COLOR: &str = "foregroundColor";
 /// A layer's own key (CALayer stores any key) for when its blur has cleared and may be dropped.
 const SHARP_AT: &str = "monhopSharpAt";
 /// Timers may fire a hair before the media clock reads the time they were set for.
@@ -61,6 +64,18 @@ pub fn group(area: Rect) -> Retained<CALayer> {
     let layer = CALayer::new();
     span(&layer, area);
     layer.setPosition(NSPoint::new(0.0, 0.0));
+    layer
+}
+
+/// A group like [`group`] that scales about `pivot`, a point in island coordinates.
+pub fn group_about(area: Rect, pivot: NSPoint) -> Retained<CALayer> {
+    let layer = group(area);
+    let bounds = layer.bounds();
+    layer.setAnchorPoint(NSPoint::new(
+        (pivot.x - bounds.origin.x) / bounds.size.width,
+        (pivot.y - bounds.origin.y) / bounds.size.height,
+    ));
+    layer.setPosition(pivot);
     layer
 }
 
@@ -281,6 +296,34 @@ pub fn remove(layer: &CALayer, key: &str) {
     layer.removeAnimationForKey(&NSString::from_str(key));
 }
 
+/// Whether an animation on `key` is on the layer now.
+pub fn animating(layer: &CALayer, key: &str) -> bool {
+    layer
+        .animationKeys()
+        .is_some_and(|keys| keys.iter().any(|name| name.to_string() == key))
+}
+
+fn sublayers(layer: &CALayer) -> Vec<Retained<CALayer>> {
+    // SAFETY: an array of the layer's sublayers, copied at once while nothing changes the tree.
+    unsafe { layer.sublayers() }.map_or_else(Vec::new, |layers| layers.to_vec())
+}
+
+/// A layer tree's makeup: each layer's sublayer count, depth first from `layer`.
+pub fn shape(layer: &CALayer) -> Vec<usize> {
+    let below = sublayers(layer);
+    iter::once(below.len())
+        .chain(below.iter().flat_map(|sub| shape(sub)))
+        .collect()
+}
+
+/// No layer in the tree from `layer` keeps a filter.
+pub fn unfiltered(layer: &CALayer) -> Result<(), String> {
+    if layer.filters().is_some_and(|filters| filters.count() > 0) {
+        return Err("a layer at rest still carries a filter".to_owned());
+    }
+    sublayers(layer).iter().try_for_each(|sub| unfiltered(sub))
+}
+
 /// Runs `change` with implicit animations off, so only explicit ones play.
 pub fn quietly<R>(change: impl FnOnce() -> R) -> R {
     CATransaction::begin();
@@ -314,9 +357,10 @@ pub fn shown_blur(layer: &CALayer) -> f64 {
     shown_number(layer, BLUR_RADIUS, 0.0)
 }
 
-fn own_number(layer: &CALayer, key: &str) -> Option<f64> {
+/// The model value of a numeric key path, where an animation would come to rest.
+pub fn number_at(layer: &CALayer, key: &str) -> Option<f64> {
     layer
-        .valueForKey(&NSString::from_str(key))
+        .valueForKeyPath(&NSString::from_str(key))
         .and_then(|value| value.downcast::<NSNumber>().ok())
         .map(|value| value.as_f64())
 }
@@ -338,7 +382,7 @@ pub fn focus(layer: &CALayer, from: f64, duration: f64, easing: [f64; 4], delay:
     set_number(layer, SHARP_AT, sharp_at);
     let layer = layer.retain();
     let _ = after(delay + duration, move || {
-        if own_number(&layer, SHARP_AT).is_some_and(|at| at <= now() + CLOCK_SLACK) {
+        if number_at(&layer, SHARP_AT).is_some_and(|at| at <= now() + CLOCK_SLACK) {
             quietly(|| set_blur(&layer, None));
         }
     });
@@ -377,7 +421,7 @@ pub fn text_ghost(layer: &CATextLayer) -> Retained<CATextLayer> {
         ghost.setString(layer.string().as_deref());
     }
     ghost.setFontSize(layer.fontSize());
-    ghost.setForegroundColor(layer.foregroundColor().as_deref());
+    ghost.setForegroundColor(shown_foreground(layer).as_deref());
     ghost.setAlignmentMode(&layer.alignmentMode());
     ghost.setTruncationMode(&layer.truncationMode());
     ghost.setContentsScale(layer.contentsScale());
@@ -418,26 +462,37 @@ pub fn hand_over_glyph(layer: &CALayer, image: &NSImage, scale: f64) -> Retained
     ghost
 }
 
-/// Recolors a line of text from the color it shows now, over `duration`.
-pub fn retint(layer: &CATextLayer, to: Color, duration: f64, easing: [f64; 4]) {
+/// The color a line of text shows now, which a retint may have taken from its model color.
+fn shown_foreground(layer: &CATextLayer) -> Option<Retained<CGColor>> {
     // SAFETY: the presentation layer is a read-only copy of this one.
-    let from = unsafe { layer.presentationLayer() }
+    unsafe { layer.presentationLayer() }
         .and_then(|shown| shown.downcast::<CATextLayer>().ok())
         .and_then(|shown| shown.foregroundColor())
-        .or_else(|| layer.foregroundColor());
+        .or_else(|| layer.foregroundColor())
+}
+
+/// Recolors a line of text from the color it shows now, over `duration`.
+pub fn retint(layer: &CATextLayer, to: Color, duration: f64, easing: [f64; 4]) {
+    let from = shown_foreground(layer);
     let target = cg(to);
     layer.setForegroundColor(Some(&target));
     if let Some(from) = from {
         let change = tween(
-            "foregroundColor",
+            FOREGROUND_COLOR,
             color_value(&from),
             color_value(&target),
             duration,
             easing,
             0.0,
         );
-        add(layer, "foregroundColor", &change);
+        add(layer, FOREGROUND_COLOR, &change);
     }
+}
+
+/// Gives a line of text `color` at once, ending a retint under way.
+pub fn tint(layer: &CATextLayer, color: Color) {
+    remove(layer, FOREGROUND_COLOR);
+    layer.setForegroundColor(Some(&cg(color)));
 }
 
 /// A system font at a CSS weight (400, 500 or 600).
@@ -592,6 +647,12 @@ pub fn fade_to(layer: &CALayer, to: f64, duration: f64, easing: [f64; 4], delay:
     );
 }
 
+/// Gives a layer's background `color` at once, ending a recolor under way.
+pub fn paint(layer: &CALayer, color: Color) {
+    remove(layer, BACKGROUND_COLOR);
+    layer.setBackgroundColor(Some(&cg(color)));
+}
+
 /// Recolors a layer's background from what shows now, over `duration`.
 pub fn recolor(layer: &CALayer, to: Color, duration: f64, easing: [f64; 4]) {
     // SAFETY: the presentation layer is a read-only copy of this one.
@@ -603,9 +664,9 @@ pub fn recolor(layer: &CALayer, to: Color, duration: f64, easing: [f64; 4]) {
     if let Some(from) = from {
         add(
             layer,
-            "backgroundColor",
+            BACKGROUND_COLOR,
             &tween(
-                "backgroundColor",
+                BACKGROUND_COLOR,
                 color_value(&from),
                 color_value(&target),
                 duration,
@@ -650,11 +711,14 @@ pub fn every(seconds: f64, fire: impl Fn() + 'static) -> Retained<NSTimer> {
 
 fn timer(seconds: f64, repeats: bool, fire: impl Fn() + 'static) -> Retained<NSTimer> {
     let block = RcBlock::new(move |_: NonNull<NSTimer>| fire());
-    // SAFETY: the timer is added to the main run loop below and fires only on this, the main,
-    // thread, so the block never crosses threads.
+    // SAFETY: the timer is scheduled below only from the main thread, on its run loop, and
+    // fires only there, so the block never crosses threads.
     let timer = unsafe { NSTimer::timerWithTimeInterval_repeats_block(seconds, repeats, &block) };
-    // SAFETY: the common modes keep it firing while a menu or a drag is tracking.
-    unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
+    // Off the main thread, as in unit tests, nothing is scheduled and the timer never fires.
+    if MainThreadMarker::new().is_some() {
+        // SAFETY: the common modes keep it firing while a menu or a drag is tracking.
+        unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
+    }
     timer
 }
 
