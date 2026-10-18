@@ -4,6 +4,13 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- A computer that joins or leaves while the notch island is open now fades in or out in its own row instead of sliding toward the notch.
+- The notch island's status dot changes color smoothly when the status changes, and the status text no longer jumps to its new color when the status changes twice in quick succession.
+- The notch island now closes when a row disappears while you hold its switch with the pointer already outside, instead of staying open until the pointer passes over it again.
+- An automatic update check no longer cuts off the other computer while it is in the middle of connecting, so sharing resumes on time instead of a few seconds late.
+
 ## [0.2.10] - 2026-10-17
 
 ### Changed
