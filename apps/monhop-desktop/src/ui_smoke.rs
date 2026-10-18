@@ -1,4 +1,5 @@
-//! Bounded webview, accordion and read-only setup checks. No prompts or input hooks run.
+//! Bounded webview, accordion and read-only setup checks on the Studio shell. No prompts or input
+//! hooks run.
 
 use std::{
     sync::{
@@ -44,12 +45,14 @@ fn finish(app: &tauri::AppHandle, passed: bool, message: &str) {
 }
 
 const RENDER_CHECK: &str = r#"(() => {
-  const heading = document.querySelector('#permissions-title');
+  const studio = document.querySelector('#studio');
+  const title = document.querySelector('#inspector-title');
   const button = document.querySelector('#permissions-refresh');
-  const sections = [...document.querySelectorAll('.setup-section')];
-  const locked = sections.filter(section => section.dataset.section !== 'ready');
-  const shell = document.querySelector('.shell');
-  const header = document.querySelector('.window-header');
+  const inspector = document.querySelector('#inspector');
+  const toolbar = document.querySelector('.toolbar');
+  const brand = document.querySelector('.brand');
+  // The inspector is drawn by app.js, so until the module has run the receipt only says not ready.
+  if (!title) return '000000000';
   const visible = node => node && node.getClientRects().length > 0
     && getComputedStyle(node).visibility === 'visible';
   const inViewport = node => {
@@ -66,28 +69,28 @@ const RENDER_CHECK: &str = r#"(() => {
   return [
     document.readyState === 'complete' && Math.abs(innerWidth - EXPECTED_WIDTH) < 1
       && innerHeight > 0 && innerHeight <= MAXIMUM_HEIGHT,
-    visible(heading) && heading.textContent.trim().length > 0 && inViewport(header)
-      && header.getBoundingClientRect().top === 0
+    visible(title) && title.textContent.trim().length > 0 && inViewport(toolbar)
+      && toolbar.getBoundingClientRect().top === 0
       && document.documentElement.dataset.platform === window.__MONHOP_PLATFORM__,
-    inViewport(shell) && document.documentElement.scrollWidth <= innerWidth + 1
+    inViewport(studio) && document.documentElement.scrollWidth <= innerWidth + 1
       && document.documentElement.scrollHeight <= innerHeight + 1
-      && (window.__MONHOP_PLATFORM__ !== 'macos' || document.querySelector('.window-heading').getBoundingClientRect().left >= 82)
+      && (window.__MONHOP_PLATFORM__ !== 'macos' || brand.getBoundingClientRect().left >= 82)
       && (window.__MONHOP_PLATFORM__ !== 'windows'
         || [...document.querySelectorAll('[data-window-action]')].length === 3
           && [...document.querySelectorAll('[data-window-action]')].every(inViewport)),
-    parseFloat(getComputedStyle(heading).fontSize) <= 30
+    parseFloat(getComputedStyle(title).fontSize) <= 30
       && parseFloat(getComputedStyle(document.body).fontSize) <= 14
       && button?.getBoundingClientRect().height >= 28
       && button?.getBoundingClientRect().height <= 40,
-    document.querySelector('#native-state').dataset.checkState === 'unchecked',
+    studio.dataset.checkState === 'unchecked',
     typeof window.__TAURI__?.core?.invoke === 'function',
-    sections.length === 3 && !document.querySelector('#setup-view').hidden
-      && document.querySelector('#home-view').hidden
-      && inViewport(sections[0].querySelector('.section-header'))
-      && inViewport(button) && button.disabled === false,
-    locked.length === 2
-      && locked.every(section => section.dataset.locked === 'true'
-        && section.querySelector('.section-body').inert),
+    studio.dataset.selection === 'local' && studio.dataset.view === 'canvas'
+      && inspector.dataset.open === 'true' && !inspector.inert && inViewport(inspector)
+      && inViewport(document.querySelector('.overview')) && inViewport(button)
+      && button.disabled === false && document.querySelector('#settings-view').inert,
+    document.querySelector('#arrange-slot').hidden && document.querySelector('#pause-slot').hidden
+      && document.querySelectorAll('[data-select^="computer:"]').length === 0
+      && document.querySelectorAll('[data-select="local"], [data-select="new"]').length === 2,
     (theme === undefined ? scheme === 'light dark' : scheme === theme)
       && color?.length === 3 && background?.length === 3
       && (dark ? background.every(value => value < 64) && color.every(value => value > 190)
@@ -136,7 +139,7 @@ pub fn check(window: WebviewWindow) {
         );
         return;
     }
-    check_at_width(window, 980);
+    check_at_width(window, 1180);
 }
 
 fn check_at_width(window: WebviewWindow, width: u16) {
@@ -147,7 +150,7 @@ fn check_at_width(window: WebviewWindow, width: u16) {
     let retry_window = window.clone();
     let app = window.app_handle().clone();
     let callback_app = app.clone();
-    let maximum_height = if width == 980 { 720 } else { 560 };
+    let maximum_height = if width == 1180 { 760 } else { 560 };
     let script = RENDER_CHECK
         .replace("EXPECTED_WIDTH", &width.to_string())
         .replace("MAXIMUM_HEIGHT", &maximum_height.to_string());
@@ -164,7 +167,7 @@ fn check_at_width(window: WebviewWindow, width: u16) {
                         });
                         return;
                     }
-                    println!("MonHop UI categories: width={} maximum_height={} ready={} html={} layout={} density={} script={} bridge={} controls={} sharing_disabled={} theme={}", width, maximum_height, flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6], flags[7], flags[8]);
+                    println!("MonHop UI categories: width={} maximum_height={} ready={} html={} layout={} density={} script={} bridge={} controls={} sharing_off={} theme={}", width, maximum_height, flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6], flags[7], flags[8]);
                     if flags.into_iter().all(|flag| flag) {
                         check_accordion(retry_window.clone(), width);
                     } else {
@@ -207,8 +210,8 @@ const ACCORDION_CHECK: &str = r#"(() => {
       animation.play();
       return animated;
     };
-    // Ambient loops (the current step's glow) never finish, so only finite entrances are awaited.
-    await Promise.all(document.querySelector('#setup-view').getAnimations({ subtree: true })
+    // Ambient loops (a live dot's ring) never finish, so only finite entrances are awaited.
+    await Promise.all(document.querySelector('#inspector').getAnimations({ subtree: true })
       .filter(a => a.effect?.getComputedTiming().iterations !== Infinity)
       .map(a => a.finished.catch(() => {})));
     const flags = [trigger?.tagName === 'BUTTON' && panel?.getAttribute('role') === 'region'
@@ -235,12 +238,13 @@ const ACCORDION_CHECK: &str = r#"(() => {
     await settle();
     flags.push(trigger.getAttribute('aria-expanded') === 'true' && !panel.hidden && !panel.inert
       && panel.getBoundingClientRect().height >= panel.scrollHeight - 1);
-    flags.push(document.querySelector('.content-region').scrollWidth <= document.querySelector('.content-region').clientWidth + 1);
+    const scroller = document.querySelector('#inspector-scroll');
+    flags.push(scroller.scrollWidth <= scroller.clientWidth + 1);
     window.__MONHOP_ACCORDION_CHECK__ = 'pending:finishing';
     trigger.click(); await settle();
-    flags.push(panel.hidden && panel.inert
-      && document.querySelector('#native-state').dataset.checkState === 'unchecked'
-      && [...document.querySelectorAll('.setup-section[data-locked="true"]')].length === 2);
+    const studio = document.querySelector('#studio');
+    flags.push(panel.hidden && panel.inert && studio.dataset.checkState === 'unchecked'
+      && studio.dataset.selection === 'local' && document.querySelector('#pause-slot').hidden);
     window.__MONHOP_ACCORDION_CHECK__ = flags.map(v => v ? '1' : '0').join('');
   })().catch(() => { window.__MONHOP_ACCORDION_CHECK__ = '000000000'; });
   return 'started';
@@ -305,7 +309,7 @@ fn poll_accordion(window: WebviewWindow, width: u16, previous: String) {
             println!("MonHop accordion categories: width={} semantics={} opening={} stacked={} expanded={} closing={} collapsed={} reversal={} layout={} setup_unchanged={}", width, flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6], flags[7], flags[8]);
             if !flags.into_iter().all(|flag| flag) {
                 finish(app, false, "MonHop accordion check: FAIL (behavior).");
-            } else if width == 980 {
+            } else if width == 1180 {
                 if callback_window.set_size(tauri::LogicalSize::new(760.0, 560.0)).is_err() {
                     finish(app, false, "MonHop UI check: FAIL (minimum window resize).");
                 } else {
@@ -373,7 +377,7 @@ fn poll_readonly_status(window: WebviewWindow) {
         const logCheck = window.__MONHOP_LOG_CHECK__;
         if (button.disabled || logCheck === 'pending') return 'pending';
         return logCheck === 'passed'
-            && document.querySelector('#native-state').dataset.checkState === 'checked'
+            && document.querySelector('#studio').dataset.checkState === 'checked'
             && document.querySelector('#permissions-content').innerText.length > 30
             && document.querySelector('#interface-content').innerText.length > 30 ? 'passed' : 'failed';
     })()"#, move |value| {
@@ -390,7 +394,7 @@ fn poll_readonly_status(window: WebviewWindow) {
             finish(app, false, "MonHop UI check: FAIL (read-only status rendering).");
             return;
         }
-        println!("MonHop setup categories: readonly_status_rendered=true sharing_disabled=true reveal_logs_authorized=true");
+        println!("MonHop setup categories: readonly_status_rendered=true sharing_off=true reveal_logs_authorized=true");
         let tray_passed = crate::tray::is_installed(app)
             && crate::tray::hide_main_window(app).is_ok()
             && next.is_visible().is_ok_and(|visible| !visible)
@@ -398,7 +402,7 @@ fn poll_readonly_status(window: WebviewWindow) {
             && next.is_visible().unwrap_or(false);
         println!("MonHop tray categories: installed_hide_show={tray_passed}");
         finish(app, tray_passed, if tray_passed {
-            "MonHop UI check: PASS (guided setup, animated accordions, read-only status and tray hide/show; sharing disabled)."
+            "MonHop UI check: PASS (guided setup, animated accordions, read-only status and tray hide/show; sharing off)."
         } else {
             "MonHop UI check: FAIL (native tray hide/show)."
         });
@@ -427,8 +431,8 @@ mod tests {
             "MonHop UI check: FAIL (render deadline at page load)."
         );
         assert_eq!(
-            deadline_message("accordion at width 980, pending:closing (window hidden)"),
-            "MonHop UI check: FAIL (render deadline at accordion at width 980, pending:closing (window hidden))."
+            deadline_message("accordion at width 1180, pending:closing (window hidden)"),
+            "MonHop UI check: FAIL (render deadline at accordion at width 1180, pending:closing (window hidden))."
         );
     }
 

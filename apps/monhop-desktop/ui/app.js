@@ -1,11 +1,10 @@
 import {
-  accessReady,
   applySnapshot,
   autoSelectInterface,
   errorMessages,
   initialState,
   nativeCheckState,
-  networkReady,
+  networkLabel,
   pairingOpenGate,
   selectInterface,
   selectedInterface,
@@ -23,13 +22,14 @@ import {
   isBusyPairing,
   isPairingAttemptLive,
   pairingFailure,
+  pairingStep,
   platformLabel,
 } from "./pairing-model.mjs";
 import {
   COUNTDOWN_TEXT_ID,
   PAIRING_CODE_INPUT_ID,
   countdownText,
-  renderComputers,
+  pairingInspector,
 } from "./screen-computers.mjs";
 import {
   applySharingView,
@@ -69,14 +69,7 @@ import {
   emptyCopyFeedback,
   isCopyReplyCurrent,
 } from "./copy-feedback-model.mjs";
-import {
-  accordionManager,
-  glideMove,
-  glideResize,
-  glideWidth,
-  setPanelOpen,
-  setRevealOpen,
-} from "./accordion.mjs";
+import { accordionManager, glideWidth } from "./accordion.mjs";
 import {
   canOpenPairingOnEntry,
   recordPairingOpenContext,
@@ -101,13 +94,14 @@ import {
   requestComputersLoad,
   setComputerArrangements,
 } from "./computers-model.mjs";
-import { activeStatus, isLiveStatus } from "./computer-status.mjs";
+import { activeStatus } from "./computer-status.mjs";
 import {
   clearForgetFor,
   keepForgetArmed,
   keepForgetListed,
   loadGate,
   pressForget,
+  resolveEnabledList,
 } from "./computer-card-model.mjs";
 import { clipboardContext, invokeSetComputerEnabled, pollFingerprint } from "./app-actions.mjs";
 import { autoscrollContext } from "./autoscroll-model.mjs";
@@ -121,32 +115,48 @@ import {
   failDimming,
   initialDimming,
 } from "./dimming-model.mjs";
-import { setupSectionGates, shouldShowPairing } from "./setup-presentation.mjs";
 import { setSlotPresent } from "./header-motion.mjs";
-import { followStep } from "./motion-model.mjs";
 import {
+  arrangeState,
+  canvasFingerprint,
+  computerSelection,
+  inspectorKind,
+  inspectorPresentation,
+  localRowStatus,
+  networkChip,
+  resolveSelection,
+  resumeTarget,
+  sameSelection,
+  selectionFromKey,
+  selectionKey,
+  sidebarRows,
+  toolbarState,
+} from "./studio-model.mjs";
+import {
+  button,
   captureDims,
   clear,
   el,
   followDims,
+  handOffFocus,
   handedOffFocus,
   icon,
   iconButton,
-  motionEnabled,
-  motionMs,
   nativeError,
   phaseLoops,
   reducedMotion,
   setLabel,
+  swap,
   turnGlyph,
 } from "./dom.mjs";
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
-import { normalizeAutostartView, trayPlace } from "./autostart-model.mjs";
+import { normalizeAutostartView } from "./autostart-model.mjs";
 import { islandContext, normalizeIslandView } from "./island-model.mjs";
-import { renderReady } from "./screen-ready.mjs";
-import { renderDisplays } from "./screen-displays.mjs";
-import { renderHome } from "./screen-home.mjs";
+import { isSelectable, localInspector } from "./screen-ready.mjs";
+import { computerInspector } from "./computer-card.mjs";
+import { banner, renderCanvas } from "./screen-displays.mjs";
 import { renderSettings } from "./screen-settings.mjs";
+import { renderSidebar } from "./sidebar.mjs";
 
 const core = window.__TAURI__?.core;
 const nativeWindow = window.__TAURI__?.window;
@@ -156,18 +166,9 @@ const platform = ["macos", "windows"].includes(nativePlatform) ? nativePlatform 
 document.documentElement.dataset.platform = platform;
 
 const SHARING_POLL_MS = 1000;
-const THEME_ORDER = ["system", "light", "dark"];
-const THEME_LABELS = {
-  system: "Theme follows the system",
-  light: "Light theme",
-  dark: "Dark theme",
-};
-const THEME_ICONS = { system: "monitor", light: "sun", dark: "moon" };
-const PAGE_TITLES = { home: "Home", setup: "Set up", settings: "Settings" };
-const PAGE_ENTER_CLEANUP_MS = 320;
+const THEMES = new Set(["system", "light", "dark"]);
 const PAIRING_POLL_MS = 500;
 const PAIRING_COUNTDOWN_TICK_MS = 250;
-const SECTION_PIN_MS = 2500;
 const LIST_UNREADABLE = "The computer list was not recognized.";
 
 let state = initialState(Boolean(core?.invoke));
@@ -177,7 +178,6 @@ let pairingPending = false;
 let pairingOperation = null;
 let pairingPollingAllowed = false;
 let pairingPollTimer = null;
-let pairingRequested = false;
 let pairedKey = null;
 // A pairing this session finished keeps its match badge on screen until the user moves on.
 let pairingResultShown = false;
@@ -189,7 +189,7 @@ let dropCopyFeedback = emptyCopyFeedback();
 let dropCopyRequest = 0;
 let dimming = initialDimming();
 // Undefined until clipboard_status succeeds or a "clipboard" event arrives, so a backend built
-// before clipboard sharing landed leaves the Home card hidden rather than showing a broken one.
+// before clipboard sharing landed leaves the section hidden rather than showing a broken one.
 let clipboardView;
 let clipboardPending = false;
 // The Mac's mouse and trackpad switches: each view is undefined until its status answers.
@@ -201,24 +201,27 @@ const pointerSwitches = {
 const controlAsCommand = { view: undefined, pending: false };
 let theme = "system";
 let themePending = false;
-// The header icon animates once after a click, not on every poll-driven render.
-let themeChanged = false;
 let dimmingRequest = 0;
 let dimPreview = null;
 let dimmingDrag = false;
 let renderAfterDrag = false;
-// Harness-only: a forced starting page skips the load-driven redirect to Home below.
-const forcedPage = ["home", "setup", "settings"].includes(window.MONHOP_PAGE)
-  ? window.MONHOP_PAGE
-  : null;
-let page = forcedPage ?? "setup";
-let landed = forcedPage !== null;
-let settingsReturnPage = "home";
+// The sidebar row the user picked; null follows the default. The harness may start on any row.
+let chosen = selectionFromKey(window.MONHOP_SELECT);
+let shownSelectionKey = null;
+// The computer in use before Pause, which Resume brings back.
+let lastActive = null;
+// Arrange was pressed and the editor is on its way; the backend's own editing flag takes over.
+let arrangeRequested = false;
+// Below the overlay width the details sheet can be closed; picking a row opens it again.
+let inspectorDismissed = false;
+// Which drawer above the Apply bar is open: "saved", "use" or none.
+let canvasDrawer = null;
+let networkMenuOpen = false;
 let updates = normalizeUpdatesView(null);
 let updatesPending = false;
 let autostart = normalizeAutostartView(null);
 let autostartPending = false;
-// Undefined until the Mac answers, so the card never shows on a platform that has no island.
+// Undefined until the Mac answers, so the section never shows on a platform that has no island.
 let island;
 let islandPending = false;
 let computers = initialComputers();
@@ -244,78 +247,84 @@ let autoPairingContexts = new Set();
 let arrangementView = null;
 let arrangementsRevision = null;
 let arrangementsRetry = { at: 0, delay: 0 };
-let pendingSection = null;
-// The frame easing the page toward the pinned section, and when it last stepped.
-const sectionScroll = { frame: 0, at: null, waiting: false };
-let pageTransition = null;
-// Session-only choice: a completed setup returns to the last step the user opened.
-let setupExpandedSection = null;
-let setupExpansionChosen = false;
 
 const nodes = {
-  shell: document.querySelector(".shell"),
-  sections: [...document.querySelectorAll("[data-section]")],
-  pageLinks: [...document.querySelectorAll("[data-page]")],
-  nativeState: document.querySelector("#native-state"),
-  headerConnection: document.querySelector("#header-connection"),
-  headerRefresh: document.querySelector("#header-refresh"),
-  headerButtons: document.querySelector("#header-buttons"),
-  primaryNav: document.querySelector("#primary-nav"),
-  setupVerdict: document.querySelector("#setup-verdict"),
-  setupDetail: document.querySelector("#setup-detail"),
-  launchAttribution: document.querySelector("#launch-attribution"),
-  readyStatus: document.querySelector("#ready-status"),
-  readyActions: document.querySelector("#ready-actions"),
-  permissionsContent: document.querySelector("#permissions-content"),
-  interfaceContent: document.querySelector("#interface-content"),
-  computersStatus: document.querySelector("#computers-status"),
-  computersActions: document.querySelector("#computers-actions"),
-  computersContent: document.querySelector("#computers-content"),
-  displaysStatus: document.querySelector("#displays-status"),
-  displaysActions: document.querySelector("#displays-actions"),
-  displaysContent: document.querySelector("#displays-content"),
-  windowControls: document.querySelector("#window-controls"),
-  homeView: document.querySelector("#home-view"),
-  homeContent: document.querySelector("#home-content"),
-  setupView: document.querySelector("#setup-view"),
-  settingsView: document.querySelector("#settings-view"),
-  settingsContent: document.querySelector("#settings-content"),
+  studio: document.querySelector("#studio"),
+  sidebarList: document.querySelector("#sidebar-list"),
+  sidebarCount: document.querySelector("#sidebar-count"),
+  sidebarRefresh: document.querySelector("#sidebar-refresh"),
+  sidebarSettings: document.querySelector("#sidebar-settings"),
+  sidebarIndicator: document.querySelector("#sidebar-indicator"),
+  sidebarVersion: document.querySelector("#sidebar-version"),
   pageTitle: document.querySelector("#page-title"),
-  pageAlert: document.querySelector("#page-alert"),
-  pageAlertPanel: document.querySelector("#page-alert-panel"),
+  networkSlot: document.querySelector("#network-slot"),
+  networkChip: document.querySelector("#network-chip"),
+  networkChipDot: document.querySelector("#network-chip-dot"),
+  networkChipLabel: document.querySelector("#network-chip-label"),
+  networkMenu: document.querySelector("#network-menu"),
+  arrangeSlot: document.querySelector("#arrange-slot"),
+  pauseSlot: document.querySelector("#pause-slot"),
+  windowControls: document.querySelector("#window-controls"),
+  canvasPane: document.querySelector("#canvas-pane"),
+  canvasBanners: document.querySelector("#canvas-banners"),
+  canvasStage: document.querySelector("#canvas-stage"),
+  canvasDock: document.querySelector("#canvas-dock"),
+  statusBarDot: document.querySelector("#status-bar-dot"),
+  statusBarText: document.querySelector("#status-bar-text"),
+  inspector: document.querySelector("#inspector"),
+  inspectorClose: document.querySelector("#inspector-close"),
+  inspectorScroll: document.querySelector("#inspector-scroll"),
+  inspectorContent: document.querySelector("#inspector-content"),
+  settingsView: document.querySelector("#settings-view"),
+  settingsScroll: document.querySelector("#settings-scroll"),
+  settingsContent: document.querySelector("#settings-content"),
 };
+// Scrollers whose position a render keeps.
+const scrollers = [
+  nodes.inspectorScroll,
+  nodes.settingsScroll,
+  nodes.canvasStage,
+  nodes.sidebarList,
+];
 
-for (const button of nodes.pageLinks)
-  button.addEventListener("click", () => goToPage(button.dataset.page));
-for (const button of nodes.windowControls.querySelectorAll("[data-window-action]")) {
-  button.addEventListener("pointerdown", (event) => event.stopPropagation());
-  button.addEventListener("dblclick", (event) => event.stopPropagation());
-  button.addEventListener("click", (event) => {
+for (const caption of nodes.windowControls.querySelectorAll("[data-window-action]")) {
+  caption.addEventListener("pointerdown", (event) => event.stopPropagation());
+  caption.addEventListener("dblclick", (event) => event.stopPropagation());
+  caption.addEventListener("click", (event) => {
     event.stopPropagation();
-    runWindowAction(button.dataset.windowAction);
+    runWindowAction(caption.dataset.windowAction);
   });
 }
 nodes.windowControls.hidden = platform !== "windows";
 accordionManager.mount();
-const headerControls = createHeaderControls();
+const toolbarControls = createToolbarControls();
+mountStaticGlyphs();
 
-for (const section of nodes.sections) {
-  section.querySelector(".section-toggle").addEventListener("click", () => {
-    if (section.dataset.locked === "true" || section.dataset.done !== "true") return;
-    setupExpansionChosen = true;
-    setupExpandedSection = section.dataset.collapsed === "true" ? section.dataset.section : null;
-    render();
-  });
+nodes.sidebarSettings.addEventListener("click", () => select("settings"));
+nodes.inspectorClose.addEventListener("click", dismissInspector);
+nodes.networkChip.addEventListener("click", () => setNetworkMenuOpen(!networkMenuOpen));
+document.addEventListener("pointerdown", (event) => {
+  if (networkMenuOpen && !nodes.networkSlot.contains(event.target)) setNetworkMenuOpen(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (networkMenuOpen) {
+    setNetworkMenuOpen(false);
+    nodes.networkChip.focus({ preventScroll: true });
+  } else if (nodes.inspector.dataset.mode === "overlay" && nodes.inspector.dataset.open === "true")
+    dismissInspector();
+});
+
+// Only the sheet closes; a docked inspector always shows its selection.
+function dismissInspector() {
+  inspectorDismissed = true;
+  render();
 }
-
-for (const event of ["wheel", "touchstart", "pointerdown", "keydown"])
-  document.querySelector(".content-region").addEventListener(
-    event,
-    () => {
-      pendingSection = null;
-    },
-    { passive: true },
-  );
+// The inspector turns into a sheet, or back, as the window crosses the overlay width.
+window.addEventListener("resize", () => {
+  if (nodes.inspector.dataset.mode !== presentInspector(inspectorKind(currentSelection())).mode)
+    render();
+});
 
 window.addEventListener("blur", () => {
   refreshAfterReturn = true;
@@ -342,8 +351,6 @@ if (!uiCheck) {
   if (platform === "macos") void loadPointerSwitches();
   if (platform === "windows") void loadControlAsCommand();
   void loadUpdatesStatus();
-  // The initial page never runs through goToPage's entry hooks, so this covers a fresh
-  // launch landing straight on Setup or Settings; the hooks below cover later visits.
   void loadAutostartStatus();
   if (platform === "macos") void loadIslandStatus();
   listenUpdates();
@@ -352,156 +359,77 @@ if (!uiCheck) {
 function onReturn() {
   if (uiCheck || !refreshAfterReturn) return;
   refreshAfterReturn = false;
-  if (page === "setup") void requestAutomaticSnapshot("focus");
+  if (showsReadiness(currentSelection())) void requestAutomaticSnapshot("focus");
   void refreshSharingStatus();
   void loadComputers();
 }
 
-// ---------- navigation ----------
+// ---------- selection ----------
 
-function goToPage(nextPage, after) {
-  if (!["home", "setup", "settings"].includes(nextPage)) return;
-  const entered = page !== nextPage;
-  landed = true;
-  if (!entered) {
-    after?.();
-    return;
-  }
-  pendingSection = null;
-  const commit = () => {
-    page = nextPage;
-    renderPageVisibility();
-    document.querySelector(".content-region").scrollTop = 0;
-  };
-  const finish = () => {
-    after?.();
-    onPageEntered(nextPage);
-    render();
-  };
-  const animate =
-    !uiCheck &&
-    !reducedMotion.matches &&
-    document.visibilityState === "visible" &&
-    typeof document.startViewTransition === "function";
-  if (!animate) {
-    document.documentElement.dataset.pageEnter = "true";
-    commit();
-    window.requestAnimationFrame(() => {
-      finish();
-      window.setTimeout(
-        () => delete document.documentElement.dataset.pageEnter,
-        PAGE_ENTER_CLEANUP_MS,
-      );
-    });
-    return;
-  }
-  pageTransition?.skipTransition();
-  const transition = document.startViewTransition(commit);
-  pageTransition = transition;
-  void transition.finished
-    .catch(() => {})
-    .finally(() => {
-      if (pageTransition !== transition) return;
-      pageTransition = null;
-      finish();
-    });
+function justPaired() {
+  return pairingResultShown && pairing.view?.phase === "paired"
+    ? pairing.view.peerFingerprint
+    : null;
 }
 
-function onPageEntered(nextPage) {
-  if (nextPage === "setup") onEnterSetup();
-  else if (nextPage === "settings") {
+function currentSelection() {
+  return resolveSelection({
+    chosen,
+    fingerprints: computers.items.map((item) => item.fingerprint),
+    active: activeFingerprint(),
+    pairingLive: isPairingAttemptLive(pairing),
+    paired: justPaired(),
+  });
+}
+
+// This Mac and the pairing exchange are where readiness and the pairing entry are on screen.
+function showsReadiness(selection) {
+  return selection.kind === "local" || selection.kind === "new";
+}
+
+// Returns the pairing it opened on the way into the New computer row, if any.
+function select(key) {
+  const next = selectionFromKey(key);
+  if (!next) return null;
+  setNetworkMenuOpen(false);
+  inspectorDismissed = false;
+  const previous = currentSelection();
+  chosen = next;
+  const opening = sameSelection(previous, next) ? null : enterSelection(previous, next);
+  render();
+  return opening;
+}
+
+function enterSelection(previous, next) {
+  // A shown code or a fresh match badge belongs to the exchange; moving on abandons it.
+  const paired = justPaired();
+  if (
+    previous.kind === "new" ||
+    (paired && next.kind !== "new" && !sameSelection(next, computerSelection(paired)))
+  )
+    leavePairing();
+  if (next.kind === "computer") void loadComputers();
+  if (next.kind === "settings") {
     void loadUpdatesStatus();
     void loadAutostartStatus();
     if (platform === "macos") void loadIslandStatus();
-  } else {
-    leavePairing();
-    if (isEditingLayout(sharing)) void endLayoutEdit();
-    void loadComputers();
   }
-}
-
-// The gear is a toggle: pressing it again from Settings returns to wherever it was opened from.
-function toggleSettings() {
-  if (page === "settings") goToPage(settingsReturnPage);
-  else {
-    settingsReturnPage = page;
-    goToPage("settings");
-  }
+  if (showsReadiness(next)) void requestAutomaticSnapshot("entry");
+  if (next.kind === "local") openPairingOnExplicitEntry();
+  return next.kind === "new" ? enterPairing() : null;
 }
 
 // A shown code or a running handshake holds the sharing port; leaving the exchange abandons it so
 // the supervisor can reconnect. Pairing again means a new code.
 function leavePairing() {
-  pairingRequested = false;
   pairingResultShown = false;
   pairing = withPairingMode(pairing, null);
   if (isPairingAttemptLive(pairing)) void cancelPairing();
 }
 
-function onEnterSetup() {
-  void requestAutomaticSnapshot("entry");
-  openPairingOnExplicitEntry();
-  void loadAutostartStatus();
-}
-
-function scrollToSection(key) {
-  pendingSection = { key, until: Date.now() + SECTION_PIN_MS };
-  pinPendingSection();
-}
-
-// The section's content arrives over the next few status polls and changes height under the user, so
-// the request is re-applied after every render until it settles or the user scrolls somewhere else.
-// With motion the page eases there frame by frame, following the section as panels glide around it.
-function pinPendingSection() {
-  const offset = pendingSectionOffset();
-  if (offset === null) return;
-  const content = document.querySelector(".content-region");
-  if (!motionEnabled()) {
-    content.scrollTop += offset;
-    return;
-  }
-  // The panels this render changed start gliding after the next frame's callbacks, so that frame waits.
-  sectionScroll.waiting = true;
-  if (sectionScroll.frame) return;
-  sectionScroll.at = null;
-  sectionScroll.frame = requestAnimationFrame(followPendingSection);
-}
-
-// How far the pinned section's top sits below the page's, or null once there is nothing to pin.
-function pendingSectionOffset() {
-  if (!pendingSection) return null;
-  const section = nodes.sections.find((node) => node.dataset.section === pendingSection.key);
-  const content = document.querySelector(".content-region");
-  if (!section || !content || Date.now() > pendingSection.until) {
-    pendingSection = null;
-    return null;
-  }
-  return section.getBoundingClientRect().top - content.getBoundingClientRect().top;
-}
-
-function followPendingSection(now) {
-  sectionScroll.frame = 0;
-  const offset = pendingSectionOffset();
-  if (offset === null || !motionEnabled()) return;
-  const content = document.querySelector(".content-region");
-  const dt = sectionScroll.at === null ? 1000 / 60 : now - sectionScroll.at;
-  sectionScroll.at = now;
-  // While a panel glides the page is still changing height under the section, and a scroll begun
-  // then would be clamped back as the page shrinks; it waits for the layout to settle instead.
-  const settling = sectionScroll.waiting || content.querySelector("[data-gliding]") !== null;
-  sectionScroll.waiting = false;
-  if (!settling) {
-    const from = content.scrollTop;
-    const pixel = 1 / (window.devicePixelRatio || 1);
-    content.scrollTop = followStep(from, from + offset, dt, motionMs("--motion-slow"), pixel);
-  }
-  if (Math.abs(offset) >= 0.5) sectionScroll.frame = requestAnimationFrame(followPendingSection);
-}
-
 // ---------- render ----------
 
 function captureInteraction() {
-  const content = document.querySelector(".content-region");
   const active = document.activeElement;
   const focused =
     active?.id || active?.dataset.focusKey
@@ -512,20 +440,22 @@ function captureInteraction() {
           end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
         }
       : null;
-  return { scrollTop: content?.scrollTop ?? 0, focused };
+  return { scroll: scrollers.map((node) => node.scrollTop), focused };
 }
 
-function restoreInteraction(interaction) {
-  const content = document.querySelector(".content-region");
-  if (content) content.scrollTop = interaction.scrollTop;
+function restoreInteraction(interaction, { resetInspector }) {
+  scrollers.forEach((node, index) => {
+    node.scrollTop = interaction.scroll[index];
+  });
+  if (resetInspector) nodes.inspectorScroll.scrollTop = 0;
   if (!interaction.focused) return;
   const focused = interaction.focused.id
     ? document.getElementById(interaction.focused.id)
     : [...document.querySelectorAll("[data-focus-key]")].find(
         (node) => node.dataset.focusKey === interaction.focused.focusKey,
       );
-  // A control inside a section that locked itself cannot take focus back; one inside a block that
-  // closed goes where that block handed its focus.
+  // A control inside a pane that closed cannot take focus back; one inside a block that closed
+  // goes where that block handed its focus.
   if (!focused || focused.disabled) return;
   const target = focused.closest("[inert]") ? handedOffFocus(focused) : focused;
   if (!target) return;
@@ -553,8 +483,51 @@ function peerName(activeComputer) {
   return "the other computer";
 }
 
-function readyDone() {
-  return Boolean(state.nativeAvailable && accessReady(state.snapshot) && networkReady(state));
+function presentInspector(kind) {
+  return inspectorPresentation({ width: window.innerWidth, kind, dismissed: inspectorDismissed });
+}
+
+// The shell's own state: what is selected, what the toolbar offers and what the canvas draws.
+function studioContext(status, active) {
+  const selection = currentSelection();
+  const fingerprints = computers.items.map((item) => item.fingerprint);
+  const localPlatform = state.snapshot?.platform ?? platform;
+  const localName = platformLabel(localPlatform, true);
+  const enabled = resolveEnabledList(sharing.view, computers, active);
+  const arrange = arrangeState({
+    connected: isConnected(sharing),
+    editing: isEditingLayout(sharing),
+    requested: arrangeRequested,
+  });
+  const canvasPrint = canvasFingerprint({ selection, active, fingerprints });
+  const canArrange =
+    Boolean(canvasPrint) && canEditLayout(sharing, state.selectedInterfaceId) && !controlsBusy();
+  const resume = resumeTarget({ lastActive, selection, fingerprints });
+  return {
+    selection,
+    selectionKey: selectionKey(selection),
+    view: selection.kind === "settings" ? "settings" : "canvas",
+    inspectorKind: inspectorKind(selection),
+    rows: sidebarRows({
+      computers,
+      sharingView: sharing.view,
+      active,
+      localName,
+      localPlatform,
+      localStatus: localRowStatus({
+        verdict: setupVerdict(state, { checking: snapshotCheck.pending }),
+        session: status,
+      }),
+      selection,
+      pairingStep: pairingStep(pairing),
+      pairingPhase: pairing.view?.phase ?? null,
+    }),
+    canvasComputer: findComputer(computers, canvasPrint),
+    canArrange,
+    arrange,
+    toolbar: toolbarState({ selection, arrange, canArrange, enabledCount: enabled.length, resume }),
+    resume,
+  };
 }
 
 function context() {
@@ -568,12 +541,14 @@ function context() {
     nativeAvailable: state.nativeAvailable,
     localName: platformLabel(platform, true),
   });
+  const studio = studioContext(status, active);
   return {
     core: Boolean(core?.invoke),
     platform,
     uiCheck,
     state,
     pairing,
+    pairingResultShown,
     sharing,
     computers,
     computerArrangements: computerArrangementsStore,
@@ -581,13 +556,10 @@ function context() {
     active,
     activeComputer,
     status,
-    gates: setupSectionGates({
-      readyDone: readyDone(),
-      pairedCount: computers.items.length,
-      activeName: activeComputer ? displayName(activeComputer) : "",
-      displaysReady: isLiveStatus(status),
-      layoutSaved: activeComputer?.setup?.saved === true,
-    }),
+    studio,
+    arrange: studio.arrange,
+    toolbar: studio.toolbar,
+    canvasDrawer,
     snapshotCheck,
     pairingPending,
     pairingOperation,
@@ -615,17 +587,20 @@ function context() {
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
     island: islandContext(platform, island, islandPending),
+    theme,
+    themePending,
     busy: controlsBusy(),
     peerName: peerName(activeComputer),
     gate: pairingOpenGate(state),
-    showPairing: shouldShowPairing({
-      requested: pairingRequested,
-      pairedCount: computers.items.length,
-      phase: pairing.view?.phase,
-      resultShown: pairingResultShown,
-    }),
     actions: {
-      goToPage,
+      select,
+      startPairing,
+      arrangeWith,
+      leaveArrange,
+      pauseSharing,
+      resumeSharing,
+      toggleCanvasDrawer,
+      setTheme,
       refreshSnapshot,
       requestPermissions,
       requestWifiPermission,
@@ -700,247 +675,116 @@ function render() {
     return;
   }
   const interaction = captureInteraction();
-  const dims = captureDims(nodes.shell);
-  // The Displays section hands back the same editor across polls; only a view it dropped is torn down.
+  const dims = captureDims(nodes.studio);
+  // The canvas hands back the same editor across polls; only a view it dropped is torn down.
   const previousArrangementView = arrangementView;
   arrangementView = null;
+  // The arrange request has done its job once the backend reports the edit.
+  if (arrangeRequested && isEditingLayout(sharing)) arrangeRequested = false;
+  lastActive = activeFingerprint() ?? lastActive;
   const ctx = context();
-  nodes.nativeState.dataset.checkState = nativeCheckState(state);
-  const pillWidth = nodes.headerConnection.getBoundingClientRect().width;
-  setLabel(nodes.nativeState, ctx.status.label);
-  glideWidth(nodes.headerConnection, pillWidth);
-  nodes.headerConnection.dataset.tone = ctx.status.tone;
-  renderPageChrome();
-  renderPageAlert(ctx);
-  renderSections(ctx);
-  renderReady(nodes, ctx);
-  renderComputers(nodes, ctx);
-  renderDisplays(nodes, ctx);
-  renderHome(nodes, ctx);
+  const { studio } = ctx;
+  // The editor needs the whole canvas, so a sheet over it steps aside as arranging starts.
+  if (studio.arrange.active && nodes.studio.dataset.arranging !== "true") inspectorDismissed = true;
+  const selectionChanged = shownSelectionKey !== null && shownSelectionKey !== studio.selectionKey;
+  shownSelectionKey = studio.selectionKey;
+  nodes.studio.dataset.checkState = nativeCheckState(state);
+  nodes.studio.dataset.selection = studio.selection.kind;
+  ctx.pageAlert = pageAlertNode(ctx);
+  renderShell(ctx);
+  renderToolbar(ctx);
+  renderSidebar(nodes, ctx);
+  renderCanvas(nodes, ctx);
+  renderInspector(ctx);
   renderSettings(nodes, ctx);
-  applySharedTransitionNames();
-  followDims(nodes.shell, dims);
+  followDims(nodes.studio, dims);
   phaseLoops();
-  restoreInteraction(interaction);
-  pinPendingSection();
+  restoreInteraction(interaction, { resetInspector: selectionChanged });
   if (previousArrangementView && previousArrangementView !== arrangementView)
     previousArrangementView.destroy();
   syncArrangements();
   syncPairingCountdown();
 }
 
-function headerButton(id, label, iconName, onClick) {
-  return iconButton({ id, label, iconName, variant: "ghost", size: "sm", onClick });
+// Settings takes over the canvas and inspector; it rises in over them, and they come back as it leaves.
+function renderShell({ studio }) {
+  const settings = studio.view === "settings";
+  const was = nodes.studio.dataset.view;
+  nodes.studio.dataset.view = studio.view;
+  nodes.sidebarVersion.textContent = updates.currentVersion ? `v${updates.currentVersion}` : "";
+  if (was === studio.view) return;
+  if (!settings) handOffFocus(nodes.settingsView, nodes.sidebarSettings);
+  nodes.settingsView.inert = !settings;
+  nodes.settingsView.dataset.open = String(settings);
+  nodes.canvasPane.inert = settings;
+  nodes.inspector.toggleAttribute("data-covered", settings);
+  if (settings) nodes.settingsScroll.scrollTop = 0;
 }
 
-// The header's buttons outlive renders, so hover, focus, tooltips and a glyph mid-change carry on.
-function createHeaderControls() {
-  const themeToggle = headerButton(
-    "theme-toggle",
-    THEME_LABELS[theme],
-    THEME_ICONS[theme],
-    cycleTheme,
-  );
-  themeToggle.classList.add("theme-toggle");
-  const hide = core?.invoke
-    ? headerButton("hide-to-tray", `Hide to ${trayPlace(platform)}`, "x", hideToTray)
-    : null;
-  const settings = headerButton("settings-gear", "Settings", "settings", toggleSettings);
-  nodes.headerButtons.replaceChildren(...[settings, themeToggle, hide].filter(Boolean));
-  const refresh = headerButton(
-    "computers-refresh",
-    "Check the paired computers again",
-    "refresh-cw",
-    loadComputers,
-  );
-  nodes.headerRefresh.replaceChildren(refresh);
-  return { themeToggle, theme, refresh };
-}
-
-// The theme glyph is swapped only when the theme changes; after a press the new one pops in.
-function renderPageChrome() {
-  renderPageVisibility();
-  const pop = themeChanged;
-  themeChanged = false;
-  const toggle = headerControls.themeToggle;
-  if (headerControls.theme === theme) return;
-  headerControls.theme = theme;
-  toggle.dataset.changed = String(pop);
-  toggle.setAttribute("aria-label", THEME_LABELS[theme]);
-  toggle.querySelector(".tooltip").textContent = THEME_LABELS[theme];
-  toggle.querySelector(":scope > svg").replaceWith(icon(THEME_ICONS[theme]));
-}
-
-// The transition callback only flips page visibility, the named tab marker and the header's page
-// action, which moves with the tab. Full page work resumes after the compositor has captured both pages.
-function renderPageVisibility() {
-  nodes.pageTitle.textContent = `MonHop · ${PAGE_TITLES[page]}`;
-  nodes.homeView.hidden = page !== "home";
-  nodes.setupView.hidden = page !== "setup";
-  nodes.settingsView.hidden = page !== "settings";
-  for (const button of nodes.pageLinks) {
-    button.setAttribute("aria-current", button.dataset.page === page ? "page" : "false");
-    const indicator = button.querySelector(".nav-active-indicator");
-    if (indicator)
-      indicator.style.viewTransitionName = button.dataset.page === page ? "nav-active-tab" : "none";
+function renderInspector(ctx) {
+  const { studio } = ctx;
+  const kind = studio.inspectorKind;
+  const computer =
+    kind === "computer" ? findComputer(computers, studio.selection.fingerprint) : null;
+  const content =
+    kind === "local"
+      ? localInspector(ctx)
+      : kind === "new"
+        ? pairingInspector(ctx)
+        : computer
+          ? computerInspector(ctx, computer)
+          : null;
+  const presentation = presentInspector(kind);
+  nodes.inspector.dataset.mode = presentation.mode;
+  nodes.studio.dataset.inspector = presentation.mode;
+  const open = presentation.open && studio.view === "canvas";
+  if (nodes.inspector.dataset.open !== String(open)) {
+    if (!open) handOffFocus(nodes.inspector, nodes.sidebarIndicator.parentElement);
+    nodes.inspector.dataset.open = String(open);
   }
-  renderHeaderRefresh();
-  applySharedTransitionNames();
+  nodes.inspector.inert = !open;
+  nodes.inspectorClose.hidden = presentation.mode !== "overlay";
+  clear(nodes.inspectorContent);
+  if (content)
+    nodes.inspectorContent.append(swap("inspector", content, studio.selectionKey, { block: true }));
 }
 
-// Home's only page action sits in the header beside the connection status. Its slot outlives
-// renders, so it pops in and out while the status pill glides aside.
-function renderHeaderRefresh() {
-  const home = page === "home";
-  if (home) {
-    const refresh = headerControls.refresh;
-    refresh.disabled = computersLoad.running;
-    refresh.toggleAttribute("aria-busy", computersLoad.running);
-    turnGlyph(refresh.querySelector(":scope > svg"), "computers-refresh", computersLoad.running);
-  }
-  setSlotPresent(nodes.headerRefresh, home, [nodes.headerConnection], {
-    focusTarget: home ? null : pageFocusAnchor(),
-  });
-}
-
-function applySharedTransitionNames() {
-  for (const node of document.querySelectorAll("[data-shared-transition]")) {
-    const pageNode = node.closest(".app-page");
-    node.style.viewTransitionName =
-      pageNode && !pageNode.hidden ? node.dataset.sharedTransition : "none";
-  }
-}
-
-// A locked section is washed out, inert, and says in its own header what is still missing.
-function renderSections(ctx) {
-  const lines = {
-    ready: readyLine(ctx.gates.ready.done),
-    computers: ctx.gates.computers.locked ? ctx.gates.computers.reason : computersLine(ctx),
-    displays: displaysLine(ctx),
-  };
-  // A fresh pairing holds Computers open on its match badge; Done hands over to the next step.
-  const expanded = setupExpansionChosen
-    ? setupExpandedSection
-    : pairingResultShown && ctx.showPairing
-      ? "computers"
-      : defaultSetupSection(ctx.gates);
-  for (const section of nodes.sections) {
-    const key = section.dataset.section;
-    const gate = ctx.gates[key];
-    const collapsed = !gate.locked && gate.done && key !== expanded;
-    const still = section.dataset.presented !== "true" || nodes.setupView.hidden;
-    const header = section.querySelector(".section-header");
-    const status = section.querySelector(".section-status");
-    // Folding moves the status line beside the title; header and line glide from where they were drawn.
-    const drawn =
-      !still && section.dataset.collapsed !== String(collapsed)
-        ? { header: header.getBoundingClientRect().height, status: status.getBoundingClientRect() }
-        : null;
-    section.dataset.locked = String(gate.locked);
-    section.dataset.done = String(gate.done);
-    section.dataset.collapsed = String(collapsed);
-    section.dataset.presented = "true";
-    status.textContent = lines[key];
-    if (drawn) {
-      glideResize(header, drawn.header);
-      glideMove(status, drawn.status);
-    }
-    const body = section.querySelector(".section-body");
-    body.inert = collapsed || gate.locked;
-    setPanelOpen(body, !collapsed, { instant: still });
-    const toggle = section.querySelector(".section-toggle");
-    const chevron = section.querySelector(".section-chevron");
-    toggle.hidden = gate.locked || !gate.done;
-    chevron.hidden = toggle.hidden;
-    toggle.disabled = gate.locked || !gate.done;
-    toggle.setAttribute("aria-expanded", String(!collapsed));
-    toggle.setAttribute("aria-label", `${collapsed ? "Expand" : "Collapse"} ${gate.title}`);
-    const marker = section.querySelector(".section-index");
-    const mark = gate.done ? "check" : String(gate.index + 1);
-    if (marker.dataset.mark !== mark) {
-      marker.dataset.mark = mark;
-      clear(marker);
-      if (mark === "check") marker.append(icon("check", 11));
-      else marker.textContent = mark;
-    }
-  }
-}
-
-// The header line is the verdict, plus the network it settled on once everything passed.
-function readyLine(done) {
-  const verdict = setupVerdict(state, { checking: snapshotCheck.pending });
-  if (!done) return verdict.label;
-  const selected = selectedInterface(state);
-  return selected ? `Ready · ${selected.networkName || selected.name}` : verdict.label;
-}
-
-function computersLine({ computers: list, activeComputer }) {
-  if (list.items.length === 0) return "None paired yet";
-  const count = `${list.items.length} paired`;
-  return activeComputer
-    ? `${count} · ${displayName(activeComputer)} in use`
-    : `${count} · none in use`;
-}
-
-function displaysLine({ gates, activeComputer }) {
-  if (gates.displays.locked) return gates.displays.reason;
-  return activeComputer?.setup?.saved === true
-    ? "Layout saved on both computers"
-    : "Not arranged yet";
-}
-
-function defaultSetupSection(gates) {
-  for (const key of ["ready", "computers", "displays"])
-    if (!gates[key].locked && !gates[key].done) return key;
-  return "displays";
-}
-
-// Where focus goes when the control holding it leaves the page: the header control of the page
-// on screen, already rebuilt for this render.
-function pageFocusAnchor() {
-  const link = nodes.pageLinks.find((button) => button.dataset.page === page);
-  return link ?? document.getElementById("settings-gear");
-}
-
-function renderPageAlert(ctx) {
+// The page alert sits above whichever pane is on screen. A pairing or arranging message that its
+// own pane already shows is left out here.
+function pageAlertNode(ctx) {
+  const { studio, arrange } = ctx;
   const stateMessages = errorMessages(state);
   const messages = [...stateMessages];
-  const pairingOnScreen = page === "setup" && ctx.showPairing;
-  const displaysOnScreen = page === "setup" && isConnected(sharing);
+  const pairingOnScreen = studio.view === "canvas" && studio.selection.kind === "new";
+  const displaysOnScreen = studio.view === "canvas" && arrange.active && isConnected(sharing);
   if (pairing.view?.phase === "error" && pairing.view.message && !pairingOnScreen)
     messages.push(pairing.view.message);
   if (pairing.message && !pairingOnScreen) messages.push(pairing.message);
   if (sharing.message && !displaysOnScreen) messages.push(sharing.message);
   if (computersLoadFailure) messages.push(computersLoadFailure);
   const unique = [...new Set(messages.filter(Boolean))];
-  // A leaving alert keeps its last words and tone while it glides shut.
-  if (!unique.length) {
-    setRevealOpen(nodes.pageAlertPanel, false, { focusTarget: pageFocusAnchor() });
-    return;
-  }
-  nodes.pageAlert.dataset.tone =
+  if (!unique.length) return null;
+  const failure =
     stateMessages.length ||
     computersLoadFailure ||
     pairing.message ||
     pairing.view?.phase === "error" ||
-    sharing.view?.phase === "error"
-      ? "failure"
-      : "notice";
-  clear(nodes.pageAlert);
-  nodes.pageAlert.append(el("span", { className: "page-alert-copy", text: unique.join(" ") }));
+    sharing.view?.phase === "error";
+  const actions = [];
   if (computersLoadFailure)
-    nodes.pageAlert.append(
+    actions.push(
       iconButton({
         id: "computers-retry",
         label: "Read the paired computers again",
         disabled: computersLoad.running,
         busy: computersLoad.running,
         size: "sm",
+        variant: "ghost",
         onClick: loadComputers,
       }),
     );
   if (stateMessages.length || sharing.message)
-    nodes.pageAlert.append(
+    actions.push(
       iconButton({
         id: "dismiss-alert",
         label: "Dismiss",
@@ -954,7 +798,211 @@ function renderPageAlert(ctx) {
         },
       }),
     );
-  setRevealOpen(nodes.pageAlertPanel, true);
+  return banner({
+    id: "page-alert",
+    tone: failure ? "danger" : "notice",
+    iconName: "triangle-alert",
+    body: unique.join(" "),
+    actions,
+  });
+}
+
+// ---------- toolbar ----------
+
+function mountStaticGlyphs() {
+  document.querySelector("#sidebar-settings-glyph").replaceChildren(icon("settings", 15));
+  document.querySelector("#network-chip-chevron").replaceChildren(icon("chevron-right", 12));
+  document.querySelector("#status-bar-escape-glyph").replaceChildren(icon("keyboard", 13));
+  const refresh = iconButton({
+    id: "computers-refresh",
+    label: "Check the paired computers again",
+    variant: "ghost",
+    size: "sm",
+    onClick: loadComputers,
+  });
+  nodes.sidebarRefresh.replaceChildren(refresh);
+}
+
+// The toolbar's buttons outlive renders, so hover, focus and a label mid-change carry on.
+function createToolbarControls() {
+  // Labels are elements, so setLabel can fade a new word in.
+  const arrange = button("", {
+    variant: "secondary",
+    size: "sm",
+    iconName: "monitor",
+    focusKey: "toolbar-arrange",
+    onClick: () => (toolbarControls.arrangeMode === "done" ? leaveArrange() : arrangeWith()),
+  });
+  arrange.id = "toolbar-arrange";
+  arrange.append(el("span", { className: "toolbar-label", text: "Arrange" }));
+  const pause = button("", {
+    variant: "secondary",
+    size: "sm",
+    focusKey: "toolbar-pause",
+    onClick: () => (toolbarControls.pauseMode === "resume" ? resumeSharing() : pauseSharing()),
+  });
+  pause.id = "toolbar-pause";
+  // Both glyphs are drawn and the mode cross-fades between them: bars to pause, a triangle to resume.
+  pause.prepend(
+    el("span", {
+      className: "pause-glyph",
+      attrs: { "aria-hidden": "true" },
+      children: [el("span", { className: "pause-bars" }), icon("play", 12)],
+    }),
+    el("span", { className: "toolbar-label", text: "Pause sharing" }),
+  );
+  nodes.arrangeSlot.replaceChildren(arrange);
+  nodes.pauseSlot.replaceChildren(pause);
+  return { arrange, pause, arrangeMode: null, pauseMode: null };
+}
+
+function renderToolbar(ctx) {
+  const { studio, toolbar } = ctx;
+  nodes.pageTitle.textContent = toolbar.title;
+  const refresh = nodes.sidebarRefresh.firstElementChild;
+  refresh.disabled = computersLoad.running || !core?.invoke;
+  refresh.toggleAttribute("aria-busy", computersLoad.running);
+  turnGlyph(refresh.querySelector(":scope > svg"), "computers-refresh", computersLoad.running);
+  const canvas = toolbar.canvasActions;
+  const busy = ctx.busy;
+  const { arrange, pause } = toolbarControls;
+  toolbarControls.arrangeMode = toolbar.arrange;
+  if (toolbar.arrange) {
+    arrange.title = toolbar.arrange === "done" ? "Done" : "Arrange";
+    setLabel(arrange.lastChild, arrange.title);
+    arrange.disabled = toolbar.arrange === "begin" && busy;
+  }
+  toolbarControls.pauseMode = toolbar.pause;
+  if (toolbar.pause) {
+    pause.title = toolbar.pause === "resume" ? "Resume" : "Pause sharing";
+    setLabel(pause.lastChild, pause.title);
+    pause.dataset.mode = toolbar.pause;
+    pause.disabled = busy;
+  }
+  const movers = [nodes.networkSlot];
+  setSlotPresent(nodes.arrangeSlot, canvas && toolbar.arrange !== null, movers, {
+    focusTarget: nodes.networkChip,
+  });
+  setSlotPresent(
+    nodes.pauseSlot,
+    canvas && toolbar.pause !== null,
+    [...movers, nodes.arrangeSlot],
+    {
+      focusTarget: nodes.networkChip,
+    },
+  );
+  renderNetworkChip(ctx);
+  nodes.studio.dataset.arranging = String(studio.arrange.active);
+}
+
+function eligibleNetworks() {
+  return (state.snapshot?.interfaces ?? []).filter(isSelectable);
+}
+
+// The chip names the network MonHop uses; its menu lists every network it could use instead.
+function renderNetworkChip(ctx) {
+  const selected = selectedInterface(state);
+  const eligible = eligibleNetworks();
+  const chip = networkChip({
+    selected,
+    label: selected ? networkLabel(selected) : "",
+    eligibleCount: eligible.length,
+    sessionActive: isSessionActive(sharing),
+  });
+  const width = nodes.networkChip.getBoundingClientRect().width;
+  setLabel(nodes.networkChipLabel, chip.text);
+  if (width) glideWidth(nodes.networkChip, width);
+  nodes.networkChip.title = chip.hint;
+  nodes.networkChip.disabled = chip.disabled || ctx.busy;
+  nodes.networkChipDot.dataset.tone = selected ? "connected" : "neutral";
+  if (nodes.networkChip.disabled && networkMenuOpen) setNetworkMenuOpen(false, { render: false });
+  clear(nodes.networkMenu);
+  nodes.networkMenu.append(
+    el("p", { className: "menu-heading", text: "Network" }),
+    ...eligible.map((item) => {
+      const checked = state.selectedInterfaceId === item.id;
+      const option = el("button", {
+        className: "menu-item",
+        attrs: { type: "button", role: "menuitemradio", "aria-checked": String(checked) },
+        dataset: { focusKey: `network-menu-${item.id}` },
+        children: [
+          el("span", { className: "menu-check", children: [checked ? icon("check", 13) : null] }),
+          el("span", {
+            className: "menu-item-copy",
+            children: [
+              el("strong", { text: networkLabel(item) }),
+              el("span", { text: item.address || item.name }),
+            ],
+          }),
+        ],
+      });
+      option.addEventListener("click", () => {
+        setNetworkMenuOpen(false);
+        nodes.networkChip.focus({ preventScroll: true });
+        chooseInterface(item.id);
+      });
+      return option;
+    }),
+    el("p", { className: "menu-note", text: chip.hint }),
+  );
+}
+
+function setNetworkMenuOpen(open, { render: draw = true } = {}) {
+  const next = open && !nodes.networkChip.disabled;
+  if (next === networkMenuOpen) return;
+  networkMenuOpen = next;
+  if (!next) handOffFocus(nodes.networkMenu, nodes.networkChip);
+  nodes.networkMenu.dataset.open = String(next);
+  nodes.networkMenu.inert = !next;
+  nodes.networkChip.setAttribute("aria-expanded", String(next));
+  if (next && draw) nodes.networkMenu.querySelector("[aria-checked='true'], .menu-item")?.focus();
+}
+
+// ---------- arranging and pausing ----------
+
+// Arrange opens the editor with the computer on the canvas; the canvas waits for the link.
+function arrangeWith(fingerprint) {
+  const target =
+    fingerprint ??
+    canvasFingerprint({
+      selection: currentSelection(),
+      active: activeFingerprint(),
+      fingerprints: computers.items.map((item) => item.fingerprint),
+    });
+  if (!target || !canEditLayout(sharing, state.selectedInterfaceId)) return;
+  if (currentSelection().kind === "settings") chosen = computerSelection(target);
+  arrangeRequested = true;
+  canvasDrawer = null;
+  render();
+  void beginLayoutEdit(target);
+}
+
+// Done and Cancel both end the edit; what was applied stays applied.
+function leaveArrange() {
+  arrangeRequested = false;
+  canvasDrawer = null;
+  render();
+  void endLayoutEdit();
+}
+
+function toggleCanvasDrawer(kind) {
+  canvasDrawer = canvasDrawer === kind ? null : kind;
+  render();
+}
+
+// The same as the tray's Pause sharing: every computer off, input stays here.
+function pauseSharing() {
+  lastActive = activeFingerprint() ?? lastActive;
+  void useComputer(null);
+}
+
+function resumeSharing() {
+  const target = resumeTarget({
+    lastActive,
+    selection: currentSelection(),
+    fingerprints: computers.items.map((item) => item.fingerprint),
+  });
+  if (target) void setComputerEnabled(target, true);
 }
 
 // ---------- snapshot / access / network ----------
@@ -1000,7 +1048,7 @@ async function takeSnapshot({ automatic, trigger }) {
   } finally {
     state = { ...state, busy: false };
     render();
-    if (page === "setup") openPairingOnExplicitEntry();
+    if (showsReadiness(currentSelection())) openPairingOnExplicitEntry();
   }
 }
 
@@ -1044,7 +1092,7 @@ function chooseInterface(id) {
   if (controlsBusy() || isSessionActive(sharing)) return;
   state = selectInterface(state, id);
   render();
-  if (page === "setup") openPairingOnExplicitEntry();
+  if (showsReadiness(currentSelection())) openPairingOnExplicitEntry();
 }
 
 async function openSettings(pane) {
@@ -1122,20 +1170,40 @@ async function openPairing() {
   await invokePairing("pairing_open", { interfaceId: state.selectedInterfaceId });
 }
 
-// The list stays the focus once a computer is paired; the code exchange opens on request.
-function beginPairing() {
-  pairingRequested = true;
+// The exchange opens on the step that picks a role, reading the identity first when it is closed.
+function enterPairing() {
   pairingResultShown = false;
-  if (!pairing.view || pairing.view.phase === "closed") {
-    void openPairing();
-    return;
-  }
-  pairing = withPairingMode(pairing, "choose");
-  render();
+  if (!pairing.view || pairing.view.phase === "closed")
+    return pairingOpenGate(state).allowed ? openPairing() : null;
+  if (!isBusyPairing(pairing)) pairing = withPairingMode(pairing, "choose");
+  return null;
 }
 
+// Pair another computer: back to the New computer row and a fresh exchange.
+function beginPairing() {
+  if (currentSelection().kind === "new") {
+    void enterPairing();
+    render();
+    return;
+  }
+  void select("new");
+}
+
+// Show a code or Enter a code from This Mac's inspector, which first selects the New computer row.
+async function startPairing(mode) {
+  const opening = select("new");
+  if (opening) await opening;
+  if (currentSelection().kind !== "new") return;
+  if (mode === "show") await showPairingCode();
+  else choosePairingMode("enter");
+}
+
+// Close or Done: the exchange gives way to the computer it added, or to the default row.
 function dismissPairing() {
+  const paired = justPaired();
   leavePairing();
+  if (paired) chosen = computerSelection(paired);
+  else if (chosen?.kind === "new") chosen = null;
   render();
 }
 
@@ -1279,9 +1347,10 @@ function applyPairingResult(result) {
   }
   if (key === pairedKey) return;
   pairedKey = key;
-  pairingRequested = false;
   // Only an attempt finishing here shows its badge; a paired state read back on open does not.
   pairingResultShown = isBusyPairing(current);
+  // The new computer's row takes over from the exchange once the list names it.
+  if (pairingResultShown && currentSelection().kind === "new") chosen = computerSelection(key);
   void loadComputers();
   void refreshSharingStatus();
 }
@@ -1350,17 +1419,13 @@ function applyComputers(next, request) {
     if (!kept.has(fingerprint)) forgetArrangementMotion(fingerprint);
   computerArrangementsStore = pruneComputerArrangements(computerArrangementsStore, computers);
   scheduleSharingPoll();
-  // The first reply decides where a launch lands: Setup with nothing paired, Home otherwise.
-  if (landed) return;
-  landed = true;
-  if (next.items.length > 0) page = "home";
 }
 
-function startRename(fingerprint, scope) {
+function startRename(fingerprint) {
   renaming = fingerprint;
   renameDraft = findComputer(computers, fingerprint)?.name ?? "";
   render();
-  const field = document.getElementById(`${scope}-rename-field-${fingerprint}`);
+  const field = document.getElementById(`rename-field-${fingerprint}`);
   field?.focus({ preventScroll: true });
   field?.select();
 }
@@ -1450,10 +1515,9 @@ async function endLayoutEdit() {
   await runSharing("edit-end", () => core.invoke("sharing_edit_end"));
 }
 
+// A display notice's way in: arranging with the computer in use.
 function changeLayout() {
-  const fingerprint = activeFingerprint();
-  goToPage("setup", () => scrollToSection("displays"));
-  void beginLayoutEdit(fingerprint);
+  arrangeWith(activeFingerprint());
 }
 
 async function dismissDisplayNotice() {
@@ -2072,8 +2136,8 @@ function applyArrangementList(fingerprint, list) {
     sharing = setArrangements(sharing, list);
 }
 
-// Loading from a card is gated and run against that card's own list, so an enabled button always
-// does something: it opens the Displays editor and puts the layout into the draft there.
+// Loading from an inspector is gated and run against that computer's own list, so an enabled button
+// always does something: it puts the layout into the draft the canvas is editing.
 function loadComputerArrangement(fingerprint, name) {
   const store = computerArrangements(computerArrangementsStore, fingerprint);
   const entry = store.items.find((item) => item.name === name) ?? null;
@@ -2087,7 +2151,7 @@ function loadComputerArrangement(fingerprint, name) {
     render();
     return;
   }
-  goToPage("setup", () => scrollToSection("displays"));
+  if (currentSelection().kind === "settings") chosen = computerSelection(fingerprint);
   // The listed fit can be older than the displays; the draft decides, and says so when it cannot.
   sharing = loadArrangementLayout(sharing, entry.layout);
   touchSetupLink();
@@ -2108,7 +2172,7 @@ async function revealLogFile() {
 
 // A pinned theme lives on the root element; without one the CSS follows the system scheme.
 function applyTheme(next) {
-  theme = THEME_ORDER.includes(next) ? next : "system";
+  theme = THEMES.has(next) ? next : "system";
   if (theme === "system") delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = theme;
 }
@@ -2124,11 +2188,9 @@ async function loadTheme() {
   render();
 }
 
-async function cycleTheme() {
-  if (themePending) return;
+async function setTheme(next) {
+  if (themePending || next === theme || !THEMES.has(next)) return;
   themePending = true;
-  themeChanged = true;
-  const next = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
   await withThemeTransition(() => {
     applyTheme(next);
     render();
@@ -2171,7 +2233,7 @@ async function hideToTray() {
   }
 }
 
-// Minimize sends MonHop to the tray, the same as the header's hide button.
+// Minimize sends MonHop to the tray; closing the window hides it there too.
 async function runWindowAction(action) {
   if (action === "minimize") {
     await hideToTray();

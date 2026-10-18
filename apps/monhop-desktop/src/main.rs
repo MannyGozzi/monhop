@@ -806,7 +806,7 @@ fn main() {
                         window_platform(),
                         check_ui
                     ))
-                    .inner_size(980.0, 720.0)
+                    .inner_size(1180.0, 760.0)
                     .min_inner_size(760.0, 560.0)
                     .incognito(true)
                     .devtools(false)

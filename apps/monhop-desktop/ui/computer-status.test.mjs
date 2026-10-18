@@ -92,8 +92,9 @@ test("no_input_source_wording", async () => {
   const files = [
     "computer-status.mjs",
     "computer-card.mjs",
-    "screen-home.mjs",
     "screen-displays.mjs",
+    "screen-settings.mjs",
+    "studio-model.mjs",
   ];
   const sources = await Promise.all(
     files.map((file) => readFile(new URL(file, import.meta.url), "utf8")),

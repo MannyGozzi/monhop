@@ -12,12 +12,11 @@ import {
   platformLabel,
   spokenCode,
 } from "./pairing-model.mjs";
-import { computerCard } from "./computer-card.mjs";
+import { inspectorHeader } from "./screen-ready.mjs";
 import { createAccordion, presence } from "./accordion.mjs";
 import {
   button,
   card,
-  clear,
   el,
   icon,
   iconButton,
@@ -43,53 +42,42 @@ export const COUNTDOWN_TEXT_ID = "pairing-countdown-text";
 // A badge drawn again within this window is still the same entrance, stagger included.
 const BADGE_ENTER_MS = 900;
 
-export function renderComputers(nodes, ctx) {
-  const { computers, actions, busy, gate, gates, pairingPending, pairingOperation, showPairing } =
-    ctx;
-  clear(nodes.computersContent);
-  clear(nodes.computersActions);
-  nodes.computersActions.append(
-    iconButton({
-      id: "pairing-reload",
-      label: "Reload pairing",
-      disabled: !gate.allowed || busy,
-      busy: pairingPending && pairingOperation === "pairing_open",
-      onClick: actions.openPairing,
-    }),
-  );
-  for (const computer of computers.items)
-    nodes.computersContent.append(computerCard(ctx, computer, { scope: "setup" }));
-  // A locked section still shows what is already paired; only the exchange, which cannot run, is withheld.
-  if (gates.computers.locked) {
-    if (computers.items.length === 0) nodes.computersContent.append(addComputerIntro());
-    return;
-  }
-  if (!showPairing) {
-    nodes.computersContent.append(
-      addComputerIntro([
-        button("Add computer", {
-          iconName: "link",
-          disabled: busy,
-          focusKey: "pairing-begin",
-          onClick: actions.beginPairing,
+// The New computer inspector: every step of the code exchange, from choosing a role to the
+// pairing picture both computers show.
+export function pairingInspector(ctx) {
+  const { actions, busy, gate, pairingPending, pairingOperation, state } = ctx;
+  const children = [
+    inspectorHeader({
+      glyph: el("span", { className: "add-glyph" }),
+      tone: "new",
+      title: "New computer",
+      meta: "Pair a computer on this network",
+      actions: [
+        iconButton({
+          id: "pairing-reload",
+          label: "Reload pairing",
+          size: "sm",
+          variant: "ghost",
+          disabled: !gate.allowed || busy,
+          busy: pairingPending && pairingOperation === "pairing_open",
+          onClick: actions.openPairing,
         }),
-      ]),
-    );
-    return;
-  }
-  renderExchange(nodes, ctx);
+      ],
+    }),
+    ...exchange(ctx),
+  ];
+  if (state.snapshot?.platform === "macos") children.push(localNetworkHelp(ctx));
+  return el("div", { className: "inspector-view", dataset: { kind: "new" }, children });
 }
 
-function addComputerIntro(actions) {
-  return card({
-    title: "Add a computer",
-    description: "Show a short code on one computer and type it on the other.",
-    actions,
-  });
+// A pairing this session finished, as the new computer's inspector shows it until the user moves on.
+export function pairedResult(ctx) {
+  const badgeElapsed = sinceChanged("pairing-badge", ctx.pairing.view?.peerFingerprint ?? null);
+  return pairedCard({ ...ctx, badgeElapsed });
 }
 
-function renderExchange(nodes, ctx) {
-  const { state, pairing } = ctx;
+function exchange(ctx) {
+  const { pairing } = ctx;
   const step = pairingStep(pairing, ctx.now);
   // Keyed off "nothing paired yet", so the badge's entrance plays the moment it first appears.
   const badgeElapsed = sinceChanged(
@@ -99,17 +87,13 @@ function renderExchange(nodes, ctx) {
   const content = stepContent(step, { ...ctx, badgeElapsed });
   const signature = step === "expired" ? "error" : step;
   // The panel glides between the steps' heights while the swap cross-fades them.
-  const panel = presence(
-    "pairing-step-panel",
-    content ? swap("pairing-step", content, signature, { block: true }) : null,
-  );
-  if (panel) nodes.computersContent.append(panel);
-  const message = presence(
-    "pairing-message",
-    pairing.message ? note(pairing.message, "danger") : null,
-  );
-  if (message) nodes.computersContent.append(message);
-  if (state.snapshot?.platform === "macos") nodes.computersContent.append(localNetworkHelp(ctx));
+  return [
+    presence(
+      "pairing-step-panel",
+      content ? swap("pairing-step", content, signature, { block: true }) : null,
+    ),
+    presence("pairing-message", pairing.message ? note(pairing.message, "danger") : null),
+  ].filter(Boolean);
 }
 
 function stepContent(step, ctx) {

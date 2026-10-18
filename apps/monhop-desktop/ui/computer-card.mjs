@@ -8,7 +8,11 @@ import {
   noticePresentation,
   releaseToShareCopy,
 } from "./sharing-model.mjs";
-import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
+import { DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
+import { normalizeClipboardView } from "./clipboard-model.mjs";
+import { clipboardLine } from "./studio-model.mjs";
+import { inspectorHeader } from "./screen-ready.mjs";
+import { pairedResult } from "./screen-computers.mjs";
 import {
   computerTone,
   controlSwitchRows,
@@ -21,10 +25,9 @@ import {
 } from "./computer-card-model.mjs";
 import {
   button,
-  card,
+  copyFeedbackControls,
   el,
   icon,
-  iconButton,
   motionEase,
   motionEnabled,
   motionMs,
@@ -56,18 +59,12 @@ import {
   tweenTiming,
 } from "./sharing-pill-model.mjs";
 
-// The longest of the play/stop animations. A card rebuilt inside this window starts its motion
-// where the last one left off, so a status poll mid-morph does not replay it from the top.
-const USE_MOTION_MS = 700;
 // A Layouts list rebuilt within this window is still the same entrance, stagger included.
 const LIST_ENTER_MS = 600;
 
-// One computer rendering keeps Home and Set up in sync while each page owns its own actions.
-export function computerCard(
-  ctx,
-  computer,
-  { scope, extras = [], details = [], viewport = true } = {},
-) {
+// A computer's inspector: who it is, its connection and the one switch that turns it on, the
+// directions of control, its displays and layouts, and the details that forget it.
+export function computerInspector(ctx, computer) {
   const { busy, renaming, renamePending, active } = ctx;
   const fingerprint = computer.fingerprint;
   const name = displayName(computer);
@@ -78,106 +75,161 @@ export function computerCard(
   const tone = computerTone(fingerprint, enabledList);
   const pending = renamePending === fingerprint;
   const editing = renaming === fingerprint || pending;
-  const key = `${scope}-${fingerprint}`;
-  const sharingHome = scope === "home" && enabled && status.key === "sharing";
-  const release = sharingHome ? releaseToShareCopy(ctx.sharing.view?.blockingPresses) : "";
+  const key = `inspector-${fingerprint}`;
+  const sharing = enabled && status.key === "sharing";
+  const release = sharing ? releaseToShareCopy(ctx.sharing.view?.blockingPresses) : "";
+  const justPaired =
+    ctx.pairingResultShown && ctx.pairing.view?.phase === "paired"
+      ? ctx.pairing.view.peerFingerprint === fingerprint
+      : false;
 
   const children = [
-    el("div", {
-      className: "computer-card",
+    inspectorHeader({
+      glyph: platformGlyph(computer.platform),
+      tone: enabled ? tone : "idle",
+      titleNode: swap(
+        `${key}-name`,
+        editing ? nameField(ctx, computer, name, pending) : nameButton(ctx, computer, name),
+        editing ? "edit" : "view",
+      ),
+      metaNode: el("p", {
+        className: "inspector-meta computer-meta",
+        children: [
+          el("span", {
+            text: editing
+              ? pending
+                ? "Saving…"
+                : "Enter to save · Esc to cancel"
+              : [platformLabel(computer.platform), computer.address].filter(Boolean).join(" · "),
+          }),
+          !editing && computer.badge ? pairPicture(computer, key) : null,
+        ],
+      }),
+    }),
+    presence(`${key}-paired`, justPaired ? pairedResult(ctx) : null),
+    el("section", {
+      className: "state-block",
+      dataset: { tone: status.tone },
       children: [
         el("div", {
-          className: "computer-identity",
+          className: "state-block-heading",
           children: [
-            el("span", {
-              className: "computer-icon-wrap",
-              dataset: enabled ? { tone } : {},
-              children: [platformGlyph(computer.platform)],
-            }),
-            el("div", {
-              className: "computer-copy",
-              children: [
-                swap(
-                  `${key}-name`,
-                  editing
-                    ? nameField(ctx, computer, scope, name, pending)
-                    : nameButton(ctx, computer, scope, name),
-                  editing ? "edit" : "view",
-                ),
-                el("span", {
-                  className: "computer-meta",
-                  children: [
-                    el("span", {
-                      text: editing
-                        ? pending
-                          ? "Saving…"
-                          : "Enter to save · Esc to cancel"
-                        : [platformLabel(computer.platform), computer.address]
-                            .filter(Boolean)
-                            .join(" · "),
-                    }),
-                    !editing && computer.badge ? pairPicture(computer, key) : null,
-                  ],
-                }),
-              ],
-            }),
+            el("span", { className: "status-dot", dataset: { tone: status.tone } }),
+            el("strong", { text: status.label }),
+            sharingPill(ctx, fingerprint, name, enabled, status.key === "sharing"),
           ],
         }),
-        el("div", {
-          className: "computer-actions",
-          children: [
-            scope === "home"
-              ? sharingPill(ctx, fingerprint, name, enabled, status.key === "sharing")
-              : useToggle(ctx, fingerprint, scope, enabled),
-          ],
-        }),
+        el("p", { className: "state-block-detail", text: status.detail }),
+        presence(`${key}-release`, release ? note(release, "warning") : null),
+        presence(`${key}-notice`, noticeLine(ctx, computer, enabled)),
       ],
     }),
-    presence(`${key}-detail`, sharingHome ? note(status.detail) : null),
-    presence(`${key}-release`, release ? note(release, "warning") : null),
     presence(
       `${key}-control`,
-      scope === "home" && enabled ? controlSwitches(ctx, computer, name, local) : null,
+      enabled ? section("Directions", [controlSwitches(ctx, computer, name, local)]) : null,
     ),
-    presence(`${key}-notice`, noticeLine(ctx, computer, enabled)),
-    presence(`${key}-viewport`, viewport ? cardArrangement(ctx, computer, key) : null),
-    presence(
-      `${key}-extras`,
-      extras.some(Boolean)
-        ? el("div", { className: "card-extras", children: extras.filter(Boolean) })
-        : null,
-    ),
+    displaysSection(ctx, computer),
+    presence(`${key}-clipboard`, clipboardSection(ctx, computer, name)),
     layoutsDisclosure(ctx, computer, key),
     createAccordion(
-      `${scope}-computer-${fingerprint}`,
+      `inspector-computer-${fingerprint}`,
       "computer-details",
       "Details",
-      ...details,
+      ...(fingerprint === active ? activeDetails(ctx, key) : []),
       ...forgetControls(ctx, computer, name),
     ),
   ];
-  const node = card({ children: children.filter(Boolean), tone: status.tone });
-  // The live edge fades in only when the computer goes live, not on every re-render while it is.
-  const live = status.tone === "active";
-  const liveElapsed = sinceChanged(`${key}-live`, live);
-  if (live && liveElapsed < USE_MOTION_MS) {
-    node.dataset.liveEnter = "true";
-    node.style.setProperty("--live-delay", `${-Math.round(liveElapsed)}ms`);
-  }
-  const identity = node.querySelector(".computer-identity");
-  // Only the one computer `active` still names gets the morph: a view transition name must be
-  // unique on the page, and with several computers enabled at once there is no single "the" card
-  // for it to belong to.
-  const isPrimary = fingerprint === active;
-  if (isPrimary && ["home", "setup"].includes(scope) && identity)
-    identity.dataset.sharedTransition = "active-computer-identity";
-  if (scope === "home" && enabled) node.classList.add("home-hero");
+  const node = el("div", {
+    className: "inspector-view",
+    dataset: { kind: "computer", tone: status.tone },
+    children: children.filter(Boolean),
+  });
   if (busy) node.dataset.busy = "true";
   return node;
 }
 
-// Each computer's Link capsule outlives renders: Home is rebuilt whenever a status poll changes it,
-// and a kept node keeps its tweens, orbit, hover and focus through each rebuild.
+function section(title, children, actions = []) {
+  return el("section", {
+    className: "inspector-section",
+    children: [
+      el("div", {
+        className: "inspector-section-heading",
+        children: [
+          el("h3", { text: title }),
+          actions.length ? el("div", { className: "row-actions", children: actions }) : null,
+        ],
+      }),
+      ...children,
+    ],
+  });
+}
+
+// Its displays live on the canvas; here is when they were last reported and the way to change them.
+function displaysSection(ctx, computer) {
+  const { actions, busy, arrange, studio } = ctx;
+  const saved = computer.setup?.saved === true;
+  return section(
+    "Displays",
+    [
+      note(
+        saved
+          ? displaysFreshness(computer.setup)
+          : "No layout yet. Arrange the displays to start sharing.",
+      ),
+    ],
+    [
+      button(saved ? "Change layout" : "Arrange displays", {
+        variant: "secondary",
+        size: "sm",
+        disabled: busy || arrange.active || !studio.canArrange,
+        focusKey: `inspector-arrange-${computer.fingerprint}`,
+        onClick: () => actions.arrangeWith(computer.fingerprint),
+      }),
+    ],
+  );
+}
+
+// The clipboard switch lives in Settings; this says what it means for this one computer.
+function clipboardSection(ctx, computer, name) {
+  if (!ctx.clipboard) return null;
+  const view = normalizeClipboardView(ctx.clipboard.view);
+  return section("Clipboard", [note(clipboardLine(view, computer.fingerprint, name))]);
+}
+
+// The last drop stays out of sight until Details opens, never in red, and always with Copy.
+function activeDetails(ctx, key) {
+  const { actions, busy, sharing, dropCopyFeedback, activeComputer } = ctx;
+  const lastFailure = sharing.view?.lastFailure;
+  const feedback = dropCopyFeedback;
+  const copy = copyFeedbackControls(feedback, {
+    disabled: busy || feedback.state === "pending",
+    focusKey: "inspector-copy-last-drop",
+    onClick: actions.copyLastDrop,
+  });
+  return [
+    activeComputer?.setup?.saved === true ? note(DRAWN_DISPLAYS_NOTE) : null,
+    presence(
+      `${key}-last-drop`,
+      lastFailure
+        ? el("div", {
+            className: "field",
+            children: [
+              note(lastFailure),
+              el("div", {
+                className: "card-actions",
+                attrs: { "data-align": "start" },
+                children: [copy.button],
+              }),
+              copy.line,
+            ],
+          })
+        : null,
+    ),
+  ];
+}
+
+// Each computer's Link capsule outlives renders: the inspector is rebuilt on every status poll, and
+// a kept node keeps its tweens, orbit, hover and focus through each rebuild.
 const pills = new Map();
 const PILL_LABELS = {
   start: "Start sharing",
@@ -543,53 +595,7 @@ function pressPill(pill, down) {
   if (!down) void settle(pill.pressTween);
 }
 
-// One button for both states, so pressing it keeps the focus and the glyph morphs in place
-// instead of one control being swapped for another.
-function useToggle(ctx, fingerprint, scope, enabled) {
-  const { actions, busy } = ctx;
-  const state = enabled ? "sharing" : "idle";
-  const node = iconButton({
-    id: `${scope}-use-${fingerprint}`,
-    label: enabled ? "Pause sharing with this computer" : "Use this computer",
-    art: useGlyphs(enabled),
-    size: "sm",
-    disabled: busy,
-    onClick: () => toggleComputerEnabled(actions, fingerprint, enabled),
-  });
-  node.classList.add("use-toggle");
-  node.dataset.state = state;
-  const elapsed = sinceChanged(`${scope}-use-state-${fingerprint}`, state);
-  if (elapsed < USE_MOTION_MS) {
-    node.dataset.enter = "true";
-    node.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
-  }
-  return node;
-}
-
-// Both glyphs are always drawn and the current one is marked, so CSS alone cross-fades and turns
-// one into the other; the fill and the ring are the button's surface under them.
-function useGlyphs(inUse) {
-  return el("span", {
-    className: "use-glyphs",
-    attrs: { "aria-hidden": "true" },
-    children: [
-      el("span", { className: "use-fill" }),
-      el("span", { className: "use-ring" }),
-      useGlyph("play", !inUse),
-      useGlyph("square", inUse),
-    ],
-  });
-}
-
-function useGlyph(name, current) {
-  return el("span", {
-    className: "use-glyph",
-    dataset: { current: String(current) },
-    children: [icon(name, 14)],
-  });
-}
-
-// The other computer shows this same picture on its card for this one.
+// The other computer shows this same picture in its own inspector for this one.
 function pairPicture(computer, key) {
   const node = el("span", {
     className: "pair-picture",
@@ -606,23 +612,23 @@ function pairPicture(computer, key) {
 
 // The name reads as text and edits in place: a pencil appears on hover and focus, and the
 // hint line below says how to finish.
-function nameButton(ctx, computer, scope, name) {
+function nameButton(ctx, computer, name) {
   const node = el("button", {
     className: "computer-name",
     attrs: { type: "button", title: "Click to rename", "aria-label": `Rename ${name}` },
     children: [el("span", { text: name }), icon("pencil", 12)],
   });
-  node.dataset.focusKey = `${scope}-name-${computer.fingerprint}`;
-  node.addEventListener("click", () => ctx.actions.startRename(computer.fingerprint, scope));
+  node.dataset.focusKey = `inspector-name-${computer.fingerprint}`;
+  node.addEventListener("click", () => ctx.actions.startRename(computer.fingerprint));
   return node;
 }
 
-function nameField(ctx, computer, scope, name, pending) {
+function nameField(ctx, computer, name, pending) {
   const { actions } = ctx;
   const field = el("input", {
     className: "computer-name-input",
     attrs: {
-      id: `${scope}-rename-field-${computer.fingerprint}`,
+      id: `rename-field-${computer.fingerprint}`,
       maxlength: 48,
       placeholder: name,
       "aria-label": `Name for ${name}`,
@@ -633,7 +639,7 @@ function nameField(ctx, computer, scope, name, pending) {
   field.value = ctx.renameDraft ?? computer.name;
   field.addEventListener("input", () => actions.draftRename(field.value));
   field.disabled = pending;
-  field.dataset.focusKey = `${scope}-rename-field-${computer.fingerprint}`;
+  field.dataset.focusKey = `rename-field-${computer.fingerprint}`;
   // Enter and Escape settle the edit themselves; the blur they cause must not settle it again.
   let settled = pending;
   const commit = () => {
@@ -661,8 +667,8 @@ function localName(ctx) {
   return platformLabel(ctx.state.snapshot?.platform ?? ctx.platform, true);
 }
 
-// MonHop is always bidirectional: each direction of control is its own switch. Home shows both for
-// every computer switched on, each keyed to its own entry in the group's control record.
+// MonHop is always bidirectional: each direction of control is its own switch, keyed to its own
+// entry in the group's control record.
 function controlSwitches(ctx, computer, peerName, local) {
   const { actions, sharing } = ctx;
   const syncing = sharing.pending?.kind === "control" || sharing.view?.control?.syncing === true;
@@ -718,33 +724,8 @@ function forgetControls(ctx, computer, name) {
   ];
 }
 
-// --- displays ---------------------------------------------------------------
-
-// The picture is the only place a card names displays, so nothing is listed twice. Home's card for
-// the computer in use draws its own bigger one and asks for this to be left out.
-function cardArrangement(ctx, computer, key) {
-  // A computer with nothing saved still says so: blank space under the header reads as a fault.
-  if (computer.setup?.saved !== true)
-    return note("No layout yet. Arrange the displays to start sharing.");
-  const localPlatform = ctx.state.snapshot?.platform ?? ctx.platform;
-  return el("div", {
-    className: "computer-viewport",
-    children: [
-      createDashboardArrangement(computer.setup, {
-        local: localName(ctx),
-        peer: displayName(computer),
-        localPlatform,
-        peerPlatform: computer.platform,
-        compact: true,
-        caption: displaysFreshness(computer.setup),
-        motionKey: `${key}-viewport`,
-      }),
-    ],
-  });
-}
-
-// A display change MonHop is already settling says so on the card itself. Only a change the user
-// has to act on is worth the banner Home puts above everything.
+// A display change MonHop is already settling says so in the inspector; only one the user has to
+// act on earns a banner above the canvas.
 function noticeLine(ctx, computer, enabled) {
   const notice = ctx.sharing.view?.displayNotice;
   if (!enabled || !notice || noticePresentation(notice.kind) !== "inline") return null;
@@ -788,7 +769,7 @@ function layoutsDisclosure(ctx, computer, key) {
   const label = entries.length ? `Layouts (${entries.length})` : "Layouts";
   const accordion = createAccordion(`${key}-layouts`, "computer-layouts", label, ...content);
   // The manager toggles the panel first and announces it afterwards, so reading the list here
-  // re-renders the card without the press being lost.
+  // re-renders the inspector without the press being lost.
   accordion.addEventListener(ACCORDION_TOGGLE, (event) => {
     if (event.detail.open) void actions.loadComputerArrangements(fingerprint);
   });

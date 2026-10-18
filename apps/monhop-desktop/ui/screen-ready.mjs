@@ -12,110 +12,213 @@ import {
 } from "./model.mjs";
 import { createAccordion } from "./accordion.mjs";
 import { isSessionActive } from "./sharing-model.mjs";
+import { platformLabel } from "./pairing-model.mjs";
+import { NETWORK_LOCKED } from "./studio-model.mjs";
 import {
   badge,
   button,
   card,
-  clear,
   el,
   facts,
   iconButton,
   note,
+  platformGlyph,
   radioMark,
   row,
   rows,
   text,
 } from "./dom.mjs";
 
-export function renderReady(nodes, ctx) {
-  const { state, snapshotCheck, actions } = ctx;
+// This Mac's inspector: getting ready (access and the network), how it was launched, and the way
+// to add a computer.
+export function localInspector(ctx) {
+  const { state, snapshotCheck, actions, platform } = ctx;
   const verdict = setupVerdict(state, { checking: snapshotCheck.pending });
-  nodes.setupVerdict.textContent = verdict.label;
-  nodes.setupDetail.textContent = verdict.detail;
-  nodes.setupVerdict.closest(".overview").dataset.tone = verdict.tone;
-  renderLaunchAttribution(nodes, ctx);
-  clear(nodes.readyActions);
-  nodes.readyActions.append(
-    iconButton({
-      id: "permissions-refresh",
-      label: "Check this computer again",
-      size: "sm",
-      disabled: !state.nativeAvailable || ctx.busy,
-      busy: snapshotCheck.pending,
-      onClick: actions.refreshSnapshot,
-    }),
-  );
-  renderAccess(nodes, ctx);
-  renderNetworks(nodes, ctx);
+  const localPlatform = state.snapshot?.platform ?? platform;
+  const version = state.snapshot?.version || ctx.updates.view.currentVersion;
+  const overview = el("section", {
+    className: "overview",
+    dataset: { tone: verdict.tone },
+    attrs: { "aria-label": "Setup status" },
+    children: [
+      el("div", {
+        className: "overview-copy",
+        children: [
+          el("strong", { text: verdict.label, attrs: { id: "setup-verdict" } }),
+          el("span", { text: verdict.detail, attrs: { id: "setup-detail" } }),
+        ],
+      }),
+      createAccordion("overview-details", "launch-details", "Details", launchAttribution(ctx)),
+    ],
+  });
+  return el("div", {
+    className: "inspector-view",
+    dataset: { kind: "local" },
+    children: [
+      inspectorHeader({
+        glyph: platformGlyph(localPlatform === "windows" ? "windows" : "macos"),
+        tone: "local",
+        title: platformLabel(localPlatform, true),
+        meta: [platformName(localPlatform), version ? `MonHop ${version}` : ""]
+          .filter(Boolean)
+          .join(" · "),
+        actions: [
+          iconButton({
+            id: "permissions-refresh",
+            label: "Check this computer again",
+            size: "sm",
+            variant: "ghost",
+            disabled: !state.nativeAvailable || ctx.busy,
+            busy: snapshotCheck.pending,
+            onClick: actions.refreshSnapshot,
+          }),
+        ],
+      }),
+      overview,
+      // Once this computer is ready, adding a computer is the next thing to do, so it comes first.
+      verdict.tone === "done" ? addComputerCard(ctx) : null,
+      el("div", {
+        className: "stack",
+        attrs: { id: "permissions-content" },
+        children: [access(ctx)],
+      }),
+      el("div", {
+        className: "stack",
+        attrs: { id: "interface-content" },
+        children: [networkCard(ctx)],
+      }),
+      verdict.tone === "done" ? null : addComputerCard(ctx),
+    ],
+  });
 }
 
-function renderLaunchAttribution(nodes, ctx) {
-  clear(nodes.launchAttribution);
+// Every inspector opens the same way: the computer's tile, its name and one line about it.
+export function inspectorHeader({
+  glyph,
+  tone,
+  title,
+  titleNode = null,
+  meta,
+  metaNode = null,
+  actions = [],
+}) {
+  return el("header", {
+    className: "inspector-header",
+    children: [
+      el("span", {
+        className: "inspector-tile",
+        dataset: { tone },
+        attrs: { "aria-hidden": "true" },
+        children: [glyph],
+      }),
+      el("div", {
+        className: "inspector-heading",
+        children: [
+          titleNode ??
+            el("h2", {
+              className: "inspector-title",
+              text: title,
+              attrs: { id: "inspector-title" },
+            }),
+          metaNode ?? el("p", { className: "inspector-meta", text: meta }),
+        ],
+      }),
+      actions.length
+        ? el("div", { className: "inspector-header-actions", children: actions })
+        : null,
+    ],
+  });
+}
+
+function platformName(platform) {
+  return platform === "windows" ? "Windows" : platform === "macos" ? "macOS" : "";
+}
+
+// Show a code or Enter a code, from the same place a first run lands.
+function addComputerCard(ctx) {
+  const { actions, busy, gate } = ctx;
+  return card({
+    title: "Add a computer",
+    description: gate.allowed
+      ? "Show a short code on one computer and type it on the other."
+      : gate.detail,
+    children: [
+      el("div", {
+        className: "pair-choices",
+        children: [
+          button("Show a code", {
+            disabled: !gate.allowed || busy,
+            focusKey: "local-pairing-show",
+            onClick: () => actions.startPairing("show"),
+          }),
+          button("Enter a code", {
+            variant: "secondary",
+            disabled: !gate.allowed || busy,
+            focusKey: "local-pairing-enter",
+            onClick: () => actions.startPairing("enter"),
+          }),
+        ],
+      }),
+    ],
+  });
+}
+
+function launchAttribution(ctx) {
+  const node = el("div", { className: "launch-attribution", attrs: { id: "launch-attribution" } });
   const launch = ctx.state.snapshot?.launch;
   if (!launch?.executable) {
-    nodes.launchAttribution.textContent = ctx.state.nativeAvailable
+    node.textContent = ctx.state.nativeAvailable
       ? "Available after the first check."
       : "The browser preview cannot report this.";
-    return;
+    return node;
   }
-  nodes.launchAttribution.append(
+  node.append(
     text("Checked app: "),
     el("code", { text: launch.executable }),
     text(launch.bundled ? " · app bundle" : " · external launch"),
   );
   if (ctx.state.snapshot.platform === "macos")
-    nodes.launchAttribution.append(
+    node.append(
       el("small", {
         text: "macOS permissions belong to the app you launched. A Terminal launch may use the launcher's entry instead.",
       }),
     );
   if (ctx.state.snapshot.version)
-    nodes.launchAttribution.append(el("small", { text: `Version ${ctx.state.snapshot.version}` }));
+    node.append(el("small", { text: `Version ${ctx.state.snapshot.version}` }));
+  return node;
 }
 
-function renderAccess(nodes, ctx) {
+function access(ctx) {
   const { state, actions, busy } = ctx;
-  clear(nodes.permissionsContent);
   const snapshot = state.snapshot;
-  if (!state.nativeAvailable) {
-    nodes.permissionsContent.append(
-      card({
-        title: "Open MonHop to continue",
-        description: "The browser preview cannot check this computer.",
-        tone: "muted",
-      }),
-    );
-    return;
-  }
-  if (!snapshot) return;
-  if (snapshot.platform === "unsupported") {
-    nodes.permissionsContent.append(
-      card({
-        title: "This computer is not supported",
-        description: "MonHop runs on macOS and Windows.",
-        tone: "danger",
-      }),
-    );
-    return;
-  }
+  if (!state.nativeAvailable)
+    return card({
+      title: "Open MonHop to continue",
+      description: "The browser preview cannot check this computer.",
+      tone: "muted",
+    });
+  if (!snapshot) return null;
+  if (snapshot.platform === "unsupported")
+    return card({
+      title: "This computer is not supported",
+      description: "MonHop runs on macOS and Windows.",
+      tone: "danger",
+    });
   if (snapshot.platform === "windows") {
-    nodes.permissionsContent.append(
-      card({
-        title: "Access",
-        description:
-          "Windows needs no extra permission for MonHop. No administrator access is requested.",
-        children: [
-          rows([
-            row({
-              title: "Windows check",
-              detail: "Secure and elevated screens stay outside MonHop.",
-              actions: [badge("Ready", "success", "check")],
-            }),
-          ]),
-        ],
-      }),
-    );
-    return;
+    return card({
+      title: "Access",
+      description:
+        "Windows needs no extra permission for MonHop. No administrator access is requested.",
+      children: [
+        rows([
+          row({
+            title: "Windows check",
+            detail: "Secure and elevated screens stay outside MonHop.",
+            actions: [badge("Ready", "success", "check")],
+          }),
+        ]),
+      ],
+    });
   }
   const items = permissionRows(snapshot).map((item) =>
     row({
@@ -146,24 +249,22 @@ function renderAccess(nodes, ctx) {
       settingsMock(),
     ),
   );
-  nodes.permissionsContent.append(
-    card({
-      title: "Access",
-      description:
-        "macOS asks once for Accessibility and Input Monitoring. MonHop records nothing during setup.",
-      children,
-      actions: needsAccess
-        ? [
-            note("You approve each macOS prompt."),
-            button("Request access", {
-              variant: "outline",
-              disabled: busy,
-              onClick: actions.requestPermissions,
-            }),
-          ]
-        : [],
-    }),
-  );
+  return card({
+    title: "Access",
+    description:
+      "macOS asks once for Accessibility and Input Monitoring. MonHop records nothing during setup.",
+    children,
+    actions: needsAccess
+      ? [
+          note("You approve each macOS prompt."),
+          button("Request access", {
+            variant: "outline",
+            disabled: busy,
+            onClick: actions.requestPermissions,
+          }),
+        ]
+      : [],
+  });
 }
 
 function recoveryDisclosure(recovery) {
@@ -245,11 +346,11 @@ function settingsMock() {
   });
 }
 
-function renderNetworks(nodes, ctx) {
+// The network list, here and in Settings: the one connection MonHop may use, locked while sharing.
+export function networkCard(ctx) {
   const { state, actions, sharing } = ctx;
-  clear(nodes.interfaceContent);
   const snapshot = state.snapshot;
-  if (!state.nativeAvailable || !snapshot || snapshot.platform === "unsupported") return;
+  if (!state.nativeAvailable || !snapshot || snapshot.platform === "unsupported") return null;
   const linked = isSessionActive(sharing);
   const eligible = snapshot.interfaces.filter(isSelectable);
   const unavailable = snapshot.interfaces.filter((item) => !isSelectable(item));
@@ -293,21 +394,19 @@ function renderNetworks(nodes, ctx) {
   if (wifi) children.push(wifi);
   const selection = selectedInterface(state);
   const description = linked
-    ? "Pause the computer in use before changing the network."
+    ? NETWORK_LOCKED
     : eligible.length > 1
       ? "Both computers must be on the same network."
       : "Both computers must be on this network.";
-  nodes.interfaceContent.append(
-    card({
-      title: "Network",
-      description,
-      children,
-      actions:
-        selection && !selection.attachmentKnown
-          ? [note("This network is not recognized yet, so MonHop cannot pin the connection to it.")]
-          : [],
-    }),
-  );
+  return card({
+    title: "Network",
+    description,
+    children,
+    actions:
+      selection && !selection.attachmentKnown
+        ? [note("This network is not recognized yet, so MonHop cannot pin the connection to it.")]
+        : [],
+  });
 }
 
 function wifiCard(ctx) {
@@ -349,6 +448,6 @@ function wifiCard(ctx) {
   });
 }
 
-function isSelectable(item) {
+export function isSelectable(item) {
   return item.physical === true && item.up === true && Boolean(item.id);
 }

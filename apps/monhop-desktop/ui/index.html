@@ -6,104 +6,75 @@
     <meta name="color-scheme" content="light dark" />
     <title>MonHop</title>
     <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./studio-canvas.css" />
+    <link rel="stylesheet" href="./studio-inspector.css" />
+    <link rel="stylesheet" href="./studio-setup.css" />
+    <link rel="stylesheet" href="./studio-settings.css" />
   </head>
   <body>
-    <main class="shell" aria-labelledby="page-title">
-      <header class="window-header" data-tauri-drag-region="deep">
-        <div class="window-heading" data-tauri-drag-region="deep">
-          <span class="app-mark" aria-hidden="true"></span>
-          <span class="window-product">MonHop</span>
-          <h1 id="page-title" class="visually-hidden">MonHop</h1>
-          <nav class="primary-nav" id="primary-nav" aria-label="MonHop navigation">
-            <button type="button" data-page="home"><span>Home</span><span class="nav-active-indicator" aria-hidden="true"></span></button>
-            <button type="button" data-page="setup"><span>Set up</span><span class="nav-active-indicator" aria-hidden="true"></span></button>
-          </nav>
+    <main class="studio" id="studio" aria-labelledby="page-title" data-view="canvas">
+      <aside class="sidebar" aria-label="Computers and settings">
+        <div class="sidebar-top" data-tauri-drag-region="deep">
+          <span class="brand" data-tauri-drag-region="deep"><span class="app-mark" aria-hidden="true"></span><span class="brand-name">MonHop</span></span>
         </div>
-        <div class="window-header-end">
-          <div class="status-pill" id="header-connection" role="status" aria-live="polite">
-            <span class="status-dot" aria-hidden="true"></span>
-            <span id="native-state">Not checked</span>
+        <div class="sidebar-heading">
+          <span>Computers</span>
+          <span class="sidebar-heading-end"><span class="sidebar-count" id="sidebar-count"></span><span id="sidebar-refresh"></span></span>
+        </div>
+        <nav class="sidebar-list" id="sidebar-list" aria-label="Computers"></nav>
+        <div class="sidebar-foot">
+          <button class="sidebar-row sidebar-settings" type="button" id="sidebar-settings" data-select="settings" data-focus-key="sidebar-settings">
+            <span class="sidebar-glyph" id="sidebar-settings-glyph" aria-hidden="true"></span>
+            <span class="sidebar-row-title">Settings</span>
+            <span class="sidebar-version" id="sidebar-version"></span>
+          </button>
+        </div>
+        <span class="sidebar-indicator" id="sidebar-indicator" aria-hidden="true"></span>
+      </aside>
+
+      <section class="workspace">
+        <header class="toolbar" data-tauri-drag-region="deep">
+          <h1 class="toolbar-title" id="page-title" data-tauri-drag-region="deep">Arrangement</h1>
+          <div class="toolbar-actions" id="toolbar-actions">
+            <span class="toolbar-slot" id="network-slot">
+              <button class="chip" type="button" id="network-chip" aria-haspopup="menu" aria-expanded="false" aria-controls="network-menu" data-focus-key="network-chip">
+                <span class="status-dot" id="network-chip-dot" aria-hidden="true"></span>
+                <span class="chip-label" id="network-chip-label">Choose a network</span>
+                <span class="chip-chevron" id="network-chip-chevron" aria-hidden="true"></span>
+              </button>
+              <div class="menu" id="network-menu" role="menu" aria-label="Network connection" data-open="false" inert></div>
+            </span>
+            <span class="toolbar-slot" id="arrange-slot" hidden inert></span>
+            <span class="toolbar-slot" id="pause-slot" hidden inert></span>
           </div>
-          <span id="header-actions"><span class="header-slot" id="header-refresh" hidden inert></span><span id="header-buttons"></span></span>
           <div class="window-controls" id="window-controls" aria-label="Window controls" hidden>
             <button class="caption-button" type="button" data-window-action="minimize" aria-label="Minimize to the tray"><svg class="lucide lucide-minus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14" /></svg></button>
             <button class="caption-button" type="button" data-window-action="maximize" aria-label="Maximize or restore window"><svg class="lucide lucide-square" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2" /></svg></button>
             <button class="caption-button caption-close" type="button" data-window-action="close" aria-label="Close window"><svg class="lucide lucide-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
           </div>
+        </header>
+
+        <div class="workspace-body" id="workspace-body">
+          <section class="canvas-pane" id="canvas-pane" aria-label="Arrangement">
+            <div class="canvas-banners" id="canvas-banners"></div>
+            <div class="canvas-stage" id="canvas-stage"></div>
+            <div class="canvas-dock" id="canvas-dock"></div>
+            <footer class="status-bar" id="status-bar">
+              <span class="status-bar-state" role="status" aria-live="polite"><span class="status-dot" id="status-bar-dot" aria-hidden="true"></span><span class="status-bar-text" id="status-bar-text">Not checked</span></span>
+              <span class="status-bar-escape" id="status-bar-escape"><span class="status-bar-escape-glyph" id="status-bar-escape-glyph" aria-hidden="true"></span><span>Hold both Control keys and Esc for 2 seconds to take your keyboard and mouse back.</span></span>
+            </footer>
+          </section>
+
+          <aside class="inspector" id="inspector" aria-label="Details" data-open="true">
+            <button class="inspector-close icon-button button" type="button" id="inspector-close" data-variant="ghost" aria-label="Close details"><svg class="lucide lucide-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
+            <div class="inspector-scroll" id="inspector-scroll"><div class="inspector-content" id="inspector-content"></div></div>
+          </aside>
+
+          <section class="settings-pane" id="settings-view" aria-label="Settings" data-open="false" inert>
+            <div class="settings-scroll" id="settings-scroll"><div class="settings-content" id="settings-content"></div></div>
+          </section>
         </div>
-      </header>
-
-      <div class="content-region">
-        <div class="glide-panel" id="page-alert-panel" hidden inert><div class="page-alert-slot"><div class="page-alert" id="page-alert" role="alert"></div></div></div>
-
-        <section class="app-page" id="home-view" aria-label="Home" hidden>
-          <div id="home-content" class="stack"></div>
-        </section>
-
-        <section class="app-page setup-page" id="setup-view" aria-label="Set up" hidden>
-          <section class="setup-section" data-section="ready" data-locked="false" aria-labelledby="permissions-title">
-            <span class="section-index" data-mark="1" aria-hidden="true">1</span>
-            <header class="section-header">
-              <button class="section-toggle" type="button" hidden aria-label="Collapse Get ready" aria-expanded="true" aria-controls="ready-body"></button>
-              <div class="section-heading">
-                <h2 id="permissions-title">Get ready</h2>
-                <p class="section-status" id="ready-status">Checking this computer.</p>
-              </div>
-              <span class="section-actions" id="ready-actions"></span>
-              <span class="section-chevron" aria-hidden="true" hidden><svg class="lucide lucide-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg></span>
-            </header>
-            <div class="section-body" id="ready-body">
-              <div class="section-body-inner">
-                <section class="overview" aria-label="Setup status">
-                  <div class="overview-copy"><strong id="setup-verdict">Checking this computer</strong><span id="setup-detail">This takes a moment.</span></div>
-                  <section class="accordion" data-accordion data-disclosure="overview-details" data-open="false">
-                    <button class="accordion-trigger" type="button" id="overview-details-trigger" data-accordion-trigger data-focus-key="disclosure-overview-details" aria-expanded="false" aria-controls="overview-details-content"><span class="accordion-label">Details</span><svg class="lucide lucide-chevron-right accordion-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg></button>
-                    <div class="accordion-panel" id="overview-details-content" role="region" aria-labelledby="overview-details-trigger" hidden inert><div class="accordion-panel-inner launch-attribution" id="launch-attribution"></div></div>
-                  </section>
-                </section>
-                <div id="permissions-content" class="stack"></div>
-                <div id="interface-content" class="stack"></div>
-              </div>
-            </div>
-          </section>
-
-          <section class="setup-section" data-section="computers" data-locked="true" aria-labelledby="computers-title">
-            <span class="section-index" data-mark="2" aria-hidden="true">2</span>
-            <header class="section-header">
-              <button class="section-toggle" type="button" hidden aria-label="Collapse Computers" aria-expanded="true" aria-controls="computers-body"></button>
-              <div class="section-heading">
-                <h2 id="computers-title">Computers</h2>
-                <p class="section-status" id="computers-status">Finish Get ready first</p>
-              </div>
-              <span class="section-actions" id="computers-actions"></span>
-              <span class="section-chevron" aria-hidden="true" hidden><svg class="lucide lucide-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg></span>
-            </header>
-            <div class="section-body" id="computers-body">
-              <div class="section-body-inner"><div id="computers-content" class="stack"></div></div>
-            </div>
-          </section>
-
-          <section class="setup-section" data-section="displays" data-locked="true" aria-labelledby="displays-title">
-            <span class="section-index" data-mark="3" aria-hidden="true">3</span>
-            <header class="section-header">
-              <button class="section-toggle" type="button" hidden aria-label="Collapse Displays" aria-expanded="true" aria-controls="displays-body"></button>
-              <div class="section-heading">
-                <h2 id="displays-title">Displays</h2>
-                <p class="section-status" id="displays-status">Pair a computer first</p>
-              </div>
-              <span class="section-actions" id="displays-actions"></span>
-              <span class="section-chevron" aria-hidden="true" hidden><svg class="lucide lucide-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg></span>
-            </header>
-            <div class="section-body" id="displays-body">
-              <div class="section-body-inner"><div id="displays-content" class="stack"></div></div>
-            </div>
-          </section>
-        </section>
-
-        <section class="app-page" id="settings-view" aria-label="Settings" hidden>
-          <div id="settings-content" class="stack"></div>
-        </section>
-      </div>
+      </section>
     </main>
     <script type="module" src="./app.js"></script>
   </body>
