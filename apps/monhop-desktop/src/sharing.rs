@@ -31,7 +31,7 @@ use monhop_transport::{
     },
     session_link::{LinkCommand, LinkEvent, LinkPersist, LinkRejectReason},
     session_native,
-    session_setup::{self, InspectedPeer, SetupFailure},
+    session_setup::{self, InspectedPeer, PeerContact, SetupFailure},
     session_source::SourceFailure,
 };
 use serde::{Deserialize, Serialize};
@@ -478,6 +478,7 @@ pub(crate) struct LinkRun {
     events: UnboundedSender<LinkEvent>,
     commands: UnboundedReceiver<LinkCommand>,
     network: Arc<SharingNetwork>,
+    contact: PeerContact,
 }
 
 pub(crate) type LinkFuture = Pin<Box<dyn Future<Output = Result<(), SetupFailure>>>>;
@@ -486,7 +487,7 @@ pub(crate) type LinkRunner = fn(LinkRun) -> LinkFuture;
 pub(crate) type LocalDisplays = fn(&str) -> Result<session_setup::DisplayTopology, String>;
 
 /// Runs the link on the network thread's shared endpoint; the returned future only waits.
-fn transport_link(run: LinkRun) -> LinkFuture {
+pub(crate) fn transport_link(run: LinkRun) -> LinkFuture {
     let LinkRun {
         interface_id,
         peer,
@@ -495,6 +496,7 @@ fn transport_link(run: LinkRun) -> LinkFuture {
         events,
         commands,
         network,
+        contact,
     } = run;
     network.open_link(SetupLinkRequest {
         interface_id,
@@ -503,6 +505,7 @@ fn transport_link(run: LinkRun) -> LinkFuture {
         persist,
         events,
         commands,
+        contact,
     })
 }
 
@@ -714,8 +717,11 @@ struct PeerState {
     /// The least wait the failing worker asks for; taken when it ends.
     failure_floor: Duration,
     /// When this computer last connected or dropped, or its first worker started: how long
-    /// sharing has heard nothing from it.
+    /// sharing has heard nothing from it, together with `contact`.
     heard_at: Option<Instant>,
+    /// Reads as now while the transport or this side holds the computer's authenticated
+    /// connection; read at each decision, since a failure before hand-out takes it back.
+    contact: PeerContact,
 }
 
 /// The key `State::peers` files a computer under.
@@ -1301,8 +1307,8 @@ impl SharingController {
         only_waiting(&lock(&self.state), quiet)
     }
 
-    /// [`Self::stop_with`] while [`Self::only_waiting`] holds, decided under the same locks so
-    /// no connection can come up in between; true when it stopped.
+    /// [`Self::stop_with`] while [`Self::only_waiting`] holds, decided under the same locks; true
+    /// when it stopped. A connection authenticating just after the decision is cut as a later one.
     pub fn stop_if_only_waiting(&self, quiet: Duration, idle_message: &str) -> bool {
         let cleanup = self.cleanup_pending();
         let _operation = lock(&self.operation);
@@ -1821,6 +1827,7 @@ impl SharingController {
                     path,
                     setup_file,
                 );
+                let contact = peer_entry(&mut lock(&state).peers, &key).contact.clone();
                 let link = runner(LinkRun {
                     interface_id,
                     peer,
@@ -1829,6 +1836,7 @@ impl SharingController {
                     events,
                     commands: outgoing,
                     network,
+                    contact,
                 });
                 pump_link(
                     state,
@@ -2155,7 +2163,7 @@ impl SharingController {
                         }
                         attempt = attempt.saturating_add(1);
                         let progress = session::SessionProgress::default();
-                        {
+                        let contact = {
                             let mut guard = lock(&state);
                             if generation_of(&guard, &key) != worker_generation {
                                 return Ok(());
@@ -2166,14 +2174,17 @@ impl SharingController {
                                 view.sharing_active = false;
                                 view.message = CONNECTING_FOR_SHARING.to_owned();
                             });
-                            peer_entry(&mut guard.peers, &key).progress = Some(progress.clone());
-                        }
+                            let entry = peer_entry(&mut guard.peers, &key);
+                            entry.progress = Some(progress.clone());
+                            entry.contact.clone()
+                        };
                         let request = ShareRequest {
                             interface_id: interface_id.clone(),
                             plan: group.clone(),
                             peer,
                             cancel: cancel.clone(),
                             progress,
+                            contact,
                         };
                         let up = match network.connect_share(request).await {
                             Ok(up) => up,
@@ -2269,6 +2280,13 @@ impl SharingController {
                                 continue;
                             }
                         };
+                        let ShareUp {
+                            inspection,
+                            cancel: session_cancel,
+                            started,
+                            ended,
+                            heard,
+                        } = up;
                         {
                             let mut guard = lock(&state);
                             guard.displays_unreadable_since = None;
@@ -2276,14 +2294,10 @@ impl SharingController {
                             entry.not_paired = false;
                             entry.heard_at = Some(Instant::now());
                         }
+                        // Let go only after `heard_at` covers it, so the peer never reads as quiet.
+                        drop(heard);
                         attempts = AttemptLog::default();
                         log::info!("sharing: attempt {attempt} connected, starting the session");
-                        let ShareUp {
-                            inspection,
-                            cancel: session_cancel,
-                            started,
-                            ended,
-                        } = up;
                         let registered = register_native_cancellation(
                             &mut lock(&state),
                             &key,
@@ -2913,7 +2927,10 @@ fn only_waiting(state: &State, quiet: Duration) -> bool {
             let view = shown_view(state, peer, true);
             !view.sharing_active
                 && matches!(view.phase, "starting" | "connecting")
-                && peer.heard_at.is_some_and(|at| at.elapsed() >= quiet)
+                && peer
+                    .heard_at
+                    .max(peer.contact.last())
+                    .is_some_and(|at| at.elapsed() >= quiet)
         })
 }
 
@@ -7224,6 +7241,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_link_worker_that_starts_after_a_switch_off_cannot_commit() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
         let controller = SharingController::default();
         let (_directory, path) = sync_test_path();
         let (fresh, bytes) = sync_payload();

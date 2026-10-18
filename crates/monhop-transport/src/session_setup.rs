@@ -36,6 +36,7 @@ use crate::{
         HandshakeConfig, HandshakeError, NegotiatedSession, SessionPurpose,
         device_id_from_fingerprint, negotiate,
     },
+    session_link::LINK_ATTEMPT_DEADLINE,
     session_native::current_displays,
 };
 
@@ -977,6 +978,117 @@ pub struct PairedMember {
     /// requests a stop once the link is released or replaced; revoking the endpoint closes the
     /// connection instead.
     pub cancel: RevocationSignal,
+    /// Keeps the member heard from until whoever runs the session records hearing from it.
+    pub heard: Heard,
+}
+
+/// How long a connection not yet handed out counts as contact: a dialing peer gives up its
+/// share or link attempt by then, so that connection can no longer come up.
+const UNSETTLED_CONTACT: Duration = DIAL_ATTEMPT_DEADLINE;
+const _: () = assert!(LINK_ATTEMPT_DEADLINE.as_nanos() <= UNSETTLED_CONTACT.as_nanos());
+
+/// When a group endpoint last held a member's connection bound to its recorded address and
+/// pinned certificate: now while one is held, through a bounded handshake and on to whoever runs
+/// its session, else when the last session handed out was let go. Read from other threads.
+#[derive(Clone, Debug, Default)]
+pub struct PeerContact(Arc<Mutex<Contacts>>);
+
+#[derive(Debug, Default)]
+struct Contacts {
+    /// When a connection whose session was handed out was last let go.
+    kept: Option<Instant>,
+    handed_out: usize,
+    /// When each connection still in its handshake stops counting.
+    unsettled: Vec<Instant>,
+}
+
+impl Contacts {
+    fn settle(&mut self, until: Instant) {
+        if let Some(index) = self.unsettled.iter().position(|at| *at == until) {
+            self.unsettled.swap_remove(index);
+        }
+    }
+}
+
+impl PeerContact {
+    pub fn last(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let contacts = self.contacts();
+        if contacts.handed_out > 0 || contacts.unsettled.iter().any(|until| *until > now) {
+            Some(now)
+        } else {
+            contacts.kept
+        }
+    }
+
+    /// Only the endpoint calls this, once it bound the connection to the member.
+    pub(crate) fn hear(&self) -> Heard {
+        let until = Instant::now() + UNSETTLED_CONTACT;
+        self.contacts().unsettled.push(until);
+        Heard {
+            contact: self.clone(),
+            until: Some(until),
+        }
+    }
+
+    fn contacts(&self) -> MutexGuard<'_, Contacts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One authenticated connection's hold on its member's contact. Let go before its session is
+/// handed out, the attempt failed and the member reads as heard from exactly as before it.
+#[must_use]
+#[derive(Debug)]
+pub struct Heard {
+    contact: PeerContact,
+    /// When it stops counting unless handed out first; None once handed out.
+    until: Option<Instant>,
+}
+
+impl Heard {
+    /// Its session was handed out: it counts until let go, which records the member as heard
+    /// from then.
+    pub(crate) fn keep(&mut self) {
+        if let Some(until) = self.until.take() {
+            let mut contacts = self.contact.contacts();
+            contacts.settle(until);
+            contacts.handed_out += 1;
+        }
+    }
+}
+
+impl Drop for Heard {
+    fn drop(&mut self) {
+        let mut contacts = self.contact.contacts();
+        match self.until {
+            Some(until) => contacts.settle(until),
+            None => {
+                contacts.handed_out = contacts.handed_out.saturating_sub(1);
+                contacts.kept = Some(Instant::now());
+            }
+        }
+    }
+}
+
+/// The endpoint's part, for another crate's stand-in for it.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use super::{Heard, PeerContact};
+
+    pub fn authenticated(contact: &PeerContact) -> Heard {
+        contact.hear()
+    }
+
+    pub fn handed_out(heard: &mut Heard) {
+        heard.keep();
+    }
+}
+
+/// A member's connection bound to its recorded address and pin, with the contact it raised.
+pub(crate) struct Authenticated {
+    pub(crate) connection: quinn::Connection,
+    heard: Heard,
 }
 
 /// The connection a group endpoint last handed out for one member, with that link's cancel.
@@ -1283,6 +1395,8 @@ pub struct GroupEndpoint {
     /// Each member's latest connection handed out, kept so forget and a newer connection can
     /// close it. Dropping a session's handle therefore does not close its connection.
     live: RefCell<Box<[Option<LiveLink>]>>,
+    /// Raised for each member, by member index, once its connection authenticates.
+    contacts: RefCell<Box<[PeerContact]>>,
     controls: RefCell<Vec<GroupMemberRecord>>,
     peers: Box<[GroupPeer]>,
     /// Paired computers the bind left out and not forgotten since.
@@ -1386,6 +1500,7 @@ impl GroupEndpoint {
             router,
             routes: table,
             live: RefCell::new(peers.iter().map(|_| None).collect()),
+            contacts: RefCell::new(peers.iter().map(|_| PeerContact::default()).collect()),
             controls: RefCell::new(members.to_vec()),
             peers,
             excluded: RefCell::new(excluded),
@@ -1407,6 +1522,15 @@ impl GroupEndpoint {
     /// Sessions already negotiated keep the control they agreed.
     pub fn set_members(&self, members: &[GroupMemberRecord]) {
         *self.controls.borrow_mut() = members.to_vec();
+    }
+
+    /// Raises `contact` while a connect here holds `member`'s authenticated connection, before
+    /// its handshake finishes, and leaves it raised once the session is handed out. Replaces the
+    /// member's earlier one.
+    pub fn watch_contact(&self, member: CertificateFingerprint, contact: PeerContact) {
+        if let Some(index) = self.index(member) {
+            self.contacts.borrow_mut()[index] = contact;
+        }
     }
 
     /// The whole endpoint's revocation: stopping or revoking it ends every member's connection
@@ -1450,8 +1574,8 @@ impl GroupEndpoint {
                     .dial_until_negotiated(index, control, purpose, agreement, cancel)
                     .await;
             }
-            let connection = self.connection(index, cancel).await?;
-            self.negotiate_while_admitted(index, connection, control, purpose, agreement, cancel)
+            let authenticated = self.connection(index, cancel).await?;
+            self.negotiate_while_admitted(index, authenticated, control, purpose, agreement, cancel)
                 .await
         })
         .await;
@@ -1459,8 +1583,8 @@ impl GroupEndpoint {
             log::debug!("share connect window of {CONNECT_WINDOW:?} passed without a session");
             return Err(SetupFailure::Connection);
         };
-        let (session, inspection) = established?;
-        self.hand_out(index, session, inspection, cancel)
+        let (session, inspection, heard) = established?;
+        self.hand_out(index, session, inspection, heard, cancel)
     }
 
     /// Whether this computer dials `member` under the pair's dial rule.
@@ -1481,7 +1605,7 @@ impl GroupEndpoint {
         &self,
         member: CertificateFingerprint,
         cancel: &RevocationSignal,
-    ) -> Result<quinn::Connection, SetupFailure> {
+    ) -> Result<Authenticated, SetupFailure> {
         let index = self.admitted(member)?;
         self.check(index, Some(cancel))?;
         self.connection(index, cancel).await
@@ -1492,21 +1616,21 @@ impl GroupEndpoint {
     pub(crate) async fn negotiate_setup(
         &self,
         member: CertificateFingerprint,
-        connection: quinn::Connection,
+        authenticated: Authenticated,
         cancel: &RevocationSignal,
     ) -> Result<PairedMember, SetupFailure> {
         let index = self.admitted(member)?;
-        let (session, inspection) = self
+        let (session, inspection, heard) = self
             .negotiate_while_admitted(
                 index,
-                connection,
+                authenticated,
                 ControlPermissions::BOTH,
                 SessionPurpose::Setup,
                 [0; 32],
                 cancel,
             )
             .await?;
-        self.hand_out(index, session, inspection, cancel)
+        self.hand_out(index, session, inspection, heard, cancel)
     }
 
     /// This computer's displays as a connect reads them.
@@ -1518,7 +1642,7 @@ impl GroupEndpoint {
         &self,
         index: usize,
         cancel: &RevocationSignal,
-    ) -> Result<quinn::Connection, SetupFailure> {
+    ) -> Result<Authenticated, SetupFailure> {
         if self.peers[index].dials {
             self.dial(index, cancel).await
         } else {
@@ -1527,12 +1651,13 @@ impl GroupEndpoint {
     }
 
     /// Records a negotiated session as the member's live connection with a fresh link cancel,
-    /// stopping and closing the one it replaces.
+    /// stopping and closing the one it replaces; `heard` goes along with the session.
     fn hand_out(
         &self,
         index: usize,
         session: NegotiatedSession,
         inspection: InspectedPeer,
+        mut heard: Heard,
         cancel: &RevocationSignal,
     ) -> Result<PairedMember, SetupFailure> {
         // Forget runs on this thread, so nothing is handed out for a member it already removed.
@@ -1553,10 +1678,12 @@ impl GroupEndpoint {
                 .connection
                 .close(0_u32.into(), MEMBER_SUPERSEDED_REASON);
         }
+        heard.keep();
         Ok(PairedMember {
             session,
             inspection,
             cancel: link_cancel,
+            heard,
         })
     }
 
@@ -1669,7 +1796,7 @@ impl GroupEndpoint {
         &self,
         index: usize,
         cancel: &RevocationSignal,
-    ) -> Result<quinn::Connection, SetupFailure> {
+    ) -> Result<Authenticated, SetupFailure> {
         let member = self.peers[index].fingerprint;
         let what = format!("share dial to {} failed", member.short_hex());
         let unreached = |error: &dyn std::fmt::Display| {
@@ -1694,7 +1821,7 @@ impl GroupEndpoint {
         self.handle
             .confirm_member(member, &connection)
             .map_err(|error| unreached(&error))?;
-        Ok(connection)
+        Ok(self.authenticated(index, connection))
     }
 
     /// Waits for the router to hand over the member's next incoming connection.
@@ -1702,7 +1829,7 @@ impl GroupEndpoint {
         &self,
         index: usize,
         cancel: &RevocationSignal,
-    ) -> Result<quinn::Connection, SetupFailure> {
+    ) -> Result<Authenticated, SetupFailure> {
         let (ticket, delivered) = routes(&self.routes).wait(index);
         let _waiting = Waiting {
             routes: &self.routes,
@@ -1715,7 +1842,8 @@ impl GroupEndpoint {
         );
         self.while_member_active(index, cancel, async {
             match delivered.await {
-                Ok(Ok(connection)) => Ok(connection),
+                // The router hands over only connections bound to this member's address and pin.
+                Ok(Ok(connection)) => Ok(self.authenticated(index, connection)),
                 Ok(Err(failure)) => Err(member_failure(&what, &failure)),
                 // Forgotten, revoked, or replaced by a newer connect for this member.
                 Err(_) => Err(self
@@ -1744,12 +1872,13 @@ impl GroupEndpoint {
     async fn negotiate_while_admitted(
         &self,
         index: usize,
-        connection: quinn::Connection,
+        authenticated: Authenticated,
         control: ControlPermissions,
         purpose: SessionPurpose,
         agreement: [u8; 32],
         cancel: &RevocationSignal,
-    ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
+    ) -> Result<(NegotiatedSession, InspectedPeer, Heard), SetupFailure> {
+        let Authenticated { connection, heard } = authenticated;
         let closing = connection.clone();
         let negotiation = self.negotiate(index, connection, control, purpose, agreement);
         tokio::pin!(negotiation);
@@ -1759,7 +1888,14 @@ impl GroupEndpoint {
         if let Err(error @ (SetupFailure::PairingRequired | SetupFailure::Cancelled)) = result {
             closing.close(0_u32.into(), self.refusal_reason(error));
         }
-        result
+        result.map(|(session, inspection)| (session, inspection, heard))
+    }
+
+    fn authenticated(&self, index: usize, connection: quinn::Connection) -> Authenticated {
+        Authenticated {
+            connection,
+            heard: self.contacts.borrow()[index].hear(),
+        }
     }
 
     async fn negotiate(
@@ -1796,12 +1932,19 @@ impl GroupEndpoint {
         purpose: SessionPurpose,
         agreement: [u8; 32],
         cancel: &RevocationSignal,
-    ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
+    ) -> Result<(NegotiatedSession, InspectedPeer, Heard), SetupFailure> {
         loop {
+            // A failed or timed-out attempt drops its `Heard`, so between attempts nothing reads
+            // as coming up.
             let attempt = tokio::time::timeout(DIAL_ATTEMPT_DEADLINE, async {
-                let connection = self.dial(index, cancel).await?;
+                let authenticated = self.dial(index, cancel).await?;
                 self.negotiate_while_admitted(
-                    index, connection, control, purpose, agreement, cancel,
+                    index,
+                    authenticated,
+                    control,
+                    purpose,
+                    agreement,
+                    cancel,
                 )
                 .await
             })
@@ -2667,6 +2810,7 @@ mod capture_stop_close_tests {
 #[cfg(test)]
 mod group_tests {
     use std::{
+        cell::Cell,
         net::{SocketAddr, UdpSocket},
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -2797,6 +2941,18 @@ mod group_tests {
         purpose: SessionPurpose,
         agreement: [u8; 32],
     ) -> Result<NegotiatedSession, HandshakeError> {
+        remote_negotiates_as(remote, hub, connection, purpose, agreement, MEMBER).await
+    }
+
+    /// `remote_negotiates`, announcing `platform` in its Hello.
+    async fn remote_negotiates_as(
+        remote: &Remote,
+        hub: &Hub,
+        connection: quinn::Connection,
+        purpose: SessionPurpose,
+        agreement: [u8; 32],
+        platform: Platform,
+    ) -> Result<NegotiatedSession, HandshakeError> {
         let displays = topology();
         let capabilities =
             Capabilities::new(Capabilities::RELATIVE_MOTION | Capabilities::DISPLAY_TOPOLOGY)
@@ -2804,7 +2960,7 @@ mod group_tests {
         let config = HandshakeConfig::new(
             &remote.identity,
             &hub.pin,
-            MEMBER,
+            platform,
             HUB,
             capabilities,
             capabilities,
@@ -3217,6 +3373,440 @@ mod group_tests {
         .await
         .expect("the kept computer still connects");
         assert!(paired.unwrap().inspection.peer_fingerprint == fingerprint);
+    }
+
+    /// `hub` reports `member`'s contact to the signal returned.
+    fn watched(hub: &Hub, member: CertificateFingerprint) -> PeerContact {
+        let contact = PeerContact::default();
+        hub.group.watch_contact(member, contact.clone());
+        contact
+    }
+
+    #[tokio::test]
+    async fn a_member_is_heard_from_once_its_connection_authenticates_before_its_handshake_ends() {
+        // Waiting for the member: heard once the router hands its connection over.
+        let computer = Computer::new();
+        let hub_waits = hub(&[&computer], false, &[]);
+        let remote = computer.dialing(&hub_waits);
+        let fingerprint = remote.fingerprint();
+        let contact = watched(&hub_waits, fingerprint);
+        let cancel = RevocationSignal::default();
+        let heard = Cell::new(None);
+        let (ours, _) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub_waits
+                    .group
+                    .connect(fingerprint, SessionPurpose::Setup, NO_AGREEMENT, &cancel),
+                interrupted_negotiation(&remote, &hub_waits, || {
+                    heard.set(contact.last());
+                    cancel.revoke();
+                })
+            )
+        })
+        .await
+        .expect("both sides settle the cancel");
+        assert!(
+            heard.get().is_some(),
+            "not heard while its Hello was pending"
+        );
+        assert_eq!(ours.err(), Some(SetupFailure::Cancelled));
+
+        // Dialing the member for a share: heard once the dial binds, before any Hello answer.
+        let computer = Computer::new();
+        let controls = [GroupMemberRecord {
+            fingerprint: computer.identity.fingerprint(),
+            control: ControlPermissions::BOTH,
+        }];
+        let hub_dials = hub(&[&computer], true, &controls);
+        let remote = computer.listening(&hub_dials);
+        let fingerprint = remote.fingerprint();
+        let contact = watched(&hub_dials, fingerprint);
+        let cancel = RevocationSignal::default();
+        let (ours, heard) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub_dials
+                    .group
+                    .connect(fingerprint, SessionPurpose::Share, NO_AGREEMENT, &cancel),
+                async {
+                    let connection = remote.endpoint.accept().await.unwrap().await.unwrap();
+                    let (_, mut hello) = connection.accept_bi().await.unwrap();
+                    hello.read_exact(&mut [0_u8; 1]).await.unwrap();
+                    let heard = contact.last();
+                    cancel.revoke();
+                    heard
+                }
+            )
+        })
+        .await
+        .expect("both sides settle the cancel");
+        assert!(heard.is_some(), "not heard while its Hello was pending");
+        assert_eq!(ours.err(), Some(SetupFailure::Cancelled));
+    }
+
+    fn unreadable_displays(_: DeviceId) -> Result<DisplayTopology, SetupFailure> {
+        Err(SetupFailure::Displays)
+    }
+
+    #[tokio::test]
+    async fn a_member_whose_handshakes_all_fail_is_not_heard_from_between_attempts() {
+        // It authenticates every dial, then never answers its Hello.
+        let computer = Computer::new();
+        let controls = [GroupMemberRecord {
+            fingerprint: computer.identity.fingerprint(),
+            control: ControlPermissions::BOTH,
+        }];
+        let hub = hub(&[&computer], true, &controls);
+        let remote = computer.listening(&hub);
+        let fingerprint = remote.fingerprint();
+        let contact = watched(&hub, fingerprint);
+        let cancel = RevocationSignal::default();
+        let (ours, ()) = tokio::time::timeout(DEADLINE * 2, async {
+            tokio::join!(
+                hub.group
+                    .connect(fingerprint, SessionPurpose::Share, NO_AGREEMENT, &cancel),
+                async {
+                    for attempt in 1..=2 {
+                        let stalled = remote.endpoint.accept().await.unwrap().await.unwrap();
+                        let (_, mut hello) = stalled.accept_bi().await.unwrap();
+                        hello.read_exact(&mut [0_u8; 1]).await.unwrap();
+                        assert!(contact.last().is_some(), "attempt {attempt} not heard");
+                        // Its handshake deadline passes well inside the wait before the next dial.
+                        let failed = until(|| contact.last().is_none());
+                        let failed = tokio::time::timeout(DIAL_INTERVAL, failed).await;
+                        assert!(
+                            failed.is_ok(),
+                            "attempt {attempt} still heard after it failed"
+                        );
+                    }
+                    cancel.revoke();
+                }
+            )
+        })
+        .await
+        .expect("both sides settle the cancel");
+        assert_eq!(ours.err(), Some(SetupFailure::Cancelled));
+
+        // This computer's own display read failing after authentication is no contact either.
+        let computer = Computer::new();
+        let hub = hub_reading(&[&computer], false, &[], unreadable_displays);
+        let remote = computer.dialing(&hub);
+        let fingerprint = remote.fingerprint();
+        let contact = watched(&hub, fingerprint);
+        let (ours, _theirs) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub.group.connect(
+                    fingerprint,
+                    SessionPurpose::Setup,
+                    NO_AGREEMENT,
+                    &hub.cancel
+                ),
+                async {
+                    until(|| hub.group.waiting(fingerprint)).await;
+                    remote
+                        .endpoint
+                        .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+                        .unwrap()
+                        .await
+                }
+            )
+        })
+        .await
+        .expect("the display failure settles at once");
+        assert_eq!(ours.err(), Some(SetupFailure::Displays));
+        assert_eq!(contact.last(), None);
+    }
+
+    #[tokio::test]
+    async fn only_a_members_authenticated_connection_counts_as_contact() {
+        let stale = DeviceIdentity::generate().unwrap();
+        let computers = [(); 3].map(|()| Computer::new());
+        let hub = hub(&computers.each_ref(), false, &[]);
+        let [member, refusing, impostor] = computers;
+        let setup = |fingerprint| {
+            hub.group.connect(
+                fingerprint,
+                SessionPurpose::Setup,
+                NO_AGREEMENT,
+                &hub.cancel,
+            )
+        };
+
+        // The member's own connection while no connect waits for it is refused before any TLS.
+        let member = member.dialing(&hub);
+        let member_heard = watched(&hub, member.fingerprint());
+        let refused = tokio::time::timeout(
+            DEADLINE,
+            member
+                .endpoint
+                .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+                .unwrap(),
+        )
+        .await
+        .expect("the refusal is prompt");
+        assert!(refused.is_err());
+
+        // A computer at no admitted address gets no answer at all.
+        let stranger = Computer::new().dialing(&hub);
+        let ignored = tokio::time::timeout(
+            Duration::from_millis(500),
+            stranger
+                .endpoint
+                .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+                .unwrap(),
+        )
+        .await;
+        assert!(ignored.is_err(), "a computer never admitted gets no answer");
+        assert_eq!(member_heard.last(), None);
+
+        // A member that refuses this computer's certificate never authenticates.
+        let refusing = Remote {
+            endpoint: loopback::dialer(refusing.socket, &refusing.identity, &pin(&stale)),
+            identity: refusing.identity,
+            address: refusing.address,
+        };
+        let refusing_heard = watched(&hub, refusing.fingerprint());
+        let (ours, theirs) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(setup(refusing.fingerprint()), async {
+                until(|| hub.group.waiting(refusing.fingerprint())).await;
+                refusing
+                    .endpoint
+                    .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+                    .unwrap()
+                    .await
+            })
+        })
+        .await
+        .expect("both sides settle the refusal");
+        assert!(theirs.is_err());
+        assert_eq!(ours.err(), Some(SetupFailure::Connection));
+        assert_eq!(refusing_heard.last(), None);
+
+        // Another certificate from a member's recorded address is refused by this computer's pin.
+        let fingerprint = impostor.identity.fingerprint();
+        let impostor_heard = watched(&hub, fingerprint);
+        let impostor = Remote {
+            endpoint: loopback::dialer(impostor.socket, &stale, &hub.pin),
+            identity: stale,
+            address: impostor.address,
+        };
+        let (ours, _theirs) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(setup(fingerprint), async {
+                until(|| hub.group.waiting(fingerprint)).await;
+                impostor
+                    .endpoint
+                    .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+                    .unwrap()
+                    .await
+            })
+        })
+        .await
+        .expect("both sides settle the refusal");
+        assert_eq!(ours.err(), Some(SetupFailure::PeerIdentityChanged));
+        assert_eq!(impostor_heard.last(), None);
+
+        // The member itself, claimed and authenticated, is heard from.
+        let (paired, _dialed) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(setup(member.fingerprint()), async {
+                until(|| hub.group.waiting(member.fingerprint())).await;
+                remote_dials(&member, &hub).await
+            })
+        })
+        .await
+        .expect("the member connects");
+        paired.unwrap();
+        assert!(member_heard.last().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_member_on_another_build_is_no_contact() {
+        let computer = Computer::new();
+        let hub = hub(&[&computer], false, &[]);
+        let remote = computer.dialing(&hub);
+        let fingerprint = remote.fingerprint();
+        let contact = watched(&hub, fingerprint);
+        let setup = || {
+            hub.group.connect(
+                fingerprint,
+                SessionPurpose::Setup,
+                NO_AGREEMENT,
+                &hub.cancel,
+            )
+        };
+        let (paired, _dialed) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(setup(), async {
+                until(|| hub.group.waiting(fingerprint)).await;
+                remote_dials(&remote, &hub).await
+            })
+        })
+        .await
+        .expect("the member connects");
+        paired.unwrap();
+        let connected = contact.last().expect("the member was heard from");
+
+        // A Hello this build cannot accept takes back only the contact its own connection raised.
+        let (mismatched, _theirs) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(setup(), async {
+                until(|| hub.group.waiting(fingerprint)).await;
+                let connection = remote
+                    .endpoint
+                    .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                remote_negotiates_as(
+                    &remote,
+                    &hub,
+                    connection,
+                    SessionPurpose::Setup,
+                    NO_AGREEMENT,
+                    HUB,
+                )
+                .await
+            })
+        })
+        .await
+        .expect("both sides settle the mismatch");
+        assert_eq!(mismatched.err(), Some(SetupFailure::VersionMismatch));
+        assert_eq!(contact.last(), Some(connected));
+    }
+
+    #[test]
+    fn each_connection_takes_back_only_its_own_contact() {
+        let contact = PeerContact::default();
+        let mut handed_out = contact.hear();
+        handed_out.keep();
+        drop(handed_out);
+        let kept = contact.last();
+        assert!(kept.is_some());
+        // Two handshakes at once that fail in either order leave the kept contact alone.
+        for older_fails_first in [true, false] {
+            let older = contact.hear();
+            let newer = contact.hear();
+            let (first, second) = if older_fails_first {
+                (older, newer)
+            } else {
+                (newer, older)
+            };
+            drop(first);
+            let held = Instant::now();
+            assert!(contact.last().is_some_and(|at| at >= held));
+            drop(second);
+            assert_eq!(contact.last(), kept);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handed_out_session_is_heard_from_until_whoever_runs_it_lets_go() {
+        let computer = Computer::new();
+        let hub = hub(&[&computer], false, &[]);
+        let remote = computer.dialing(&hub);
+        let fingerprint = remote.fingerprint();
+        let contact = watched(&hub, fingerprint);
+        let (paired, _dialed) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(
+                hub.group.connect(
+                    fingerprint,
+                    SessionPurpose::Setup,
+                    NO_AGREEMENT,
+                    &hub.cancel
+                ),
+                async {
+                    until(|| hub.group.waiting(fingerprint)).await;
+                    remote_dials(&remote, &hub).await
+                }
+            )
+        })
+        .await
+        .expect("the member connects");
+        let PairedMember { heard, .. } = paired.unwrap();
+        // However long its runner takes to record the session, the member stays heard from.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let held = Instant::now();
+        assert!(contact.last().is_some_and(|at| at >= held));
+        drop(heard);
+        let kept = contact.last().expect("kept once let go");
+        assert!(kept >= held);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(contact.last(), Some(kept));
+    }
+
+    /// Set while a test holds this computer's display read stalled.
+    static DISPLAYS_STALLED: (Mutex<bool>, std::sync::Condvar) =
+        (Mutex::new(false), std::sync::Condvar::new());
+
+    /// Stalls `stalled_displays` until dropped, a failing test included.
+    struct DisplayStall;
+
+    impl DisplayStall {
+        fn hold() -> Self {
+            *DISPLAYS_STALLED
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = true;
+            Self
+        }
+    }
+
+    impl Drop for DisplayStall {
+        fn drop(&mut self) {
+            *DISPLAYS_STALLED
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = false;
+            DISPLAYS_STALLED.1.notify_all();
+        }
+    }
+
+    fn stalled_displays(_: DeviceId) -> Result<DisplayTopology, SetupFailure> {
+        let (stalled, released) = &DISPLAYS_STALLED;
+        let stalled = stalled.lock().unwrap_or_else(PoisonError::into_inner);
+        drop(
+            released
+                .wait_while(stalled, |stalled| *stalled)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        Err(SetupFailure::Displays)
+    }
+
+    #[tokio::test]
+    async fn an_accepted_connection_stuck_before_its_handshake_stops_counting_once_its_dialer_gave_up()
+     {
+        let stall = DisplayStall::hold();
+        let computer = Computer::new();
+        let controls = [GroupMemberRecord {
+            fingerprint: computer.identity.fingerprint(),
+            control: ControlPermissions::BOTH,
+        }];
+        let hub = hub_reading(&[&computer], false, &controls, stalled_displays);
+        let remote = computer.dialing(&hub);
+        let fingerprint = remote.fingerprint();
+        let contact = watched(&hub, fingerprint);
+        let cancel = RevocationSignal::default();
+        let (ours, ()) = tokio::time::timeout(DEADLINE * 2, async {
+            tokio::join!(
+                hub.group
+                    .connect(fingerprint, SessionPurpose::Share, NO_AGREEMENT, &cancel),
+                async {
+                    until(|| hub.group.waiting(fingerprint)).await;
+                    let _dialed = remote
+                        .endpoint
+                        .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+                        .unwrap()
+                        .await
+                        .unwrap();
+                    until(|| contact.last().is_some()).await;
+                    // Its display read still stalls, but the dialer's attempt is over.
+                    tokio::time::sleep(DIAL_ATTEMPT_DEADLINE).await;
+                    assert_eq!(contact.last(), None);
+                    cancel.revoke();
+                }
+            )
+        })
+        .await
+        .expect("the cancel ends the stalled accept");
+        drop(stall);
+        assert_eq!(ours.err(), Some(SetupFailure::Cancelled));
+        assert_eq!(contact.last(), None);
     }
 
     /// The hub dials `remote` for a setup link while it answers.

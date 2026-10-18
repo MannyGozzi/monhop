@@ -44,6 +44,7 @@ windows = { version = "=0.61.3", features = ["Wdk_System_SystemServices", "Win32
 tauri-build = { version = "=2.6.3", default-features = false, features = ["config-json"] }
 
 [dev-dependencies]
+monhop-transport = { path = "../../crates/monhop-transport", version = "=0.2.10", features = ["test-support"] }
 zeroize = "=1.9.0"
 
 [lints]

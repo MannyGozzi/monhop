@@ -20,8 +20,8 @@ use crate::{
     crypto::CertificateFingerprint,
     session_handshake::{ControlStreams, NegotiatedSession, SessionPurpose},
     session_setup::{
-        GroupEndpoint, InspectedPeer, MEMBER_RELEASED_REASON, PairedMember, PreparedEndpoint,
-        SetupFailure, is_transient, prepare_endpoint, read_native_displays,
+        Authenticated, GroupEndpoint, Heard, InspectedPeer, MEMBER_RELEASED_REASON, PairedMember,
+        PreparedEndpoint, SetupFailure, is_transient, prepare_endpoint, read_native_displays,
     },
 };
 
@@ -175,6 +175,7 @@ pub async fn run_setup_link_on(
         group,
         member,
         claim: RefCell::new(None),
+        heard: RefCell::new(None),
     };
     run_link(&connector, cancel, &persist, &events, &mut commands).await
 }
@@ -182,17 +183,20 @@ pub async fn run_setup_link_on(
 /// Supplies one connection at a time. The production implementations own a bound, pinned
 /// endpoint, or take one member's connections from the shared group endpoint.
 trait LinkConnector {
+    /// What `next_connection` hands to `negotiate`.
+    type Connection;
+
     /// Windows dials the pinned peer; macOS binds once and accepts.
     fn dials(&self) -> bool;
 
     fn next_connection(
         &self,
         cancel: &RevocationSignal,
-    ) -> impl Future<Output = Result<quinn::Connection, SetupFailure>>;
+    ) -> impl Future<Output = Result<Self::Connection, SetupFailure>>;
 
     fn negotiate(
         &self,
-        connection: quinn::Connection,
+        connection: Self::Connection,
         cancel: &RevocationSignal,
     ) -> impl Future<Output = Result<(NegotiatedSession, InspectedPeer), SetupFailure>>;
 
@@ -221,6 +225,8 @@ struct EndpointConnector {
 }
 
 impl LinkConnector for EndpointConnector {
+    type Connection = quinn::Connection;
+
     fn dials(&self) -> bool {
         self.prepared.dials()
     }
@@ -268,9 +274,13 @@ struct GroupConnector<'a> {
     dials: bool,
     /// The link cancel and connection of the member's last connection handed to this link.
     claim: RefCell<Option<(RevocationSignal, quinn::Connection)>>,
+    /// Keeps the member heard from while that connection carries the link.
+    heard: RefCell<Option<Heard>>,
 }
 
 impl LinkConnector for GroupConnector<'_> {
+    type Connection = Authenticated;
+
     fn dials(&self) -> bool {
         self.dials
     }
@@ -278,29 +288,33 @@ impl LinkConnector for GroupConnector<'_> {
     async fn next_connection(
         &self,
         cancel: &RevocationSignal,
-    ) -> Result<quinn::Connection, SetupFailure> {
+    ) -> Result<Authenticated, SetupFailure> {
         self.group.setup_connection(self.member, cancel).await
     }
 
     async fn negotiate(
         &self,
-        connection: quinn::Connection,
+        authenticated: Authenticated,
         cancel: &RevocationSignal,
     ) -> Result<(NegotiatedSession, InspectedPeer), SetupFailure> {
         // A connection handed out while this one was dialed or awaited must not be replaced.
         if let Some(failure) = self.taken() {
-            connection.close(0_u32.into(), MEMBER_RELEASED_REASON);
+            authenticated
+                .connection
+                .close(0_u32.into(), MEMBER_RELEASED_REASON);
             return Err(failure);
         }
         let PairedMember {
             session,
             inspection,
             cancel: claim,
+            heard,
         } = self
             .group
-            .negotiate_setup(self.member, connection, cancel)
+            .negotiate_setup(self.member, authenticated, cancel)
             .await?;
         *self.claim.borrow_mut() = Some((claim, session.connection.clone()));
+        *self.heard.borrow_mut() = Some(heard);
         Ok((session, inspection))
     }
 
@@ -324,6 +338,7 @@ impl LinkConnector for GroupConnector<'_> {
         if let Some((_, connection)) = self.claim.borrow().as_ref() {
             connection.close(0_u32.into(), MEMBER_RELEASED_REASON);
         }
+        self.heard.take();
     }
 
     async fn close(&self) {
@@ -334,6 +349,7 @@ impl LinkConnector for GroupConnector<'_> {
 impl GroupConnector<'_> {
     /// Ends the member's connection through the endpoint, unless another connection took it.
     fn let_go(&self) {
+        self.heard.take();
         if let Some((claim, _)) = self.claim.take()
             && !claim.is_stopping()
         {
@@ -1720,7 +1736,9 @@ mod tests {
         crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig, VerifiedPeer},
         guarded_endpoint::loopback,
         session_handshake::{HandshakeConfig, device_id_from_fingerprint, negotiate},
-        session_setup::{GroupMemberRecord, MEMBER_SUPERSEDED_REASON, handshake_failure},
+        session_setup::{
+            GroupMemberRecord, MEMBER_SUPERSEDED_REASON, PeerContact, handshake_failure,
+        },
     };
 
     const TEST_DEADLINE: Duration = Duration::from_secs(30);
@@ -1737,6 +1755,8 @@ mod tests {
     }
 
     impl LinkConnector for Loopback {
+        type Connection = quinn::Connection;
+
         fn dials(&self) -> bool {
             self.peer_address.is_some()
         }
@@ -3103,6 +3123,77 @@ mod tests {
     /// The connection the other computer's link last made or accepted.
     fn remote_connection(remote: &Loopback) -> quinn::Connection {
         remote.connection.lock().unwrap().clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_setup_link_hears_its_member_before_the_handshake_ends() {
+        let computer = Computer::new(false);
+        let hub = group_hub(&[&computer], &[]);
+        let remote = computer.remote(&hub);
+        let member = remote.identity.fingerprint();
+        let contact = PeerContact::default();
+        hub.group.watch_contact(member, contact.clone());
+        let order = Arc::new(AtomicUsize::new(0));
+        let (mut ours, run) = party(&order);
+        let (ended, heard) = tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::join!(hub_link(&hub, member, run), async {
+                until(|| hub.group.waiting(member)).await;
+                let connection = remote
+                    .endpoint
+                    .connect(hub.address, LOCAL_TLS_SERVER_NAME)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                // The hub's Hello is under way and never answered.
+                let (_, mut hello) = connection.accept_bi().await.unwrap();
+                hello.read_exact(&mut [0_u8; 1]).await.unwrap();
+                let heard = contact.last();
+                ours.cancel.revoke();
+                heard
+            })
+        })
+        .await
+        .expect("the link settles the cancel");
+        assert!(heard.is_some(), "not heard while its Hello was pending");
+        assert_eq!(ended.err(), Some(SetupFailure::Cancelled));
+        while let Ok(event) = ours.inbox.try_recv() {
+            assert!(!matches!(event, LinkEvent::Connected { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_setup_link_is_heard_from_while_its_connection_carries_it() {
+        let computer = Computer::new(false);
+        let hub = group_hub(&[&computer], &[]);
+        let remote = computer.remote(&hub);
+        let member = remote.identity.fingerprint();
+        let contact = PeerContact::default();
+        hub.group.watch_contact(member, contact.clone());
+        let order = Arc::new(AtomicUsize::new(0));
+        let (mut ours, our_run) = party(&order);
+        let (theirs, their_run) = party(&order);
+        let (closed, remote_side, ()) = tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::join!(
+                hub_link(&hub, member, our_run),
+                remote_link(&remote, &hub, their_run),
+                async {
+                    wait_connected(&mut ours.inbox).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let held = Instant::now();
+                    assert!(contact.last().is_some_and(|at| at >= held));
+                    closes(&mut ours).await;
+                    let kept = contact.last().expect("kept once the link let go");
+                    assert!(kept >= held);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    assert_eq!(contact.last(), Some(kept));
+                    theirs.cancel.revoke();
+                }
+            )
+        })
+        .await
+        .expect("bounded group setup link test");
+        assert_eq!(closed, Ok(()));
+        assert_eq!(remote_side, Err(SetupFailure::Cancelled));
     }
 
     #[tokio::test]

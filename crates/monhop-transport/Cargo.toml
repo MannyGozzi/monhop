@@ -23,6 +23,10 @@ tokio = { version = "=1.53.1", default-features = false, features = ["rt", "macr
 [dev-dependencies]
 quinn-proto = { version = "=0.11.18", default-features = false }
 
+[features]
+# The endpoint's contact calls, for another crate's tests standing in for it.
+test-support = []
+
 [target.'cfg(target_os = "macos")'.dependencies]
 monhop-platform-macos = { path = "../monhop-platform-macos", version = "=0.2.10" }
 

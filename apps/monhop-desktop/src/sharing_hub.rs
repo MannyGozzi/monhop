@@ -25,7 +25,10 @@ use monhop_transport::{
     session_handshake::{NegotiatedSession, device_id_from_fingerprint},
     session_hub::{HubClosed, HubConfig, HubEvent, HubEvents, PeerEnd, ShareHub, start_share_hub},
     session_link::{LinkCommand, LinkEvent, LinkPersist, run_setup_link_on},
-    session_setup::{GroupEndpoint, GroupMemberRecord, InspectedPeer, SetupFailure, same_network},
+    session_setup::{
+        GroupEndpoint, GroupMemberRecord, Heard, InspectedPeer, PeerContact, SetupFailure,
+        same_network,
+    },
 };
 use tokio::{
     sync::{
@@ -136,6 +139,8 @@ pub(crate) struct ShareRequest {
     /// The worker's own cancel: revoking it ends the connect.
     pub(crate) cancel: RevocationSignal,
     pub(crate) progress: SessionProgress,
+    /// Raised once the endpoint holds `peer`'s authenticated connection.
+    pub(crate) contact: PeerContact,
 }
 
 /// A Share session the hub took.
@@ -146,6 +151,8 @@ pub(crate) struct ShareUp {
     /// Set once both directions of the session finished startup.
     pub(crate) started: Arc<AtomicBool>,
     pub(crate) ended: oneshot::Receiver<ShareEnd>,
+    /// Keeps the peer heard from; let go only once sharing recorded hearing from it.
+    pub(crate) heard: Heard,
 }
 
 #[derive(Debug)]
@@ -211,6 +218,8 @@ pub(crate) struct SetupLinkRequest {
     pub(crate) persist: LinkPersist,
     pub(crate) events: UnboundedSender<LinkEvent>,
     pub(crate) commands: UnboundedReceiver<LinkCommand>,
+    /// Raised once the endpoint holds `peer`'s authenticated connection.
+    pub(crate) contact: PeerContact,
 }
 
 enum Command {
@@ -472,6 +481,7 @@ pub(crate) struct PortMember<S> {
     pub(crate) session: S,
     pub(crate) inspection: InspectedPeer,
     pub(crate) cancel: RevocationSignal,
+    pub(crate) heard: Heard,
 }
 
 /// The transport the network thread drives; tests swap it for a fake, as `LinkRunner` is
@@ -515,6 +525,9 @@ pub(crate) trait PortEndpoint: 'static {
 
     /// Whether `member` was admitted at bind and not forgotten since.
     fn admits(&self, member: CertificateFingerprint) -> bool;
+
+    /// Raises `contact` whenever `member`'s connection authenticates here.
+    fn watch_contact(&self, member: CertificateFingerprint, contact: PeerContact);
 
     async fn connect(
         &self,
@@ -629,6 +642,10 @@ impl PortEndpoint for GroupEndpoint {
         Self::admits(self, member)
     }
 
+    fn watch_contact(&self, member: CertificateFingerprint, contact: PeerContact) {
+        Self::watch_contact(self, member, contact);
+    }
+
     async fn connect(
         &self,
         member: CertificateFingerprint,
@@ -640,6 +657,7 @@ impl PortEndpoint for GroupEndpoint {
             session: paired.session,
             inspection: paired.inspection,
             cancel: paired.cancel,
+            heard: paired.heard,
         })
     }
 
@@ -976,6 +994,7 @@ async fn share<P: ShareHubPort>(
         }
     };
     let peer = request.peer;
+    endpoint.watch_contact(peer, request.contact.clone());
     let task = tokio::task::spawn_local(connect(Rc::clone(net), endpoint, request, reply));
     net.borrow_mut().member(peer).connects.push(task);
 }
@@ -1381,6 +1400,7 @@ async fn admit<P: ShareHubPort>(
         cancel: member.cancel,
         started,
         ended: receiver,
+        heard: member.heard,
     })
 }
 
@@ -1428,6 +1448,7 @@ async fn link<P: ShareHubPort>(
         }
     };
     let peer = request.peer;
+    endpoint.watch_contact(peer, request.contact.clone());
     let task = tokio::task::spawn_local(run_link(Rc::clone(net), endpoint, request, reply));
     net.borrow_mut().member(peer).links.push(task);
 }
@@ -1548,7 +1569,10 @@ mod tests {
     };
     use monhop_core::{DisplayId, Platform, Point};
     use monhop_protocol::{DisplayDescription, DisplayTopology};
-    use monhop_transport::session::{LinkClose, LinkStats};
+    use monhop_transport::{
+        session::{LinkClose, LinkStats},
+        session_setup::test_support::{authenticated, handed_out},
+    };
     use std::{
         collections::{BTreeSet, VecDeque},
         path::{Path, PathBuf},
@@ -1577,6 +1601,8 @@ mod tests {
     enum Answer {
         Accept(Box<InspectedPeer>),
         Refuse(SetupFailure),
+        /// The member's connection authenticates; its session setup goes on to the next answer.
+        Authenticate,
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -1609,6 +1635,8 @@ mod tests {
     struct FakeState {
         calls: Vec<Call>,
         answers: BTreeMap<String, VecDeque<Answer>>,
+        /// The contact each computer's connects raise, as the network thread last named it.
+        contacts: BTreeMap<String, PeerContact>,
         sessions: Vec<Live>,
         ends: Vec<(String, Result<(), SessionFailure>, LinkClose)>,
         next_hub: u64,
@@ -1628,6 +1656,16 @@ mod tests {
         /// The next endpoint dropped waits here, marking `dropping` first.
         drop_gate: Option<std::sync::mpsc::Receiver<()>>,
         dropping: bool,
+        /// The next attach waits here, marking `attaching` first: a session handed out that
+        /// sharing has not heard of yet, as one waiting for a hub to finish is.
+        attach_gate: Option<std::sync::mpsc::Receiver<()>>,
+        attaching: bool,
+    }
+
+    impl FakeState {
+        fn contact(&self, key: &str) -> PeerContact {
+            self.contacts.get(key).cloned().unwrap_or_default()
+        }
     }
 
     /// The transport as the network thread sees it, scripted by the test.
@@ -1669,6 +1707,14 @@ mod tests {
                 .entry(key(peer))
                 .or_default()
                 .push_back(answer);
+        }
+
+        /// Every answer given for `peer` was taken by a connect.
+        fn answered(&self, peer: char) -> bool {
+            self.state()
+                .answers
+                .get(&key(peer))
+                .is_none_or(VecDeque::is_empty)
         }
 
         /// The next connect with `peer` meets it showing exactly `record`'s entries.
@@ -1796,6 +1842,11 @@ mod tests {
         }
 
         fn attach(&self, _member: CertificateFingerprint, session: &FakeSession) -> FakeAttachment {
+            let gate = self.0.state().attach_gate.take();
+            if let Some(gate) = gate {
+                self.0.state().attaching = true;
+                let _ = gate.recv();
+            }
             self.0.call(Call::Attach(session.0.clone()));
             FakeAttachment {
                 fake: self.0.clone(),
@@ -1819,6 +1870,13 @@ mod tests {
             !self.excluded.contains(&fingerprint_key(&member.full_hex()))
         }
 
+        fn watch_contact(&self, member: CertificateFingerprint, contact: PeerContact) {
+            self.fake
+                .state()
+                .contacts
+                .insert(fingerprint_key(&member.full_hex()), contact);
+        }
+
         async fn connect(
             &self,
             member: CertificateFingerprint,
@@ -1831,22 +1889,38 @@ mod tests {
             if self.excluded.contains(&key) {
                 return Err(SetupFailure::NetworkRoute);
             }
+            let mut heard = None;
             loop {
-                let answer = self
-                    .fake
-                    .state()
-                    .answers
-                    .get_mut(&key)
-                    .and_then(VecDeque::pop_front);
+                let answer = {
+                    let mut state = self.fake.state();
+                    let answer = state.answers.get_mut(&key).and_then(VecDeque::pop_front);
+                    // Under the pop's lock, so a test that saw the answer taken sees its contact.
+                    match &answer {
+                        Some(Answer::Authenticate) => {
+                            heard = Some(authenticated(&state.contact(&key)));
+                        }
+                        // The transport hands out only connections that authenticated.
+                        Some(Answer::Accept(_)) if heard.is_none() => {
+                            heard = Some(authenticated(&state.contact(&key)));
+                        }
+                        Some(Answer::Refuse(_)) => heard = None,
+                        _ => {}
+                    }
+                    answer
+                };
                 match answer {
                     Some(Answer::Accept(inspection)) => {
+                        let mut heard = heard.expect("raised as the answer was taken");
+                        handed_out(&mut heard);
                         return Ok(PortMember {
                             session: FakeSession(key),
                             inspection: *inspection,
                             cancel: RevocationSignal::default(),
+                            heard,
                         });
                     }
                     Some(Answer::Refuse(failure)) => return Err(failure),
+                    Some(Answer::Authenticate) => {}
                     None if cancel.is_stopping() => return Err(SetupFailure::Cancelled),
                     None => tokio::time::sleep(Duration::from_millis(2)).await,
                 }
@@ -2224,6 +2298,7 @@ mod tests {
             peer: fingerprint(peer),
             cancel: RevocationSignal::default(),
             progress: SessionProgress::default(),
+            contact: PeerContact::default(),
         }
     }
 
@@ -2241,6 +2316,7 @@ mod tests {
             },
             events,
             commands,
+            contact: PeerContact::default(),
         }
     }
 
@@ -2906,6 +2982,99 @@ mod tests {
         assert_eq!(app.update_room(Duration::ZERO), UpdateRoom::Waiting);
         assert_eq!(app.update_room(away), UpdateRoom::Taken);
         finish(&app, &path);
+    }
+
+    #[test]
+    fn an_update_never_cuts_a_connection_that_authenticated_before_its_setup_finished() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let saved = preferences();
+        let record = crate::sharing_preferences::tests::group(&saved);
+        let path = setup_holding("update-contact", &record);
+        let fake = Fake::default();
+        let app = app(&fake, &path);
+        let away = Duration::from_secs(3);
+        supervise_until(&app, || fake.connects('B') == 1);
+        let contact = fake.state().contacts[&key('B')].clone();
+        eventually(|| app.update_room(away) == UpdateRoom::Waiting);
+
+        // Each attempt authenticates and then fails: this computer's display read, then the
+        // handshake.
+        let failures = [SetupFailure::Displays, SetupFailure::Handshake];
+        for (attempt, failure) in failures.into_iter().enumerate() {
+            fake.answer('B', Answer::Authenticate);
+            eventually(|| fake.answered('B'));
+            assert!(contact.last().is_some());
+            assert_eq!(peer_json(&app, 'B')["phase"], "starting");
+            assert_eq!(app.update_room(away), UpdateRoom::Taken);
+            assert!(!app.sharing.stop_if_only_waiting(away, NOT_CONNECTED));
+            assert!(app.begin_update(false, Some(away)).is_err());
+            assert!(app.sharing.worker_alive(fingerprint('B')));
+
+            // Nothing is coming up after the failure, so it waits as it did before the contact.
+            fake.answer('B', Answer::Refuse(failure));
+            eventually(|| fake.answered('B'));
+            assert_eq!(contact.last(), None);
+            assert_eq!(app.update_room(away), UpdateRoom::Waiting);
+            eventually(|| fake.connects('B') == attempt + 2);
+        }
+        assert!(app.sharing.stop_if_only_waiting(away, NOT_CONNECTED));
+        finish(&app, &path);
+    }
+
+    #[test]
+    fn an_update_never_cuts_a_session_handed_out_before_sharing_heard_of_it() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let saved = preferences();
+        let record = crate::sharing_preferences::tests::group(&saved);
+        let path = setup_holding("update-handed-out", &record);
+        let fake = Fake::default();
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        fake.state().attach_gate = Some(gate);
+        let app = app(&fake, &path);
+        let away = Duration::from_millis(300);
+        supervise_until(&app, || fake.connects('B') == 1);
+        fake.answer('B', Answer::Accept(Box::new(inspection(&saved))));
+
+        // The session is handed out, then held well past `away` before sharing hears of it.
+        eventually(|| fake.state().attaching);
+        std::thread::sleep(away * 2);
+        assert_eq!(peer_json(&app, 'B')["phase"], "starting");
+        assert!(!app.sharing.only_waiting(away));
+        assert!(!app.sharing.stop_if_only_waiting(away, NOT_CONNECTED));
+        drop(open);
+        supervise_until(&app, || sharing_with(&app, 'B'));
+        finish(&app, &path);
+    }
+
+    #[test]
+    fn an_update_never_cuts_a_setup_link_whose_connection_authenticated() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let saved = preferences();
+        let record = crate::sharing_preferences::tests::group(&saved);
+        let path = setup_holding("link-contact", &record);
+        let fake = Fake::default();
+        let sharing = SharingController::with_network(
+            crate::sharing::transport_link,
+            Duration::from_secs(600),
+            network_on(&fake),
+            local_screen,
+        );
+        sharing
+            .connect_link(path.clone(), INTERFACE.into(), fingerprint('B'))
+            .unwrap();
+        eventually(|| fake.state().contacts.contains_key(&key('B')));
+        let contact = fake.state().contacts[&key('B')].clone();
+        let away = Duration::from_secs(1);
+        eventually(|| sharing.only_waiting(away));
+
+        // The endpoint holds the link's authenticated connection; its handshake is not done.
+        let heard = authenticated(&contact);
+        assert!(!sharing.only_waiting(away));
+        assert!(!sharing.stop_if_only_waiting(away, NOT_CONNECTED));
+        drop(heard);
+        assert!(sharing.stop_if_only_waiting(away, NOT_CONNECTED));
+        eventually(|| sharing.shutdown_ready());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
