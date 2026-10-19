@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-10-18
+
 ### Added
 
 - The mouse's back and forward buttons and a two-finger swipe left or right step back and forward through what you selected in MonHop's window, such as from Settings back to a computer.
@@ -288,7 +290,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.11...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.12...HEAD
+[0.2.12]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.12
 [0.2.11]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.11
 [0.2.10]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.10
 [0.2.9]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.9
