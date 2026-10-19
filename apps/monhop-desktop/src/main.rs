@@ -174,10 +174,13 @@ async fn sharing_edit_begin(
 }
 
 #[tauri::command]
-async fn sharing_edit_end(app: tauri::AppHandle) -> Result<SharingView, String> {
+async fn sharing_edit_end(
+    app: tauri::AppHandle,
+    switch_off: Option<String>,
+) -> Result<SharingView, String> {
     let controller = app.state::<Arc<AppController>>().inner().clone();
     spawn_blocking_command(
-        move || controller.edit_end(),
+        move || controller.edit_end(switch_off.as_deref()),
         "Arranging did not end cleanly. Try again.",
     )
     .await?

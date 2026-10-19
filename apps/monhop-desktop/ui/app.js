@@ -99,6 +99,7 @@ import { activeStatus } from "./computer-status.mjs";
 import {
   clearForgetFor,
   keepForgetArmed,
+  isComputerEnabled,
   keepForgetListed,
   loadGate,
   pressForget,
@@ -220,6 +221,8 @@ let shownSelectionKey = null;
 let lastActive = null;
 // Arrange was pressed and the editor is on its way; the backend's own editing flag takes over.
 let arrangeRequested = false;
+// The computer Arrange switched on to open the link; leaving without applying switches it off again.
+let arrangeSwitchedOn = null;
 // Below the overlay width the details sheet can be closed; picking a row opens it again.
 let inspectorDismissed = false;
 // Which drawer above the Apply bar is open: "saved", "use" or none.
@@ -708,6 +711,8 @@ function render() {
   arrangementView = null;
   // The arrange request has done its job once the backend reports the edit.
   if (arrangeRequested && isEditingLayout(sharing)) arrangeRequested = false;
+  // An edit that ended any other way, an Apply included, keeps the computer switched on.
+  if (!arrangeRequested && !isEditingLayout(sharing)) arrangeSwitchedOn = null;
   lastActive = activeFingerprint() ?? lastActive;
   const ctx = context();
   const { studio } = ctx;
@@ -1094,6 +1099,8 @@ function arrangeWith(fingerprint) {
     });
   if (!target || !canEditLayout(sharing, state.selectedInterfaceId)) return;
   if (currentSelection().kind === "settings") chosen = computerSelection(target);
+  const enabled = resolveEnabledList(sharing.view, computers, activeFingerprint());
+  arrangeSwitchedOn = isComputerEnabled(target, enabled) ? null : target;
   arrangeRequested = true;
   canvasDrawer = null;
   render();
@@ -1102,10 +1109,12 @@ function arrangeWith(fingerprint) {
 
 // Done and Cancel both end the edit; what was applied stays applied.
 function leaveArrange() {
+  const switchedOn = arrangeSwitchedOn;
+  arrangeSwitchedOn = null;
   arrangeRequested = false;
   canvasDrawer = null;
   render();
-  void endLayoutEdit();
+  void endLayoutEdit(switchedOn);
 }
 
 function toggleCanvasDrawer(kind) {
@@ -1648,9 +1657,10 @@ async function beginLayoutEdit(fingerprint = activeFingerprint()) {
   await runSharing("edit", () => core.invoke("sharing_edit_begin", { interfaceId, fingerprint }));
 }
 
-async function endLayoutEdit() {
+// `switchOff` goes back off in the same backend step, so no session starts with it in between.
+async function endLayoutEdit(switchOff = null) {
   if (!isEditingLayout(sharing)) return;
-  await runSharing("edit-end", () => core.invoke("sharing_edit_end"));
+  await runSharing("edit-end", () => core.invoke("sharing_edit_end", { switchOff }));
 }
 
 // A display notice's way in: arranging with the computer in use.

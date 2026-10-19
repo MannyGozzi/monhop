@@ -529,15 +529,26 @@ impl AppController {
     }
 
     /// Ends arranging. The arranging link closes first, so the session, or a standing link when
-    /// no layout fits, follows within a tick rather than at once.
-    pub fn edit_end(&self) -> Result<SharingView, String> {
-        let view = {
+    /// no layout fits, follows within a tick rather than at once. `switch_off` is a computer that
+    /// arranging switched on; it goes back off before the nudge, so no session starts with it.
+    pub fn edit_end(&self, switch_off: Option<&str>) -> Result<SharingView, String> {
+        let (view, switched) = {
             let _lease = self.gate.begin()?;
             log::info!("user: ended arranging");
             *lock(&self.sharing_retry_after) = None;
-            self.sharing.end_editing()
+            let switched = switch_off
+                .map(|fingerprint| {
+                    let fingerprint = parse_fingerprint(fingerprint)?;
+                    log::info!("user: switched computer {} off", short(fingerprint));
+                    let path = self.setup_path()?;
+                    self.sharing.set_enabled(&path, fingerprint, false, None)
+                })
+                .transpose();
+            // Arranging ends even when the switch fails, so the window never stays in the editor.
+            (self.sharing.end_editing(), switched)
         };
         self.nudge();
+        switched?;
         Ok(view)
     }
 
@@ -2313,10 +2324,37 @@ mod tests {
                 .err(),
             Some("The setup folder could not be located.".to_owned())
         );
-        assert!(controller.edit_end().is_ok());
+        assert!(controller.edit_end(None).is_ok());
         controller.use_setup_path(std::env::temp_dir().join("monhop-lifecycle-unused.json"));
         controller.sharing.stop_with("Stopped.");
         assert!(controller.sharing.shutdown_ready());
+    }
+
+    #[test]
+    fn ending_arranging_switches_off_the_computer_it_switched_on() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let controller = AppController::default();
+        let path =
+            std::env::temp_dir().join(format!("monhop-edit-end-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        controller.use_setup_path(path.clone());
+        let peer = "B".repeat(64);
+        controller
+            .sharing
+            .set_enabled(&path, parse_fingerprint(&peer).unwrap(), true, None)
+            .unwrap();
+        assert_eq!(controller.load_setup(&path, "").unwrap().enabled().len(), 1);
+        assert!(controller.edit_end(Some(&peer)).is_ok());
+        assert!(
+            controller
+                .load_setup(&path, "")
+                .unwrap()
+                .enabled()
+                .is_empty()
+        );
+        assert!(controller.edit_end(Some("not a fingerprint")).is_err());
+        controller.sharing.stop_with("Stopped.");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
