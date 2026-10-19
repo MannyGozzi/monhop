@@ -1,1 +1,262 @@
 /* Studio canvas pane. Component rules only; shared tokens live in styles.css, pane tokens at the top here. */
+:root {
+  /* Display tiles are small screens: their computer's tone lit under a sheen, falling into shade at
+     the lower corner, inside a thin bezel with a light rim. */
+  --canvas-tile-tone: 74%;
+  --canvas-tile-tone-hover: 84%;
+  --canvas-tile-depth: oklch(.14 .02 262 / 74%);
+  --canvas-tile-sheen: oklch(1 0 0 / 17%);
+  --canvas-tile-clear: oklch(1 0 0 / 0%);
+  --canvas-tile-rim: oklch(1 0 0 / 14%);
+  --canvas-tile-offline: light-dark(oklch(.58 .006 255), oklch(.4 .006 262));
+  --canvas-tile-hatch: oklch(1 0 0 / 11%);
+  --canvas-offline-tag: .78;
+  --canvas-tile-shadow: drop-shadow(0 1px 1px light-dark(oklch(.3 .04 262 / 16%), oklch(0 0 0 / 40%))) drop-shadow(0 8px 10px light-dark(oklch(.28 .05 262 / 18%), oklch(0 0 0 / 46%)));
+  --canvas-tile-shadow-hover: drop-shadow(0 2px 2px light-dark(oklch(.3 .04 262 / 18%), oklch(0 0 0 / 42%))) drop-shadow(0 12px 14px light-dark(oklch(.28 .05 262 / 22%), oklch(0 0 0 / 52%)));
+  --canvas-tile-lift: drop-shadow(0 4px 4px light-dark(oklch(.3 .04 262 / 20%), oklch(0 0 0 / 45%))) drop-shadow(0 20px 22px light-dark(oklch(.28 .05 262 / 28%), oklch(0 0 0 / 60%)));
+  --canvas-tile-lift-y: -3px;
+  --canvas-quiet-opacity: .36;
+  --canvas-quiet-saturate: .2;
+  /* The crossing: the bezel's groove, a soft accent glow, and the lit edge itself. */
+  --canvas-seam-groove: 6px;
+  --canvas-seam-width: 3px;
+  --canvas-seam-glow-width: 7px;
+  --canvas-seam-glow-blur: 4px;
+  --canvas-seam-glow-opacity: .55;
+  --canvas-seam-off-opacity: .5;
+  --canvas-handle-stroke: 1px;
+  --canvas-handle-glyph: 2.4;
+  --canvas-handle-shadow: drop-shadow(0 3px 5px light-dark(oklch(.28 .05 262 / 26%), oklch(0 0 0 / 55%)));
+  --canvas-ruler-opacity: .55;
+  --canvas-dot-ring: 1.2px;
+  /* The place a computer still pairing will take: marching dashes on an accent wash. */
+  --canvas-slot-dash: 5px 4px;
+  --canvas-slot-travel: -9px;
+  --canvas-slot-loop: 1200ms;
+  --canvas-slot-stroke: 1.2px;
+  --canvas-keycap-height: 18px;
+  --canvas-banner-glyph: 28px;
+  --canvas-chevron-closed: -90deg;
+  --canvas-chevron-open: 90deg;
+  --canvas-swatch: 8px;
+  --canvas-card-y: 0px;
+}
+:root[data-theme="dark"] { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); } }
+
+/* The pane: banners on top, the stage filling the middle, and one dock at the bottom where the Apply
+   bar takes the status bar's place while arranging. */
+.canvas-pane { grid-template-rows: auto minmax(0, 1fr) auto; }
+.canvas-dock, .status-bar { grid-row: 3; grid-column: 1; align-self: end; }
+.canvas-dock { position: relative; z-index: 1; container: canvas-dock / inline-size; }
+.canvas-banners { container: canvas-banners / inline-size; }
+
+/* Every view fills the stage; the picture fits itself inside it. */
+.canvas-view:is([data-view="saved"], [data-view="empty"], [data-view="unarranged"], [data-view="waiting"], [data-view="blocked"]) { position: absolute; inset: 0; display: block; min-height: 0; padding: 0; }
+.canvas-stage > [data-exit="true"] { pointer-events: none; }
+.canvas-picture, .dashboard-arrangement-preview[data-size="canvas"] { position: absolute; inset: 0; display: block; margin: 0; }
+.dashboard-arrangement-preview[data-size="canvas"] .dashboard-arrangement-canvas { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.canvas-view > .dashboard-arrangement-preview[data-state="unavailable"] { position: absolute; top: 50%; left: 50%; width: min(calc(100% - var(--gap-8)), var(--canvas-card-width)); translate: -50% -50%; border-radius: var(--radius-card); padding: var(--gap-4) var(--gap-5); background: var(--panel); box-shadow: var(--shadow-panel); }
+.arrangement-scene { transform-box: view-box; transform-origin: 0 0; }
+.dashboard-arrangement-canvas .arrangement-display { transform-box: fill-box; transform-origin: 0 0; }
+
+/* Display tiles */
+.arrangement-group { color: var(--display-local); filter: var(--canvas-tile-shadow); transition: transform var(--motion-spring) var(--ease-spring), opacity var(--motion-slow) var(--ease-out), filter var(--motion-slow) var(--ease-out); }
+.arrangement-group[data-quiet="true"] { opacity: var(--canvas-quiet-opacity); filter: saturate(var(--canvas-quiet-saturate)) var(--canvas-tile-shadow); }
+.arrangement-display-bezel { fill: var(--tile-bezel); stroke: var(--canvas-tile-rim); stroke-width: var(--hairline-width); transition: stroke var(--motion-fast) var(--ease-out); }
+.arrangement-display-screen { fill: color-mix(in oklab, currentColor var(--canvas-tile-tone), var(--tile-shade)); transition: fill var(--motion-slow) var(--ease-out); }
+.arrangement-display-depth, .arrangement-display-sheen { pointer-events: none; }
+.arrangement-display-hatch { opacity: 0; pointer-events: none; transition: opacity var(--motion-slow) var(--ease-out); }
+.arrangement-paint-clear { stop-color: var(--canvas-tile-clear); }
+.arrangement-paint-depth { stop-color: var(--canvas-tile-depth); }
+.arrangement-paint-sheen { stop-color: var(--canvas-tile-sheen); }
+.arrangement-paint-hatch { fill: var(--canvas-tile-hatch); }
+.arrangement-group[data-state="offline"] .arrangement-display-screen { fill: var(--canvas-tile-offline); }
+.arrangement-group[data-state="offline"] .arrangement-display-hatch { opacity: 1; }
+.arrangement-display-name { fill: var(--tile-text); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); pointer-events: none; }
+.arrangement-display-size, .arrangement-display-offline { font-family: var(--font-mono); font-weight: var(--weight-medium); font-variant-numeric: tabular-nums; pointer-events: none; }
+.arrangement-display-size { fill: var(--tile-meta); }
+.arrangement-display-offline { fill: var(--tile-text); opacity: 0; transition: opacity var(--motion-base) var(--ease-out); }
+.arrangement-group[data-state="offline"] .arrangement-display-offline { opacity: var(--canvas-offline-tag); }
+.arrangement-display-primary { fill: var(--tile-text); }
+.arrangement-display-shared { color: var(--tile-meta); stroke-width: var(--icon-stroke-bold); pointer-events: none; }
+
+/* Group labels: the computer's name, its state dot and its state in words. */
+.arrangement-group-label-text { fill: var(--foreground); font-size: var(--tile-label-text); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); }
+.arrangement-group-label-status { fill: var(--subtle-foreground); font-weight: var(--weight-regular); letter-spacing: 0; }
+.arrangement-group-label-plate { fill: var(--panel); }
+.arrangement-group-label-dot { fill: var(--subtle-foreground); stroke: transparent; stroke-width: var(--canvas-dot-ring); transition: fill var(--motion-base) var(--ease-out), stroke var(--motion-base) var(--ease-out); }
+.arrangement-group-label-dot[data-tone="neutral"] { fill: transparent; stroke: var(--subtle-foreground); }
+.arrangement-group-label-dot:is([data-tone="connected"], [data-tone="active"]) { fill: var(--success); }
+.arrangement-group-label-dot:is([data-tone="checking"], [data-tone="syncing"], [data-tone="stopping"]) { fill: var(--warning); }
+.arrangement-group-label-dot[data-tone="error"] { fill: var(--destructive); }
+
+/* The crossing glows in the accent with a handle at its middle; it goes grey with an offline computer. */
+.arrangement-seam-underlay { stroke: var(--tile-bezel); stroke-linecap: round; stroke-width: var(--canvas-seam-groove); }
+.arrangement-seam-glow { stroke: var(--primary); stroke-linecap: round; stroke-width: var(--canvas-seam-glow-width); opacity: var(--canvas-seam-glow-opacity); filter: blur(var(--canvas-seam-glow-blur)); transition: opacity var(--motion-base) var(--ease-out); }
+.arrangement-seam { stroke: var(--primary); stroke-linecap: round; stroke-width: var(--canvas-seam-width); filter: none; transition: stroke var(--motion-base) var(--ease-out), opacity var(--motion-base) var(--ease-out); }
+.arrangement-seam-run[data-tone="off"] .arrangement-seam { stroke: var(--subtle-foreground); opacity: var(--canvas-seam-off-opacity); }
+.arrangement-seam-run[data-tone="off"] .arrangement-seam-glow { opacity: 0; }
+.arrangement-seams.is-preview .arrangement-seam-glow { opacity: 0; }
+.arrangement-seam-handle { filter: var(--canvas-handle-shadow); }
+.arrangement-seam-handle circle { fill: var(--solid); stroke: var(--primary); stroke-width: var(--canvas-handle-stroke); transition: stroke var(--motion-base) var(--ease-out); }
+.arrangement-seam-glyph { fill: none; stroke: var(--primary); stroke-linecap: round; stroke-linejoin: round; stroke-width: var(--canvas-handle-glyph); transition: stroke var(--motion-base) var(--ease-out); }
+.arrangement-seam-handle[data-tone="off"] circle { stroke: var(--hairline-strong); }
+.arrangement-seam-handle[data-tone="off"] .arrangement-seam-glyph { stroke: var(--subtle-foreground); }
+
+/* The quiet ruler under the arrangement. */
+.arrangement-ruler-line { stroke: var(--subtle-foreground); stroke-width: var(--hairline-width); opacity: var(--canvas-ruler-opacity); }
+.arrangement-ruler-text { fill: var(--subtle-foreground); font-family: var(--font-mono); font-size: var(--tile-meta-text); font-weight: var(--weight-medium); font-variant-numeric: tabular-nums; }
+
+/* The slot a computer still pairing will take. */
+.arrangement-slot-frame { fill: color-mix(in oklab, var(--primary) var(--mix-faint), transparent); stroke: var(--primary); stroke-dasharray: var(--canvas-slot-dash); stroke-width: var(--canvas-slot-stroke); }
+.arrangement-slot-plus { fill: none; stroke: var(--primary); stroke-linecap: round; stroke-width: var(--canvas-slot-stroke); }
+.arrangement-slot-title { fill: var(--primary); font-weight: var(--weight-semibold); }
+.arrangement-slot-detail { fill: var(--subtle-foreground); }
+@media (prefers-reduced-motion: no-preference) {
+  .arrangement-slot-frame { animation: canvas-slot-march var(--canvas-slot-loop) linear var(--canvas-slot-phase, 0ms) infinite; }
+}
+@keyframes canvas-slot-march { to { stroke-dashoffset: var(--canvas-slot-travel); } }
+
+/* The legend: a compact, quiet strip at the bottom left of the stage. */
+.arrangement-legend { flex-wrap: nowrap; justify-content: flex-start; gap: var(--gap-4); overflow: hidden; color: var(--subtle-foreground); font-size: var(--text-xs); white-space: nowrap; pointer-events: none; }
+.dashboard-arrangement-preview[data-size="canvas"] > .arrangement-legend, .arrangement-stage > .arrangement-legend { position: absolute; right: var(--gap-4); bottom: var(--gap-3); left: var(--gap-4); display: flex; }
+.arrangement-legend-item { flex: none; }
+.arrangement-legend-item:is([data-kind="caption"], [data-kind="hint"]) { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.arrangement-legend-item[data-kind="hint"] { order: -1; color: var(--muted-foreground); }
+.canvas-view:has(.canvas-card) .arrangement-legend { display: none; }
+.arrangement-legend-item[data-kind="caption"] { order: 1; }
+.arrangement-legend-item:is([data-kind="caption"], [data-kind="hint"]) > span { overflow: hidden; text-overflow: ellipsis; }
+.arrangement-legend-item[data-kind="primary"] .arrangement-legend-swatch { width: var(--dot-size); height: var(--dot-size); background: var(--muted-foreground); }
+.arrangement-legend-item[data-kind="seam"] .arrangement-legend-swatch { height: var(--canvas-seam-width); border-radius: var(--radius-pill); box-shadow: 0 0 var(--canvas-seam-glow-blur) color-mix(in oklab, var(--primary) var(--mix-glow-strong), transparent); }
+.arrangement-legend-item[data-kind="shared"] .arrangement-legend-swatch { color: var(--muted-foreground); }
+@container canvas-stage (max-width: 520px) { .arrangement-legend-item:is([data-kind="primary"], [data-kind="shared"], [data-kind="seam"]) { display: none; } }
+.canvas-stage { container: canvas-stage / size; }
+
+/* A note that the arrangement just applied, floating at the top of the stage. */
+.canvas-toast { position: absolute; top: var(--gap-3); left: 50%; display: inline-flex; align-items: center; gap: var(--gap-2); max-width: calc(100% - var(--gap-8)); margin: 0; border-radius: var(--radius-pill); padding: var(--gap-1) var(--gap-3) var(--gap-1) var(--gap-1); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-chip); color: var(--muted-foreground); font-size: var(--text-sm); white-space: nowrap; translate: -50% 0; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-spring) var(--ease-spring), visibility 0s linear 0s; }
+.canvas-toast > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.canvas-toast > span:last-child:empty { display: none; }
+.canvas-toast[data-shown="false"] { opacity: 0; transform: translateY(calc(var(--motion-rise) * -2)); visibility: hidden; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-base) var(--ease-out), visibility 0s linear var(--motion-base); }
+
+/* The card under a picture that says what comes next; alone, it sits in the middle of the stage. */
+.canvas-card { position: absolute; top: 0; left: 50%; width: min(calc(100% - var(--gap-8)), var(--canvas-card-width)); translate: -50% var(--canvas-card-y); transition: translate var(--motion-slow) var(--ease-out); }
+.canvas-view:is([data-picture="false"], [data-view="blocked"]) .canvas-card { top: 50%; translate: -50% -50%; }
+.canvas-card > .canvas-placeholder { max-width: none; border-radius: var(--radius-card); padding: var(--gap-5) var(--gap-6); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-panel); }
+.canvas-card > .canvas-placeholder p { text-wrap: pretty; }
+.canvas-card > .canvas-placeholder .add-glyph { width: var(--icon-size-sm); height: var(--icon-size-sm); }
+.canvas-card > .state-card { width: 100%; padding: var(--gap-4); }
+
+/* Banners: one refined card each at the top of the canvas, tone glyph, title, a line of body and the
+   actions at the right. They glide in and out (accordion.mjs presence). */
+.canvas-banners .banner { display: grid; grid-template-columns: var(--canvas-banner-glyph) minmax(0, 1fr) auto; align-items: center; gap: var(--gap-1) var(--gap-3); padding: var(--gap-3); }
+.canvas-banners .banner-glyph { display: grid; width: var(--canvas-banner-glyph); height: var(--canvas-banner-glyph); place-items: center; border-radius: var(--radius); background: color-mix(in oklab, var(--tone) var(--mix-tint), transparent); }
+.canvas-banners .banner-glyph svg { width: var(--icon-size); height: var(--icon-size); }
+.canvas-banners .banner-copy strong { overflow: hidden; font-size: var(--text-base); letter-spacing: var(--tracking-title); text-overflow: ellipsis; white-space: nowrap; }
+.canvas-banners .banner-copy p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.canvas-banners .banner-copy:not(:has(strong)) p { color: var(--foreground); }
+.canvas-banners .banner-actions { flex-wrap: nowrap; gap: var(--gap-1); margin-left: 0; }
+@container canvas-banners (max-width: 480px) {
+  .canvas-banners .banner { grid-template-columns: var(--canvas-banner-glyph) minmax(0, 1fr); align-items: start; }
+  .canvas-banners .banner-actions { grid-column: 2; flex-wrap: wrap; }
+  .canvas-banners .banner-copy p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; white-space: normal; }
+}
+
+/* The Apply bar: a glass bar docked at the bottom. Its state and the way out on top, the tools under. */
+.apply-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "status actions" "tools tools"; align-items: center; gap: var(--gap-2) var(--gap-3); padding: var(--gap-2) var(--gap-2) var(--gap-2) var(--gap-4); }
+.apply-bar-status { grid-area: status; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--gap-half); min-width: 0; }
+.apply-bar-status > * { min-width: 0; }
+.apply-bar-actions { grid-area: actions; flex-wrap: nowrap; justify-content: flex-end; margin-left: 0; }
+.apply-bar-tools { grid-area: tools; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--gap-1) var(--gap-3); margin: 0 calc(var(--gap-2) * -1) 0 calc(var(--gap-4) * -1); border-top: var(--hairline-width) solid var(--hairline); padding: var(--gap-2) var(--gap-2) 0 var(--gap-2); }
+.apply-bar-tools:not(:has(button)) { display: none; }
+.apply-bar:not(:has(.apply-bar-tools button)) { grid-template-areas: "status actions"; }
+.apply-bar-drawers, .apply-bar-tools .arrangement-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap-1); }
+.apply-bar-tools .arrangement-control { background: transparent; box-shadow: none; color: var(--foreground); font-weight: var(--weight-medium); }
+.apply-bar-tools .arrangement-control:hover:not(:disabled) { background: var(--surface-hover); }
+.apply-bar-tools .arrangement-control.is-current:not(:disabled) { color: var(--subtle-foreground); }
+.apply-bar-drawer-toggle.button { font-weight: var(--weight-medium); }
+.apply-bar-chevron { color: var(--subtle-foreground); transform: rotate(var(--canvas-chevron-closed)); }
+.apply-bar-drawer-toggle[aria-expanded="true"] .apply-bar-chevron { transform: rotate(var(--canvas-chevron-open)); }
+@media (prefers-reduced-motion: no-preference) {
+  .apply-bar-chevron[data-enter="true"] { animation: canvas-chevron-close var(--motion-spring) var(--ease-spring) var(--motion-delay, 0ms) both; }
+  .apply-bar-drawer-toggle[aria-expanded="true"] .apply-bar-chevron[data-enter="true"] { animation-name: canvas-chevron-open; }
+}
+@keyframes canvas-chevron-open { from { transform: rotate(var(--canvas-chevron-closed)); } }
+@keyframes canvas-chevron-close { from { transform: rotate(var(--canvas-chevron-open)); } }
+.apply-bar-status .progress-line { min-height: var(--control-height-sm); color: var(--muted-foreground); }
+.apply-bar-status .progress-line[data-tone="busy"] { color: var(--foreground); }
+.apply-bar-status .progress-line[data-tone="busy"] .spinner { color: var(--primary); }
+.apply-bar-status .progress-line[data-tone="danger"] { flex-wrap: nowrap; }
+.apply-bar-status .progress-line > :is(.badge, .button, .spinner) { flex: none; }
+.apply-bar-status .progress-line > .progress-line-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@container canvas-dock (max-width: 600px) {
+  .apply-bar:has(.apply-bar-status [data-tone="danger"]) { grid-template-columns: minmax(0, 1fr); grid-template-areas: "status" "actions" "tools"; }
+}
+@container canvas-dock (max-width: 460px) {
+  .apply-bar { grid-template-columns: minmax(0, 1fr); grid-template-areas: "status" "actions" "tools"; }
+  .apply-bar:not(:has(.apply-bar-tools button)) { grid-template-areas: "status" "actions"; }
+}
+
+/* The drawers above the bar glide open (presence) and scroll inside. */
+.canvas-drawer { gap: var(--gap-3); padding: var(--gap-3) var(--gap-4) var(--gap-4); }
+.canvas-drawer-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--gap-half) var(--gap-2); }
+.canvas-drawer-heading strong, .canvas-drawer .arrangement-use-heading > span:first-child { font-size: var(--text-base); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); }
+.canvas-drawer-heading span { color: var(--muted-foreground); font-size: var(--text-sm); }
+
+/* The status bar: the overall state on the left, the emergency stop as keys on the right. */
+.status-bar { flex-wrap: nowrap; gap: var(--gap-4); padding: var(--gap-2) var(--gap-3) var(--gap-2) var(--gap-4); container: status-bar / inline-size; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear 0s; }
+.canvas-pane:is([data-mode="edit"], [data-mode="waiting"]) .status-bar { opacity: 0; transform: translateY(var(--motion-slide)); visibility: hidden; pointer-events: none; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-base) var(--ease-out), visibility 0s linear var(--motion-base); }
+.status-bar-state { flex: 1 1 auto; }
+.status-bar-text { display: flex; gap: var(--gap-2); }
+.status-bar-label { flex: none; }
+.status-bar-detail { min-width: 0; overflow: hidden; color: var(--muted-foreground); font-weight: var(--weight-regular); text-overflow: ellipsis; }
+.status-bar-detail:empty { display: none; }
+.status-bar-escape { flex: none; color: var(--subtle-foreground); font-size: var(--text-xs); white-space: nowrap; cursor: default; }
+.status-bar-keys { display: inline-flex; align-items: center; gap: var(--gap-2); }
+.status-bar-keys .keycaps { flex-wrap: nowrap; }
+.status-bar-keys .keycap { min-width: var(--canvas-keycap-height); height: var(--canvas-keycap-height); padding: 0 var(--gap-1); background: var(--solid); color: var(--muted-foreground); }
+.status-bar-escape-short { display: none; }
+@container status-bar (max-width: 480px) {
+  .status-bar-detail { display: none; }
+  .status-bar-escape-long { display: none; }
+  .status-bar-escape-short { display: inline; }
+}
+
+/* Arrange mode: the editor fills the canvas under a tidy header, a quiet line under the title. */
+.canvas-view .arrangement-editor { grid-template-rows: auto minmax(var(--stage-min-height), 1fr) auto; }
+.arrangement-editor > .arrangement-stage { margin-top: var(--gap-1); }
+.arrangement-heading { display: grid; gap: var(--gap-half); min-width: 0; padding: var(--gap-2) var(--gap-2) 0; }
+.arrangement-heading h3 { font-size: var(--text-md); letter-spacing: var(--tracking-title); }
+.arrangement-status { overflow: hidden; color: var(--muted-foreground); text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.arrangement-stage { position: relative; }
+.arrangement-stage > .arrangement-legend { bottom: var(--gap-2); }
+.arrangement-stage .arrangement-display { transform-box: fill-box; transform-origin: center; transition: transform var(--motion-spring) var(--ease-spring); }
+.arrangement-group[tabindex]:hover { filter: var(--canvas-tile-shadow-hover); }
+.arrangement-group[tabindex]:hover .arrangement-display-screen { fill: color-mix(in oklab, currentColor var(--canvas-tile-tone-hover), var(--tile-shade)); }
+.arrangement-group:focus-visible .arrangement-display-bezel { stroke: var(--primary); stroke-width: var(--stroke-bold); }
+/* Dragging, the group lifts off the desk: a deeper shadow, the tiles raised and a touch larger. */
+.arrangement-group.is-dragging { opacity: 1; filter: var(--canvas-tile-lift); }
+.arrangement-stage .arrangement-group.is-dragging .arrangement-display { transform: translateY(var(--canvas-tile-lift-y)) scale(var(--scale-drag)); }
+.arrangement-stage[data-drop="none"] .is-dragging .arrangement-display-bezel { stroke: var(--destructive); stroke-width: var(--stroke-bold); }
+.arrangement-drop-outline rect { fill: color-mix(in oklab, var(--primary) var(--mix-faint), transparent); stroke: var(--primary); stroke-dasharray: var(--canvas-slot-dash); stroke-width: var(--canvas-slot-stroke); }
+@media (prefers-reduced-motion: no-preference) {
+  .arrangement-group[data-motion="enter"] .arrangement-display { animation: tile-in var(--motion-slow) var(--ease-out) both; }
+  .arrangement-group[data-motion="leave"] .arrangement-display { animation: tile-out var(--motion-base) var(--ease-out) both; }
+}
+
+/* The monitor cabled to both computers: which one it shows, as a segmented control whose thumb glides. */
+.arrangement-editor > .glide-panel > .arrangement-shared { padding-top: var(--gap-2); }
+.arrangement-shared-item { border-radius: var(--radius-card); padding: var(--gap-2) var(--gap-2) var(--gap-2) var(--gap-4); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-panel); }
+.arrangement-shared-copy { display: inline-flex; align-items: center; gap: var(--gap-1); white-space: nowrap; }
+.arrangement-shared-glyph { flex: none; color: var(--subtle-foreground); }
+.arrangement-shared .segmented { position: relative; isolation: isolate; background: var(--surface-inset); box-shadow: inset 0 0 0 var(--hairline-width) var(--hairline-strong); }
+.segmented-thumb { position: absolute; z-index: -1; top: var(--gap-half); bottom: var(--gap-half); left: var(--gap-half); width: calc((100% - var(--gap-half) * (var(--segment-count, 2) + 1)) / var(--segment-count, 2)); border-radius: var(--radius-sm); background: var(--solid); box-shadow: var(--shadow-chip); transform: translateX(calc(var(--segment-index, 0) * (100% + var(--gap-half)))); transition: transform var(--motion-spring) var(--ease-spring); }
+.arrangement-shared .segmented-option { display: inline-flex; align-items: center; justify-content: center; gap: var(--gap-2); }
+.arrangement-shared .segmented-option[aria-checked="true"] { background: transparent; box-shadow: none; }
+.segmented-swatch { --tone: var(--display-local); flex: none; width: var(--canvas-swatch); height: var(--canvas-swatch); border-radius: var(--radius-swatch); background: color-mix(in oklab, var(--tone) var(--canvas-tile-tone), var(--tile-shade)); box-shadow: inset 0 0 0 var(--hairline-width) var(--tile-bezel); }
+.segmented-option[data-tone="peer"] .segmented-swatch { --tone: var(--display-peer); }
+.segmented-option[data-tone="peer-2"] .segmented-swatch { --tone: var(--display-peer-2); }
+.segmented-option[data-tone="peer-3"] .segmented-swatch { --tone: var(--display-peer-3); }
+.segmented-option[data-tone="peer-4"] .segmented-swatch { --tone: var(--display-peer-4); }
+.segmented-option[data-tone="peer-5"] .segmented-swatch { --tone: var(--display-peer-5); }
+.segmented-option[data-tone="peer-6"] .segmented-swatch { --tone: var(--display-peer-6); }

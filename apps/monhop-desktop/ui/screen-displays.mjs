@@ -20,55 +20,74 @@ import {
   sharedMonitorChoices,
 } from "./sharing-model.mjs";
 import { createArrangementView } from "./arrangement-view.mjs";
-import { displaysFreshness, newestFirst, resolveEnabledList } from "./computer-card-model.mjs";
+import { newestFirst, resolveEnabledList } from "./computer-card-model.mjs";
 import { layoutChipStrip } from "./computer-card.mjs";
 import { presence } from "./accordion.mjs";
-import { createDashboardArrangement } from "./dashboard-arrangement.mjs";
+import { createDashboardArrangement, createLocalPicture } from "./dashboard-arrangement.mjs";
 import { canInstall, installHint } from "./updates-model.mjs";
 import {
   badge,
   button,
   clear,
+  copyAnimation,
   el,
   icon,
+  motionEase,
+  motionEnabled,
+  motionMs,
+  motionToken,
   note,
   row,
   rows,
   setLabel,
+  sinceChanged,
   stableLabel,
   stateCard,
-  swap,
 } from "./dom.mjs";
+
+// The picture's motion runs on the same tokens and helpers as every other UI motion.
+const MOTION = {
+  enabled: motionEnabled,
+  ms: motionMs,
+  ease: motionEase,
+  copy: copyAnimation,
+  token: motionToken,
+};
+// A computer in these states cannot be reached, so its displays are drawn offline.
+const OFFLINE_KEYS = new Set(["error", "attention"]);
+// A first guess at the height of the card under a picture, corrected once the card is laid out.
+const CARD_ESTIMATE = 148;
+const SLOT_COPY = { title: "New computer", detail: "Its displays appear here" };
+const ESCAPE_SENTENCE =
+  "Hold both Control keys and Esc for 2 seconds to take your keyboard and mouse back.";
+
+// The view on the canvas, kept across renders so its state changes transition in place; it is
+// replaced, cross-fading, only when what it shows changes.
+let shown = null;
+let stageObserver = null;
+let escapePlatform = null;
 
 // The canvas: its banners, the arrangement (read only, or the live editor while arranging), the
 // Apply bar and the status bar.
 export function renderCanvas(nodes, ctx) {
+  watchStage(nodes.canvasStage);
   renderBanners(nodes.canvasBanners, ctx);
   const mode = canvasMode(ctx);
   nodes.canvasPane.dataset.mode = mode;
-  let mounted = null;
-  let content;
-  if (mode === "edit") {
-    const built = editorContent(ctx);
-    content = built.element;
-    mounted = built.mounted;
-  } else {
-    releaseEditor();
-    content =
-      { saved: savedContent, waiting: waitingContent, unarranged: unarrangedContent }[mode]?.(
-        ctx,
-      ) ?? emptyContent(ctx);
+  if (mode !== "edit") releaseEditor();
+  const signature = viewSignature(mode, ctx);
+  if (shown?.signature === signature && shown.element.isConnected) shown.update(ctx);
+  else {
+    const view = buildView(mode, ctx, stageSize(nodes.canvasStage));
+    showView(nodes.canvasStage, { ...view, signature });
+    view.mounted?.();
   }
-  clear(nodes.canvasStage);
-  nodes.canvasStage.append(swap("canvas-stage", content, mode, { block: true }));
   clear(nodes.canvasDock);
   const drawer = presence("canvas-drawer", mode === "edit" ? drawerContent(ctx) : null);
   if (drawer) nodes.canvasDock.append(drawer);
   const bar = presence("apply-bar", ctx.arrange.active ? applyBar(ctx, mode) : null);
   if (bar) nodes.canvasDock.append(bar);
   renderStatusBar(nodes, ctx);
-  // The editor is fed its new state only once it is back in the document, so a moved group animates there.
-  mounted?.();
 }
 
 function canvasMode(ctx) {
@@ -82,6 +101,76 @@ function canvasMode(ctx) {
 function hasEditableArrangement(sharing) {
   const arrangement = arrangementForSharing(sharing);
   return Boolean(arrangement?.groups?.local && arrangement.groups?.peer);
+}
+
+// Each computer's picture is its own view, so moving between computers cross-fades.
+function viewSignature(mode, ctx) {
+  const fingerprint = ctx.studio.canvasComputer?.fingerprint ?? "";
+  if (mode === "waiting") return `${mode}:${isConnected(ctx.sharing)}`;
+  return mode === "saved" || mode === "unarranged" ? `${mode}:${fingerprint}` : mode;
+}
+
+function buildView(mode, ctx, stage) {
+  if (mode === "edit") return editView(ctx);
+  if (mode === "saved") return savedView(ctx, stage);
+  if (mode === "waiting") return waitingView(ctx, stage);
+  if (mode === "unarranged") return unarrangedView(ctx, stage);
+  return emptyView(ctx, stage);
+}
+
+function stageSize(node) {
+  return { width: node.clientWidth, height: node.clientHeight };
+}
+
+// One observer for the life of the window: the canvas refits its picture whenever its own box
+// changes, whether the window, a banner or the inspector moved it.
+function watchStage(stage) {
+  if (stageObserver || typeof ResizeObserver !== "function") return;
+  stageObserver = new ResizeObserver(() => shown?.refit?.(stageSize(stage)));
+  stageObserver.observe(stage);
+}
+
+// The outgoing view fades where it stands while the new one rises in; a view replaced mid-fade
+// leaves from the opacity it had reached.
+function showView(stage, view) {
+  const leaving = shown?.element?.isConnected ? shown.element : null;
+  if (leaving) {
+    const opacity = Number(getComputedStyle(leaving).opacity);
+    for (const animation of leaving.getAnimations()) animation.cancel();
+    leaving.dataset.exit = "true";
+    leaving.inert = true;
+    leaving.setAttribute("aria-hidden", "true");
+    for (const node of [leaving, ...leaving.querySelectorAll("[id], [data-focus-key]")]) {
+      node.removeAttribute("id");
+      delete node.dataset.focusKey;
+    }
+    if (motionEnabled() && opacity > 0)
+      leaving
+        .animate([{ opacity }, { opacity: 0 }], {
+          duration: motionMs("--motion-fast"),
+          easing: motionEase(),
+          fill: "forwards",
+        })
+        .finished.then(
+          () => leaving.remove(),
+          () => leaving.remove(),
+        );
+    else leaving.remove();
+  }
+  for (const stale of stage.querySelectorAll(":scope > :not([data-exit='true'])")) stale.remove();
+  stage.append(view.element);
+  shown = view;
+  if (leaving && motionEnabled())
+    view.element.animate(
+      [
+        {
+          opacity: 0,
+          transform: `translateY(${motionToken("--motion-rise")}) scale(${motionToken("--scale-sheet")})`,
+        },
+        { opacity: 1, transform: "none" },
+      ],
+      { duration: motionMs("--motion-base"), easing: motionEase() },
+    );
 }
 
 // --- banners ------------------------------------------------------------------
@@ -116,7 +205,7 @@ export function banner({ tone, iconName, title, body, actions = [], id }) {
         className: "banner-copy",
         children: [
           title ? el("strong", { text: title }) : null,
-          body ? el("p", { text: body }) : null,
+          body ? el("p", { text: body, attrs: { title: body } }) : null,
         ],
       }),
       actions.length ? el("div", { className: "banner-actions", children: actions }) : null,
@@ -127,17 +216,17 @@ export function banner({ tone, iconName, title, body, actions = [], id }) {
 // A computer switched on that cannot connect says so above the canvas, with a way to retry or let go.
 function attentionBanners(ctx) {
   const { computers, sharing, active, actions, busy } = ctx;
-  const local = platformLabel(ctx.state.snapshot?.platform ?? ctx.platform, true);
+  const local = localName(ctx);
   const enabled = resolveEnabledList(sharing.view, computers, active);
   const known = new Set(enabled);
-  const shown = [];
+  const shownBanners = [];
   for (const computer of computers.items) {
     const key = `canvas-attention-${computer.fingerprint}`;
     const status = known.has(computer.fingerprint)
       ? computerStatus(computer, sharing.view, active, local)
       : null;
-    const attention = status && ["error", "attention"].includes(status.key);
-    shown.push([
+    const attention = status && OFFLINE_KEYS.has(status.key);
+    shownBanners.push([
       key,
       attention
         ? banner({
@@ -146,6 +235,13 @@ function attentionBanners(ctx) {
             title: `${displayName(computer)}: ${status.label}`,
             body: status.detail,
             actions: [
+              button("Pause", {
+                variant: "ghost",
+                size: "sm",
+                disabled: busy,
+                focusKey: `${key}-pause`,
+                onClick: () => actions.setComputerEnabled(computer.fingerprint, false),
+              }),
               button("Try again", {
                 variant: "secondary",
                 size: "sm",
@@ -154,19 +250,12 @@ function attentionBanners(ctx) {
                 focusKey: `${key}-retry`,
                 onClick: () => actions.setComputerEnabled(computer.fingerprint, true),
               }),
-              button("Pause", {
-                variant: "ghost",
-                size: "sm",
-                disabled: busy,
-                focusKey: `${key}-pause`,
-                onClick: () => actions.setComputerEnabled(computer.fingerprint, false),
-              }),
             ],
           })
         : null,
     ]);
   }
-  return shown;
+  return shownBanners;
 }
 
 // Only the computer in use has displays to rearrange, so the notice needs one to point at. A notice
@@ -184,18 +273,18 @@ function displayNoticeBanner(ctx) {
     title: copy.title,
     body: copy.body,
     actions: [
-      button(copy.primaryLabel, {
-        size: "sm",
-        disabled: busy,
-        focusKey: "canvas-display-notice-arrange",
-        onClick: actions.changeLayout,
-      }),
       button(copy.secondaryLabel, {
         variant: "ghost",
         size: "sm",
         disabled: busy,
         focusKey: "canvas-display-notice-dismiss",
         onClick: actions.dismissDisplayNotice,
+      }),
+      button(copy.primaryLabel, {
+        size: "sm",
+        disabled: busy,
+        focusKey: "canvas-display-notice-arrange",
+        onClick: actions.changeLayout,
       }),
     ],
   });
@@ -224,116 +313,151 @@ function updateReadyBanner({ updates, actions }) {
   });
 }
 
-// --- the arrangement ------------------------------------------------------------
+// --- the read-only views ----------------------------------------------------------
 
-function savedContent(ctx) {
-  const { studio, sharing, status, peerName } = ctx;
-  const computer = studio.canvasComputer;
-  const localPlatform = ctx.state.snapshot?.platform ?? ctx.platform;
-  const applied = hasAppliedLayout(sharing) && !isSessionStatus(status);
-  return el("div", {
-    className: "canvas-view",
-    dataset: { view: "saved" },
-    children: [
-      createDashboardArrangement(computer.setup, {
-        local: platformLabel(localPlatform, true),
-        peer: displayName(computer),
-        localPlatform,
-        peerPlatform: computer.platform,
+function localPlatformOf(ctx) {
+  return ctx.state.snapshot?.platform ?? ctx.platform;
+}
+
+function localName(ctx) {
+  return platformLabel(localPlatformOf(ctx), true);
+}
+
+// The sidebar's own words for this computer, so its label never disagrees with its row.
+function localStatus(ctx) {
+  const local = ctx.studio.rows.find((entry) => entry.kind === "local");
+  return local ? { label: local.label, tone: local.tone } : null;
+}
+
+function peerStatus(ctx, computer) {
+  const status = computerStatus(computer, ctx.sharing.view, ctx.active, localName(ctx));
+  return { label: status.label, tone: status.tone, offline: OFFLINE_KEYS.has(status.key) };
+}
+
+// A pairing on screen draws the place the new computer will take, and quiets the others.
+function pairingLive(ctx) {
+  return ctx.studio.selection.kind === "new" || ctx.pairing?.view?.phase === "showing";
+}
+
+function savedView(ctx, stage) {
+  const computer = ctx.studio.canvasComputer;
+  const element = el("div", { className: "canvas-view", dataset: { view: "saved" } });
+  const toast = el("p", {
+    className: "canvas-toast",
+    attrs: { role: "status" },
+    children: [badge("Applied on both computers", "success", "check"), el("span")],
+  });
+  let setupKey = null;
+  let picture = null;
+  const pictureNames = (context) => ({
+    local: localName(context),
+    peer: displayName(computer),
+    localPlatform: localPlatformOf(context),
+    peerPlatform: computer.platform,
+    statuses: { local: localStatus(context), peer: peerStatus(context, computer) },
+    quiet: pairingLive(context) ? ["peer"] : [],
+    slot: pairingLive(context) ? SLOT_COPY : null,
+  });
+  function update(context) {
+    const current = findComputer(context.computers, computer.fingerprint) ?? computer;
+    const key = JSON.stringify(current.setup ?? null);
+    const names = pictureNames(context);
+    if (key !== setupKey || !picture?.update) {
+      setupKey = key;
+      const next = createDashboardArrangement(current.setup, {
+        ...names,
         motionKey: `canvas-${computer.fingerprint}-layout`,
-        compactLegend: true,
-        caption: displaysFreshness(computer.setup),
-      }),
-      applied
-        ? note(`Applied on both computers. Sharing with ${peerName} starts in a moment.`, "success")
-        : null,
-    ],
+        stage: stageSize(element.parentElement ?? element),
+        motion: MOTION,
+      });
+      if (picture) picture.element.replaceWith(next.element);
+      else element.prepend(next.element);
+      picture = next;
+    } else picture.update(names);
+    const applied = hasAppliedLayout(context.sharing) && !isSessionStatus(context.status);
+    toast.lastElementChild.textContent = applied
+      ? `Sharing with ${context.peerName} starts in a moment.`
+      : "";
+    toast.dataset.shown = String(applied);
+  }
+  setupKey = JSON.stringify(computer.setup ?? null);
+  picture = createDashboardArrangement(computer.setup, {
+    ...pictureNames(ctx),
+    motionKey: `canvas-${computer.fingerprint}-layout`,
+    stage,
+    motion: MOTION,
   });
+  element.append(picture.element, toast);
+  update(ctx);
+  return { element, update, refit: (size) => picture?.refit(size) };
 }
 
-function unarrangedContent(ctx) {
-  const { studio, actions, busy } = ctx;
-  const computer = studio.canvasComputer;
-  return placeholder({
-    title: "Not arranged yet",
-    body: `Place ${displayName(computer)}'s displays next to this computer's, so the pointer crosses where you expect.`,
-    actions: [
-      button("Arrange displays", {
-        iconName: "monitor",
-        disabled: busy || !studio.canArrange,
-        focusKey: "canvas-arrange",
-        onClick: () => actions.arrangeWith(computer.fingerprint),
-      }),
-    ],
+// A canvas without an arrangement draws this computer's own displays above a card that says what
+// comes next. `card(context)` builds that card; `slot(context)` names the place still empty.
+function pictureView(ctx, stage, { view, card, slot }) {
+  const host = el("div", { className: "canvas-picture" });
+  const element = el("div", { className: "canvas-view", dataset: { view }, children: [host] });
+  let cardHeight = CARD_ESTIMATE;
+  const pictureNames = (context) => ({
+    local: localName(context),
+    localPlatform: localPlatformOf(context),
+    statuses: { local: localStatus(context) },
+    slot: slot(context),
+    card: cardHeight,
   });
-}
-
-// Arranging needs the link with the other computer; until it is up the canvas says what it waits for.
-function waitingContent(ctx) {
-  const { sharing, status } = ctx;
-  if (isConnected(sharing))
-    return placeholder({
-      title: "The displays cannot be arranged yet",
-      body: arrangementForSharing(sharing)?.message || "Reconnect every computer, then try again.",
-    });
-  return el("div", {
-    className: "canvas-view",
-    dataset: { view: "waiting" },
-    children: [
-      stateCard({
-        id: "canvas-waiting",
-        tone: status.tone === "error" ? "error" : "checking",
-        iconName: "triangle-alert",
-        title: status.key === "connected" ? "Opening the arrangement" : status.label,
-        detail: status.detail,
-      }),
-    ],
-  });
-}
-
-// With nothing paired the canvas shows this computer's own displays, as the last check reported them.
-function emptyContent(ctx) {
-  const displays = ctx.state.snapshot?.displays ?? [];
-  const local = platformLabel(ctx.state.snapshot?.platform ?? ctx.platform, true);
-  const widest = Math.max(1, ...displays.map((display) => display.width));
-  return el("div", {
-    className: "canvas-view",
-    dataset: { view: "empty" },
-    children: [
-      displays.length
-        ? el("div", {
-            className: "local-displays",
-            attrs: { role: "img", "aria-label": `${local}'s displays` },
-            children: displays.map((display) => localDisplay(display, widest)),
-          })
-        : null,
-      placeholder({
-        title: displays.length ? `${local}'s displays` : "No computer paired yet",
-        body: "Add a computer, then place its displays next to these so the pointer crosses where you expect.",
-        actions: [
-          button("Add a computer", {
-            disabled: ctx.busy,
-            focusKey: "canvas-add-computer",
-            onClick: () => ctx.actions.select("new"),
-          }),
-        ],
-      }),
-    ],
-  });
-}
-
-function localDisplay(display, widest) {
-  const tile = el("div", {
-    className: "local-display",
-    dataset: { primary: String(display.primary) },
-    children: [
-      el("strong", { text: display.name || "Display" }),
-      el("span", { text: `${display.width} × ${display.height}` }),
-    ],
-  });
-  tile.style.setProperty("--display-share", String(display.width / widest));
-  tile.style.setProperty("--display-ratio", `${display.width} / ${Math.max(1, display.height)}`);
-  return tile;
+  let displaysKey = null;
+  let picture = null;
+  let cardKey = null;
+  let cardNode = null;
+  // The card sits under the picture, where the picture's fit puts it, and glides with it.
+  function placeCard() {
+    const top = picture?.cardTop();
+    if (top !== null && top !== undefined) element.style.setProperty("--canvas-card-y", `${top}px`);
+  }
+  function measureCard({ still = false } = {}) {
+    const height = cardNode?.isConnected ? cardNode.offsetHeight : 0;
+    if (height > 0 && Math.abs(height - cardHeight) >= 1) {
+      cardHeight = height;
+      picture?.setCard(height, { still });
+    }
+    placeCard();
+  }
+  function update(context, size = null) {
+    const reported = context.state.snapshot?.displays ?? [];
+    const key = JSON.stringify(reported);
+    const names = pictureNames(context);
+    if (key !== displaysKey) {
+      displaysKey = key;
+      picture = createLocalPicture(reported, {
+        ...names,
+        motionKey: `canvas-${view}-local`,
+        stage: size ?? stageSize(element.parentElement ?? element),
+        motion: MOTION,
+      });
+      host.replaceChildren(...(picture ? [picture.element] : []));
+      element.dataset.picture = String(Boolean(picture));
+    } else picture?.update(names);
+    const built = card(context);
+    if (built.key !== cardKey) {
+      cardKey = built.key;
+      const next = el("div", { className: "canvas-card", children: [built.node] });
+      if (cardNode) cardNode.replaceWith(next);
+      else element.append(next);
+      cardNode = next;
+      measureCard();
+    } else built.refresh?.(cardNode.firstElementChild);
+    placeCard();
+  }
+  update(ctx, stage);
+  return {
+    element,
+    update,
+    mounted: () => measureCard({ still: true }),
+    refit: (size) => {
+      picture?.refit(size);
+      placeCard();
+    },
+  };
 }
 
 function placeholder({ title, body, actions = [] }) {
@@ -347,19 +471,141 @@ function placeholder({ title, body, actions = [] }) {
   });
 }
 
+// With nothing paired the canvas shows this computer's own displays, as the last check reported them.
+function emptyView(ctx, stage) {
+  return pictureView(ctx, stage, {
+    view: "empty",
+    slot: (context) => (pairingLive(context) ? SLOT_COPY : null),
+    card: (context) => {
+      const local = localName(context);
+      const known = Boolean(context.state.snapshot?.displays?.length);
+      const pairing = pairingLive(context);
+      const title = known ? `${local}'s displays` : "No computer paired yet";
+      if (pairing)
+        return {
+          key: `pairing:${title}`,
+          node: placeholder({
+            title,
+            body: "The new computer's displays appear beside these once it pairs.",
+          }),
+        };
+      const add = button("Add a computer", {
+        disabled: context.busy,
+        focusKey: "canvas-add-computer",
+        onClick: () => context.actions.select("new"),
+      });
+      add.prepend(el("span", { className: "add-glyph", attrs: { "aria-hidden": "true" } }));
+      return {
+        key: `add:${title}`,
+        node: placeholder({
+          title,
+          body: "Add a computer, then place its displays next to these so the pointer crosses where you expect.",
+          actions: [add],
+        }),
+        refresh: (node) => {
+          const control = node.querySelector('[data-focus-key="canvas-add-computer"]');
+          if (control) control.disabled = context.busy;
+        },
+      };
+    },
+  });
+}
+
+function unarrangedView(ctx, stage) {
+  const computer = ctx.studio.canvasComputer;
+  return pictureView(ctx, stage, {
+    view: "unarranged",
+    slot: () => ({ title: displayName(computer), detail: "Not placed yet" }),
+    card: (context) => {
+      const arrange = button("Arrange displays", {
+        iconName: "monitor",
+        disabled: context.busy || !context.studio.canArrange,
+        focusKey: "canvas-arrange",
+        onClick: () => context.actions.arrangeWith(computer.fingerprint),
+      });
+      return {
+        key: "unarranged",
+        node: placeholder({
+          title: "Not arranged yet",
+          body: `Place ${displayName(computer)}'s displays next to this computer's, so the pointer crosses where you expect.`,
+          actions: [arrange],
+        }),
+        refresh: (node) => {
+          const control = node.querySelector('[data-focus-key="canvas-arrange"]');
+          if (control) control.disabled = context.busy || !context.studio.canArrange;
+        },
+      };
+    },
+  });
+}
+
+// Arranging needs the link with the other computer; until it is up the canvas says what it waits for.
+function waitingView(ctx, stage) {
+  if (isConnected(ctx.sharing)) {
+    const element = el("div", {
+      className: "canvas-view",
+      dataset: { view: "blocked" },
+      children: [
+        el("div", {
+          className: "canvas-card",
+          children: [
+            placeholder({
+              title: "The displays cannot be arranged yet",
+              body:
+                arrangementForSharing(ctx.sharing)?.message ||
+                "Reconnect every computer, then try again.",
+            }),
+          ],
+        }),
+      ],
+    });
+    return { element, update() {} };
+  }
+  return pictureView(ctx, stage, {
+    view: "waiting",
+    slot: (context) => ({ title: context.peerName, detail: "Its displays appear once connected" }),
+    card: (context) => {
+      const { status } = context;
+      const tone = status.tone === "error" ? "error" : "checking";
+      const title = status.key === "connected" ? "Opening the arrangement" : status.label;
+      return {
+        key: `${tone}|${title}|${status.detail}`,
+        node: stateCard({
+          id: "canvas-waiting",
+          tone,
+          iconName: "triangle-alert",
+          title,
+          detail: status.detail,
+        }),
+      };
+    },
+  });
+}
+
 // --- arranging ----------------------------------------------------------------
 
-function editorContent(ctx) {
-  const reset = resetControl(ctx);
-  const arrangement = arrangementForSharing(ctx.sharing);
-  const editor = liveEditor(ctx, reset, arrangement);
+function editView(ctx) {
+  const element = el("div", { className: "canvas-view", dataset: { view: "edit" } });
+  let mountedEditor = null;
+  function update(context) {
+    const editor = liveEditor(context);
+    if (mountedEditor !== editor.element) {
+      element.replaceChildren(editor.element);
+      mountedEditor = editor.element;
+    }
+    // The editor is fed its new state only once it is in the document, so a moved group animates there.
+    editor.mounted();
+  }
+  let first = liveEditor(ctx);
+  element.append(first.element);
+  mountedEditor = first.element;
   return {
-    element: el("div", {
-      className: "canvas-view",
-      dataset: { view: "edit" },
-      children: [editor.element],
-    }),
-    mounted: editor.mounted,
+    element,
+    update,
+    mounted: () => {
+      first?.mounted();
+      first = null;
+    },
   };
 }
 
@@ -379,8 +625,8 @@ function resetControl({ sharing, actions, busy }) {
   };
 }
 
-// Apply, leave, and the editor's own Reset and Fit, with the saved arrangements and the displays in
-// use a press away in the drawer above.
+// Apply and the way out, the editor's own Reset and Fit, and the saved arrangements and the
+// displays in use a press away in the drawer above.
 function applyBar(ctx, mode) {
   const { sharing, actions, busy, arrange, canvasDrawer } = ctx;
   const applying = sharing.pending?.kind === "apply" || isSyncing(sharing);
@@ -400,14 +646,22 @@ function applyBar(ctx, mode) {
       el("div", {
         className: "apply-bar-status",
         children: [
-          editing ? syncStatus(ctx) : note(ctx.status.detail),
+          editing
+            ? syncStatus(ctx)
+            : el("p", {
+                className: "progress-line",
+                text: "Apply turns on once both computers connect.",
+              }),
           sharing.message && editing ? note(sharing.message, "danger") : null,
         ],
       }),
       // The tools wrap as one group and the way out as another, so Apply never strays from Done.
       el("div", {
         className: "apply-bar-tools",
-        children: [...toggles, editing ? live?.controls : null],
+        children: [
+          el("div", { className: "apply-bar-drawers", children: toggles }),
+          editing ? live?.controls : null,
+        ],
       }),
       el("div", {
         className: "apply-bar-actions",
@@ -433,13 +687,26 @@ function applyBar(ctx, mode) {
     ],
   });
   function drawerToggle(context, kind, label) {
-    return button(label, {
+    const open = canvasDrawer === kind;
+    const toggle = button(label, {
       variant: "ghost",
       size: "sm",
-      pressed: canvasDrawer === kind,
+      pressed: open,
       focusKey: `apply-bar-${kind}`,
       onClick: () => context.actions.toggleCanvasDrawer(kind),
     });
+    toggle.classList.add("apply-bar-drawer-toggle");
+    toggle.setAttribute("aria-expanded", String(open));
+    const chevron = icon("chevron-right", 12);
+    chevron.classList.add("apply-bar-chevron");
+    // The toggle is rebuilt on every poll, so the chevron's turn carries on from when it was pressed.
+    const elapsed = sinceChanged(`apply-bar-${kind}-open`, open);
+    if (elapsed < motionMs("--motion-spring")) {
+      chevron.dataset.enter = "true";
+      chevron.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+    }
+    toggle.append(chevron);
+    return toggle;
   }
 }
 
@@ -453,7 +720,16 @@ function drawerContent(ctx) {
     return el("div", {
       className: "canvas-drawer",
       dataset: { kind: "saved" },
-      children: arrangementsContent(ctx),
+      children: [
+        el("div", {
+          className: "canvas-drawer-heading",
+          children: [
+            el("strong", { text: "Saved arrangements" }),
+            el("span", { text: "Load one, or save the arrangement above under a name." }),
+          ],
+        }),
+        ...arrangementsContent(ctx),
+      ],
     });
   if (ctx.canvasDrawer === "use" && live?.usePanel)
     return el("div", {
@@ -464,15 +740,51 @@ function drawerContent(ctx) {
   return null;
 }
 
+// The overall state on the left, and the way to take input back, drawn as the keys to hold.
 function renderStatusBar(nodes, ctx) {
   const { status } = ctx;
   nodes.statusBarDot.dataset.tone = status.tone;
-  setLabel(
-    nodes.statusBarText,
-    status.detail && status.detail !== status.label
-      ? `${status.label} · ${status.detail}`
-      : status.label,
+  const text = nodes.statusBarText;
+  if (!text.querySelector(".status-bar-label")) {
+    text.replaceChildren(
+      el("span", { className: "status-bar-label" }),
+      el("span", { className: "status-bar-detail" }),
+    );
+  }
+  const detail = status.detail && status.detail !== status.label ? status.detail : "";
+  setLabel(text.querySelector(".status-bar-label"), status.label);
+  setLabel(text.querySelector(".status-bar-detail"), detail);
+  text.title = detail ? `${status.label} · ${detail}` : status.label;
+  renderEscape(nodes.statusBarText.closest(".status-bar"), ctx.platform);
+}
+
+function renderEscape(bar, platform) {
+  const escape = bar?.querySelector(".status-bar-escape");
+  if (!escape || escapePlatform === platform) return;
+  escapePlatform = platform;
+  const windows = platform === "windows";
+  const control = windows ? "Ctrl" : "⌃";
+  escape.title = ESCAPE_SENTENCE;
+  escape.replaceChildren(
+    el("span", { className: "visually-hidden", text: ESCAPE_SENTENCE }),
+    el("span", {
+      className: "status-bar-keys",
+      attrs: { "aria-hidden": "true" },
+      children: [
+        el("span", { text: "Hold" }),
+        el("span", {
+          className: "keycaps",
+          children: [keycap(control), keycap(control), keycap(windows ? "Esc" : "esc")],
+        }),
+        el("span", { className: "status-bar-escape-long", text: "for 2 s to take input back" }),
+        el("span", { className: "status-bar-escape-short", text: "for 2 s" }),
+      ],
+    }),
   );
+}
+
+function keycap(label) {
+  return el("kbd", { className: "keycap", text: label });
 }
 
 // The app rebuilds this screen on every status poll; keeping the editor alive keeps a drag alive with it.
@@ -490,7 +802,7 @@ function liveOptions(ctx) {
     return {
       localPlatform: view.localPlatform,
       peerPlatform: view.peerPlatform,
-      localLabel: `${platformLabel(view.localPlatform)} · This computer`,
+      localLabel: platformLabel(view.localPlatform, true),
       peerLabel: ctx.peerName,
     };
   return { members: memberOptions(group, computers, ctx) };
@@ -506,7 +818,7 @@ function memberOptions(group, computers, ctx) {
       key: memberKey,
       platform: member.platform,
       label: member.local
-        ? `${platformLabel(member.platform)} · This computer`
+        ? platformLabel(member.platform, true)
         : memberLabel(member, computers, ctx),
     };
   });
@@ -517,8 +829,17 @@ function memberLabel(member, computers, ctx) {
   return computer ? displayName(computer) : ctx.peerName;
 }
 
-function liveEditor(ctx, reset, arrangement) {
+// Every member is on the link while arranging, so each label's dot shows the same live state.
+function labelTones(ctx, options) {
+  const tone = ctx.status.tone;
+  const keys = options.members?.map((member) => member.key) ?? ["local", "peer"];
+  return Object.fromEntries(keys.map((key) => [key, { tone }]));
+}
+
+function liveEditor(ctx) {
   const { sharing, actions, busy } = ctx;
+  const reset = resetControl(ctx);
+  const arrangement = arrangementForSharing(sharing);
   const setup = liveOptions(ctx);
   const key = JSON.stringify(setup);
   const handlers = {
@@ -529,6 +850,7 @@ function liveEditor(ctx, reset, arrangement) {
   };
   const shared = sharedMonitorChoices(sharing);
   const inUse = displayUseChoices(sharing);
+  const labelDetails = labelTones(ctx, setup);
   if (live?.key !== key) {
     releaseEditor();
     const view = createArrangementView({
@@ -537,6 +859,7 @@ function liveEditor(ctx, reset, arrangement) {
       arrangement,
       shared,
       inUse,
+      labelDetails,
       disabled: busy,
       canReset: reset.enabled,
       resetHint: reset.hint,
@@ -566,6 +889,7 @@ function liveEditor(ctx, reset, arrangement) {
         arrangement,
         shared,
         inUse,
+        labelDetails,
         disabled: busy,
         canReset: reset.enabled,
         resetHint: reset.hint,
@@ -584,37 +908,41 @@ function syncStatus(ctx) {
   const { sharing, actions, busy } = ctx;
   const sync = sharing.view?.sync ?? { state: "idle", message: "" };
   const line = el("div", { className: "progress-line" });
-  if (sharing.pending?.kind === "apply" || sync.state === "sending")
+  if (sharing.pending?.kind === "apply" || sync.state === "sending") {
+    line.dataset.tone = "busy";
     line.append(
       el("span", { className: "spinner" }),
       el("span", { text: "Applying on both computers…" }),
     );
-  else if (sync.state === "receiving")
+  } else if (sync.state === "receiving") {
+    line.dataset.tone = "busy";
     line.append(
       el("span", { className: "spinner" }),
       el("span", { text: `Receiving a layout from ${ctx.peerName}…` }),
     );
-  else if (hasAppliedCurrentLayout(sharing))
+  } else if (hasAppliedCurrentLayout(sharing)) {
+    line.dataset.tone = "success";
     line.append(badge("Applied on both computers", "success", "check"));
-  else if (sync.state === "applied")
+  } else if (sync.state === "applied")
     line.append(
       el("span", { text: "You changed the layout. Apply again to update both computers." }),
     );
-  else if (sync.state === "rejected")
+  else if (sync.state === "rejected") {
+    line.dataset.tone = "danger";
+    const reason = sync.message || "The other computer could not use this layout.";
     line.append(
       badge("Not applied", "danger"),
-      el("span", { text: sync.message || "The other computer could not use this layout." }),
+      el("span", { className: "progress-line-text", text: reason, attrs: { title: reason } }),
       button("Try again", {
         variant: "ghost",
         size: "sm",
+        iconName: "refresh-cw",
         disabled: !canApplySetup(sharing) || busy,
+        focusKey: "apply-bar-retry",
         onClick: actions.applySetup,
       }),
     );
-  else
-    line.append(
-      el("span", { text: "Apply sends this layout to both computers. They save the same layout." }),
-    );
+  } else line.append(el("span", { text: "Apply saves this layout on both computers." }));
   return line;
 }
 

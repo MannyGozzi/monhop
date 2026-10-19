@@ -12,6 +12,8 @@ import {
 } from "./arrangement-model.mjs";
 import {
   COARSE_NUDGE_PIXELS,
+  MAX_DISPLAY_EXTENT,
+  cappedFit,
   NUDGE_PIXELS,
   groupAriaText,
   membersFromOptions,
@@ -260,4 +262,16 @@ test("nudgeTarget: an unrecognized key or non-finite scale yields no target", ()
     nudgeTarget(groups, geometry.placement, { group: "peer" }, "ArrowUp", false, 0),
     null,
   );
+});
+
+test("a fit never draws a display larger than the cap, and stays centred", () => {
+  const insets = { top: 10, right: 10, bottom: 10, left: 10 };
+  const small = [{ id: "a", x: 0, y: 0, width: 2560, height: 1440 }];
+  const roomy = { width: 2000, height: 1600 };
+  const fit = cappedFit(small, roomy, insets);
+  assert.equal(fit.scale, MAX_DISPLAY_EXTENT / 2560);
+  assert.equal(fit.originX + (2560 * fit.scale) / 2, roomy.width / 2);
+  assert.equal(fit.originY + (1440 * fit.scale) / 2, roomy.height / 2);
+  const tight = { width: 300, height: 200 };
+  assert.deepEqual(cappedFit(small, tight, insets), fitTransform(small, tight, insets));
 });

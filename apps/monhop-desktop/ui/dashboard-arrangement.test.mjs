@@ -3,10 +3,19 @@ import test from "node:test";
 
 import { placementOffset } from "./arrangement-model.mjs";
 import {
+  CANVAS_MARGIN,
   arrangementMotion,
+  canvasInsets,
+  carryTransform,
+  composeWithCard,
   dashboardCaption,
-  DRAWN_DISPLAYS_NOTE,
+  DRAWN_DISPLAYS_CAPTION,
+  extentLabel,
+  flipFrom,
+  localDisplayTiles,
+  restingCarry,
   savedDashboardArrangement,
+  slotTile,
 } from "./dashboard-arrangement.mjs";
 
 function threeSetup() {
@@ -255,7 +264,7 @@ test("a layout with no crossing yet still draws both computers' displays, just u
   assert.deepEqual(result.tiles.map((tile) => tile.id).toSorted(), ["1", "2"]);
   // The caption says what is missing rather than warning that the saved details need a review.
   assert.equal(dashboardCaption(result), "No crossing yet. Arrange the displays to connect them.");
-  assert.equal(dashboardCaption(savedDashboardArrangement(setup())), DRAWN_DISPLAYS_NOTE);
+  assert.equal(dashboardCaption(savedDashboardArrangement(setup())), DRAWN_DISPLAYS_CAPTION);
 });
 
 test("a redrawn viewport knows which displays moved, and which ones are new on screen", () => {
@@ -386,4 +395,98 @@ test("motion is tracked per display, so a three-member viewport knows which memb
   const motion = arrangementMotion(before, after);
   assert.deepEqual(Object.keys(motion.moved), ["2"]);
   assert.deepEqual(motion.entered, ["4"]);
+});
+
+test("canvas insets grow with the stage and keep half of it for the picture", () => {
+  const small = canvasInsets({ width: 400, height: 300 });
+  assert.deepEqual(small, {
+    top: CANVAS_MARGIN.top,
+    right: CANVAS_MARGIN.side,
+    bottom: CANVAS_MARGIN.bottom,
+    left: CANVAS_MARGIN.side,
+  });
+  const large = canvasInsets({ width: 2000, height: 1000 });
+  assert.equal(large.left, 2000 * CANVAS_MARGIN.share);
+  assert.equal(large.top, 1000 * CANVAS_MARGIN.share);
+  assert.equal(
+    canvasInsets({ width: 400, height: 300 }, { ruler: true }).bottom,
+    CANVAS_MARGIN.bottom + CANVAS_MARGIN.ruler,
+  );
+  assert.equal(
+    canvasInsets({ width: 400, height: 300 }, { reserve: 900 }).bottom,
+    CANVAS_MARGIN.bottom + 150,
+  );
+});
+
+test("this computer's displays stand side by side on one baseline", () => {
+  const tiles = localDisplayTiles([
+    { name: "Built-in", width: 1728, height: 1117, primary: true },
+    { name: "", width: 2560, height: 1440 },
+    { name: "Broken", width: 0, height: 900 },
+  ]);
+  assert.deepEqual(
+    tiles.map((tile) => [tile.id, tile.name, tile.x, tile.y, tile.primary, tile.group]),
+    [
+      ["local-0", "Built-in", 0, 1440 - 1117, true, "local"],
+      ["local-1", "Display", 1728 + 2560 * 0.06, 0, false, "local"],
+    ],
+  );
+  assert.deepEqual(localDisplayTiles(null), []);
+});
+
+test("the pairing slot sits right of the arrangement, bottom aligned, at the average width", () => {
+  const tiles = [
+    { id: "a", x: 0, y: 0, width: 2000, height: 1000 },
+    { id: "b", x: 2000, y: 200, width: 1000, height: 800 },
+  ];
+  const slot = slotTile(tiles);
+  assert.equal(slot.width, 1500);
+  assert.equal(slot.height, 1500 * (10 / 16));
+  assert.equal(slot.x, 3000 + 1500 * 0.2);
+  assert.equal(slot.y + slot.height, 1000);
+  assert.equal(slotTile([]).id, "slot");
+});
+
+test("the ruler reads the whole arrangement's size", () => {
+  assert.equal(
+    extentLabel([
+      { x: 0, y: 0, width: 2560, height: 1440 },
+      { x: 2560, y: 300, width: 1920, height: 1080 },
+    ]),
+    "4480 × 1440",
+  );
+  assert.equal(extentLabel([]), "");
+});
+
+test("a refit carries the picture from where it was drawn", () => {
+  const from = { scale: 0.1, originX: 40, originY: 60 };
+  assert.ok(restingCarry(carryTransform({ scale: 1, x: 0, y: 0 }, from, from)));
+  const to = { scale: 0.05, originX: 20, originY: 30 };
+  const carry = carryTransform({ scale: 1, x: 0, y: 0 }, from, to);
+  assert.equal(carry.scale, 2);
+  // A display at desktop (100, 100) was drawn at (50, 70); under the carry it starts there again.
+  assert.equal(carry.scale * (to.originX + 100 * to.scale) + carry.x, 50);
+  assert.equal(carry.scale * (to.originY + 100 * to.scale) + carry.y, 70);
+  assert.ok(!restingCarry(carry));
+});
+
+test("a moved display starts from the inverse of its move", () => {
+  assert.deepEqual(
+    flipFrom({ x: 10, y: 20, width: 100, height: 50 }, { x: 30, y: 10, width: 50, height: 50 }),
+    { x: -20, y: 10, scaleX: 2, scaleY: 1 },
+  );
+});
+
+test("a picture and its card are centred as one block", () => {
+  const fit = { scale: 0.1, originX: 0, originY: 0 };
+  const extent = { x: 0, y: 40, width: 300, height: 100 };
+  const { fit: moved, cardTop } = composeWithCard(fit, extent, { width: 600, height: 600 }, 150);
+  // The block is a 24 px label band, the 100 px picture, a 28 px gap and the 150 px card.
+  const start = (600 - (24 + 100 + 28 + 150)) / 2;
+  assert.equal(moved.originY, start + 24 - 40);
+  assert.equal(cardTop, Math.round(start + 24 + 100 + 28));
+  assert.deepEqual(composeWithCard(fit, extent, { width: 600, height: 600 }, 0), {
+    fit,
+    cardTop: null,
+  });
 });

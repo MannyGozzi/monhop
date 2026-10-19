@@ -1,35 +1,61 @@
 import {
-  VIEW_INSETS,
   arrangementGeometry,
   chainPlacement,
   computerGroups,
   drawnDisplaysAcross,
-  fitTransform,
+  formatSize,
   groupRects,
   hiddenDisplaysAcross,
   hiddenFromLayout,
   monitorKey,
   placementFromLayout,
+  sameTransform,
   sharedMonitorsAcross,
   tileRects,
 } from "./arrangement-model.mjs";
 import {
+  createGroupLabelNode,
   createGroupNode,
   createLegend,
+  createRulerNode,
   createSeamLayer,
+  tileMarks,
+  createSlotNode,
+  createTilePaint,
   labelBoxes,
   refineText,
   svgNode,
 } from "./arrangement-render.mjs";
+import { cappedFit } from "./arrangement-view-model.mjs";
 import { normalizeStoredLayout } from "./sharing-model.mjs";
 
 const MAX_U64 = "18446744073709551615";
 const MAX_COORDINATE = 20_000_000;
-const VIEW = { width: 640, height: 150 };
-const PREVIEW_INSETS = VIEW_INSETS;
 const STALE = "Saved arrangement details need a fresh review.";
 // Below this a move is a rounding difference, not a rearrangement worth animating.
 const MOVE_EPSILON = 0.5;
+// The room the canvas keeps around its picture: a label band above, the ruler and the legend strip
+// below, and air at the sides. Each grows with the canvas past its floor.
+export const CANVAS_MARGIN = Object.freeze({
+  top: 52,
+  side: 40,
+  bottom: 48,
+  ruler: 34,
+  share: 0.09,
+});
+// Labels may reach past the picture's margin, never past these.
+const LABEL_INSETS = Object.freeze({ top: 0, right: 12, bottom: 0, left: 12 });
+const RULER_GAP = 18;
+// A card under a picture: the label band above the picture, the gap down to the card, and the
+// least room kept above the label.
+const COMPOSE = Object.freeze({ label: 24, gap: 28, edge: 16 });
+const MIN_STAGE = { width: 240, height: 160 };
+// A lone computer's displays sit side by side with this much of the widest one between them, so
+// they read as one computer's screens without claiming an arrangement nobody made.
+const LOCAL_GAP = 0.06;
+// The slot for a computer still pairing: a typical display of the arrangement, 16:10, beside it.
+const SLOT_ASPECT = 10 / 16;
+const SLOT_GAP = 0.2;
 // Where each viewport last drew each display, so the next drawing can start from there.
 const lastDrawn = new Map();
 
@@ -131,11 +157,13 @@ export function savedDashboardArrangement(setup) {
 // missing instead of warning that the details need a review.
 export function dashboardCaption(arrangement) {
   if (arrangement?.noCrossingYet) return "No crossing yet. Arrange the displays to connect them.";
-  return DRAWN_DISPLAYS_NOTE;
+  return DRAWN_DISPLAYS_CAPTION;
 }
 
 // The diagram follows this computer's displays live and the other computer's as last reported.
 export const DRAWN_DISPLAYS_NOTE = "Displays as each computer last reported them.";
+// The same, short enough for the legend strip under the picture.
+export const DRAWN_DISPLAYS_CAPTION = "Sizes as each computer last reported";
 
 // What changed between two drawings of one viewport: how far each display moved, as the inverse
 // translate a FLIP transition starts from, and which displays are on screen for the first time.
@@ -154,141 +182,575 @@ export function arrangementMotion(previous, current) {
   return { moved, entered };
 }
 
-function motionEnabled() {
-  return !matchMedia("(prefers-reduced-motion: reduce)").matches && !document.hidden;
+// --- fitting the canvas ------------------------------------------------------
+
+// The picture's margins for a canvas of `stage`'s size. `reserve` is room a card below the picture
+// takes; it never takes more than half the canvas, so the picture always keeps some.
+export function canvasInsets(stage, { reserve = 0, ruler = false } = {}) {
+  const side = Math.max(CANVAS_MARGIN.side, stage.width * CANVAS_MARGIN.share);
+  const top = Math.max(CANVAS_MARGIN.top, stage.height * CANVAS_MARGIN.share);
+  const bottom =
+    Math.max(CANVAS_MARGIN.bottom, stage.height * CANVAS_MARGIN.share) +
+    (ruler ? CANVAS_MARGIN.ruler : 0) +
+    Math.min(Math.max(0, reserve), stage.height / 2);
+  return { top, right: side, bottom, left: side };
 }
 
-// The drawing is rebuilt from nothing every render, so a display that moved is placed where it
-// belongs and then offset back to where it was; clearing the offset a frame later slides it over.
-// A display that vanished left with its node, so only arrivals are faded.
-function playMotion(svg, motion) {
-  const started = [];
-  for (const [id, [dx, dy]] of Object.entries(motion.moved)) {
-    const node = tileNode(svg, id);
-    if (!node) continue;
-    node.style.transform = `translate(${dx}px, ${dy}px)`;
-    started.push(node);
-  }
-  for (const id of motion.entered) {
-    const node = tileNode(svg, id);
-    if (node) node.dataset.motion = "enter";
-  }
-  if (!started.length) return;
-  requestAnimationFrame(() => {
-    // Reading the box lays the offset out, so clearing it below is a change the transition can run.
-    for (const node of started) node.getBoundingClientRect();
-    for (const node of started) {
-      node.dataset.motion = "settle";
-      node.style.transform = "";
-    }
+// With a card under the picture the two are centred as one block: the label band, the picture and,
+// `CARD_GAP` below it, the card `card` pixels tall. Returns the moved fit and where the card's top lands.
+export function composeWithCard(fit, extent, stage, card) {
+  if (!(card > 0) || !extent) return { fit, cardTop: null };
+  const block = COMPOSE.label + extent.height + COMPOSE.gap + card;
+  const start = Math.max(COMPOSE.edge, (stage.height - block) / 2);
+  const shift = start + COMPOSE.label - extent.y;
+  return {
+    fit: { ...fit, originY: fit.originY + shift },
+    cardTop: Math.round(start + COMPOSE.label + extent.height + COMPOSE.gap),
+  };
+}
+
+// This computer's displays as the snapshot reports them: sizes but no positions, so they stand
+// side by side on one baseline, in the order reported.
+export function localDisplayTiles(reported) {
+  const list = (Array.isArray(reported) ? reported : [])
+    .filter((display) => display?.width > 1 && display?.height > 1)
+    .slice(0, 16);
+  if (!list.length) return [];
+  const widest = Math.max(...list.map((display) => display.width));
+  const tallest = Math.max(...list.map((display) => display.height));
+  let x = 0;
+  return list.map((display, index) => {
+    const tile = {
+      id: `local-${index}`,
+      name: typeof display.name === "string" && display.name ? display.name : "Display",
+      width: display.width,
+      height: display.height,
+      x,
+      y: tallest - display.height,
+      primary: display.primary === true,
+      group: "local",
+      side: "local",
+    };
+    x += display.width + widest * LOCAL_GAP;
+    return tile;
   });
 }
 
-// Display identifiers are digits only, so they go straight into a selector.
-function tileNode(svg, id) {
-  return svg.querySelector(`.arrangement-monitor[data-display="${id}"]`);
+function boundsOf(rects) {
+  const list = Object.values(rects ?? {});
+  if (!list.length) return null;
+  const x = Math.min(...list.map((rect) => rect.x));
+  const y = Math.min(...list.map((rect) => rect.y));
+  return {
+    x,
+    y,
+    width: Math.max(...list.map((rect) => rect.x + rect.width)) - x,
+    height: Math.max(...list.map((rect) => rect.y + rect.height)) - y,
+  };
 }
 
+// Where a computer that is still pairing will go: a typical display's size, beside the others.
+export function slotTile(tiles) {
+  const bounds = boundsOf(tiles);
+  if (!bounds) return { id: "slot", x: 0, y: 0, width: 2560, height: 2560 * SLOT_ASPECT };
+  const width = tiles.reduce((sum, tile) => sum + tile.width, 0) / tiles.length;
+  const height = width * SLOT_ASPECT;
+  return {
+    id: "slot",
+    x: bounds.x + bounds.width + width * SLOT_GAP,
+    y: bounds.y + bounds.height - height,
+    width,
+    height,
+  };
+}
+
+// The whole arrangement's size in desktop pixels, as the ruler under it reads.
+export function extentLabel(tiles) {
+  const bounds = boundsOf(tiles);
+  return bounds ? formatSize(bounds.width, bounds.height) : "";
+}
+
+// Where to start a refitted picture so it first draws exactly where the old fit drew it: the old
+// drawing's own glide (`visual`, a uniform scale and offset) composed with the step from the new
+// fit back to the old one. Easing that to nothing glides the picture to its new fit.
+export function carryTransform(visual, from, to) {
+  const scale = visual?.scale ?? 1;
+  const k = from.scale / to.scale;
+  return {
+    scale: scale * k,
+    x: scale * (from.originX - k * to.originX) + (visual?.x ?? 0),
+    y: scale * (from.originY - k * to.originY) + (visual?.y ?? 0),
+  };
+}
+
+export function restingCarry(carry) {
+  return Math.abs(carry.scale - 1) < 1e-3 && Math.abs(carry.x) < 0.5 && Math.abs(carry.y) < 0.5;
+}
+
+// The transform that draws `next` where `drawn` was, about `next`'s own top-left corner.
+export function flipFrom(drawn, next) {
+  return {
+    x: drawn.x - next.x,
+    y: drawn.y - next.y,
+    scaleX: drawn.width / Math.max(1e-6, next.width),
+    scaleY: drawn.height / Math.max(1e-6, next.height),
+  };
+}
+
+function restingFlip(flip) {
+  return (
+    Math.abs(flip.x) < MOVE_EPSILON &&
+    Math.abs(flip.y) < MOVE_EPSILON &&
+    Math.abs(flip.scaleX - 1) < 1e-3 &&
+    Math.abs(flip.scaleY - 1) < 1e-3
+  );
+}
+
+function modelSignature(tiles, seams) {
+  return JSON.stringify([
+    tiles.map((tile) => [tile.id, tile.group, tile.x, tile.y, tile.width, tile.height]),
+    seams.map((seam) => [seam.start, seam.end]),
+  ]);
+}
+
+// --- the canvas picture ---------------------------------------------------------
+
+// The saved arrangement filling the canvas. Returns `{element, refit(stage)}`: the canvas calls
+// refit whenever its own size changes, and the picture glides to the new fit.
 export function createDashboardArrangement(setup, names = {}) {
   const arrangement = savedDashboardArrangement(setup);
-  const root = document.createElement("figure");
-  root.className = "dashboard-arrangement-preview";
-  if (typeof names.transitionName === "string")
-    root.dataset.sharedTransition = names.transitionName;
-  root.dataset.state = arrangement.available ? "saved" : "unavailable";
-  if (names.compact) root.dataset.size = "compact";
-  if (names.compactLegend) root.dataset.size = "home";
   if (!arrangement.available) {
     // Nothing is drawn, so the remembered positions would only make the next drawing slide in
     // from where a different arrangement once sat.
     if (names.motionKey) lastDrawn.delete(names.motionKey);
+    const root = document.createElement("figure");
+    root.className = "dashboard-arrangement-preview";
+    root.dataset.state = "unavailable";
     const message = document.createElement("p");
     message.className = "dashboard-arrangement-unavailable";
     message.textContent = arrangement.message;
     root.append(message);
-    return root;
+    return { element: root, refit() {}, update() {}, setCard() {}, cardTop: () => null };
   }
-
   const members = memberPresentation(names, arrangement.groups.order);
-  const labels = Object.fromEntries(members.map((member) => [member.key, member.label]));
   const seamCount = arrangement.seams.length;
+  return createPicture(
+    {
+      tiles: arrangement.tiles,
+      seams: arrangement.seams,
+      members,
+      ruler: true,
+      ariaLabel: `${joinLabels(members.map((member) => member.label))}. ${arrangement.noCrossingYet ? "No crossing yet." : `${seamCount} saved display seam${seamCount === 1 ? "" : "s"}.`}`,
+      legend: [
+        ...(arrangement.tiles.some((tile) => tile.primary)
+          ? [{ kind: "primary", label: "Primary display" }]
+          : []),
+        ...(arrangement.tiles.some((tile) => tile.shared)
+          ? [{ kind: "shared", label: "Cabled to both" }]
+          : []),
+        ...(seamCount ? [{ kind: "seam", label: "Pointer crossing" }] : []),
+        { kind: "caption", label: dashboardCaption(arrangement) },
+      ],
+    },
+    names,
+  );
+}
 
+// This computer's own displays, for a canvas with no arrangement to show yet. Null with none known.
+export function createLocalPicture(reported, names = {}) {
+  const tiles = localDisplayTiles(reported);
+  if (!tiles.length) {
+    if (names.motionKey) lastDrawn.delete(names.motionKey);
+    return null;
+  }
+  const name = label(names.local, "This computer");
+  return createPicture(
+    {
+      tiles,
+      seams: [],
+      members: [
+        {
+          key: "local",
+          label: name,
+          platform: platform(names.localPlatform, "macos"),
+          tone: "local",
+        },
+      ],
+      ruler: false,
+      ariaLabel: `${name}'s displays`,
+      legend: tiles.some((tile) => tile.primary)
+        ? [{ kind: "primary", label: "Primary display" }]
+        : [],
+    },
+    names,
+  );
+}
+
+// `names.statuses`, keyed by member, gives each label its state dot and words, and marks a computer
+// that cannot be reached as offline. `names.quiet` lists members drawn quietly, and `names.slot`
+// ({title, detail}) adds the dashed place a computer still pairing will take. `names.motion`
+// carries dom.mjs's motion helpers; without it the picture never moves.
+function createPicture(content, names) {
+  const root = document.createElement("figure");
+  root.className = "dashboard-arrangement-preview";
+  root.dataset.size = "canvas";
+  root.dataset.state = "saved";
   const svg = svgNode("svg");
   svg.classList.add("dashboard-arrangement-canvas");
-  svg.setAttribute("viewBox", `0 0 ${VIEW.width} ${VIEW.height}`);
   svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
   svg.setAttribute("role", "img");
-  svg.setAttribute(
-    "aria-label",
-    `${joinLabels(members.map((member) => member.label))}. ${arrangement.noCrossingYet ? "No crossing yet." : `${seamCount} saved display seam${seamCount === 1 ? "" : "s"}.`}`,
-  );
+  svg.setAttribute("aria-label", content.ariaLabel);
+  const paint = createTilePaint();
+  const scene = svgNode("g");
+  scene.classList.add("arrangement-scene");
+  svg.append(paint.defs, scene);
+  root.append(svg);
+  if (content.legend.length) root.append(createLegend(content.legend, { tag: "figcaption" }));
 
-  const transform = fitTransform(arrangement.tiles, VIEW, PREVIEW_INSETS);
-  const rects = {
-    tiles: tileRects(arrangement.tiles, transform),
-    groups: groupRects(arrangement.tiles, transform),
+  const motion = names.motion ?? null;
+  const key = names.motionKey ?? null;
+  const labels = Object.fromEntries(content.members.map((member) => [member.key, member.label]));
+  const model = modelSignature(content.tiles, content.seams);
+  let looks = pictureLooks(content, names);
+  let slotCopy = names.slot ?? null;
+  let card = names.card ?? 0;
+  let drawn = null;
+
+  function draw(stage, { force = false, still = false } = {}) {
+    const size = {
+      width: Math.max(MIN_STAGE.width, Math.round(stage?.width || MIN_STAGE.width)),
+      height: Math.max(MIN_STAGE.height, Math.round(stage?.height || MIN_STAGE.height)),
+    };
+    if (!force && drawn?.size.width === size.width && drawn?.size.height === size.height) return;
+    svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
+    root.dataset.slot = String(Boolean(slotCopy));
+    const slot = slotCopy ? slotTile(content.tiles) : null;
+    const fitted = slot ? [...content.tiles, slot] : content.tiles;
+    const insets = canvasInsets(size, {
+      reserve: card > 0 ? card + COMPOSE.gap : 0,
+      ruler: content.ruler,
+    });
+    const capped = cappedFit(fitted, size, insets);
+    const { fit, cardTop } = composeWithCard(
+      capped,
+      boundsOf(tileRects(fitted, capped)),
+      size,
+      card,
+    );
+    const rects = tileRects(content.tiles, fit);
+    const groups = groupRects(content.tiles, fit);
+    const boxes = labelBoxes(groups, labels, size, LABEL_INSETS, looks.details);
+    const groupsLayer = svgNode("g");
+    groupsLayer.classList.add("arrangement-groups");
+    for (const member of content.members) {
+      if (!groups[member.key]) continue;
+      groupsLayer.append(
+        createGroupNode({
+          tiles: content.tiles.filter((tile) => (tile.group ?? tile.side) === member.key),
+          tileRects: rects,
+          groupKey: member.key,
+          platform: member.platform,
+          side: member.key,
+          tone: member.tone,
+          label: member.label,
+          rect: groups[member.key],
+          labelBox: boxes[member.key],
+          paint,
+          state: looks.offline.has(member.key) ? "offline" : null,
+          quiet: looks.quiet.has(member.key),
+        }),
+      );
+    }
+    const seams = createSeamLayer(content.seams, fit, {
+      offTiles: looks.offTiles,
+      keepClear: tileMarks(content.tiles, rects),
+    });
+    seams.dataset.motionId = "seams";
+    const extent = boundsOf(rects);
+    const ruler =
+      content.ruler && extent
+        ? createRulerNode(
+            { x: extent.x, y: extent.y + extent.height + RULER_GAP, width: extent.width },
+            extentLabel(content.tiles),
+          )
+        : null;
+    if (ruler) ruler.dataset.motionId = "ruler";
+    const slotNode = slot ? slotNodeFor(slot, fit, slotCopy, motion) : null;
+    const previous = key ? lastDrawn.get(key) : drawn;
+    const visual = previous?.scene?.isConnected ? visualOf(previous.scene) : null;
+    scene.replaceChildren(groupsLayer, seams, ...[slotNode, ruler].filter(Boolean));
+    const state = {
+      size,
+      fit,
+      cardTop,
+      model,
+      rects,
+      groups,
+      boxes,
+      slot,
+      slotCopy,
+      scene,
+      animations: [],
+    };
+    playMotion(previous, visual, state, still ? null : motion);
+    drawn = state;
+    if (key) lastDrawn.set(key, state);
+    // Real text metrics need a laid-out canvas, so the estimated truncation is corrected on the next frame.
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => refineText(svg));
+  }
+
+  // A poll that changes only a computer's state restyles the nodes in place, so CSS eases the
+  // change; a slot coming or going changes the fit, so the picture is redrawn and glides.
+  function update(next = {}) {
+    const nextSlot = next.slot ?? null;
+    looks = pictureLooks(content, next);
+    if (!drawn) return;
+    if (JSON.stringify(nextSlot) !== JSON.stringify(slotCopy)) {
+      slotCopy = nextSlot;
+      draw(drawn.size, { force: true });
+      return;
+    }
+    restyle();
+  }
+
+  function restyle() {
+    const boxes = labelBoxes(drawn.groups, labels, drawn.size, LABEL_INSETS, looks.details);
+    for (const node of scene.querySelectorAll(".arrangement-group")) {
+      const member = node.dataset.group;
+      setData(node, "state", looks.offline.has(member) ? "offline" : null);
+      setData(node, "quiet", looks.quiet.has(member) ? "true" : null);
+      const shownLabel = node.querySelector(".arrangement-group-label");
+      const was = drawn.boxes[member];
+      const box = boxes[member];
+      if (!shownLabel || !box) continue;
+      if (sameLabelPlace(was, box)) {
+        const dot = shownLabel.querySelector(".arrangement-group-label-dot");
+        if (dot && box.detail?.tone) dot.dataset.tone = box.detail.tone;
+        continue;
+      }
+      const replacement = createGroupLabelNode(labels[member], box, drawn.groups[member]);
+      replacement.dataset.motionId = `label:${member}`;
+      shownLabel.replaceWith(replacement);
+      if (motion?.enabled())
+        replacement.animate([{ opacity: 0 }, { opacity: 1 }], {
+          duration: motion.ms("--motion-base"),
+          easing: motion.ease("--ease-out"),
+        });
+    }
+    drawn.boxes = boxes;
+    for (const node of scene.querySelectorAll(".arrangement-seam-run, .arrangement-seam-handle"))
+      setData(
+        node,
+        "tone",
+        looks.offTiles.has(node.dataset.from) || looks.offTiles.has(node.dataset.to) ? "off" : null,
+      );
+  }
+
+  // The card's height is known only once it is laid out; a picture not yet on screen takes it still.
+  function setCard(height, { still = false } = {}) {
+    if (!drawn || Math.abs(height - card) < 1) return;
+    card = height;
+    draw(drawn.size, { force: true, still });
+  }
+
+  draw(names.stage);
+  return {
+    element: root,
+    refit: (stage) => draw(stage),
+    update,
+    setCard,
+    cardTop: () => drawn?.cardTop ?? null,
   };
-  const boxes = labelBoxes(rects.groups, labels, VIEW, PREVIEW_INSETS);
-  const groupsLayer = svgNode("g");
-  groupsLayer.classList.add("arrangement-groups");
-  for (const member of members) {
-    if (!rects.groups[member.key]) continue;
-    groupsLayer.append(
-      createGroupNode({
-        tiles: arrangement.tiles.filter((tile) => tile.group === member.key),
-        tileRects: rects.tiles,
-        groupKey: member.key,
-        platform: member.platform,
-        side: member.key,
-        tone: member.tone,
-        label: member.label,
-        rect: rects.groups[member.key],
-        labelBox: boxes[member.key],
+}
+
+// How each computer looks: its label's dot and words, offline or not, quiet or not.
+function pictureLooks(content, names) {
+  const statuses = names.statuses ?? {};
+  const offline = new Set(
+    content.members.filter((member) => statuses[member.key]?.offline).map((member) => member.key),
+  );
+  return {
+    offline,
+    quiet: new Set(names.quiet ?? []),
+    offTiles: new Set(
+      content.tiles.filter((tile) => offline.has(tile.group ?? tile.side)).map((tile) => tile.id),
+    ),
+    details: Object.fromEntries(
+      content.members.map((member) => [
+        member.key,
+        statuses[member.key]
+          ? { tone: statuses[member.key].tone, status: statuses[member.key].label ?? "" }
+          : null,
+      ]),
+    ),
+  };
+}
+
+function sameLabelPlace(a, b) {
+  return (
+    Boolean(a && b) &&
+    a.placement === b.placement &&
+    Math.abs(a.x - b.x) < 0.5 &&
+    Math.abs(a.y - b.y) < 0.5 &&
+    Math.abs(a.width - b.width) < 0.5 &&
+    (a.detail?.status ?? "") === (b.detail?.status ?? "") &&
+    Boolean(a.detail?.tone) === Boolean(b.detail?.tone)
+  );
+}
+
+function setData(node, name, value) {
+  if (value === null) delete node.dataset[name];
+  else if (node.dataset[name] !== value) node.dataset[name] = value;
+}
+
+function slotNodeFor(slot, fit, copy, motion) {
+  const node = createSlotNode(tileRects([slot], fit).slot, copy);
+  node.dataset.motionId = "slot";
+  // The marching dashes keep the document clock, so a redrawn slot never restarts them.
+  const period = motion?.ms("--canvas-slot-loop") ?? 0;
+  if (period > 0)
+    node.style.setProperty("--canvas-slot-phase", `${-Math.round(performance.now() % period)}ms`);
+  return node;
+}
+
+// What a drawing shows right now: its scene's glide, and each display's own, mid-flight or not.
+function visualOf(scene) {
+  const tiles = {};
+  for (const node of scene.querySelectorAll(".arrangement-display")) {
+    const matrix = matrixOf(node);
+    if (matrix) tiles[node.dataset.display] = matrix;
+  }
+  return { scene: matrixOf(scene), tiles };
+}
+
+function matrixOf(node) {
+  const value = getComputedStyle(node).transform;
+  if (!value || value === "none") return null;
+  const matrix = new DOMMatrixReadOnly(value);
+  return { scale: matrix.a, scaleY: matrix.d, x: matrix.e, y: matrix.f };
+}
+
+// One drawing replaces another three ways. The same arrangement at the same fit carries on any
+// motion still running. The same arrangement refitted glides as one picture from where it is drawn.
+// A changed arrangement glides each display from where it was drawn, and fades in the rest.
+function playMotion(previous, visual, state, motion) {
+  const sceneMotion = () => state.scene.getAnimations?.() ?? [];
+  if (!motion?.enabled()) {
+    for (const animation of sceneMotion()) animation.cancel();
+    return;
+  }
+  if (!previous || !visual) return;
+  const animate = (node, id, frames, duration, easing) => {
+    state.animations.push({
+      id,
+      animation: node.animate(frames, {
+        duration: motion.ms(duration),
+        easing: motion.ease(easing),
       }),
+    });
+  };
+  const sameModel = previous.model === state.model;
+  if (sameModel && sameTransform(previous.fit, state.fit)) {
+    if (previous.scene === state.scene) return;
+    for (const { id, animation } of previous.animations) {
+      if (animation.playState !== "running") continue;
+      const node =
+        id === "scene" ? state.scene : state.scene.querySelector(`[data-motion-id="${id}"]`);
+      if (node) state.animations.push({ id, animation: motion.copy(animation, node) });
+    }
+    return;
+  }
+  for (const animation of sceneMotion()) animation.cancel();
+  if (sameModel) {
+    const start = carryTransform(visual.scene, previous.fit, state.fit);
+    if (!restingCarry(start))
+      animate(
+        state.scene,
+        "scene",
+        [
+          { transform: `matrix(${start.scale}, 0, 0, ${start.scale}, ${start.x}, ${start.y})` },
+          { transform: "none" },
+        ],
+        "--motion-slow",
+        "--ease-out",
+      );
+    slotMotion(previous, state, animate, motion);
+    return;
+  }
+  const scene = visual.scene ?? { scale: 1, x: 0, y: 0 };
+  for (const [id, rect] of Object.entries(state.rects)) {
+    const node = state.scene.querySelector(`[data-motion-id="tile:${id}"]`);
+    if (!node) continue;
+    const was = previous.rects[id];
+    if (!was) {
+      animate(node, `tile:${id}`, enterFrames(rect, motion), "--motion-slow", "--ease-out");
+      continue;
+    }
+    const own = visual.tiles[id] ?? { scale: 1, scaleY: 1, x: 0, y: 0 };
+    const drawn = {
+      x: scene.scale * (was.x + own.x) + scene.x,
+      y: scene.scale * (was.y + own.y) + scene.y,
+      width: scene.scale * own.scale * was.width,
+      height: scene.scale * own.scaleY * was.height,
+    };
+    const flip = flipFrom(drawn, rect);
+    if (restingFlip(flip)) continue;
+    animate(
+      node,
+      `tile:${id}`,
+      [
+        { transform: `translate(${flip.x}px, ${flip.y}px) scale(${flip.scaleX}, ${flip.scaleY})` },
+        { transform: "none" },
+      ],
+      "--motion-spring",
+      "--ease-spring",
     );
   }
-  const seams = createSeamLayer(arrangement.seams, transform);
-  svg.append(groupsLayer, seams);
+  for (const node of state.scene.querySelectorAll(
+    '[data-motion-id^="label:"], [data-motion-id="seams"], [data-motion-id="ruler"], [data-motion-id="slot"]',
+  ))
+    animate(
+      node,
+      node.dataset.motionId,
+      [{ opacity: 0 }, { opacity: 1 }],
+      "--motion-slow",
+      "--ease-out",
+    );
+}
 
-  const seamSignature = JSON.stringify(arrangement.seams.map((seam) => [seam.start, seam.end]));
-  if (names.motionKey) {
-    const previous = lastDrawn.get(names.motionKey);
-    lastDrawn.set(names.motionKey, { tiles: rects.tiles, seams: seamSignature });
-    const motion = arrangementMotion(previous?.tiles, rects.tiles);
-    if (motionEnabled()) {
-      playMotion(svg, motion);
-      if (previous?.seams !== seamSignature) seams.dataset.motion = "enter";
-    }
+// A slot that arrives fades in; one that leaves fades out where the glide carries it, starting
+// where it was drawn: its old place, mapped into the new fit, is exactly where the glide begins.
+function slotMotion(previous, state, animate, motion) {
+  if (state.slot && !previous.slot) {
+    const node = state.scene.querySelector('[data-motion-id="slot"]');
+    if (node)
+      animate(node, "slot", [{ opacity: 0 }, { opacity: 1 }], "--motion-slow", "--ease-out");
+    return;
   }
+  if (!previous.slot || state.slot || !previous.slotCopy) return;
+  const ghost = createSlotNode(tileRects([previous.slot], state.fit).slot, previous.slotCopy);
+  ghost.dataset.exit = "true";
+  state.scene.append(ghost);
+  const animation = ghost.animate([{ opacity: 1 }, { opacity: 0 }], {
+    duration: motion.ms("--motion-base"),
+    easing: motion.ease("--ease-out"),
+    fill: "forwards",
+  });
+  animation.finished.then(
+    () => ghost.remove(),
+    () => ghost.remove(),
+  );
+}
 
-  // The compact viewport rides inside a computer card, where the legend would cost more room
-  // than it explains; the picture and one caption are what that card needs.
-  const legendItems = [
-    ...members.map((member) => ({
-      kind: "group",
-      label: member.label,
-      side: member.key,
-      tone: member.tone,
-    })),
-    ...(names.compactLegend ? [] : [{ kind: "primary", label: "Primary display" }]),
-    ...(arrangement.tiles.some((tile) => tile.shared)
-      ? [{ kind: "shared", label: "Cabled to both computers" }]
-      : []),
-    ...(seamCount ? [{ kind: "seam", label: "Pointer crossing" }] : []),
+// A display arriving grows into place about its own centre, from nearly full size.
+function enterFrames(rect, motion) {
+  const scale = Number.parseFloat(motion.token("--scale-enter")) || 1;
+  const x = (rect.width * (1 - scale)) / 2;
+  const y = (rect.height * (1 - scale)) / 2;
+  return [
+    { opacity: 0, transform: `translate(${x}px, ${y}px) scale(${scale})` },
+    { opacity: 1, transform: "none" },
   ];
-  const legend = names.compact ? null : createLegend(legendItems);
-  const captionText =
-    names.hideCaption && !arrangement.noCrossingYet
-      ? ""
-      : names.caption && !arrangement.noCrossingYet
-        ? names.caption
-        : dashboardCaption(arrangement);
-  const caption = captionText ? document.createElement("figcaption") : null;
-  if (caption) caption.textContent = captionText;
-  root.append(svg, ...(legend ? [legend] : []), ...(caption ? [caption] : []));
-  // Real text metrics need a laid-out canvas, so the estimated truncation is corrected on the next frame.
-  if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => refineText(svg));
-  return root;
 }
 
 // The label, platform and color tone for each group in `order`, from a group record's own
