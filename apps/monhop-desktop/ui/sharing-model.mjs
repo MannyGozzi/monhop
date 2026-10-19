@@ -730,7 +730,7 @@ export function validateLayout(state, layout = state.layout) {
     }
   }
   if (links.length > MAX_LINKS)
-    return invalidLayout("The layout supports at most 64 directed edges.");
+    return invalidLayout("An arrangement supports at most 64 directed edges.");
   // Every member's cursor can cross now, so a crossing may not share an edge span any member's own
   // desktop already routes to one of its own neighbours.
   const ownSeamsAny = order.flatMap((key) => ownSeams(all.byKey[key], hidden));
@@ -1094,7 +1094,7 @@ const DISPLAY_NOTICE_COPY = {
   waiting: {
     presentation: "banner",
     title: "Your displays changed",
-    body: () => "No saved layout fits. Arrange the displays to start sharing.",
+    body: () => "No saved arrangement fits. Arrange the displays to start sharing.",
     primaryLabel: "Arrange displays",
     secondaryLabel: "Dismiss",
   },
@@ -1105,21 +1105,21 @@ const DISPLAY_NOTICE_COPY = {
     presentation: "banner",
     title: "Your displays changed",
     body: () =>
-      "Sharing continues with a layout adapted to them. Arrange the displays if you want something different.",
+      "Sharing continues with an arrangement adapted to them. Arrange the displays if you want something different.",
     primaryLabel: "Arrange displays",
     secondaryLabel: "Keep going",
   },
   updating: {
     presentation: "inline",
     title: null,
-    body: () => "Updating the layout…",
+    body: () => "Updating the arrangement…",
     primaryLabel: null,
     secondaryLabel: null,
   },
   peerDeciding: {
     presentation: "inline",
     title: null,
-    body: (peerName) => `${peerName} is choosing the layout.`,
+    body: (peerName) => `${peerName} is choosing the arrangement.`,
     primaryLabel: null,
     secondaryLabel: null,
   },

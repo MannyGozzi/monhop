@@ -254,7 +254,7 @@ test("a display change the user must settle gets the banner; one MonHop is settl
   const waiting = displayNoticeCopy("waiting", "Office Windows PC");
   assert.equal(waiting.presentation, "banner");
   assert.equal(waiting.title, "Your displays changed");
-  assert.equal(waiting.body, "No saved layout fits. Arrange the displays to start sharing.");
+  assert.equal(waiting.body, "No saved arrangement fits. Arrange the displays to start sharing.");
   assert.equal(waiting.primaryLabel, "Arrange displays");
   assert.equal(waiting.secondaryLabel, "Dismiss");
 
@@ -263,21 +263,21 @@ test("a display change the user must settle gets the banner; one MonHop is settl
   assert.equal(continued.title, "Your displays changed");
   assert.equal(
     continued.body,
-    "Sharing continues with a layout adapted to them. Arrange the displays if you want something different.",
+    "Sharing continues with an arrangement adapted to them. Arrange the displays if you want something different.",
   );
   assert.equal(continued.primaryLabel, "Arrange displays");
   assert.equal(continued.secondaryLabel, "Keep going");
 
   const updating = displayNoticeCopy("updating", "Office Windows PC");
   assert.equal(updating.presentation, "inline");
-  assert.equal(updating.body, "Updating the layout…");
+  assert.equal(updating.body, "Updating the arrangement…");
   assert.equal(updating.title, null);
   assert.equal(updating.primaryLabel, null);
   assert.equal(updating.secondaryLabel, null);
 
   const peerDeciding = displayNoticeCopy("peerDeciding", "Office Windows PC");
   assert.equal(peerDeciding.presentation, "inline");
-  assert.equal(peerDeciding.body, "Office Windows PC is choosing the layout.");
+  assert.equal(peerDeciding.body, "Office Windows PC is choosing the arrangement.");
   assert.equal(peerDeciding.primaryLabel, null);
 
   assert.equal(displayNoticeCopy("bogus", "Office Windows PC"), null);
