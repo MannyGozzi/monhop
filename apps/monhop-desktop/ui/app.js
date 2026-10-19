@@ -166,6 +166,7 @@ import { computerInspector } from "./computer-card.mjs";
 import { banner, renderCanvas } from "./screen-displays.mjs";
 import { renderSettings } from "./screen-settings.mjs";
 import { renderSidebar } from "./sidebar.mjs";
+import { MOUSE_STEPS, emptyTrail, step as stepTrail, trackSwipe, visit } from "./history-model.mjs";
 
 const core = window.__TAURI__?.core;
 const nativeWindow = window.__TAURI__?.window;
@@ -223,6 +224,9 @@ let lastActive = null;
 let arrangeRequested = false;
 // The computer Arrange switched on to open the link; leaving without applying switches it off again.
 let arrangeSwitchedOn = null;
+// The picks back and forward step through, and the horizontal swipe in progress.
+let trail = emptyTrail();
+let swipeGesture = null;
 // Below the overlay width the details sheet can be closed; picking a row opens it again.
 let inspectorDismissed = false;
 // Which drawer above the Apply bar is open: "saved", "use" or none.
@@ -319,6 +323,16 @@ const toolbarControls = createToolbarControls();
 mountStaticGlyphs();
 
 nodes.sidebarSettings.addEventListener("click", () => select("settings"));
+document.addEventListener("mousedown", (event) => {
+  if (MOUSE_STEPS[event.button]) event.preventDefault();
+});
+document.addEventListener("mouseup", (event) => {
+  const direction = MOUSE_STEPS[event.button];
+  if (!direction) return;
+  event.preventDefault();
+  navigate(direction);
+});
+document.addEventListener("wheel", onSwipeWheel, { passive: true });
 nodes.inspectorClose.addEventListener("click", dismissInspector);
 nodes.inspectorScrim.addEventListener("click", dismissInspector);
 nodes.networkChip.addEventListener("click", () => setNetworkMenuOpen(!networkMenuOpen));
@@ -413,16 +427,63 @@ function showsReadiness(selection) {
 }
 
 // Returns the pairing it opened on the way into the New computer row, if any.
-function select(key) {
+function select(key, { fromHistory = false } = {}) {
   const next = selectionFromKey(key);
   if (!next) return null;
   setNetworkMenuOpen(false);
   inspectorDismissed = false;
   const previous = currentSelection();
-  chosen = next;
+  if (fromHistory) chosen = next;
+  else choose(next);
   const opening = sameSelection(previous, next) ? null : enterSelection(previous, next);
   render();
   return opening;
+}
+
+// Every pick the user makes goes on the trail that back and forward step through.
+function choose(next) {
+  trail = visit(trail, selectionKey(currentSelection()), selectionKey(next));
+  chosen = next;
+}
+
+// The side mouse buttons and a horizontal swipe step back and forward through the picks.
+function navigate(direction) {
+  const result = stepTrail(trail, selectionKey(currentSelection()), direction, canShowSelection);
+  trail = result.trail;
+  if (result.key) select(result.key, { fromHistory: true });
+}
+
+function canShowSelection(key) {
+  const selection = selectionFromKey(key);
+  if (selection?.kind !== "computer") return selection !== null;
+  return computers.items.some((item) => item.fingerprint === selection.fingerprint);
+}
+
+function onSwipeWheel(event) {
+  if (event.ctrlKey || ownsSideways(event.target)) {
+    swipeGesture = null;
+    return;
+  }
+  const result = trackSwipe(swipeGesture, {
+    dx: event.deltaX,
+    dy: event.deltaY,
+    at: event.timeStamp,
+  });
+  swipeGesture = result.swipe;
+  if (result.direction) navigate(result.direction);
+}
+
+// A slider, or anything that scrolls sideways, keeps the horizontal swipes made over it.
+function ownsSideways(target) {
+  for (let node = target instanceof Element ? target : null; node; node = node.parentElement) {
+    if (node.matches('input[type="range"]')) return true;
+    if (
+      node.scrollWidth > node.clientWidth + 1 &&
+      ["auto", "scroll"].includes(getComputedStyle(node).overflowX)
+    )
+      return true;
+  }
+  return false;
 }
 
 function enterSelection(previous, next) {
@@ -1098,7 +1159,7 @@ function arrangeWith(fingerprint) {
       fingerprints: computers.items.map((item) => item.fingerprint),
     });
   if (!target || !canEditLayout(sharing, state.selectedInterfaceId)) return;
-  if (currentSelection().kind === "settings") chosen = computerSelection(target);
+  if (currentSelection().kind === "settings") choose(computerSelection(target));
   const enabled = resolveEnabledList(sharing.view, computers, activeFingerprint());
   arrangeSwitchedOn = isComputerEnabled(target, enabled) ? null : target;
   arrangeRequested = true;
@@ -1339,7 +1400,7 @@ async function startPairing(mode) {
 function dismissPairing() {
   const paired = pairing.view?.phase === "paired" ? pairing.view.peerFingerprint : null;
   leavePairing();
-  if (paired) chosen = computerSelection(paired);
+  if (paired) choose(computerSelection(paired));
   else if (chosen?.kind === "new") chosen = null;
   render();
 }
@@ -2299,7 +2360,7 @@ function loadComputerArrangement(fingerprint, name) {
     render();
     return;
   }
-  if (currentSelection().kind === "settings") chosen = computerSelection(fingerprint);
+  if (currentSelection().kind === "settings") choose(computerSelection(fingerprint));
   // The listed fit can be older than the displays; the draft decides, and says so when it cannot.
   sharing = loadArrangementLayout(sharing, entry.layout);
   touchSetupLink();

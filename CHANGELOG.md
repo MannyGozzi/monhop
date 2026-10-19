@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- The mouse's back and forward buttons and a two-finger swipe left or right step back and forward through what you selected in MonHop's window, such as from Settings back to a computer.
+
 ### Changed
 
 - MonHop's window is redesigned around one surface instead of the Home, Set up and Settings pages. A sidebar lists this computer, each paired computer with its own connection state, Add a computer and Settings. The middle shows your displays as one arrangement, and the right side shows whatever you select. Getting this computer ready, pairing a new computer, arranging displays and choosing who controls whom all happen in place, without switching pages.
