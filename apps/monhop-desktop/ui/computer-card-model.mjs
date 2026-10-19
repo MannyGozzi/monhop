@@ -1,5 +1,5 @@
-// Every decision a computer card makes about its arrangement viewport and its Layouts list, kept
-// apart from the DOM so the rules are checked without a browser. The card only draws what it returns.
+// Every decision a computer card makes about its arrangement viewport and its saved arrangements,
+// kept apart from the DOM so the rules are checked without a browser. The card only draws what it returns.
 
 // Focus is restored by key across a re-render, so two rows of one computer must never share one.
 // The fingerprint's first bytes name the computer and a hash of the whole name names the row.
@@ -96,23 +96,35 @@ export function layoutChips(entry) {
   };
 }
 
+// Every way into Arrange says so while a session runs, since arranging stops it.
+export const ARRANGE_PAUSES = "Sharing pauses while you arrange.";
+
 const LOAD_BLOCKED = {
-  inactive: "Use this computer to load its layouts.",
-  disconnected: "Available once this computer is connected.",
-  misfit: "This layout does not fit the displays connected now.",
+  unavailable: "Arranging is not available right now.",
+  misfit: "This arrangement does not fit the displays connected now.",
 };
 
-// Load is drawn on every row and enabled only when pressing it would really load: the entry the
-// row drew, on the computer in use, over a connected link. A blocked row says why.
-export function loadGate({ isActive, connected, entry }) {
-  if (!isActive) return { enabled: false, reason: LOAD_BLOCKED.inactive };
-  if (!connected) return { enabled: false, reason: LOAD_BLOCKED.disconnected };
-  if (entry?.fits !== true || !entry.layout) return { enabled: false, reason: LOAD_BLOCKED.misfit };
-  return { enabled: true, reason: "" };
+// Load is drawn on every row. Over a live link with this computer it loads at once when the entry
+// fits; otherwise it opens Arrange with this computer and loads once that link is up, where the
+// draft decides whether it still fits. A blocked row says why; `hint` is for one that works.
+export function loadGate({ linked, canArrange, sessionActive = false, entry }) {
+  const blocked = (reason) => ({ enabled: false, arrange: !linked, reason, hint: "" });
+  if (!entry?.layout) return blocked(LOAD_BLOCKED.misfit);
+  if (linked)
+    return entry.fits === true
+      ? { enabled: true, arrange: false, reason: "", hint: "" }
+      : blocked(LOAD_BLOCKED.misfit);
+  if (!canArrange) return blocked(LOAD_BLOCKED.unavailable);
+  return { enabled: true, arrange: true, reason: "", hint: sessionActive ? ARRANGE_PAUSES : "" };
 }
 
-// Forget takes two presses. One row across the whole app is armed at a time, named by its
-// computer and its exact layout, so the same name under another computer is never armed with it.
+// The live link is with this computer: the view names its peer, else the computer in use.
+export function isLinkedWith(fingerprint, { connected, peerFingerprint = null, active = null }) {
+  return connected === true && Boolean(fingerprint) && (peerFingerprint ?? active) === fingerprint;
+}
+
+// Delete takes two presses. One row across the whole app is armed at a time, named by its
+// computer and its exact arrangement, so the same name under another computer is never armed with it.
 export function isForgetArmed(armed, fingerprint, name) {
   return armed?.fingerprint === fingerprint && armed?.name === name;
 }
@@ -189,14 +201,23 @@ export function controlSwitchRows(control, localName, peerName, syncing, fingerp
 
 // One pass over a computer's history: order, row keys, the armed confirm, and whether Load works.
 // `pending` is that computer's own read or forget still in flight, which locks its rows alone.
-export function layoutRows({ fingerprint, entries, armed, isActive, connected, busy, pending }) {
+export function layoutRows({
+  fingerprint,
+  entries,
+  armed,
+  linked,
+  canArrange,
+  sessionActive,
+  busy,
+  pending,
+}) {
   const locked = busy === true || pending === true;
   return newestFirst(entries).map((entry) => ({
     entry,
     key: layoutRowKey(fingerprint, entry.name),
     armed: isForgetArmed(armed, fingerprint, entry.name),
     disabled: locked,
-    load: loadGate({ isActive, connected, entry }),
+    load: loadGate({ linked, canArrange, sessionActive, entry }),
   }));
 }
 

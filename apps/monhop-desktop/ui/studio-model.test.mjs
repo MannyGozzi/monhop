@@ -14,6 +14,7 @@ import {
   defaultSelection,
   inspectorKind,
   inspectorPresentation,
+  isPaused,
   localRowStatus,
   networkChip,
   networkMenuItems,
@@ -211,7 +212,7 @@ test("the add row becomes the selected New computer and says where the pairing i
   assert.equal(pairingRowLabel("paired"), "Paired");
 });
 
-test("arranging stays on while the link waits for Apply, and Done shows only when it can leave", () => {
+test("arranging stays on while the link waits for Apply, and the toolbar's Arrange leaves once it starts", () => {
   assert.deepEqual(arrangeState({}), { active: false, leavable: false });
   assert.deepEqual(arrangeState({ connected: true }), { active: true, leavable: false });
   assert.deepEqual(arrangeState({ connected: true, editing: true }), {
@@ -231,10 +232,9 @@ test("arranging stays on while the link waits for Apply, and Done shows only whe
       .arrange,
     null,
   );
-  assert.equal(
-    toolbarState({ ...canvas, arrange: arrangeState({ editing: true }), canArrange: true }).arrange,
-    "done",
-  );
+  // The Apply bar's own button is the one way out, so the toolbar offers nothing while arranging.
+  for (const arrange of [arrangeState({ editing: true }), arrangeState({ requested: true })])
+    assert.equal(toolbarState({ ...canvas, arrange, canArrange: true }).arrange, null);
 });
 
 test("the toolbar titles the view and offers Pause, Resume or neither", () => {
@@ -242,11 +242,24 @@ test("the toolbar titles the view and offers Pause, Resume or neither", () => {
   const settings = toolbarState({ selection: SETTINGS, arrange, enabledCount: 1 });
   assert.equal(settings.title, "Settings");
   assert.equal(settings.canvasActions, false);
-  const sharing = toolbarState({ selection: LOCAL, arrange, enabledCount: 2, resume: A });
+  const sharing = toolbarState({ selection: LOCAL, arrange, enabledCount: 2 });
   assert.equal(sharing.title, "Arrangement");
   assert.equal(sharing.pause, "pause");
-  assert.equal(toolbarState({ selection: LOCAL, arrange, resume: A }).pause, "resume");
+  // A pause keeps the group switched on, so Resume shows exactly while that group is paused.
+  assert.equal(
+    toolbarState({ selection: LOCAL, arrange, enabledCount: 1, paused: true }).pause,
+    "resume",
+  );
+  // Nothing switched on: no group to pause or resume; the computer's own switch is the way in.
   assert.equal(toolbarState({ selection: LOCAL, arrange }).pause, null);
+  assert.equal(toolbarState({ selection: LOCAL, arrange, paused: true }).pause, null);
+});
+
+test("the live view says whether sharing is paused, and the computer list until it answers", () => {
+  assert.equal(isPaused({ sharingView: { paused: true }, computers: { paused: false } }), true);
+  assert.equal(isPaused({ sharingView: { paused: false }, computers: { paused: true } }), false);
+  assert.equal(isPaused({ sharingView: null, computers: { paused: true } }), true);
+  assert.equal(isPaused({}), false);
 });
 
 test("the canvas draws the selected computer, else the one in use, else the first", () => {
@@ -257,12 +270,13 @@ test("the canvas draws the selected computer, else the one in use, else the firs
   assert.equal(canvasFingerprint({ selection: LOCAL, fingerprints: [] }), null);
 });
 
-test("Resume brings back the computer last in use, then the selected one, then the first", () => {
-  const fingerprints = [A, B];
-  assert.equal(resumeTarget({ lastActive: B, selection: computerSelection(A), fingerprints }), B);
-  assert.equal(resumeTarget({ lastActive: C, selection: computerSelection(B), fingerprints }), B);
-  assert.equal(resumeTarget({ lastActive: C, selection: LOCAL, fingerprints }), A);
-  assert.equal(resumeTarget({ fingerprints: [] }), null);
+test("Resume brings back the paused group: the computer last in use when it is in it, else its first", () => {
+  assert.equal(resumeTarget({ lastActive: B, enabled: [A, B] }), B);
+  assert.equal(resumeTarget({ lastActive: C, enabled: [A, B] }), A);
+  assert.equal(resumeTarget({ enabled: [B] }), B);
+  // Never a computer outside the group, even the one last in use.
+  assert.equal(resumeTarget({ lastActive: C, enabled: [] }), null);
+  assert.equal(resumeTarget({}), null);
 });
 
 test("the network chip names the connection and locks while a session runs", () => {
@@ -355,6 +369,8 @@ test("the pairing row becomes the computer it added, listed once, until Done or 
   const row = rows.at(-1);
   assert.equal(row.title, "Computer 2");
   assert.equal(row.label, "Paired");
+  // The same quiet dot as every other paired computer's.
+  assert.equal(row.tone, "neutral");
   assert.equal(row.platform, "macos");
   assert.equal(row.select, "new");
   assert.equal(row.adopt, "new");

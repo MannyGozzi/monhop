@@ -15,6 +15,15 @@ const TONES = {
   error: "error",
 };
 
+const PAUSED_DETAIL = "Input stays on this computer until you resume.";
+
+// A pause keeps the group switched on, so its members read as paused rather than off.
+function inPausedGroup(sharingView, fingerprint) {
+  if (sharingView?.paused !== true || !fingerprint || !Array.isArray(sharingView.enabled))
+    return false;
+  return sharingView.enabled.includes(fingerprint.toLowerCase());
+}
+
 // The link or the session is up with this computer: the Displays section may be used.
 const LIVE_KEYS = new Set(["connected", "editing", "sharing", "reconnecting"]);
 
@@ -37,9 +46,28 @@ export function computerStatus(computer, sharingView, active, localName) {
   // This is about the reply as a whole, so it is checked before any per-computer lookup.
   if (phase === "unknown")
     return message ? status("attention", "Needs attention", message) : reaching(name);
+  if (inPausedGroup(sharingView, fingerprint)) return status("paused", "Paused", PAUSED_DETAIL);
   const peer = findPeer(sharingView, fingerprint);
-  if (peer) return peerStatus(peer, sharingView, name, localName);
-  return legacyStatus(fingerprint, name, phase, message, sharingView, active, localName);
+  const value = peer
+    ? peerStatus(peer, sharingView, name, localName)
+    : legacyStatus(fingerprint, name, phase, message, sharingView, active, localName);
+  return startingAfterApply(value, peer?.phase ?? phase, sharingView);
+}
+
+// Apply closes the arranging link and the session opens after it, which is one step for the user:
+// the link waiting to close, the stop, the closed link and the dial all read as sharing starting.
+const AFTER_APPLY_PHASES = new Set(["connected", "stopping", "off", "connecting", "starting"]);
+
+function startingAfterApply(value, phase, sharingView) {
+  if (
+    sharingView?.sync?.state !== "applied" ||
+    sharingView.paused === true ||
+    sharingView.editing === true ||
+    !AFTER_APPLY_PHASES.has(phase) ||
+    ["standby", "error"].includes(value.key)
+  )
+    return value;
+  return status("connecting", "Starting sharing…", "Applied on both computers.");
 }
 
 function findPeer(sharingView, fingerprint) {
@@ -87,7 +115,7 @@ function peerStatus(peer, sharingView, name, localName) {
 function legacyStatus(fingerprint, name, phase, message, sharingView, active, localName) {
   const live = Boolean(fingerprint) && sharingView?.peerFingerprint === fingerprint;
   if (!live && active !== fingerprint)
-    return status("standby", "Paired", "Standby. Use it to share input with it.");
+    return status("standby", "Paired", "Off. Turn it on to share with it.");
   if (!live) {
     if (phase === "error" && message) return status("error", "Can't connect", message);
     if (phase === "off" && message) return offStatus(message);
@@ -125,7 +153,7 @@ function legacyStatus(fingerprint, name, phase, message, sharingView, active, lo
 const TRANSITIONS = ["Reconnecting", "Connecting", "Sharing is on", "Switching"];
 
 function offStatus(message) {
-  if (message.startsWith("Paused")) return status("paused", "Paused", message);
+  if (message.startsWith("Paused")) return status("paused", "Paused", PAUSED_DETAIL);
   if (TRANSITIONS.some((word) => message.includes(word)))
     return status("connecting", "Connecting…", message);
   return status("paused", "Not connected", message);
@@ -156,8 +184,10 @@ export function activeStatus({
   if (!computer)
     return status(
       "none",
-      "No computer",
-      computers.items.length ? "Choose a computer to use." : "Pair a computer to get started.",
+      "Not sharing",
+      computers.items.length
+        ? "Turn on a computer to share with it."
+        : "Pair a computer to get started.",
     );
   return computerStatus(computer, sharingView, single, localName);
 }

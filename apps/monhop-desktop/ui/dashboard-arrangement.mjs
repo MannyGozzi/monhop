@@ -23,10 +23,11 @@ import {
   createSlotNode,
   createTilePaint,
   labelBoxes,
+  matrixOf,
   refineText,
   svgNode,
 } from "./arrangement-render.mjs";
-import { cappedFit } from "./arrangement-view-model.mjs";
+import { cappedFit, heldShift } from "./arrangement-view-model.mjs";
 import { normalizeStoredLayout } from "./sharing-model.mjs";
 
 const MAX_U64 = "18446744073709551615";
@@ -330,7 +331,7 @@ export function createDashboardArrangement(setup, names = {}) {
     message.className = "dashboard-arrangement-unavailable";
     message.textContent = arrangement.message;
     root.append(message);
-    return { element: root, refit() {}, update() {}, setCard() {}, cardTop: () => null };
+    return { element: root, hold() {}, refit() {}, update() {}, setCard() {}, cardTop: () => null };
   }
   const members = memberPresentation(names, arrangement.groups.order);
   const seamCount = arrangement.seams.length;
@@ -416,14 +417,8 @@ function createPicture(content, names) {
   let card = names.card ?? 0;
   let drawn = null;
 
-  function draw(stage, { force = false, still = false } = {}) {
-    const size = {
-      width: Math.max(MIN_STAGE.width, Math.round(stage?.width || MIN_STAGE.width)),
-      height: Math.max(MIN_STAGE.height, Math.round(stage?.height || MIN_STAGE.height)),
-    };
-    if (!force && drawn?.size.width === size.width && drawn?.size.height === size.height) return;
-    svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
-    root.dataset.slot = String(Boolean(slotCopy));
+  // Where the picture and its card sit on a canvas of `size`, without drawing anything.
+  function placeFor(size) {
     const slot = slotCopy ? slotTile(content.tiles) : null;
     const fitted = slot ? [...content.tiles, slot] : content.tiles;
     const insets = canvasInsets(size, {
@@ -431,12 +426,31 @@ function createPicture(content, names) {
       ruler: content.ruler,
     });
     const capped = cappedFit(fitted, size, insets);
-    const { fit, cardTop } = composeWithCard(
-      capped,
-      boundsOf(tileRects(fitted, capped)),
-      size,
-      card,
-    );
+    const place = composeWithCard(capped, boundsOf(tileRects(fitted, capped)), size, card);
+    return { slot, fitted, ...place };
+  }
+
+  // While the canvas glides the drawing keeps its scale and follows the new fit's centre by viewBox
+  // alone; the refit once the canvas settles glides on from where it is held.
+  function hold(stage) {
+    if (!drawn) return;
+    const size = canvasSize(stage);
+    const { fitted, fit } = placeFor(size);
+    const { x, y } = heldShift(drawn.fit, fit, boundsOf(fitted));
+    drawn.hold = Math.abs(x) < MOVE_EPSILON && Math.abs(y) < MOVE_EPSILON ? null : { size, x, y };
+    const origin = drawn.hold ? `${-x} ${-y}` : "0 0";
+    svg.setAttribute("viewBox", `${origin} ${size.width} ${size.height}`);
+  }
+
+  function draw(stage, { force = false, still = false } = {}) {
+    const size = canvasSize(stage);
+    const same = drawn?.size.width === size.width && drawn?.size.height === size.height;
+    if (!force && same && !drawn.hold) return;
+    const previous = key ? lastDrawn.get(key) : drawn;
+    const visual = previous?.scene?.isConnected ? visualOf(previous.scene, previous.hold) : null;
+    svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
+    root.dataset.slot = String(Boolean(slotCopy));
+    const { slot, fit, cardTop } = placeFor(size);
     const rects = tileRects(content.tiles, fit);
     const groups = groupRects(content.tiles, fit);
     const boxes = labelBoxes(groups, labels, size, LABEL_INSETS, looks.details);
@@ -476,8 +490,6 @@ function createPicture(content, names) {
         : null;
     if (ruler) ruler.dataset.motionId = "ruler";
     const slotNode = slot ? slotNodeFor(slot, fit, slotCopy, motion) : null;
-    const previous = key ? lastDrawn.get(key) : drawn;
-    const visual = previous?.scene?.isConnected ? visualOf(previous.scene) : null;
     scene.replaceChildren(groupsLayer, seams, ...[slotNode, ruler].filter(Boolean));
     const state = {
       size,
@@ -507,7 +519,7 @@ function createPicture(content, names) {
     if (!drawn) return;
     if (JSON.stringify(nextSlot) !== JSON.stringify(slotCopy)) {
       slotCopy = nextSlot;
-      draw(drawn.size, { force: true });
+      draw(drawn.hold?.size ?? drawn.size, { force: true });
       return;
     }
     restyle();
@@ -550,16 +562,25 @@ function createPicture(content, names) {
   function setCard(height, { still = false } = {}) {
     if (!drawn || Math.abs(height - card) < 1) return;
     card = height;
-    draw(drawn.size, { force: true, still });
+    draw(drawn.hold?.size ?? drawn.size, { force: true, still });
   }
 
   draw(names.stage);
   return {
     element: root,
+    hold,
     refit: (stage) => draw(stage),
     update,
     setCard,
-    cardTop: () => drawn?.cardTop ?? null,
+    cardTop: () =>
+      drawn && drawn.cardTop !== null ? Math.round(drawn.cardTop + (drawn.hold?.y ?? 0)) : null,
+  };
+}
+
+function canvasSize(stage) {
+  return {
+    width: Math.max(MIN_STAGE.width, Math.round(stage?.width || MIN_STAGE.width)),
+    height: Math.max(MIN_STAGE.height, Math.round(stage?.height || MIN_STAGE.height)),
   };
 }
 
@@ -606,28 +627,25 @@ function setData(node, name, value) {
 function slotNodeFor(slot, fit, copy, motion) {
   const node = createSlotNode(tileRects([slot], fit).slot, copy);
   node.dataset.motionId = "slot";
-  // The marching dashes keep the document clock, so a redrawn slot never restarts them.
+  // The slot breathes on the document clock, so a redrawn slot never restarts it.
   const period = motion?.ms("--canvas-slot-loop") ?? 0;
   if (period > 0)
     node.style.setProperty("--canvas-slot-phase", `${-Math.round(performance.now() % period)}ms`);
   return node;
 }
 
-// What a drawing shows right now: its scene's glide, and each display's own, mid-flight or not.
-function visualOf(scene) {
+// What a drawing shows right now: its scene's glide, moved by any hold, and each display's own,
+// mid-flight or not.
+function visualOf(scene, hold) {
   const tiles = {};
   for (const node of scene.querySelectorAll(".arrangement-display")) {
     const matrix = matrixOf(node);
     if (matrix) tiles[node.dataset.display] = matrix;
   }
-  return { scene: matrixOf(scene), tiles };
-}
-
-function matrixOf(node) {
-  const value = getComputedStyle(node).transform;
-  if (!value || value === "none") return null;
-  const matrix = new DOMMatrixReadOnly(value);
-  return { scale: matrix.a, scaleY: matrix.d, x: matrix.e, y: matrix.f };
+  const glide = matrixOf(scene);
+  if (!hold) return { scene: glide, tiles };
+  const base = glide ?? { scale: 1, scaleY: 1, x: 0, y: 0 };
+  return { scene: { ...base, x: base.x + hold.x, y: base.y + hold.y }, tiles };
 }
 
 // One drawing replaces another three ways. The same arrangement at the same fit carries on any
@@ -650,7 +668,7 @@ function playMotion(previous, visual, state, motion) {
     });
   };
   const sameModel = previous.model === state.model;
-  if (sameModel && sameTransform(previous.fit, state.fit)) {
+  if (sameModel && sameTransform(previous.fit, state.fit) && !previous.hold) {
     if (previous.scene === state.scene) return;
     for (const { id, animation } of previous.animations) {
       if (animation.playState !== "running") continue;

@@ -97,9 +97,11 @@ import {
 } from "./computers-model.mjs";
 import { activeStatus } from "./computer-status.mjs";
 import {
+  ARRANGE_PAUSES,
   clearForgetFor,
   keepForgetArmed,
   isComputerEnabled,
+  isLinkedWith,
   keepForgetListed,
   loadGate,
   pressForget,
@@ -124,6 +126,7 @@ import {
   computerSelection,
   inspectorKind,
   inspectorPresentation,
+  isPaused,
   listStep,
   localRowStatus,
   networkChip,
@@ -224,6 +227,9 @@ let lastActive = null;
 let arrangeRequested = false;
 // The computer Arrange switched on to open the link; leaving without applying switches it off again.
 let arrangeSwitchedOn = null;
+// A Load pressed before its computer's link was up, as { fingerprint, layout }: Arrange opens with
+// that computer and the layout goes into the draft once the link connects.
+let loadOnConnect = null;
 // The picks back and forward step through, and the horizontal swipe in progress.
 let trail = emptyTrail();
 let swipeGesture = null;
@@ -285,6 +291,9 @@ const nodes = {
   networkMenu: document.querySelector("#network-menu"),
   arrangeSlot: document.querySelector("#arrange-slot"),
   pauseSlot: document.querySelector("#pause-slot"),
+  detailsSlot: document.querySelector("#details-slot"),
+  workspace: document.querySelector(".workspace"),
+  sidebarGlass: document.querySelector("#sidebar-glass"),
   windowControls: document.querySelector("#window-controls"),
   canvasPane: document.querySelector("#canvas-pane"),
   canvasBanners: document.querySelector("#canvas-banners"),
@@ -359,23 +368,90 @@ function dismissInspector() {
   inspectorDismissed = true;
   render();
 }
+
+function showInspector() {
+  inspectorDismissed = false;
+  render();
+}
 // The inspector turns into a sheet, or back, as the window crosses the overlay width.
 window.addEventListener("resize", () => {
   if (nodes.inspector.dataset.mode !== presentInspector(inspectorKind(currentSelection())).mode)
     render();
 });
 
+// The sidebar column snaps as the window crosses the narrow width, in one layout instead of one a
+// frame; the sidebar's edge and everything it moved glide over from where they were drawn.
+const narrowShell = window.matchMedia("(max-width: 900px)");
+let shellGlides = [];
+narrowShell.addEventListener("change", glideShell);
+
+function glideShell() {
+  if (!motionEnabled()) return;
+  const indicator = nodes.sidebarIndicator.getAnimations().length ? [] : [nodes.sidebarIndicator];
+  const stretched = [nodes.sidebarGlass, ...indicator];
+  const moved = [
+    nodes.workspace,
+    ...nodes.studio.querySelectorAll(
+      ".brand, .sidebar-heading-end, .sidebar-version, .sidebar-picture[data-shown='true']",
+    ),
+  ];
+  const parts = [...stretched, ...moved];
+  // Drawn where the old column put them, a glide still running included, so a reversal retargets.
+  const was = narrowShell.matches ? "--sidebar-width" : "--sidebar-width-narrow";
+  nodes.studio.style.gridTemplateColumns = `var(${was}) minmax(0, 1fr)`;
+  const before = parts.map((node) => node.getBoundingClientRect());
+  for (const glide of shellGlides) glide.cancel();
+  nodes.studio.style.removeProperty("grid-template-columns");
+  const after = parts.map((node) => node.getBoundingClientRect());
+  const timing = { duration: motionMs("--motion-slow"), easing: motionEase("--ease-glide") };
+  shellGlides = parts.flatMap((node, index) => {
+    const [from, to] = [before[index], after[index]];
+    const stretch = index < stretched.length;
+    if (!to.width || Math.abs(stretch ? from.width - to.width : from.left - to.left) < 0.5)
+      return [];
+    const transform = stretch
+      ? `scaleX(${from.width / to.width})`
+      : `translateX(${from.left - to.left}px)`;
+    const origin = "left center";
+    return [
+      node.animate(
+        [
+          { transform, transformOrigin: origin },
+          { transform: "none", transformOrigin: origin },
+        ],
+        timing,
+      ),
+    ];
+  });
+}
+
+// Hidden or unfocused, the window holds its endless loops still: CSS pauses them under
+// :root[data-window-idle="true"], the canvas's included.
+function markWindowIdle(idle) {
+  if (idle) document.documentElement.dataset.windowIdle = "true";
+  else delete document.documentElement.dataset.windowIdle;
+}
+
 window.addEventListener("blur", () => {
   refreshAfterReturn = true;
+  markWindowIdle(true);
 });
-window.addEventListener("focus", onReturn);
+window.addEventListener("focus", () => {
+  markWindowIdle(false);
+  onReturn();
+});
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
     refreshAfterReturn = true;
+    markWindowIdle(true);
     return;
   }
-  if (document.visibilityState === "visible") onReturn();
+  if (document.visibilityState === "visible") {
+    markWindowIdle(false);
+    onReturn();
+  }
 });
+markWindowIdle(document.visibilityState === "hidden" || !document.hasFocus());
 
 render();
 void loadTheme();
@@ -586,9 +662,8 @@ function studioContext(status, active) {
     requested: arrangeRequested,
   });
   const canvasPrint = canvasFingerprint({ selection, active, fingerprints });
-  const canArrange =
-    Boolean(canvasPrint) && canEditLayout(sharing, state.selectedInterfaceId) && !controlsBusy();
-  const resume = resumeTarget({ lastActive, selection, fingerprints });
+  const canArrange = Boolean(canvasPrint) && canArrangeNow();
+  const paused = isPaused({ sharingView: sharing.view, computers });
   const step = pairingStep(pairing);
   return {
     selection,
@@ -602,7 +677,10 @@ function studioContext(status, active) {
       localName,
       localPlatform,
       localStatus: localRowStatus({
-        verdict: setupVerdict(state, { checking: snapshotCheck.pending }),
+        verdict: setupVerdict(state, {
+          checking: snapshotCheck.pending,
+          paired: computers.items.length > 0,
+        }),
         session: status,
       }),
       selection,
@@ -613,9 +691,14 @@ function studioContext(status, active) {
     canvasComputer: findComputer(computers, canvasPrint),
     canArrange,
     arrange,
-    toolbar: toolbarState({ selection, arrange, canArrange, enabledCount: enabled.length, resume }),
-    resume,
+    toolbar: toolbarState({ selection, arrange, canArrange, enabledCount: enabled.length, paused }),
+    paused,
   };
+}
+
+// Arranging can start now: a network is chosen, no command is in flight and nothing is stopping.
+function canArrangeNow() {
+  return canEditLayout(sharing, state.selectedInterfaceId) && !controlsBusy();
 }
 
 function context() {
@@ -774,6 +857,7 @@ function render() {
   if (arrangeRequested && isEditingLayout(sharing)) arrangeRequested = false;
   // An edit that ended any other way, an Apply included, keeps the computer switched on.
   if (!arrangeRequested && !isEditingLayout(sharing)) arrangeSwitchedOn = null;
+  settleLoadOnConnect();
   lastActive = activeFingerprint() ?? lastActive;
   const ctx = context();
   const { studio } = ctx;
@@ -969,21 +1053,21 @@ function mountStaticGlyphs() {
   nodes.sidebarRefresh.replaceChildren(refresh);
 }
 
-// The toolbar's buttons outlive renders, so hover, focus and a label mid-change carry on. Each draws
-// both of its glyphs and cross-fades between them; short of room, a tooltip names it.
+// The toolbar's buttons outlive renders, so hover, focus and a label mid-change carry on. Pause
+// draws both of its glyphs and cross-fades between them; short of room, a tooltip names each one.
 function createToolbarControls() {
   const arrange = button("", {
     variant: "secondary",
     size: "sm",
     focusKey: "toolbar-arrange",
-    onClick: () => (toolbarControls.arrangeMode === "done" ? leaveArrange() : arrangeWith()),
+    onClick: () => arrangeWith(),
   });
   arrange.id = "toolbar-arrange";
   arrange.append(
     el("span", {
-      className: "toolbar-glyph arrange-glyph",
+      className: "toolbar-glyph",
       attrs: { "aria-hidden": "true" },
-      children: [icon("monitor", 12), icon("check", 12)],
+      children: [icon("monitor", 12)],
     }),
     el("span", { className: "toolbar-label", text: "Arrange" }),
   );
@@ -995,19 +1079,30 @@ function createToolbarControls() {
   });
   pause.id = "toolbar-pause";
   // Bars to pause, a triangle to resume.
+  const pauseLabel = el("span", { className: "toolbar-label", text: "Pause sharing" });
   pause.append(
     el("span", {
       className: "toolbar-glyph pause-glyph",
       attrs: { "aria-hidden": "true" },
       children: [el("span", { className: "pause-bars" }), icon("play", 12)],
     }),
-    el("span", { className: "toolbar-label", text: "Pause sharing" }),
+    pauseLabel,
   );
   const arrangeTip = toolbarTooltip("toolbar-arrange-tooltip", arrange);
   const pauseTip = toolbarTooltip("toolbar-pause-tooltip", pause);
+  // Below the overlay width a closed details sheet comes back from here.
+  const details = iconButton({
+    id: "toolbar-details",
+    label: "Show details",
+    iconName: "app-window",
+    variant: "secondary",
+    size: "sm",
+    onClick: showInspector,
+  });
   nodes.arrangeSlot.replaceChildren(arrange, arrangeTip);
   nodes.pauseSlot.replaceChildren(pause, pauseTip);
-  return { arrange, pause, arrangeTip, pauseTip, arrangeMode: null, pauseMode: null };
+  nodes.detailsSlot.replaceChildren(details);
+  return { arrange, pause, pauseLabel, arrangeTip, pauseTip, pauseMode: null };
 }
 
 function toolbarTooltip(id, control) {
@@ -1024,19 +1119,18 @@ function renderToolbar(ctx) {
   turnGlyph(refresh.querySelector(":scope > svg"), "computers-refresh", computersLoad.running);
   const canvas = toolbar.canvasActions;
   const busy = ctx.busy;
-  const { arrange, pause, arrangeTip, pauseTip } = toolbarControls;
-  toolbarControls.arrangeMode = toolbar.arrange;
+  const { arrange, pause, pauseLabel, arrangeTip, pauseTip } = toolbarControls;
   if (toolbar.arrange) {
-    const label = toolbar.arrange === "done" ? "Done" : "Arrange";
-    setLabel(arrange.lastChild, label);
-    arrangeTip.textContent = label;
-    arrange.dataset.mode = toolbar.arrange;
-    arrange.disabled = toolbar.arrange === "begin" && busy;
+    // Arranging stops a session, so the tip says so then, and shows at any width.
+    const hint = isSessionActive(sharing);
+    arrangeTip.textContent = hint ? ARRANGE_PAUSES : "Arrange";
+    nodes.arrangeSlot.dataset.hint = String(hint);
+    arrange.disabled = busy;
   }
   toolbarControls.pauseMode = toolbar.pause;
   if (toolbar.pause) {
     const label = toolbar.pause === "resume" ? "Resume" : "Pause sharing";
-    setLabel(pause.lastChild, label);
+    setLabel(pauseLabel, label);
     pauseTip.textContent = label;
     pause.dataset.mode = toolbar.pause;
     pause.disabled = busy;
@@ -1052,6 +1146,13 @@ function renderToolbar(ctx) {
     {
       focusTarget: nodes.networkChip,
     },
+  );
+  const sheet = presentInspector(studio.inspectorKind);
+  setSlotPresent(
+    nodes.detailsSlot,
+    canvas && sheet.mode === "overlay" && studio.inspectorKind !== null && !sheet.open,
+    [...movers, nodes.arrangeSlot, nodes.pauseSlot],
+    { focusTarget: nodes.inspectorClose },
   );
   renderNetworkChip(ctx);
   nodes.studio.dataset.arranging = String(studio.arrange.active);
@@ -1173,6 +1274,7 @@ function leaveArrange() {
   const switchedOn = arrangeSwitchedOn;
   arrangeSwitchedOn = null;
   arrangeRequested = false;
+  loadOnConnect = null;
   canvasDrawer = null;
   render();
   void endLayoutEdit(switchedOn);
@@ -1189,11 +1291,11 @@ function pauseSharing() {
   void useComputer(null);
 }
 
+// Switching one computer of the paused group on resumes the whole group.
 function resumeSharing() {
   const target = resumeTarget({
     lastActive,
-    selection: currentSelection(),
-    fingerprints: computers.items.map((item) => item.fingerprint),
+    enabled: resolveEnabledList(sharing.view, computers, activeFingerprint()),
   });
   if (target) void setComputerEnabled(target, true);
 }
@@ -1500,8 +1602,10 @@ function schedulePairingPoll() {
     try {
       const result = await core.invoke("pairing_status");
       if (generation !== pairingGeneration) return;
+      const before = { pairing, shown: pairingResultShown };
       applyPairingResult(result);
-      render();
+      // A poll that changes nothing leaves the inspector alone, so a press held across it still lands.
+      if (!sameSharingView(before, { pairing, shown: pairingResultShown })) render();
       if (isBusyPairing(pairing)) schedulePairingPoll();
       else pairingPollingAllowed = false;
     } catch (error) {
@@ -1539,8 +1643,10 @@ function syncPairingCountdown() {
       render();
       return;
     }
+    // Ticks four times a second but reads in whole seconds, so most ticks leave the text alone.
     const text = document.getElementById(COUNTDOWN_TEXT_ID);
-    if (text) text.textContent = countdownText(left);
+    const next = countdownText(left);
+    if (text && text.textContent !== next) text.textContent = next;
   }, PAIRING_COUNTDOWN_TICK_MS);
 }
 
@@ -2345,26 +2451,50 @@ function applyArrangementList(fingerprint, list) {
     sharing = setArrangements(sharing, list);
 }
 
+function linkedWith(fingerprint) {
+  return isLinkedWith(fingerprint, {
+    connected: isConnected(sharing),
+    peerFingerprint: sharing.view?.peerFingerprint,
+    active: activeFingerprint(),
+  });
+}
+
 // Loading from an inspector is gated and run against that computer's own list, so an enabled button
-// always does something: it puts the layout into the draft the canvas is editing.
+// always does something: it puts the layout into the draft the canvas is editing, opening Arrange
+// with that computer first when its link is not up.
 function loadComputerArrangement(fingerprint, name) {
   const store = computerArrangements(computerArrangementsStore, fingerprint);
   const entry = store.items.find((item) => item.name === name) ?? null;
-  const gate = loadGate({
-    isActive: fingerprint === activeFingerprint(),
-    connected: isConnected(sharing),
-    entry,
-  });
+  const gate = loadGate({ linked: linkedWith(fingerprint), canArrange: canArrangeNow(), entry });
   if (!gate.enabled || controlsBusy()) {
-    sharing = { ...sharing, message: gate.reason || "The layout could not be loaded." };
+    sharing = { ...sharing, message: gate.reason || "The arrangement could not be loaded." };
     render();
     return;
   }
   if (currentSelection().kind === "settings") choose(computerSelection(fingerprint));
-  // The listed fit can be older than the displays; the draft decides, and says so when it cannot.
-  sharing = loadArrangementLayout(sharing, entry.layout);
-  touchSetupLink();
+  if (gate.arrange) {
+    loadOnConnect = { fingerprint, layout: entry.layout };
+    arrangeWith(fingerprint);
+    return;
+  }
+  loadIntoDraft(entry.layout);
   render();
+}
+
+// The listed fit can be older than the displays; the draft decides, and says so when it cannot.
+function loadIntoDraft(layout) {
+  sharing = loadArrangementLayout(sharing, layout);
+  touchSetupLink();
+}
+
+// Run by every render: the waiting Load lands once its link is up, and is dropped once arranging ends.
+function settleLoadOnConnect() {
+  if (!loadOnConnect) return;
+  if (!arrangeRequested && !isEditingLayout(sharing)) loadOnConnect = null;
+  else if (linkedWith(loadOnConnect.fingerprint)) {
+    loadIntoDraft(loadOnConnect.layout);
+    loadOnConnect = null;
+  }
 }
 
 // ---------- window ----------

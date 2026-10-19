@@ -29,10 +29,10 @@
   --canvas-handle-shadow: drop-shadow(0 3px 5px light-dark(oklch(.28 .05 262 / 26%), oklch(0 0 0 / 55%)));
   --canvas-ruler-opacity: .55;
   --canvas-dot-ring: 1.2px;
-  /* The place a computer still pairing will take: marching dashes on an accent wash. */
+  /* The place a computer still pairing will take: dashes on an accent wash that breathes, by
+     opacity alone so the compositor runs it. */
   --canvas-slot-dash: 5px 4px;
-  --canvas-slot-travel: -9px;
-  --canvas-slot-loop: 1200ms;
+  --canvas-slot-loop: var(--loop-breathe);
   --canvas-slot-stroke: 1.2px;
   --canvas-keycap-height: 18px;
   --canvas-banner-glyph: 28px;
@@ -113,9 +113,9 @@
 .arrangement-slot-title { fill: var(--primary); font-weight: var(--weight-semibold); }
 .arrangement-slot-detail { fill: var(--subtle-foreground); }
 @media (prefers-reduced-motion: no-preference) {
-  .arrangement-slot-frame { animation: canvas-slot-march var(--canvas-slot-loop) linear var(--canvas-slot-phase, 0ms) infinite; }
+  .arrangement-slot-frame { animation: canvas-slot-breathe var(--canvas-slot-loop) var(--ease-in-out) var(--canvas-slot-phase, 0ms) infinite; }
 }
-@keyframes canvas-slot-march { to { stroke-dashoffset: var(--canvas-slot-travel); } }
+@keyframes canvas-slot-breathe { 50% { opacity: var(--opacity-dim); } }
 
 /* The legend: a compact, quiet strip at the bottom left of the stage. */
 .arrangement-legend { flex-wrap: nowrap; justify-content: flex-start; gap: var(--gap-4); overflow: hidden; color: var(--subtle-foreground); font-size: var(--text-xs); white-space: nowrap; pointer-events: none; }

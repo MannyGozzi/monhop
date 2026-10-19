@@ -11,7 +11,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 ### Changed
 
 - MonHop's window is redesigned around one surface instead of the Home, Set up and Settings pages. A sidebar lists this computer, each paired computer with its own connection state, Add a computer and Settings. The middle shows your displays as one arrangement, and the right side shows whatever you select. Getting this computer ready, pairing a new computer, arranging displays and choosing who controls whom all happen in place, without switching pages.
-- Arranging displays has its own Arrange mode with a bar for Apply, saved arrangements and the displays in use. Sharing still pauses while you arrange and resumes when you apply.
+- Arranging displays has its own Arrange mode with a bar for Apply, saved arrangements and the displays in use. Sharing still pauses while you arrange and resumes when you apply. Leaving without applying says Discard changes when you moved something.
 - Each computer now has one switch to share with it, in place of the separate sharing buttons on Home and Set up.
 - Clipboard, screen dimming, mouse and trackpad, keyboard, updates, startup, the notch island, appearance and diagnostics now all live in Settings. Start at login appears only there.
 - The window shows how to take your keyboard and mouse back at any time: hold both Control keys and Esc for two seconds.

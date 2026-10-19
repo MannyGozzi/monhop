@@ -113,7 +113,8 @@ function updateRow(row, model) {
   if (row.glyph === glyph) return;
   const first = row.glyph === undefined;
   row.glyph = glyph;
-  row.tile.dataset.kind = model.platform ? "computer" : model.kind;
+  // Tinted by role as on the canvas: This Mac the local tone, every other computer the peer one.
+  row.tile.dataset.kind = model.kind;
   row.tile.dataset.platform = model.platform ?? "";
   row.tile.replaceChildren(
     model.platform ? platformGlyph(model.platform) : el("span", { className: "add-glyph" }),

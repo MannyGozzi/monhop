@@ -76,11 +76,11 @@ test("the open-settings label and description follow the platform", () => {
   assert.equal(autostartOpenLabel("windows"), "Open Startup settings");
   assert.equal(
     autostartDescription("macos"),
-    "MonHop starts in the menu bar at login and reconnects to this computer.",
+    "MonHop starts in the menu bar at login and reconnects to your computers.",
   );
   assert.equal(
     autostartDescription("windows"),
-    "MonHop starts in the system tray at login and reconnects to this computer.",
+    "MonHop starts in the system tray at login and reconnects to your computers.",
   );
   assert.equal(trayPlace("macos"), "the menu bar");
   assert.equal(trayPlace("windows"), "the system tray");

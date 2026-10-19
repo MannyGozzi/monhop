@@ -338,14 +338,15 @@ export function errorMessages(state) {
   return [...snapshotErrors, ...state.messages].filter(Boolean);
 }
 
-export function setupVerdict(state, { checking = false } = {}) {
+// `paired` is whether any computer is paired yet; only then is pairing the next step.
+export function setupVerdict(state, { checking = false, paired = false } = {}) {
   if (!state.nativeAvailable) {
     return { label: "Preview only", detail: "Open MonHop to check this computer.", tone: "wait" };
   }
   if (state.actionFailed) {
     return {
       label: "Something did not finish",
-      detail: "See the message above, then try again.",
+      detail: "See the alert at the top of the window, then try again.",
       tone: "fail",
     };
   }
@@ -368,7 +369,8 @@ export function setupVerdict(state, { checking = false } = {}) {
   if (state.snapshot.errors.length) {
     return {
       label: "A check needs attention",
-      detail: "Some information could not be read. See the message above.",
+      detail:
+        "Some information could not be read. See the alert at the top of the window, then try again.",
       tone: "fail",
     };
   }
@@ -388,7 +390,7 @@ export function setupVerdict(state, { checking = false } = {}) {
   }
   return {
     label: "Ready",
-    detail: `Using ${networkLabel(selectedInterface(state))}. Pair a computer below.`,
+    detail: `Using ${networkLabel(selectedInterface(state))}.${paired ? "" : " Pair a computer below."}`,
     tone: "done",
   };
 }

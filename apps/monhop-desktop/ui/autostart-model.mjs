@@ -57,5 +57,5 @@ export function trayPlace(platform) {
 }
 
 export function autostartDescription(platform) {
-  return `MonHop starts in ${trayPlace(platform)} at login and reconnects to this computer.`;
+  return `MonHop starts in ${trayPlace(platform)} at login and reconnects to your computers.`;
 }

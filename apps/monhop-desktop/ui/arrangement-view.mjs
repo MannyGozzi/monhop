@@ -1,4 +1,5 @@
 import {
+  arrangementBounds,
   arrangementGeometry,
   constrainTransform,
   describeArrangement,
@@ -21,17 +22,20 @@ import {
   createSeamLayer,
   createTilePaint,
   labelBoxes,
+  matrixOf,
   tileMarks,
   refineText,
   setPosition,
   svgNode,
+  watchSize,
 } from "./arrangement-render.mjs";
 import { revealPanel, setRevealOpen } from "./accordion.mjs";
-import { switchRow } from "./dom.mjs";
+import { motionEase, motionEnabled, motionMs, switchRow } from "./dom.mjs";
 import { icon } from "./icons.mjs";
 import {
   cappedFit,
   groupAriaText,
+  heldShift,
   membersFromOptions,
   normalizeUseChoices,
   nudgePixels,
@@ -42,7 +46,7 @@ import {
 const MIN_STAGE_WIDTH = 280;
 const MIN_STAGE_HEIGHT = 190;
 const SNAP_PIXELS = 14;
-// Below this a group's rect moved a rounding difference, not a rearrangement worth FLIP-animating.
+// Below this a group moved or resized by a rounding difference, not a change worth animating.
 const GROUP_MOVE_EPSILON = 0.5;
 const INSTRUCTIONS =
   "Drag a computer against another; the edge where they touch is where the pointer crosses. With a computer selected, arrow keys nudge it and Shift with an arrow moves it further.";
@@ -69,31 +73,41 @@ function emptyPreview() {
   return layer;
 }
 
-function reducedMotion() {
-  return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+// Which groups are on screen for the first time, and which are gone (their last node is handed to
+// the leaving layer instead of being discarded).
+function groupChanges(previous, current) {
+  const entered = Object.keys(current ?? {}).filter((key) => !previous?.[key]);
+  const left = Object.keys(previous ?? {}).filter((key) => !current?.[key]);
+  return { entered, left };
 }
 
-// What changed between two drawings' group rects: how far each continuing group moved (the inverse
-// translate a FLIP transition starts from), which groups are on screen for the first time, and which
-// ones are gone (their last node is handed to the leaving layer instead of being discarded).
-function groupMotion(previous, current) {
-  const moved = {};
-  const entered = [];
-  const left = [];
-  const seen = new Set();
-  for (const [key, rect] of Object.entries(current ?? {})) {
-    seen.add(key);
-    const was = previous?.[key];
-    if (!was) {
-      entered.push(key);
-      continue;
-    }
-    const delta = [was.x - rect.x, was.y - rect.y];
-    if (Math.abs(delta[0]) >= GROUP_MOVE_EPSILON || Math.abs(delta[1]) >= GROUP_MOVE_EPSILON)
-      moved[key] = delta;
-  }
-  for (const key of Object.keys(previous ?? {})) if (!seen.has(key)) left.push(key);
-  return { moved, entered, left };
+function sameSize(a, b) {
+  return Boolean(a && b) && a.width === b.width && a.height === b.height;
+}
+
+function stageBox(box) {
+  return {
+    width: Math.max(MIN_STAGE_WIDTH, Math.round(box?.width || MIN_STAGE_WIDTH)),
+    height: Math.max(MIN_STAGE_HEIGHT, Math.round(box?.height || MIN_STAGE_HEIGHT)),
+  };
+}
+
+// How far a group is into its enter animation, or null once it has finished or never entered.
+function enterElapsed(node) {
+  if (node.dataset.motion !== "enter") return null;
+  const running = node
+    .getAnimations({ subtree: true })
+    .find((animation) => "animationName" in animation && animation.playState === "running");
+  return running ? running.currentTime : null;
+}
+
+function resting(from, to) {
+  return (
+    Math.abs(from.x - to.x) < GROUP_MOVE_EPSILON &&
+    Math.abs(from.y - to.y) < GROUP_MOVE_EPSILON &&
+    Math.abs(from.width - to.width) < GROUP_MOVE_EPSILON &&
+    Math.abs(from.height - to.height) < GROUP_MOVE_EPSILON
+  );
 }
 
 function memberMaps(members) {
@@ -221,13 +235,18 @@ export function createArrangementView(options) {
   let groups = arrangement.groups;
   let pending = null;
   let destroyed = false;
-  let frame = null;
   let drag = null;
   let transform = null;
   let stageSize = { width: MIN_STAGE_WIDTH, height: MIN_STAGE_HEIGHT };
   let rects = { tiles: {}, groups: {} };
   let nodes = {};
   let rendered = { shape: null, scale: null, disabled: null };
+  // What the last render drew from and at which stage size; a render with both unchanged is skipped.
+  let drawnFor = null;
+  // The stage size the resize watch last saw, and how far a glide holding the drawing moved it.
+  let observed = null;
+  let held = null;
+  let useSignature = null;
   let groupLayer = null;
   let seamLayer = null;
   let previewLayer = null;
@@ -239,9 +258,7 @@ export function createArrangementView(options) {
   leavingLayer.setAttribute("aria-hidden", "true");
   let announced = "";
 
-  const resizeObserver =
-    typeof ResizeObserver === "function" ? new ResizeObserver(() => scheduleRender()) : null;
-  resizeObserver?.observe(stage);
+  const stageWatch = watchSize(stage, { change: holdScene, settle: () => renderScene() });
 
   function announce(message) {
     if (message === announced) return;
@@ -260,11 +277,41 @@ export function createArrangementView(options) {
   }
 
   function stageMetrics() {
-    const box = stage.getBoundingClientRect();
-    return {
-      width: Math.max(MIN_STAGE_WIDTH, Math.round(box.width || MIN_STAGE_WIDTH)),
-      height: Math.max(MIN_STAGE_HEIGHT, Math.round(box.height || MIN_STAGE_HEIGHT)),
-    };
+    return stageBox(observed ?? stage.getBoundingClientRect());
+  }
+
+  // While the stage glides the drawing keeps its scale and follows the centre the refit will give
+  // it, by viewBox alone; the render once the stage settles refits from where it is held.
+  function holdScene(size) {
+    observed = size.width && size.height ? size : null;
+    if (destroyed || drag || !drawnFor?.transform || !observed) return;
+    const next = stageBox(observed);
+    held = sameSize(next, drawnFor.size)
+      ? null
+      : heldShift(
+          drawnFor.transform,
+          cappedFit(arrangement.tiles, next, EDIT_INSETS),
+          arrangementBounds(arrangement.tiles),
+        );
+    const origin = held ? `${-held.x} ${-held.y}` : "0 0";
+    svg.setAttribute("viewBox", `${origin} ${next.width} ${next.height}`);
+  }
+
+  function contentSignature() {
+    return JSON.stringify([
+      arrangement.tiles,
+      arrangement.seams,
+      arrangement.connected,
+      arrangement.valid,
+      arrangement.message,
+      labels,
+      platforms,
+      tones,
+      labelDetails,
+      disabled,
+      shared,
+      inUse,
+    ]);
   }
 
   function renderShared() {
@@ -359,9 +406,13 @@ export function createArrangementView(options) {
   function renderUse() {
     const withDisplays = groups.order.filter((key) => inUse[key]?.length);
     if (!withDisplays.length) {
+      useSignature = null;
       setRevealOpen(usePanel, false, { focusTarget: fit });
       return;
     }
+    const signature = JSON.stringify([withDisplays, inUse, labels, tones, disabled]);
+    if (signature === useSignature) return;
+    useSignature = signature;
     const useHeading = document.createElement("div");
     useHeading.className = "arrangement-use-heading";
     const useTitle = document.createElement("span");
@@ -413,27 +464,32 @@ export function createArrangementView(options) {
     setRevealOpen(usePanel, true);
   }
 
-  function renderScene() {
-    if (destroyed || drag) return;
-    if (frame !== null) cancelAnimationFrame(frame);
-    frame = null;
+  // `force` redraws an unchanged scene, as a cancelled drag needs to put its group back.
+  function renderScene({ force = false } = {}) {
+    if (destroyed || drag || !root.isConnected) return;
     if (pending) {
       arrangement = pending;
       groups = arrangement.groups;
       pending = null;
     }
+    // The stage size and every drawn position are read before the first write.
+    const size = stageMetrics();
+    const content = contentSignature();
+    // While the stage glides the held drawing stands; the render once it settles refits it.
+    if (drawnFor?.content === content && !force && !refitNext)
+      if (sameSize(drawnFor.size, size) ? !held : stageWatch.settling()) return;
     const focused = svg.contains(document.activeElement)
       ? focusKeyOf(document.activeElement)
       : null;
-    // Measuring the stage also flushes the previous positions, so a moved group animates to its new one.
-    stageSize = stageMetrics();
-    svg.setAttribute("viewBox", `0 0 ${stageSize.width} ${stageSize.height}`);
-    renderShared();
-    renderUse();
-
     const all = arrangement.tiles;
     // Nothing to place means nothing to measure: the message alone is the scene until displays return.
     if (!all.length) {
+      stageSize = size;
+      held = null;
+      drawnFor = { content, size, transform: null };
+      svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
+      renderShared();
+      renderUse();
       svg.replaceChildren(paint.defs);
       nodes = {};
       rendered = { shape: null, scale: null, disabled: null };
@@ -443,17 +499,32 @@ export function createArrangementView(options) {
       return;
     }
     const shape = shapeOf(arrangement);
-    const key = `${shape}@${stageSize.width}x${stageSize.height}`;
-    const ideal = cappedFit(all, stageSize, EDIT_INSETS);
+    const key = `${shape}@${size.width}x${size.height}`;
+    const ideal = cappedFit(all, size, EDIT_INSETS);
     const stored = storedView?.key === key && !refitNext ? storedView.transform : null;
     // Edits pan the kept view instead of rescaling it; only a layout too large for that scale is refitted.
-    transform = constrainTransform(all, stored, stageSize, EDIT_INSETS) ?? ideal;
+    const next = constrainTransform(all, stored, size, EDIT_INSETS) ?? ideal;
+    // The same displays at the same places and scale only need fresh seams; anything else is rebuilt.
+    const sameSet =
+      rendered.shape !== null &&
+      rendered.shape === shape &&
+      rendered.scale === next.scale &&
+      rendered.disabled === disabled;
+    // A rebuilt group, or one whose coordinates the held view origin moved, starts where it shows.
+    const drawn = motionEnabled() && (!sameSet || held) ? drawnGroups() : null;
+
+    stageSize = size;
+    transform = next;
     refitNext = false;
+    held = null;
     storedView = { key, transform };
+    svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
+    renderShared();
+    renderUse();
     fit.classList.toggle("is-current", sameTransform(transform, ideal));
 
-    const previousGroupRects = rects.groups;
     const previousNodes = nodes;
+    const previousGroups = rects.groups;
     rects = { tiles: tileRects(all, transform), groups: groupRects(all, transform) };
     const boxes = labelBoxes(rects.groups, labels, stageSize, LABEL_INSETS, labelDetails);
     stage.dataset.state = arrangement.connected
@@ -463,14 +534,8 @@ export function createArrangementView(options) {
         : "invalid";
     stage.dataset.dragging = "false";
 
-    // The same displays at the same places and scale only need fresh seams; anything else is rebuilt.
-    const sameSet =
-      rendered.shape !== null &&
-      rendered.shape === shape &&
-      rendered.scale === transform.scale &&
-      rendered.disabled === disabled;
     if (sameSet) {
-      for (const groupKey of groups.order) refreshGroup(groupKey, boxes[groupKey]);
+      for (const groupKey of groups.order) refreshGroup(groupKey, boxes[groupKey], !drawn);
       replaceLayer("guideLayer", createGuideLayer([], stageSize));
       replaceLayer(
         "seamLayer",
@@ -500,40 +565,105 @@ export function createArrangementView(options) {
         seamLayer,
         previewLayer,
       );
-      playGroupMotion(groupMotion(previousGroupRects, rects.groups), previousNodes);
+      // A first drawing appears with its view; only later ones bring groups in one by one.
+      if (drawnFor) enterAndLeave(groupChanges(previousGroups, rects.groups), previousNodes);
     }
+    if (drawn) flipGroups(drawn, { rebuilt: !sameSet });
     rendered = { shape, scale: transform.scale, disabled };
+    drawnFor = { content, size, transform };
     refineText(svg);
     restingStatus();
     if (!disabled && focused)
       svg.querySelector(`[data-focus-key="${focused}"]`)?.focus({ preventScroll: true });
   }
 
-  // Plays a full-rebuild's motion: continuing groups FLIP from their last rect, a joining group
-  // fades and scales in (`data-motion="enter"`, styled in styles.css), and a group that just left
-  // keeps its last node fading in `leavingLayer` until its own leave animation ends. Reduced motion
-  // skips all of it: the rebuild already drew every node at its true, final position.
-  function playGroupMotion(motion, previousNodes) {
-    if (reducedMotion()) return;
-    const settled = [];
-    for (const [groupKey, [dx, dy]] of Object.entries(motion.moved)) {
-      const node = nodes[groupKey];
+  // Where each group shows this frame in stage pixels, mid-glide or held, with how far it is into
+  // entering or else the transform of any display inside still lifted or settling.
+  function drawnGroups() {
+    const shift = held ?? { x: 0, y: 0 };
+    const drawn = {};
+    for (const [groupKey, node] of Object.entries(nodes)) {
       const rect = rects.groups[groupKey];
-      if (!node || !rect) continue;
-      setPosition(node, rect.x + dx, rect.y + dy);
-      settled.push({ node, rect });
+      if (!rect || !node.isConnected) continue;
+      const matrix = matrixOf(node) ?? { scale: 1, scaleY: 1, x: rect.x, y: rect.y };
+      const entering = enterElapsed(node);
+      const displays = {};
+      if (entering === null)
+        for (const tile of node.querySelectorAll(".arrangement-display")) {
+          const value = getComputedStyle(tile).transform;
+          if (value && value !== "none") displays[tile.dataset.display] = value;
+        }
+      drawn[groupKey] = {
+        x: matrix.x + shift.x,
+        y: matrix.y + shift.y,
+        width: rect.width * matrix.scale,
+        height: rect.height * matrix.scaleY,
+        displays,
+        entering,
+      };
     }
-    for (const groupKey of motion.entered) {
+    return drawn;
+  }
+
+  // Each group starts where it shows and springs to its place, its size included, so a drop or a
+  // refit never jumps. A rebuilt group carries on entering, or its displays settling from the lift
+  // they had. Once anything moves, the seams fade in as the groups land.
+  function flipGroups(drawn, { rebuilt }) {
+    const starts = [];
+    const lifted = [];
+    const entering = [];
+    let moved = false;
+    for (const [groupKey, node] of Object.entries(nodes)) {
+      const from = drawn[groupKey];
+      const to = rects.groups[groupKey];
+      if (!from || !to?.width || !to.height) continue;
+      moved ||= !resting(from, to);
+      node.style.transition = "none";
+      setPosition(node, from.x, from.y, [from.width / to.width, from.height / to.height]);
+      starts.push([node, to]);
+      if (!rebuilt) continue;
+      if (from.entering !== null) {
+        node.dataset.motion = "enter";
+        entering.push([node, from.entering]);
+      }
+      for (const tile of node.querySelectorAll(".arrangement-display")) {
+        const lift = from.displays[tile.dataset.display];
+        if (!lift) continue;
+        tile.style.transition = "none";
+        tile.style.transform = lift;
+        lifted.push(tile);
+      }
+    }
+    if (!starts.length) return;
+    // One flush makes each start a computed value, so setting the true place below transitions.
+    groupLayer.getBoundingClientRect();
+    for (const [node, elapsed] of entering)
+      for (const animation of node.getAnimations({ subtree: true }))
+        if ("animationName" in animation) animation.currentTime = elapsed;
+    for (const [node, to] of starts) {
+      node.style.removeProperty("transition");
+      setPosition(node, to.x, to.y);
+    }
+    for (const tile of lifted) tile.style.removeProperty("transition");
+    for (const tile of lifted) tile.style.removeProperty("transform");
+    if (moved)
+      seamLayer.animate([{ opacity: 0 }, { opacity: 1 }], {
+        duration: motionMs("--motion-base"),
+        delay: motionMs("--motion-fast"),
+        easing: motionEase(),
+        fill: "backwards",
+      });
+  }
+
+  // A joining group fades and scales in (`data-motion="enter"`, styled in studio-canvas.css), and a
+  // group that just left keeps its last node fading in `leavingLayer` until its leave animation ends.
+  function enterAndLeave(changes, previousNodes) {
+    if (!motionEnabled()) return;
+    for (const groupKey of changes.entered) {
       const node = nodes[groupKey];
       if (node) node.dataset.motion = "enter";
     }
-    if (settled.length)
-      requestAnimationFrame(() => {
-        // Reading the box lays the offset out, so setting the true position below is a change the transition can run.
-        for (const { node } of settled) node.getBoundingClientRect();
-        for (const { node, rect } of settled) setPosition(node, rect.x, rect.y);
-      });
-    for (const groupKey of motion.left) {
+    for (const groupKey of changes.left) {
       const node = previousNodes?.[groupKey];
       if (!node) continue;
       node.dataset.motion = "leave";
@@ -579,8 +709,9 @@ export function createArrangementView(options) {
     return node;
   }
 
-  // Same displays at the same scale: move the tiles that exist instead of drawing them again.
-  function refreshGroup(groupKey, labelBox) {
+  // Same displays at the same scale: move the tiles that exist instead of drawing them again. A
+  // group flipped from where it shows takes its place in flipGroups instead.
+  function refreshGroup(groupKey, labelBox, place) {
     const node = nodes[groupKey];
     node.classList.remove("is-dragging");
     node.setAttribute("aria-label", groupAria(groupKey));
@@ -588,7 +719,7 @@ export function createArrangementView(options) {
       createGroupLabelNode(labels[groupKey], labelBox, rects.groups[groupKey]),
       node.firstChild,
     );
-    setPosition(node, rects.groups[groupKey].x, rects.groups[groupKey].y);
+    if (place) setPosition(node, rects.groups[groupKey].x, rects.groups[groupKey].y);
   }
 
   function groupAria(groupKey) {
@@ -610,11 +741,6 @@ export function createArrangementView(options) {
       seams: arrangement.seams,
       otherGroupCount: groups.order.length - 1,
     });
-  }
-
-  function scheduleRender() {
-    if (destroyed || drag || frame !== null) return;
-    frame = requestAnimationFrame(() => renderScene());
   }
 
   function candidateFor(deltaX, deltaY) {
@@ -735,14 +861,14 @@ export function createArrangementView(options) {
 
   function cancelDrag() {
     if (!endDrag()) return;
-    renderScene();
+    renderScene({ force: true });
     announce("Move cancelled. The arrangement is unchanged.");
   }
 
   function commitDrag(current) {
     if (!current) return;
     if (!current.moved || !current.resolved) {
-      renderScene();
+      renderScene({ force: true });
       if (current.moved) announce("No touching position there, so the arrangement is unchanged.");
       return;
     }
@@ -884,8 +1010,7 @@ export function createArrangementView(options) {
       if (destroyed) return;
       destroyed = true;
       endDrag();
-      resizeObserver?.disconnect();
-      if (frame !== null) cancelAnimationFrame(frame);
+      stageWatch.disconnect();
       listenForPointer(false);
       stage.removeEventListener("keydown", onStageKeyDown);
     },

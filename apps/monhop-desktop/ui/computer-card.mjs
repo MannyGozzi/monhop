@@ -5,6 +5,7 @@ import { platformLabel } from "./pairing-model.mjs";
 import {
   displayNoticeCopy,
   isConnected,
+  isSessionActive,
   noticePresentation,
   releaseToShareCopy,
 } from "./sharing-model.mjs";
@@ -12,13 +13,16 @@ import { DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
 import { normalizeClipboardView } from "./clipboard-model.mjs";
 import { clipboardLine } from "./studio-model.mjs";
 import { inspectorHeader } from "./screen-ready.mjs";
+import { pairBadgeLabel } from "./pair-badge-model.mjs";
 import {
+  ARRANGE_PAUSES,
   computerMeta,
   computerTone,
   controlSwitchRows,
   groupedFingerprint,
   isComputerEnabled,
   isInFlight,
+  isLinkedWith,
   layoutChips,
   layoutRows,
   resolveEnabledList,
@@ -43,11 +47,11 @@ import {
   withTooltip,
 } from "./dom.mjs";
 
-// A Layouts list rebuilt within this window is still the same entrance, stagger included.
+// A saved arrangements list rebuilt within this window is still the same entrance, stagger included.
 const LIST_ENTER_MS = 600;
 
 // A computer's inspector: who it is, its state with the one switch that shares with it, the
-// directions of control, its clipboard, its arrangement and layouts, its details and Forget.
+// directions of control, its clipboard, its arrangement and saved arrangements, its details and Forget.
 export function computerInspector(ctx, computer) {
   const { active } = ctx;
   const fingerprint = computer.fingerprint;
@@ -56,14 +60,16 @@ export function computerInspector(ctx, computer) {
   const status = computerStatus(computer, ctx.sharing.view, active, local);
   const enabledList = resolveEnabledList(ctx.sharing.view, ctx.computers, active);
   const enabled = isComputerEnabled(fingerprint, enabledList);
-  const tone = enabled ? computerTone(fingerprint, enabledList) : "idle";
+  // A paused group stays switched on but shares with nothing, so its switches read off.
+  const on = enabled && !ctx.studio.paused;
+  const tone = on ? computerTone(fingerprint, enabledList) : "idle";
   const key = `inspector-${fingerprint}`;
   const node = el("div", {
     className: "inspector-view computer-inspector",
     dataset: { kind: "computer", tone: status.tone },
     children: [
       header(ctx, computer, name, tone, key),
-      stateBlock(ctx, computer, { name, status, enabled, key }),
+      stateBlock(ctx, computer, { name, status, enabled, on, key }),
       presence(`${key}-control`, enabled ? directions(ctx, computer, name, local) : null),
       presence(`${key}-clipboard`, clipboardSection(ctx, computer, name, key)),
       arrangementSection(ctx, computer, key),
@@ -152,12 +158,15 @@ function pairPicture(computer, key) {
     className: "pair-picture",
     attrs: { tabindex: 0 },
     dataset: { focusKey: `${key}-pair-picture` },
-    children: [el("span", { text: "Pairing picture" }), pairBadge(computer.badge)],
+    children: [
+      el("span", { className: "pair-picture-label", text: "Pairing picture" }),
+      pairBadge(computer.badge),
+    ],
   });
   return withTooltip(
     node,
     `${key}-pair-picture-tooltip`,
-    "The other computer shows this same picture. If they differ, forget this computer and pair again.",
+    `${pairBadgeLabel(computer.badge)}. The other computer shows this same picture. If they differ, forget this computer and pair again.`,
   );
 }
 
@@ -222,7 +231,7 @@ function localName(ctx) {
 
 // One state, one control: the label with its tone dot, a spinner while it is on its way, the
 // switch that shares with this computer, and what the state means.
-function stateBlock(ctx, computer, { name, status, enabled, key }) {
+function stateBlock(ctx, computer, { name, status, enabled, on, key }) {
   const release =
     enabled && status.key === "sharing"
       ? releaseToShareCopy(ctx.sharing.view?.blockingPresses)
@@ -255,7 +264,7 @@ function stateBlock(ctx, computer, { name, status, enabled, key }) {
             }),
             spinning ? "spin" : "rest",
           ),
-          shareSwitch(ctx, computer, name, enabled),
+          shareSwitch(ctx, computer, name, on),
         ],
       }),
       fadingText(`${key}-state-detail`, "computer-state-detail", status.detail),
@@ -266,14 +275,14 @@ function stateBlock(ctx, computer, { name, status, enabled, key }) {
 }
 
 // The kit's switch, lifted out of its row: the state above is its label, so the whole block is not
-// one click target. On means this computer is switched on for sharing.
-function shareSwitch(ctx, computer, name, enabled) {
+// one click target. On means sharing with this computer; turning it on also resumes a pause.
+function shareSwitch(ctx, computer, name, on) {
   const label = shareSwitchLabel(name);
   const control = switchRow(label, {
-    checked: enabled,
+    checked: on,
     disabled: ctx.busy,
     focusKey: `share-${computer.fingerprint}`,
-    onChange: () => toggleComputerEnabled(ctx.actions, computer.fingerprint, enabled),
+    onChange: () => toggleComputerEnabled(ctx.actions, computer.fingerprint, on),
   }).querySelector(".switch");
   control.classList.add("computer-share-switch");
   control.setAttribute("aria-label", label);
@@ -348,9 +357,9 @@ function clipboardSection(ctx, computer, name, key) {
   );
 }
 
-// --- arrangement and layouts ----------------------------------------------------
+// --- arrangement and saved arrangements -------------------------------------------
 
-// The canvas draws the displays; here is the way into Arrange and the layouts kept with this computer.
+// The canvas draws the displays; here is the way into Arrange and the arrangements kept with this computer.
 function arrangementSection(ctx, computer, key) {
   const { actions, busy, arrange, studio } = ctx;
   const arrangeButton = button("Arrange", {
@@ -360,6 +369,7 @@ function arrangementSection(ctx, computer, key) {
     focusKey: `inspector-arrange-${computer.fingerprint}`,
     onClick: () => actions.arrangeWith(computer.fingerprint),
   });
+  if (isSessionActive(ctx.sharing)) arrangeButton.title = ARRANGE_PAUSES;
   return section("Arrangement", [layoutsDisclosure(ctx, computer, key)], {
     actions: [arrangeButton],
     className: "computer-arrangement",
@@ -374,8 +384,13 @@ function layoutsDisclosure(ctx, computer, key) {
     fingerprint,
     entries: store.items,
     armed: layoutForget,
-    isActive: fingerprint === active,
-    connected: isConnected(sharing),
+    linked: isLinkedWith(fingerprint, {
+      connected: isConnected(sharing),
+      peerFingerprint: sharing.view?.peerFingerprint,
+      active,
+    }),
+    canArrange: ctx.studio.canArrange,
+    sessionActive: isSessionActive(sharing),
     busy,
     pending: store.loading,
   });
@@ -385,12 +400,12 @@ function layoutsDisclosure(ctx, computer, key) {
     content.push(
       note(
         store.loading
-          ? "Reading the saved layouts…"
-          : "MonHop remembers each layout applied with this computer.",
+          ? "Reading the saved arrangements…"
+          : "MonHop remembers each arrangement you apply with this computer.",
       ),
     );
   else content.push(layoutList(ctx, fingerprint, entries));
-  const label = entries.length ? `Layouts (${entries.length})` : "Layouts";
+  const label = entries.length ? `Saved arrangements (${entries.length})` : "Saved arrangements";
   const accordion = createAccordion(`${key}-layouts`, "computer-layouts", label, ...content);
   // The manager toggles the panel first and announces it afterwards, so reading the list here
   // re-renders the inspector without the press being lost.
@@ -433,7 +448,7 @@ export function layoutChipStrip(key, entry) {
   });
 }
 
-// The name over one quiet line, its crossings then its chips, with Load and Forget beside it.
+// The name over one quiet line, its crossings then its chips, with Load and Delete beside it.
 function layoutRow(ctx, fingerprint, item, index) {
   const { actions } = ctx;
   const { entry, key, armed, disabled, load } = item;
@@ -478,7 +493,7 @@ function forgetLayoutButton(actions, fingerprint, entry, key, armed, disabled) {
     focusKey: `layout-forget-${key}`,
     onClick: () => actions.pressLayoutForget(fingerprint, entry.name),
   });
-  node.append(stableLabel(`layout-forget-${key}`, ["Forget", "Confirm forget"], armed ? 1 : 0));
+  node.append(stableLabel(`layout-forget-${key}`, ["Delete", "Confirm delete"], armed ? 1 : 0));
   return node;
 }
 
@@ -492,7 +507,7 @@ function loadButton(actions, fingerprint, entry, key, load, disabled) {
     focusKey: `layout-load-${key}`,
     onClick: () => void actions.loadComputerArrangement(fingerprint, entry.name),
   });
-  if (load.reason) node.title = load.reason;
+  if (load.reason || load.hint) node.title = load.reason || load.hint;
   return node;
 }
 

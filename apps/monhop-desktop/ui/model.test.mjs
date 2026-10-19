@@ -283,11 +283,19 @@ test("failed checks and partial reports do not present a successful next step", 
   const snapshot = { ...macSnapshot, permissions: { accessibility: true, inputMonitoring: true } };
   const failed = { ...applySnapshot(initialState(true), snapshot), actionFailed: true };
   assert.equal(setupVerdict(failed).label, "Something did not finish");
+  assert.equal(
+    setupVerdict(failed).detail,
+    "See the alert at the top of the window, then try again.",
+  );
   const partial = applySnapshot(initialState(true), {
     ...snapshot,
     errors: ["Could not read networks"],
   });
   assert.equal(setupVerdict(partial).label, "A check needs attention");
+  assert.match(
+    setupVerdict(partial).detail,
+    /See the alert at the top of the window, then try again\.$/,
+  );
   assert.equal(accessReady(partial.snapshot), false);
   assert.equal(accessReady({ ...partial.snapshot, errors: [] }), true);
 });
@@ -302,8 +310,10 @@ test("the verdict says ready only with access and a recognized network", () => {
     "en0",
   );
   assert.equal(setupVerdict(ready).label, "Ready");
-  assert.match(setupVerdict(ready).detail, /Ethernet/);
+  assert.match(setupVerdict(ready).detail, /^Using .*Ethernet.*\. Pair a computer below\.$/);
   assert.equal(setupVerdict(ready).tone, "done");
+  // Once a computer is paired, pairing is no longer the next step.
+  assert.match(setupVerdict(ready, { paired: true }).detail, /^Using .*Ethernet[^.]*\.$/);
 });
 
 test("pairing stays inert until a checked capability and recognized selection exist", () => {

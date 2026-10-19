@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   canCheck,
+  checkHint,
   canInstall,
   installHint,
   normalizeUpdatesView,
@@ -124,10 +125,19 @@ test("installing needs a ready build and no active sharing session", () => {
 test("the install hint only appears when sharing blocks a ready install", () => {
   assert.equal(
     installHint({ ...base, phase: "ready", sharingActive: true }),
-    "Sharing is running. Turn it off first or quit MonHop to update.",
+    "Pause sharing to restart now, or it installs when you quit MonHop.",
   );
   assert.equal(installHint({ ...base, phase: "ready", sharingActive: false }), "");
   assert.equal(installHint({ ...base, phase: "downloading", sharingActive: true }), "");
+});
+
+test("the check hint only appears when sharing is all that blocks Check now", () => {
+  for (const phase of ["idle", "upToDate", "available", "failed"])
+    assert.equal(checkHint({ ...base, phase, sharingActive: true }), "Pause sharing to check now.");
+  assert.equal(checkHint({ ...base, phase: "idle", sharingActive: false }), "");
+  // A ready build shows Restart to update and its own hint; a running step is its own reason.
+  for (const phase of ["ready", "checking", "downloading", "installing"])
+    assert.equal(checkHint({ ...base, phase, sharingActive: true }), "", phase);
 });
 
 test("installing cannot start another check or install", () => {

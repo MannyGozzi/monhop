@@ -1,6 +1,6 @@
 import { computerStatus, isSessionStatus } from "./computer-status.mjs";
 import { displayName, findComputer } from "./computers-model.mjs";
-import { platformLabel } from "./pairing-model.mjs";
+import { pairingStep, platformLabel } from "./pairing-model.mjs";
 import {
   MAX_ARRANGEMENT_NAME,
   arrangementForSharing,
@@ -14,17 +14,20 @@ import {
   groupFromView,
   hasAppliedCurrentLayout,
   hasAppliedLayout,
+  isBusySharing,
   isConnected,
   isSyncing,
   normalizeArrangementName,
   sharedMonitorChoices,
 } from "./sharing-model.mjs";
 import { createArrangementView } from "./arrangement-view.mjs";
+import { watchSize } from "./arrangement-render.mjs";
 import { newestFirst, resolveEnabledList } from "./computer-card-model.mjs";
 import { layoutChipStrip } from "./computer-card.mjs";
 import { presence } from "./accordion.mjs";
 import { createDashboardArrangement, createLocalPicture } from "./dashboard-arrangement.mjs";
 import { UPDATE_READY_NOTE, canInstall, installHint } from "./updates-model.mjs";
+import { ESCAPE_SENTENCE, escapeKeys } from "./escape-model.mjs";
 import {
   badge,
   button,
@@ -58,13 +61,11 @@ const OFFLINE_KEYS = new Set(["error", "attention"]);
 // A first guess at the height of the card under a picture, corrected once the card is laid out.
 const CARD_ESTIMATE = 148;
 const SLOT_COPY = { title: "New computer", detail: "Its displays appear here" };
-const ESCAPE_SENTENCE =
-  "Hold both Control keys and Esc for 2 seconds to take your keyboard and mouse back.";
 
 // The view on the canvas, kept across renders so its state changes transition in place; it is
 // replaced, cross-fading, only when what it shows changes.
 let shown = null;
-let stageObserver = null;
+let stageWatch = null;
 let escapePlatform = null;
 
 // The canvas: its banners, the arrangement (read only, or the live editor while arranging), the
@@ -122,12 +123,13 @@ function stageSize(node) {
   return { width: node.clientWidth, height: node.clientHeight };
 }
 
-// One observer for the life of the window: the canvas refits its picture whenever its own box
-// changes, whether the window, a banner or the inspector moved it.
+// One watch for the life of the window: while the canvas box glides, whether a banner, the dock or
+// the window moved it, the picture holds its fit, and it refits once the box settles.
 function watchStage(stage) {
-  if (stageObserver || typeof ResizeObserver !== "function") return;
-  stageObserver = new ResizeObserver(() => shown?.refit?.(stageSize(stage)));
-  stageObserver.observe(stage);
+  stageWatch ??= watchSize(stage, {
+    change: (size) => shown?.hold?.(size),
+    settle: (size) => shown?.refit?.(size),
+  });
 }
 
 // The outgoing view fades where it stands while the new one rises in; a view replaced mid-fade
@@ -160,17 +162,21 @@ function showView(stage, view) {
   for (const stale of stage.querySelectorAll(":scope > :not([data-exit='true'])")) stale.remove();
   stage.append(view.element);
   shown = view;
-  if (leaving && motionEnabled())
-    view.element.animate(
-      [
-        {
-          opacity: 0,
-          transform: `translateY(${motionToken("--motion-rise")}) scale(${motionToken("--scale-sheet")})`,
-        },
-        { opacity: 1, transform: "none" },
-      ],
-      { duration: motionMs("--motion-base"), easing: motionEase() },
-    );
+  if (leaving) riseIn(view.element);
+}
+
+function riseIn(element) {
+  if (!motionEnabled()) return;
+  element.animate(
+    [
+      {
+        opacity: 0,
+        transform: `translateY(${motionToken("--motion-rise")}) scale(${motionToken("--scale-sheet")})`,
+      },
+      { opacity: 1, transform: "none" },
+    ],
+    { duration: motionMs("--motion-base"), easing: motionEase() },
+  );
 }
 
 // --- banners ------------------------------------------------------------------
@@ -235,7 +241,7 @@ function attentionBanners(ctx) {
             title: `${displayName(computer)}: ${status.label}`,
             body: status.detail,
             actions: [
-              button("Pause", {
+              button("Turn off", {
                 variant: "ghost",
                 size: "sm",
                 disabled: busy,
@@ -295,9 +301,10 @@ function updateReadyBanner({ updates, actions }) {
   const { view, pending } = updates;
   if (view.phase !== "ready") return null;
   const hint = installHint(view);
+  // A hint says why Restart waits; it is information, so it never takes an alarming tone.
   return banner({
     id: "canvas-update-ready",
-    tone: "success",
+    tone: hint ? "neutral" : "success",
     iconName: "refresh-cw",
     title: `MonHop ${view.availableVersion} is ready`,
     body: hint || UPDATE_READY_NOTE,
@@ -334,8 +341,10 @@ function peerStatus(ctx, computer) {
   return { label: status.label, tone: status.tone, offline: OFFLINE_KEYS.has(status.key) };
 }
 
-// A pairing on screen draws the place the new computer will take, and quiets the others.
+// A pairing on screen draws the place the new computer will take, and quiets the others; once it
+// has paired, the new computer has its own place.
 function pairingLive(ctx) {
+  if (ctx.pairing && pairingStep(ctx.pairing, ctx.now) === "paired") return false;
   return ctx.studio.selection.kind === "new" || ctx.pairing?.view?.phase === "showing";
 }
 
@@ -389,7 +398,12 @@ function savedView(ctx, stage) {
   });
   element.append(picture.element, toast);
   update(ctx);
-  return { element, update, refit: (size) => picture?.refit(size) };
+  return {
+    element,
+    update,
+    hold: (size) => picture?.hold(size),
+    refit: (size) => picture?.refit(size),
+  };
 }
 
 // A canvas without an arrangement draws this computer's own displays above a card that says what
@@ -453,6 +467,10 @@ function pictureView(ctx, stage, { view, card, slot }) {
     element,
     update,
     mounted: () => measureCard({ still: true }),
+    hold: (size) => {
+      picture?.hold(size);
+      placeCard();
+    },
     refit: (size) => {
       picture?.refit(size);
       placeCard();
@@ -591,6 +609,8 @@ function editView(ctx) {
     const editor = liveEditor(context);
     if (mountedEditor !== editor.element) {
       element.replaceChildren(editor.element);
+      // An editor's first drawing does not bring its groups in, so a new one rises in as a view does.
+      riseIn(editor.element);
       mountedEditor = editor.element;
     }
     // The editor is fed its new state only once it is in the document, so a moved group animates there.
@@ -631,6 +651,9 @@ function applyBar(ctx, mode) {
   const { sharing, actions, busy, arrange, canvasDrawer } = ctx;
   const applying = sharing.pending?.kind === "apply" || isSyncing(sharing);
   const editing = mode === "edit";
+  if (!sharing.view?.editing) draftChanged = false;
+  else if (isConnected(sharing) && !isBusySharing(sharing))
+    draftChanged = canResetArrangement(sharing);
   const toggles = editing
     ? [
         drawerToggle(ctx, "saved", savedLabel(sharing)),
@@ -647,10 +670,10 @@ function applyBar(ctx, mode) {
         className: "apply-bar-status",
         children: [
           editing
-            ? syncStatus(ctx)
+            ? syncStatus(ctx, draftChanged)
             : el("p", {
                 className: "progress-line",
-                text: "Apply turns on once both computers connect.",
+                text: "Sharing is paused while you arrange. Apply turns on once both computers connect.",
               }),
           sharing.message && editing ? note(sharing.message, "danger") : null,
         ],
@@ -666,15 +689,7 @@ function applyBar(ctx, mode) {
       el("div", {
         className: "apply-bar-actions",
         children: [
-          arrange.leavable
-            ? button(sharing.view?.editing ? "Done" : "Cancel", {
-                variant: "ghost",
-                size: "sm",
-                disabled: busy && !applying,
-                focusKey: "apply-bar-leave",
-                onClick: actions.leaveArrange,
-              })
-            : null,
+          arrange.leavable ? leaveButton(ctx, applying) : null,
           button(applying ? "Applying…" : "Apply on both computers", {
             busy: applying,
             size: "sm",
@@ -708,6 +723,21 @@ function applyBar(ctx, mode) {
     toggle.append(chevron);
     return toggle;
   }
+}
+
+// The only way out of arranging. Leaving keeps what both computers already run, so once the draft
+// differs from it the button says it discards; before the edit opens there is nothing to discard.
+function leaveButton({ sharing, actions, busy }, applying) {
+  const leave = button(sharing.view?.editing ? "" : "Cancel", {
+    variant: "ghost",
+    size: "sm",
+    disabled: busy && !applying,
+    focusKey: "apply-bar-leave",
+    onClick: actions.leaveArrange,
+  });
+  if (sharing.view?.editing)
+    leave.append(stableLabel("apply-bar-leave", LEAVE_LABELS, draftChanged ? 1 : 0));
+  return leave;
 }
 
 function savedLabel(sharing) {
@@ -762,8 +792,6 @@ function renderEscape(bar, platform) {
   const escape = bar?.querySelector(".status-bar-escape");
   if (!escape || escapePlatform === platform) return;
   escapePlatform = platform;
-  const windows = platform === "windows";
-  const control = windows ? "Ctrl" : "⌃";
   escape.title = ESCAPE_SENTENCE;
   escape.replaceChildren(
     el("span", { className: "visually-hidden", text: ESCAPE_SENTENCE }),
@@ -774,7 +802,7 @@ function renderEscape(bar, platform) {
         el("span", { text: "Hold" }),
         el("span", {
           className: "keycaps",
-          children: [keycap(control), keycap(control), keycap(windows ? "Esc" : "esc")],
+          children: escapeKeys(platform).map(keycap),
         }),
         el("span", { className: "status-bar-escape-long", text: "for 2 s to take input back" }),
         el("span", { className: "status-bar-escape-short", text: "for 2 s" }),
@@ -789,6 +817,10 @@ function keycap(label) {
 
 // The app rebuilds this screen on every status poll; keeping the editor alive keeps a drag alive with it.
 let live = null;
+// Whether the draft differs from what both computers run. canResetArrangement reads false while a
+// command is in flight or the link is down, so its last answer stands until it can answer again.
+let draftChanged = false;
+const LEAVE_LABELS = ["Done", "Discard changes"];
 
 // Today's exactly-two-computer options (`localPlatform`/`peerPlatform`/`localLabel`/`peerLabel`) for
 // up to two members, unchanged; past that the picture needs a member per computer, so this instead
@@ -904,7 +936,7 @@ function releaseEditor() {
   live = null;
 }
 
-function syncStatus(ctx) {
+function syncStatus(ctx, changed) {
   const { sharing, actions, busy } = ctx;
   const sync = sharing.view?.sync ?? { state: "idle", message: "" };
   const line = el("div", { className: "progress-line" });
@@ -918,18 +950,14 @@ function syncStatus(ctx) {
     line.dataset.tone = "busy";
     line.append(
       el("span", { className: "spinner" }),
-      el("span", { text: `Receiving a layout from ${ctx.peerName}…` }),
+      el("span", { text: `Receiving an arrangement from ${ctx.peerName}…` }),
     );
   } else if (hasAppliedCurrentLayout(sharing)) {
     line.dataset.tone = "success";
     line.append(badge("Applied on both computers", "success", "check"));
-  } else if (sync.state === "applied")
-    line.append(
-      el("span", { text: "You changed the layout. Apply again to update both computers." }),
-    );
-  else if (sync.state === "rejected") {
+  } else if (sync.state === "rejected") {
     line.dataset.tone = "danger";
-    const reason = sync.message || "The other computer could not use this layout.";
+    const reason = sync.message || "The other computer could not use this arrangement.";
     line.append(
       badge("Not applied", "danger"),
       el("span", { className: "progress-line-text", text: reason, attrs: { title: reason } }),
@@ -942,7 +970,14 @@ function syncStatus(ctx) {
         onClick: actions.applySetup,
       }),
     );
-  } else line.append(el("span", { text: "Apply saves this layout on both computers." }));
+  } else
+    line.append(
+      el("span", {
+        text: changed
+          ? "You moved displays. Apply to use this arrangement on both computers."
+          : "Apply saves this arrangement on both computers.",
+      }),
+    );
   return line;
 }
 

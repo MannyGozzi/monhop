@@ -39,6 +39,9 @@ const RULER_TEXT_GAP = 7;
 const SLOT_RADIUS = 6;
 // Lucide's arrow-left-right on its 24-unit grid, drawn at half size in the seam handle.
 const SWAP_GLYPH = "M8 3 4 7l4 4M4 7h16M16 21l4-4-4-4M20 17H4";
+// Frames a box must hold its size before it counts as settled. A starting transition's first frame
+// samples its start value, so one unchanged frame does not mean the glide is over.
+const SETTLE_FRAMES = 3;
 
 let paintSequence = 0;
 
@@ -46,8 +49,59 @@ export function svgNode(name) {
   return document.createElementNS(SVG_NS, name);
 }
 
-export function setPosition(node, x, y) {
-  node?.setAttribute("transform", `translate(${round(x)} ${round(y)})`);
+export function setPosition(node, x, y, scale = null) {
+  const scaled = scale ? ` scale(${scale[0].toFixed(4)} ${scale[1].toFixed(4)})` : "";
+  node?.setAttribute("transform", `translate(${round(x)} ${round(y)})${scaled}`);
+}
+
+// A node's computed transform as scale and offset, mid-animation included; null when it has none.
+export function matrixOf(node) {
+  const value = getComputedStyle(node).transform;
+  if (!value || value === "none") return null;
+  const matrix = new DOMMatrixReadOnly(value);
+  return { scale: matrix.a, scaleY: matrix.d, x: matrix.e, y: matrix.f };
+}
+
+// Follows `node`'s box: `change(size)` on the frame after each resize, before that frame lays out,
+// and `settle(size)` once it holds still, so a drawing redraws once when a glide ends instead of on
+// every frame of it. `settling()` is true from a resize until its settle.
+export function watchSize(node, { change, settle }) {
+  if (typeof ResizeObserver !== "function") return { settling: () => false, disconnect() {} };
+  let size = null;
+  let changed = false;
+  let quiet = 0;
+  let frame = null;
+  const tick = () => {
+    if (changed) {
+      changed = false;
+      change(size);
+    }
+    quiet += 1;
+    if (quiet < SETTLE_FRAMES) {
+      frame = requestAnimationFrame(tick);
+      return;
+    }
+    frame = null;
+    settle(size);
+  };
+  const observer = new ResizeObserver(([entry]) => {
+    const border = entry.borderBoxSize?.[0];
+    size = {
+      width: Math.round(border?.inlineSize ?? entry.contentRect.width),
+      height: Math.round(border?.blockSize ?? entry.contentRect.height),
+    };
+    changed = true;
+    quiet = 0;
+    frame ??= requestAnimationFrame(tick);
+  });
+  observer.observe(node);
+  return {
+    settling: () => frame !== null,
+    disconnect() {
+      observer.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
+    },
+  };
 }
 
 // The gradients and hatch every tile of one drawing paints with. Ids are per drawing, so a picture
@@ -531,16 +585,19 @@ export function createLegend(items, { tag = "div" } = {}) {
 
 // Canvas metrics only estimate the CSS font; once the text is laid out its real advance width decides.
 export function refineText(root) {
-  for (const node of root.querySelectorAll?.("text[data-text]") ?? []) {
-    if (typeof node.getComputedTextLength !== "function") return;
+  const nodes = [...(root.querySelectorAll?.("text[data-text]") ?? [])];
+  if (typeof nodes[0]?.getComputedTextLength !== "function") return;
+  // Every full text goes in before any is measured, so the page lays out once for all that fit.
+  const estimates = nodes.map((node) => node.textContent);
+  for (const node of nodes) node.textContent = node.dataset.text ?? "";
+  const widths = nodes.map((node) => node.getComputedTextLength());
+  nodes.forEach((node, index) => {
     const full = node.dataset.text ?? "";
     const maxWidth = Number(node.dataset.width);
-    const estimate = node.textContent;
-    node.textContent = full;
-    const width = node.getComputedTextLength();
+    const width = widths[index];
     if (!(width > 0) || !Number.isFinite(maxWidth)) {
-      node.textContent = estimate;
-      continue;
+      node.textContent = estimates[index];
+      return;
     }
     const shown =
       width <= maxWidth
@@ -551,9 +608,10 @@ export function refineText(root) {
               node.textContent = value;
               return node.getComputedTextLength();
             });
-    node.textContent = shown;
-    node.setAttribute("visibility", shown ? "visible" : "hidden");
-  }
+    if (node.textContent !== shown) node.textContent = shown;
+    const visibility = shown ? "visible" : "hidden";
+    if (node.getAttribute("visibility") !== visibility) node.setAttribute("visibility", visibility);
+  });
 }
 
 // A display drawn as a small screen: its computer's tone glowing under a sheen, inside a thin

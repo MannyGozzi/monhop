@@ -185,6 +185,7 @@ export function rows(items) {
   return el("div", { className: "rows", children: items });
 }
 
+// A disabled selectable row keeps its place and its checked mark but takes no press.
 export function row({
   title,
   detail,
@@ -192,6 +193,7 @@ export function row({
   actions,
   selectable = false,
   checked = null,
+  disabled = false,
   onSelect,
   focusKey,
 }) {
@@ -206,6 +208,10 @@ export function row({
     node.dataset.selectable = "true";
     node.setAttribute("role", "radio");
     node.setAttribute("aria-checked", String(checked === true));
+    if (disabled) {
+      node.setAttribute("aria-disabled", "true");
+      return node;
+    }
     node.tabIndex = 0;
     if (focusKey) node.dataset.focusKey = focusKey;
     node.addEventListener("click", () => onSelect?.());
@@ -328,14 +334,19 @@ export function motionEase(name = "--ease-out") {
 const motionMemory = new Map();
 const enterMs = () => motionMs("--motion-base");
 const exitMs = () => motionMs("--motion-fast");
-const ENTER_FRAMES = [
-  { opacity: 0, transform: "translateY(3px) scale(.97)" },
+// Enters rise into place; exits drift half as far upward, eased in and out so the first frame is no cut.
+const rise = () => motionToken("--motion-rise") || "0px";
+const shrink = () => motionToken("--scale-enter") || "1";
+const enterFrames = () => [
+  { opacity: 0, transform: `translateY(${rise()}) scale(${shrink()})` },
   { opacity: 1, transform: "none" },
 ];
-const EXIT_FRAMES = [
-  { opacity: 1, transform: "none" },
-  { opacity: 0, transform: "translateY(-2px) scale(.97)" },
-];
+const exitTo = () => ({
+  opacity: 0,
+  transform: `translateY(calc(${rise()} * -.5)) scale(${shrink()})`,
+});
+const exitFrames = () => [{ opacity: 1, transform: "none" }, exitTo()];
+const EXIT_EASE = "--ease-in-out";
 
 // The one reduced-motion query all UI motion reads.
 export const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -364,8 +375,8 @@ export function handedOffFocus(node) {
 
 // Plays `keyframes` as if they started `elapsed` ms ago, so a re-render continues the motion
 // instead of restarting it. The animation is cancelled once it has finished.
-function play(node, keyframes, duration, elapsed, after) {
-  const animation = node.animate(keyframes, { duration, easing: motionEase(), fill: "both" });
+function play(node, keyframes, duration, elapsed, after, ease = "--ease-out") {
+  const animation = node.animate(keyframes, { duration, easing: motionEase(ease), fill: "both" });
   animation.currentTime = Math.min(Math.max(elapsed, 0), duration);
   void settle(animation, after);
   return animation;
@@ -508,11 +519,11 @@ export function swap(key, node, signature, { block = false } = {}) {
   if (block) wrapper.dataset.block = "true";
   const elapsed = now - entry.changedAt;
   if (elapsed >= enterMs() || !motionEnabled()) return wrapper;
-  play(node, ENTER_FRAMES, enterMs(), elapsed);
+  play(node, enterFrames(), enterMs(), elapsed);
   if (entry.leaving && elapsed < exitMs()) {
     const ghost = ghostOf(entry.leaving);
     wrapper.append(ghost);
-    play(ghost, EXIT_FRAMES, exitMs(), elapsed, () => ghost.remove());
+    play(ghost, exitFrames(), exitMs(), elapsed, () => ghost.remove(), EXIT_EASE);
   }
   return wrapper;
 }
@@ -557,12 +568,54 @@ export function stableLabel(key, labels, current) {
   return node;
 }
 
-// A live label fades in place. Its container keeps normal layout rather than animating width.
+// A live label cross-fades in place: the new text rises in while a copy of the old one fades out
+// over the spot it held, each from what was drawn the moment the label changed, so a change landing
+// mid-fade carries on from there. The node itself only ever holds the current text.
+const labelEnters = new WeakMap();
+
 export function setLabel(node, label) {
   if (node.textContent === label) return;
+  labelEnters.get(node)?.cancel();
+  labelEnters.delete(node);
+  const parent = node.parentElement;
+  const motion = Boolean(parent) && motionEnabled();
+  const ghost = motion && node.textContent ? labelGhost(node, parent) : null;
   node.textContent = label;
-  if (!motionEnabled()) return;
-  play(node, ENTER_FRAMES, enterMs(), 0);
+  if (!motion) return;
+  if (ghost) fitLabelGhost(ghost, parent);
+  labelEnters.set(node, play(node, enterFrames(), enterMs(), 0));
+}
+
+// The old label as drawn now, laid over the spot it holds and fading out; none when it is not on screen.
+function labelGhost(node, parent) {
+  parent.dataset.labelFade = "true";
+  if (node.offsetParent !== parent) {
+    dropLabelGhost(parent, null);
+    return null;
+  }
+  const drawn = getComputedStyle(node);
+  const from = { opacity: drawn.opacity, transform: drawn.transform };
+  const ghost = ghostOf(node);
+  ghost.dataset.labelGhost = "true";
+  ghost.style.left = `${node.offsetLeft}px`;
+  ghost.style.top = `${node.offsetTop}px`;
+  // No wider than the label was, so a truncated one stays truncated; offsetWidth rounds, hence the pixel.
+  ghost.style.maxWidth = `${node.offsetWidth + 1}px`;
+  parent.append(ghost);
+  play(ghost, [from, exitTo()], exitMs(), 0, () => dropLabelGhost(parent, ghost), EXIT_EASE);
+  return ghost;
+}
+
+// A parent that pulled in to fit a shorter label clips the copy at its new content edge.
+function fitLabelGhost(ghost, parent) {
+  const edge = parent.clientWidth - Number.parseFloat(getComputedStyle(parent).paddingRight);
+  const room = Math.max(edge - ghost.offsetLeft, 0);
+  if (room < ghost.offsetWidth) ghost.style.maxWidth = `${room}px`;
+}
+
+function dropLabelGhost(parent, ghost) {
+  ghost?.remove();
+  if (!parent.querySelector(":scope > [data-label-ghost]")) delete parent.dataset.labelFade;
 }
 
 export function platformGlyph(platform) {

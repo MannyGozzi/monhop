@@ -43,6 +43,17 @@ export function cappedFit(all, stage, insets, maxExtent = MAX_DISPLAY_EXTENT) {
   };
 }
 
+// How far a drawing made with fit `from` moves, keeping that scale, so the middle of `bounds` sits
+// where fit `to` puts it: what a canvas holds while its box glides toward `to`.
+export function heldShift(from, to, bounds) {
+  const x = bounds.x + bounds.width / 2;
+  const y = bounds.y + bounds.height / 2;
+  return {
+    x: to.originX + x * to.scale - (from.originX + x * from.scale),
+    y: to.originY + y * to.scale - (from.originY + y * from.scale),
+  };
+}
+
 // --- options ---------------------------------------------------------------
 
 // `options.members` (new: `[{key, label, platform, tone}]`) or `options.local/peerPlatform` +

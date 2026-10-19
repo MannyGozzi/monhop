@@ -13,6 +13,7 @@ import {
   isComputerEnabled,
   isForgetArmed,
   isInFlight,
+  isLinkedWith,
   keepForgetArmed,
   keepForgetListed,
   layoutChips,
@@ -112,25 +113,44 @@ test("no list draws a Remembered chip: every entry in a Layouts list is remember
     assert.doesNotMatch(source, /"Remembered"/, files[index]);
 });
 
-test("Load is enabled only when pressing it would really load, and says why when it is not", () => {
-  const connectedHere = { isActive: true, connected: true, entry: entry("Desk") };
-  assert.deepEqual(loadGate(connectedHere), { enabled: true, reason: "" });
-
-  const elsewhere = loadGate({ ...connectedHere, isActive: false });
-  assert.equal(elsewhere.enabled, false);
-  assert.match(elsewhere.reason, /use this computer/i);
-
-  const offline = loadGate({ ...connectedHere, connected: false });
-  assert.equal(offline.enabled, false);
-  assert.match(offline.reason, /connected/i);
-
+test("Load loads at once over this computer's link, and otherwise opens Arrange to load there", () => {
+  const linked = { linked: true, canArrange: true, entry: entry("Desk") };
+  assert.deepEqual(loadGate(linked), { enabled: true, arrange: false, reason: "", hint: "" });
   for (const patch of [{ fits: false }, { layout: null }]) {
-    const misfit = loadGate({ ...connectedHere, entry: entry("Desk", patch) });
+    const misfit = loadGate({ ...linked, entry: entry("Desk", patch) });
     assert.equal(misfit.enabled, false, JSON.stringify(patch));
-    assert.match(misfit.reason, /does not fit/i);
+    assert.match(misfit.reason, /arrangement does not fit/i);
   }
+
+  // Without the link the listed fit is unknown, so Load arranges first and the draft decides.
+  const offline = loadGate({ ...linked, linked: false, entry: entry("Desk", { fits: false }) });
+  assert.deepEqual(offline, { enabled: true, arrange: true, reason: "", hint: "" });
+  assert.equal(
+    loadGate({ ...linked, linked: false, sessionActive: true }).hint,
+    "Sharing pauses while you arrange.",
+  );
+  const stuck = loadGate({ ...linked, linked: false, canArrange: false });
+  assert.equal(stuck.enabled, false);
+  assert.match(stuck.reason, /not available/i);
+  assert.equal(
+    loadGate({ ...linked, linked: false, entry: entry("Desk", { layout: null }) }).enabled,
+    false,
+  );
+
   // An entry the list no longer holds is never loadable.
-  assert.equal(loadGate({ isActive: true, connected: true, entry: null }).enabled, false);
+  assert.equal(loadGate({ linked: true, canArrange: true, entry: null }).enabled, false);
+  assert.equal(loadGate({ linked: false, canArrange: true, entry: null }).enabled, false);
+});
+
+test("the link is with a computer when the connected view names it, else when it is the one in use", () => {
+  assert.equal(isLinkedWith(WINDOWS, { connected: true, peerFingerprint: WINDOWS }), true);
+  assert.equal(isLinkedWith(WINDOWS, { connected: true, active: WINDOWS }), true);
+  assert.equal(
+    isLinkedWith(WINDOWS, { connected: true, peerFingerprint: MAC, active: WINDOWS }),
+    false,
+  );
+  assert.equal(isLinkedWith(WINDOWS, { connected: false, peerFingerprint: WINDOWS }), false);
+  assert.equal(isLinkedWith(null, { connected: true, active: null }), false);
 });
 
 test("Forget takes two presses, on one row across the whole app", () => {
@@ -258,8 +278,8 @@ test("a computer's rows are ordered, keyed, gated and locked in one pass", () =>
     fingerprint: WINDOWS,
     entries,
     armed: { fingerprint: WINDOWS, name: "Desk" },
-    isActive: true,
-    connected: true,
+    linked: true,
+    canArrange: true,
     busy: false,
     pending: false,
   });
@@ -284,8 +304,8 @@ test("a computer's rows are ordered, keyed, gated and locked in one pass", () =>
         fingerprint: WINDOWS,
         entries,
         armed: null,
-        isActive: true,
-        connected: true,
+        linked: true,
+        canArrange: true,
         busy: false,
         pending: false,
         ...patch,

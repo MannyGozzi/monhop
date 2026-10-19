@@ -930,7 +930,7 @@ export function spokenSize(width, height) {
 
 // --- canvas fitting ------------------------------------------------------
 
-function arrangementBounds(all) {
+export function arrangementBounds(all) {
   const x = Math.min(...all.map((t) => t.x));
   const y = Math.min(...all.map((t) => t.y));
   return {

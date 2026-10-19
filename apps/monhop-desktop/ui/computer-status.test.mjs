@@ -30,7 +30,74 @@ test("a computer nobody is using reads as paired, whatever the live connection i
   assert.equal(standby.key, "standby");
   assert.equal(standby.label, "Paired");
   assert.equal(standby.tone, "neutral");
+  assert.equal(standby.detail, "Off. Turn it on to share with it.");
   assert.equal(isLiveStatus(standby), false);
+});
+
+test("after Apply, the closing link, the stop and the dial back all read as sharing starting", () => {
+  const applied = { state: "applied", message: "" };
+  for (const [phase, message] of [
+    ["connected", ""],
+    ["stopping", "Stopping."],
+    ["off", "Layout applied on both computers. Sharing is on."],
+    ["off", ""],
+    ["connecting", ""],
+    ["starting", "Reaching the other computer."],
+  ]) {
+    const live = view({ phase, message, sync: applied, peerFingerprint: WINDOWS, active: WINDOWS });
+    const starting = computerStatus(computer, live, WINDOWS, LOCAL_NAME);
+    assert.deepEqual(
+      [starting.key, starting.label, starting.detail],
+      ["connecting", "Starting sharing…", "Applied on both computers."],
+      phase,
+    );
+    // The same phase from a peer entry reads the same.
+    const peers = view({ sync: applied, peers: [{ fingerprint: WINDOWS, phase, message }] });
+    assert.equal(computerStatus(computer, peers, WINDOWS, LOCAL_NAME).label, "Starting sharing…");
+  }
+  const sharing = view({
+    phase: "sharing",
+    sync: applied,
+    peerFingerprint: WINDOWS,
+    active: WINDOWS,
+  });
+  assert.equal(computerStatus(computer, sharing, WINDOWS, LOCAL_NAME).label, "Sharing");
+  // Arranging again after an Apply is arranging, not starting.
+  const again = view({
+    phase: "connected",
+    sync: applied,
+    editing: true,
+    peerFingerprint: WINDOWS,
+    active: WINDOWS,
+  });
+  assert.equal(computerStatus(computer, again, WINDOWS, LOCAL_NAME).label, "Arranging displays");
+  // Without an applied sync, a pause, a failure or another computer, nothing is renamed.
+  const stopping = view({ phase: "stopping", peerFingerprint: WINDOWS, active: WINDOWS });
+  assert.equal(computerStatus(computer, stopping, WINDOWS, LOCAL_NAME).label, "Stopping…");
+  const paused = view({
+    phase: "off",
+    message: "Paused. Input is local.",
+    sync: applied,
+    paused: true,
+  });
+  assert.equal(computerStatus(computer, paused, WINDOWS, LOCAL_NAME).label, "Paused");
+  const failed = view({ phase: "error", message: "Refused.", sync: applied, active: WINDOWS });
+  assert.equal(computerStatus(computer, failed, WINDOWS, LOCAL_NAME).label, "Can't connect");
+  const off = view({ phase: "off", sync: applied, peerFingerprint: WINDOWS, active: WINDOWS });
+  assert.equal(computerStatus(other, off, WINDOWS, LOCAL_NAME).label, "Paired");
+  const pill = activeStatus({
+    computers: normalizeComputers({ computers: [computer], active: WINDOWS }),
+    sharingView: view({
+      phase: "stopping",
+      sync: applied,
+      peerFingerprint: WINDOWS,
+      active: WINDOWS,
+    }),
+    active: WINDOWS,
+    nativeAvailable: true,
+    localName: LOCAL_NAME,
+  });
+  assert.equal(pill.label, "Starting sharing…");
 });
 
 test("both_directions_copy", () => {
@@ -251,7 +318,12 @@ test("an unrecognized reply keeps its message, under a label that is not an alar
 // doing, a reconnect or a started session is on its way back, and the rest is simply not connected.
 test("each reason the link is down gets the label that reason deserves", () => {
   const cases = [
-    ["Paused. Input is local.", "Paused", "paused"],
+    [
+      "Paused. Input is local.",
+      "Paused",
+      "paused",
+      "Input stays on this computer until you resume.",
+    ],
     ["Not connected. Input is local.", "Not connected", "paused"],
     ["Switching computers.", "Connecting…", "connecting"],
     ["The other computer left. Reconnecting.", "Connecting…", "connecting"],
@@ -268,7 +340,7 @@ test("each reason the link is down gets the label that reason deserves", () => {
       "connecting",
     ],
   ];
-  for (const [message, label, key] of cases) {
+  for (const [message, label, key, detail = message] of cases) {
     const status = computerStatus(
       computer,
       view({ phase: "off", active: WINDOWS, message }),
@@ -276,7 +348,7 @@ test("each reason the link is down gets the label that reason deserves", () => {
     );
     assert.equal(status.label, label, message);
     assert.equal(status.key, key, message);
-    assert.equal(status.detail, message, message);
+    assert.equal(status.detail, detail, message);
     assert.notEqual(status.tone, "error", message);
     assert.equal(isLiveStatus(status), false, message);
   }
@@ -310,8 +382,8 @@ test("the header pill names the computer in use, or why there is nothing to repo
     "Preview only",
   );
   const none = activeStatus({ computers, sharingView: null, active: null, nativeAvailable: true });
-  assert.equal(none.label, "No computer");
-  assert.equal(none.detail, "Choose a computer to use.");
+  assert.equal(none.label, "Not sharing");
+  assert.equal(none.detail, "Turn on a computer to share with it.");
   assert.equal(
     activeStatus({
       computers: initialComputers(),
@@ -542,8 +614,8 @@ test("zero and one enabled computers keep today's exact wording even with an `en
     nativeAvailable: true,
     localName: LOCAL_NAME,
   });
-  assert.equal(zero.label, "No computer");
-  assert.equal(zero.detail, "Choose a computer to use.");
+  assert.equal(zero.label, "Not sharing");
+  assert.equal(zero.detail, "Turn on a computer to share with it.");
 
   const one = activeStatus({
     computers,
@@ -555,4 +627,13 @@ test("zero and one enabled computers keep today's exact wording even with an `en
   });
   assert.equal(one.label, "Sharing");
   assert.equal(one.detail, "Either computer's keyboard and mouse can control the other");
+});
+
+test("a computer in the paused group reads as paused, not off", () => {
+  const paused = view({ phase: "off", paused: true, enabled: [WINDOWS.toLowerCase()] });
+  const status = computerStatus(computer, paused, null, LOCAL_NAME);
+  assert.equal(status.label, "Paused");
+  assert.equal(status.detail, "Input stays on this computer until you resume.");
+  const outside = computerStatus(computer, view({ phase: "off", paused: true, enabled: [] }), null);
+  assert.equal(outside.label, "Paired");
 });

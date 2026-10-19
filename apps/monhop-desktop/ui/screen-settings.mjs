@@ -2,6 +2,7 @@ import {
   UPDATE_READY_NOTE,
   canCheck,
   canInstall,
+  checkHint,
   installHint,
   updatesStatusText,
 } from "./updates-model.mjs";
@@ -36,6 +37,7 @@ import {
 } from "./clipboard-model.mjs";
 import { presence } from "./accordion.mjs";
 import { networkCard } from "./screen-ready.mjs";
+import { ESCAPE_SENTENCE, escapeKeys } from "./escape-model.mjs";
 import { fadingText } from "./computer-card.mjs";
 import { tweenValue } from "./motion-model.mjs";
 import {
@@ -133,7 +135,7 @@ function sharingCard(ctx) {
   const pauseRow = row({
     title: resume ? "Sharing is paused" : "Pause sharing",
     detail: resume
-      ? "Resume picks up with the computer you used last."
+      ? "Resume turns your computers back on."
       : "Stops sharing with every computer. Input stays local.",
     actions: [pause],
   });
@@ -147,8 +149,7 @@ function sharingCard(ctx) {
         fadeCopy(pauseRow, "settings-pause-copy", resume ? "resume" : "pause"),
         row({
           title: "Take your input back",
-          detail:
-            "Hold both Control keys and Escape for two seconds to take your keyboard and mouse back.",
+          detail: ESCAPE_SENTENCE,
           actions: [keycaps(ctx.platform)],
         }),
       ]),
@@ -158,11 +159,10 @@ function sharingCard(ctx) {
 
 // The emergency stop's keys, as this computer's keyboard labels them.
 function keycaps(platform) {
-  const keys = platform === "macos" ? ["control", "control", "esc"] : ["Ctrl", "Ctrl", "Esc"];
   return el("span", {
     className: "keycaps",
     attrs: { "aria-hidden": "true" },
-    children: keys.map((key) => el("kbd", { className: "keycap", text: key })),
+    children: escapeKeys(platform).map((key) => el("kbd", { className: "keycap", text: key })),
   });
 }
 
@@ -294,7 +294,8 @@ function pointerCard({ core, autoscroll, swipe, actions }) {
   return section({
     id: "settings-pointer",
     title: "Mouse and trackpad",
-    description: "When another computer's mouse controls this Mac, or this trackpad controls it.",
+    description:
+      "When another computer's mouse controls this Mac, or this Mac's trackpad controls another computer.",
     children: [
       rows(switches),
       fadingText("settings-autoscroll-message", "note", autoscroll?.view.error, "danger"),
@@ -371,7 +372,7 @@ function updatesCard(ctx) {
         switchRow("Install updates automatically", {
           checked: view.automatic,
           description:
-            "Off until you enable it. Checks github.com and downloads signed updates only while sharing is paused. " +
+            "Checks github.com and downloads signed updates only while sharing is paused. " +
             "Install by quitting MonHop or pressing Restart to update.",
           disabled: pending || !core,
           id: "settings-updates-automatic",
@@ -380,7 +381,7 @@ function updatesCard(ctx) {
         // Keyed by phase, so a download's rising percentage counts up in place.
         fadeCopy(statusRow, "settings-updates-copy", view.phase),
       ]),
-      fadingText("settings-updates-hint", "note", installHint(view), "danger"),
+      fadingText("settings-updates-hint", "note", installHint(view) || checkHint(view)),
     ],
   });
 }

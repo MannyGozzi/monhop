@@ -11,7 +11,8 @@ const PHASES = new Set([
   "failed",
 ]);
 const BUSY_PHASES = new Set(["checking", "downloading", "installing"]);
-const SHARING_HINT = "Sharing is running. Turn it off first or quit MonHop to update.";
+const SHARING_HINT = "Pause sharing to restart now, or it installs when you quit MonHop.";
+const CHECK_SHARING_HINT = "Pause sharing to check now.";
 const CHECK_FAILED = "The update check did not finish.";
 
 // Under a ready update, wherever Restart to update is offered.
@@ -94,4 +95,11 @@ export function canInstall(view) {
 // The reason "Restart to update" is disabled, shown under it; empty when installing is allowed.
 export function installHint(view) {
   return view.phase === "ready" && view.sharingActive ? SHARING_HINT : "";
+}
+
+// The reason Check now is disabled when sharing is the only thing in its way; empty otherwise.
+export function checkHint(view) {
+  return view.sharingActive && view.phase !== "ready" && !BUSY_PHASES.has(view.phase)
+    ? CHECK_SHARING_HINT
+    : "";
 }

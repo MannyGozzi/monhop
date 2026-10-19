@@ -127,7 +127,7 @@ function pairedHeader(ctx) {
   const platform = computer?.platform ?? view.peerPlatform;
   return inspectorHeader({
     glyph: platformGlyph(platform === "windows" ? "windows" : "macos"),
-    tone: "local",
+    tone: "peer",
     title: pairedName(ctx),
     meta: computerMeta(platformLabel(platform), computer?.address ?? view.peerAddress),
   });

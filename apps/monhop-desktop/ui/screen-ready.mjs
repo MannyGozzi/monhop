@@ -41,7 +41,10 @@ const UNRECOGNIZED =
 // add a computer, and how it was launched.
 export function localInspector(ctx) {
   const { state, snapshotCheck, actions, platform } = ctx;
-  const verdict = setupVerdict(state, { checking: snapshotCheck.pending });
+  const verdict = setupVerdict(state, {
+    checking: snapshotCheck.pending,
+    paired: ctx.computers.items.length > 0,
+  });
   const localPlatform = state.snapshot?.platform ?? platform;
   const version = state.snapshot?.version || ctx.updates.view.currentVersion;
   return el("div", {
@@ -531,8 +534,10 @@ function launchAttribution(ctx) {
 // ---------- the network list, here and in Settings ----------
 
 // The networks MonHop may use as radio rows, and the ones it cannot under a disclosure.
+// While a session runs the rows keep the chosen network checked but take no press.
 function networkList(ctx, scope) {
-  const { state, actions } = ctx;
+  const { state, actions, sharing } = ctx;
+  const locked = isSessionActive(sharing);
   const interfaces = state.snapshot.interfaces;
   const eligible = interfaces.filter(canSelectInterface);
   const unavailable = interfaces.filter((item) => !canSelectInterface(item));
@@ -551,6 +556,7 @@ function networkList(ctx, scope) {
             detail: `${networkDetail(item)}${item.address ? ` · ${item.address}` : ""}`,
             leading: radioMark(),
             selectable: true,
+            disabled: locked,
             checked: state.selectedInterfaceId === item.id,
             focusKey: `${scope}-${item.id}`,
             onSelect: () => actions.chooseInterface(item.id),

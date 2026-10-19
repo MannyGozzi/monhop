@@ -172,7 +172,7 @@ export function sidebarRows({
       fingerprint: paired.fingerprint,
       title: listed ? displayName(listed) : platformLabel(paired.platform),
       label: PAIRING_ROW_LABELS.paired,
-      tone: "connected",
+      tone: "neutral",
       platform: listed?.platform ?? paired.platform ?? null,
       badge: paired.badge ?? listed?.badge ?? null,
       badgeShown: true,
@@ -221,32 +221,34 @@ export function canvasFingerprint({ selection, active = null, fingerprints = [] 
   return fingerprints[0] ?? null;
 }
 
-// Resume brings back the computer last in use; failing that the selected one, then the first.
-export function resumeTarget({ lastActive = null, selection = null, fingerprints = [] }) {
-  for (const fingerprint of [
-    lastActive,
-    selection?.kind === "computer" ? selection.fingerprint : null,
-    fingerprints[0],
-  ])
-    if (fingerprint && fingerprints.includes(fingerprint)) return fingerprint;
-  return null;
+// A pause keeps the group switched on and only stops sharing with it. The live view knows first;
+// before it answers, the computer list does.
+export function isPaused({ sharingView = null, computers = null }) {
+  return sharingView ? sharingView.paused === true : computers?.paused === true;
 }
 
-// The toolbar: Settings keeps only its title; the canvas offers Arrange, or Done once arranging can
-// be left, and Pause while anything is switched on or Resume once a paired computer could come back.
+// Resume brings back the paused group: the computer last in use when it is in the group, else the
+// group's first. Never a computer outside it.
+export function resumeTarget({ lastActive = null, enabled = [] }) {
+  if (lastActive && enabled.includes(lastActive)) return lastActive;
+  return enabled[0] ?? null;
+}
+
+// The toolbar: Settings keeps only its title; the canvas offers Arrange until arranging starts,
+// where the Apply bar's own button is the way out, and Pause or Resume while a group is switched on.
 export function toolbarState({
   selection,
   arrange,
   canArrange = false,
   enabledCount = 0,
-  resume = null,
+  paused = false,
 }) {
   const settings = selection?.kind === "settings";
   return {
     title: settings ? "Settings" : "Arrangement",
     canvasActions: !settings,
-    arrange: arrange.active ? (arrange.leavable ? "done" : null) : canArrange ? "begin" : null,
-    pause: enabledCount > 0 ? "pause" : resume ? "resume" : null,
+    arrange: !arrange.active && canArrange ? "begin" : null,
+    pause: enabledCount > 0 ? (paused ? "resume" : "pause") : null,
   };
 }
 
@@ -260,7 +262,7 @@ export function clipboardLine(view, fingerprint, name) {
     : `Turn on clipboard sharing on ${name} too.`;
 }
 
-export const NETWORK_LOCKED = "Pause the computer in use before changing the network.";
+export const NETWORK_LOCKED = "Pause sharing to change the network.";
 
 // The network chip names the one connection MonHop may use, and is locked while a session runs.
 // `name` and `address` are drawn apart, the address in mono; `text` reads them as one.

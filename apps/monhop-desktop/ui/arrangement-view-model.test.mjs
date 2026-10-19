@@ -16,6 +16,7 @@ import {
   cappedFit,
   NUDGE_PIXELS,
   groupAriaText,
+  heldShift,
   membersFromOptions,
   nearestGroup,
   neighborWord,
@@ -45,6 +46,23 @@ function chainOf(keys) {
   const transform = fitTransform(geometry.tiles, STAGE);
   return { groups, geometry, rects: groupRects(geometry.tiles, transform) };
 }
+
+test("heldShift: a held drawing keeps its scale and lands its middle where the next fit puts it", () => {
+  const bounds = { x: 0, y: 0, width: 100, height: 50 };
+  const from = { scale: 1, originX: 0, originY: 0 };
+  assert.deepEqual(heldShift(from, from, bounds), { x: 0, y: 0 });
+  assert.deepEqual(heldShift(from, { scale: 2, originX: 10, originY: 20 }, bounds), {
+    x: 60,
+    y: 45,
+  });
+  const tile = [{ id: "a", x: 0, y: 0, width: 100, height: 100 }];
+  const flush = { top: 0, right: 0, bottom: 0, left: 0 };
+  const shrunk = cappedFit(tile, { width: 400, height: 120 }, flush);
+  const tall = cappedFit(tile, { width: 400, height: 200 }, flush);
+  const shift = heldShift(tall, shrunk, { x: 0, y: 0, width: 100, height: 100 });
+  assert.equal(shift.x, 0);
+  assert.equal(shift.y, -40);
+});
 
 test("membersFromOptions: the legacy local/peer options produce today's defaults", () => {
   const members = membersFromOptions({});
