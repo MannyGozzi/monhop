@@ -87,6 +87,51 @@ function permissionStatus(value) {
   return { label: "Unknown", tone: "unknown" };
 }
 
+const WINDOWS_ACCESS =
+  "Windows needs no extra permission for MonHop. No administrator access is requested.";
+
+// The Get ready checklist: each permission (or Windows's none), then the network, each done or
+// not with the word its row shows. Nothing until this computer has been checked.
+export function readinessItems(state) {
+  const snapshot = state.snapshot;
+  if (!snapshot || snapshot.platform === "unsupported") return [];
+  const access =
+    snapshot.platform === "windows"
+      ? [
+          {
+            key: "windows",
+            title: "Windows check",
+            done: true,
+            status: "Ready",
+            detail: `${WINDOWS_ACCESS} Secure and elevated screens stay outside MonHop.`,
+          },
+        ]
+      : permissionRows(snapshot).map((item) => ({
+          key: item.key,
+          title: item.title,
+          done: item.status.tone === "granted",
+          status: item.status.label,
+          detail: item.why,
+          pane: item.pane,
+          recovery: item.recovery,
+        }));
+  const selected = selectedInterface(state);
+  const network = {
+    key: "network",
+    title: "Network connection",
+    done: networkReady(state),
+    status: !selected ? "Not chosen" : selected.attachmentKnown ? "Chosen" : "Not recognized",
+    detail: selected
+      ? [networkLabel(selected), selected.address].filter(Boolean).join(" · ")
+      : "Pick the network both computers share.",
+  };
+  return [...access, network];
+}
+
+export function readinessCount(items) {
+  return `${items.filter((item) => item.done).length} of ${items.length} ready`;
+}
+
 export function accessReady(snapshot) {
   if (!snapshot || snapshot.errors.length) return false;
   if (snapshot.platform === "windows") return true;

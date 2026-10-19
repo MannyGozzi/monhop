@@ -18,6 +18,8 @@ import {
   normalizeSnapshot,
   pairingOpenGate,
   permissionRows,
+  readinessCount,
+  readinessItems,
   selectInterface,
   setupVerdict,
   wifiAuthorizationStatus,
@@ -405,4 +407,54 @@ test("snapshot network labels are byte-bounded display text without changing sel
   state = selectInterface(state, item.id);
   assert.equal(state.selectedInterfaceId, item.id);
   assert.equal(pairingOpenGate(state).allowed, true);
+});
+
+test("the Get ready checklist lists each permission, then the network, and counts what is done", () => {
+  assert.deepEqual(readinessItems(initialState(true)), []);
+  const checked = applySnapshot(initialState(true), macSnapshot);
+  const items = readinessItems(checked);
+  assert.deepEqual(
+    items.map((item) => [item.key, item.done, item.status]),
+    [
+      ["accessibility", true, "Allowed"],
+      ["inputMonitoring", false, "Not allowed"],
+      ["network", false, "Not chosen"],
+    ],
+  );
+  assert.equal(items[1].pane, "input-monitoring");
+  assert.equal(items[1].recovery.summary, "Fix Input Monitoring in Settings");
+  assert.equal(readinessCount(items), "1 of 3 ready");
+
+  const unrecognized = selectInterface(checked, "en0");
+  assert.equal(readinessItems(unrecognized).at(-1).status, "Not recognized");
+  assert.equal(readinessItems(unrecognized).at(-1).detail, "Ethernet · 192.168.50.10");
+
+  const ready = selectInterface(
+    applySnapshot(initialState(true), {
+      ...macSnapshot,
+      permissions: { accessibility: true, inputMonitoring: true },
+      interfaces: [{ ...macSnapshot.interfaces[0], attachmentKnown: true }],
+    }),
+    "en0",
+  );
+  assert.equal(readinessCount(readinessItems(ready)), "3 of 3 ready");
+  assert.equal(readinessItems(ready).at(-1).status, "Chosen");
+});
+
+test("Windows lists its no-permission row in place of the macOS permissions", () => {
+  const windows = applySnapshot(initialState(true), { ...macSnapshot, platform: "windows" });
+  const items = readinessItems(windows);
+  assert.deepEqual(
+    items.map((item) => [item.key, item.done]),
+    [
+      ["windows", true],
+      ["network", false],
+    ],
+  );
+  assert.match(items[0].detail, /needs no extra permission/);
+  assert.equal(readinessCount(items), "1 of 2 ready");
+  assert.deepEqual(
+    readinessItems(applySnapshot(initialState(true), { ...macSnapshot, platform: "unsupported" })),
+    [],
+  );
 });

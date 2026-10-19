@@ -2,6 +2,8 @@
 // toolbar offers and how the inspector is presented. app.js and sidebar.mjs only draw these answers.
 import { computerStatus } from "./computer-status.mjs";
 import { displayName } from "./computers-model.mjs";
+import { canSelectInterface, interfaceAssessment, networkLabel } from "./model.mjs";
+import { PAIRING_PROGRESS, platformLabel } from "./pairing-model.mjs";
 
 // Below this window width the inspector stops sharing the row with the canvas and becomes a sheet.
 export const INSPECTOR_OVERLAY_BELOW = 1060;
@@ -96,9 +98,7 @@ const PAIRING_ROW_LABELS = {
   error: "Pairing did not finish",
 };
 const PROGRESS_ROW_LABELS = {
-  connecting: "Connecting",
-  verifying: "Checking the code",
-  saving: "Saving the pairing",
+  ...Object.fromEntries(PAIRING_PROGRESS.map((step) => [step.key, step.title])),
   stopping: "Stopping",
 };
 
@@ -107,8 +107,16 @@ export function pairingRowLabel(step, phase) {
   return PAIRING_ROW_LABELS[step] ?? PAIRING_ROW_LABELS.choose;
 }
 
+// The computer a finished exchange added, while its result is on screen: the pairing row becomes it.
+export function pairedOnScreen({ selection, pairingStep, view = null }) {
+  if (selection?.kind !== "new" || pairingStep !== "paired" || !view?.peerFingerprint) return null;
+  return { fingerprint: view.peerFingerprint, platform: view.peerPlatform, badge: view.badge };
+}
+
 // Every sidebar row top to bottom: This Mac, each paired computer with its own state, and the row
-// that adds a computer, which becomes the selected New computer while a pairing is on screen.
+// that adds a computer, which becomes the selected New computer while a pairing is on screen. Once
+// that pairing finishes (`paired`), the same row turns into the computer it added, listed once:
+// `adopt` hands it the add row's node, and `select` keeps the exchange selected until Done.
 export function sidebarRows({
   computers,
   sharingView = null,
@@ -119,44 +127,83 @@ export function sidebarRows({
   selection,
   pairingStep = "choose",
   pairingPhase = null,
+  paired = null,
 }) {
   const key = selectionKey(selection);
   const rows = [
     {
       key: "local",
+      select: "local",
       kind: "local",
       title: localName,
       label: localStatus.label,
       tone: localStatus.tone,
       platform: localPlatform,
+      badge: null,
       selected: key === "local",
     },
   ];
-  for (const computer of computers?.items ?? []) {
+  const items = computers?.items ?? [];
+  for (const computer of items) {
+    if (computer.fingerprint === paired?.fingerprint) continue;
     const status = computerStatus(computer, sharingView, active, localName);
     const rowKey = `computer:${computer.fingerprint}`;
     rows.push({
       key: rowKey,
+      select: rowKey,
       kind: "computer",
       fingerprint: computer.fingerprint,
       title: displayName(computer),
       label: status.label,
       tone: status.tone,
       platform: computer.platform,
+      badge: computer.badge ?? null,
       selected: key === rowKey,
     });
+  }
+  if (paired && key === "new") {
+    const listed = items.find((item) => item.fingerprint === paired.fingerprint) ?? null;
+    rows.push({
+      key: `computer:${paired.fingerprint}`,
+      select: "new",
+      adopt: "new",
+      kind: "computer",
+      fingerprint: paired.fingerprint,
+      title: listed ? displayName(listed) : platformLabel(paired.platform),
+      label: PAIRING_ROW_LABELS.paired,
+      tone: "connected",
+      platform: listed?.platform ?? paired.platform ?? null,
+      badge: paired.badge ?? listed?.badge ?? null,
+      badgeShown: true,
+      selected: true,
+    });
+    return rows;
   }
   const adding = key === "new";
   rows.push({
     key: "new",
+    select: "new",
     kind: "new",
     title: adding ? "New computer" : "Add a computer",
     label: adding ? pairingRowLabel(pairingStep, pairingPhase) : "Show or enter a code",
     tone: adding && ["show", "progress"].includes(pairingStep) ? "checking" : "neutral",
     platform: null,
+    badge: null,
     selected: adding,
   });
   return rows;
+}
+
+// The next or previous item of a list for the arrow keys, Home and End; the ends hold, never wrap.
+export function listStep(count, index, key) {
+  if (count < 1) return -1;
+  const last = count - 1;
+  const at = Math.min(Math.max(index, 0), last);
+  if (key === "Home") return 0;
+  if (key === "End") return last;
+  if (key === "ArrowDown") return index < 0 ? 0 : Math.min(at + 1, last);
+  if (key === "ArrowUp") return index < 0 ? last : Math.max(at - 1, 0);
+  return -1;
 }
 
 // Arranging is its own canvas mode. A link that is up without a session has nothing applied yet,
@@ -215,21 +262,49 @@ export function clipboardLine(view, fingerprint, name) {
 export const NETWORK_LOCKED = "Pause the computer in use before changing the network.";
 
 // The network chip names the one connection MonHop may use, and is locked while a session runs.
+// `name` and `address` are drawn apart, the address in mono; `text` reads them as one.
 export function networkChip({
   selected = null,
   label = "",
   eligibleCount = 0,
   sessionActive = false,
 }) {
-  const name = selected
-    ? [label, selected.address].filter(Boolean).join(" · ")
-    : "Choose a network";
-  if (sessionActive) return { text: name, disabled: true, hint: NETWORK_LOCKED };
+  const name = selected ? label : "Choose a network";
+  const address = selected?.address ?? "";
+  const parts = { name, address, text: [name, address].filter(Boolean).join(" · ") };
+  if (sessionActive) return { ...parts, disabled: true, hint: NETWORK_LOCKED };
   if (!eligibleCount)
     return {
-      text: name,
+      ...parts,
       disabled: true,
       hint: "No connected Wi-Fi or Ethernet network was found.",
     };
-  return { text: name, disabled: false, hint: "Both computers must be on this network." };
+  return { ...parts, disabled: false, hint: "Both computers must be on this network." };
+}
+
+// The chip's menu: every network MonHop could use, the chosen one checked, then the ones it cannot
+// use, greyed out with the reason.
+export function networkMenuItems(interfaces = [], selectedId = null) {
+  const usable = [];
+  const unusable = [];
+  for (const item of interfaces) {
+    const entry = { id: item.id, label: networkLabel(item) };
+    if (canSelectInterface(item))
+      usable.push({
+        ...entry,
+        detail: [item.address || item.name, item.attachmentKnown ? "" : "Not recognized"]
+          .filter(Boolean)
+          .join(" · "),
+        checked: item.id === selectedId,
+        disabled: false,
+      });
+    else
+      unusable.push({
+        ...entry,
+        detail: interfaceAssessment(item),
+        checked: false,
+        disabled: true,
+      });
+  }
+  return [...usable, ...unusable];
 }

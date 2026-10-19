@@ -1,1 +1,111 @@
 /* Studio setup pane. Component rules only; shared tokens live in styles.css, pane tokens at the top here. */
+:root {
+  --ready-mark-size: 18px;
+  --ready-mark-ring: 1.5px;
+  --countdown-hairline: 2px;
+}
+
+/* ---------- inspector sections shared by This Mac and New computer ---------- */
+.inspector-section-aside { color: var(--subtle-foreground); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.inspector-section-lead { color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); }
+.inspector-view[data-kind="local"] .pair-choices { padding-top: var(--gap-1); }
+
+/* ---------- This Mac: the Get ready checklist ---------- */
+.ready-list { display: grid; min-width: 0; }
+.ready-list > .glide-panel + .glide-panel > .ready-item, .ready-list + .ready-list > .glide-panel:first-child > .ready-item { border-top: var(--hairline-width) solid var(--hairline); }
+.ready-item { display: grid; grid-template-columns: var(--ready-mark-size) minmax(0, 1fr); align-items: start; gap: var(--gap-3); min-width: 0; padding-block: var(--gap-3); }
+.ready-list > .glide-panel:first-child > .ready-item { padding-top: var(--gap-1); }
+/* A hollow ring until done, then a soft filled disc with its check. */
+.ready-mark, .pairing-step-mark { display: grid; width: var(--ready-mark-size); height: var(--ready-mark-size); place-items: center; border-radius: var(--radius-circle); box-shadow: inset 0 0 0 var(--ready-mark-ring) var(--hairline-strong); color: transparent; transition: background-color var(--motion-base) var(--ease-out), box-shadow var(--motion-base) var(--ease-out), color var(--motion-base) var(--ease-out); }
+.ready-mark svg, .pairing-step-mark svg { width: var(--icon-size-sm); height: var(--icon-size-sm); stroke-width: var(--icon-stroke-bold); }
+.ready-item[data-done="true"] .ready-mark, .pairing-step[data-state="done"] .pairing-step-mark { background: color-mix(in oklab, var(--success) var(--mix-tint-strong), transparent); box-shadow: inset 0 0 0 var(--ready-mark-ring) transparent; color: var(--success-text); }
+.ready-item[data-done="false"] .ready-mark { box-shadow: inset 0 0 0 var(--ready-mark-ring) color-mix(in oklab, var(--warning) var(--mix-edge), transparent); }
+.ready-body { display: grid; gap: var(--gap-1); min-width: 0; }
+.ready-line { display: flex; align-items: center; justify-content: space-between; gap: var(--gap-2); min-width: 0; min-height: var(--ready-mark-size); }
+.ready-title { min-width: 0; overflow: hidden; font-size: var(--text-base); font-weight: var(--weight-medium); text-overflow: ellipsis; white-space: nowrap; }
+.ready-status { flex: none; color: var(--muted-foreground); font-size: var(--text-sm); }
+.ready-item[data-done="false"] .ready-status { color: var(--warning-text); }
+.ready-line > .button { flex: none; margin-block: calc(var(--gap-1) * -1); margin-inline-end: calc(var(--gap-3) * -1); }
+.ready-value { min-width: 0; overflow: hidden; color: var(--muted-foreground); font-size: var(--text-sm); font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.ready-note { color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); overflow-wrap: anywhere; }
+.ready-note[data-tone="warning"] { color: var(--warning-text); }
+.ready-fix { display: grid; gap: var(--gap-2); min-width: 0; }
+.ready-body > .glide-panel > .ready-fix { padding-top: var(--gap-1); }
+.ready-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap-2); }
+/* Disclosures under a fix line their labels up with the text above them. */
+.ready-fix > .accordion, .ready-list > .glide-panel > .accordion { margin-inline: calc(var(--gap-3) * -1); }
+.ready-list > .glide-panel > .accordion { margin-left: calc(var(--ready-mark-size) + var(--gap-3) - var(--gap-3)); }
+.ready-fix .accordion-trigger { min-height: var(--control-height); font-size: var(--text-sm); }
+.ready-wifi { display: grid; gap: var(--gap-2); min-width: 0; border-radius: var(--radius-group); padding: var(--gap-3); background: var(--surface-inset); }
+.ready-subtitle { min-width: 0; font-size: var(--text-sm); font-weight: var(--weight-medium); }
+
+/* ---------- New computer: the code exchange ---------- */
+.inspector-view[data-kind="new"] > .glide-panel { border-top: 0; }
+.inspector-view[data-kind="new"] > .glide-panel:has(> .pairing-progress) { border-top: var(--hairline-width) solid var(--hairline); }
+.inspector-section.pairing-roles { padding-block: 0 var(--gap-4); }
+.pairing-stage { display: grid; min-width: 0; padding: 0 var(--card-padding) var(--gap-4); }
+.pairing-stage > .inspector-section { padding: var(--gap-2) 0 0; }
+.pairing-footer { padding: var(--gap-1) var(--card-padding) var(--card-padding); }
+.pairing-message { padding: 0 var(--card-padding) var(--gap-4); }
+.pairing-body { display: grid; gap: var(--gap-3); min-width: 0; }
+.pairing-lead { color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); }
+.pairing-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--gap-2); }
+.pairing-actions[data-align="start"] { justify-content: flex-start; }
+
+/* The role switch: one thumb glides under whichever way in is picked. */
+.segmented.role-switch { position: relative; isolation: isolate; }
+.role-switch-thumb { position: absolute; z-index: -1; top: var(--gap-half); bottom: var(--gap-half); left: var(--gap-half); width: calc((100% - var(--gap-half) * 3) / 2); border-radius: var(--radius-sm); background: var(--solid); box-shadow: var(--shadow-chip); pointer-events: none; }
+.role-switch-thumb[data-at="1"] { transform: translateX(calc(100% + var(--gap-half))); }
+.role-switch[data-picked="false"] .role-switch-thumb { opacity: 0; }
+.role-switch .segmented-option[aria-checked="true"] { background: transparent; box-shadow: none; }
+
+/* The code: large and mono, with a hairline that drains as it expires. */
+.pairing-code-block { display: grid; gap: var(--gap-3); min-width: 0; border-radius: var(--radius-group); padding: var(--gap-5) var(--gap-4) var(--gap-4); background: var(--surface-inset); }
+.pairing-code { display: grid; justify-items: center; min-width: 0; }
+.pairing-code[data-pending="true"] { gap: var(--gap-3); border-radius: var(--radius-group); padding: var(--gap-5) var(--gap-4) var(--gap-4); background: var(--surface-inset); }
+.pairing-code-groups { display: flex; flex-wrap: wrap; justify-content: center; gap: 0 var(--gap-1); padding-left: var(--tracking-code); color: var(--foreground); font-family: var(--font-mono); font-size: var(--text-code-sm); font-variant-numeric: tabular-nums slashed-zero; font-weight: var(--weight-semibold); letter-spacing: var(--tracking-code); line-height: var(--leading-tight); }
+.pairing-code-dash, .pairing-code[data-pending="true"] .pairing-code-groups { color: var(--subtle-foreground); }
+.pairing-expiry { display: grid; gap: var(--gap-2); justify-items: center; }
+.pairing-expiry-track { display: block; width: min(100%, var(--pair-countdown-width)); height: var(--countdown-hairline); overflow: hidden; border-radius: var(--radius-pill); background: var(--hairline); }
+/* app.js holds --countdown-left at the fraction still left; motion drains it on the compositor instead. */
+.pair-countdown-fill { display: block; height: 100%; border-radius: inherit; background: var(--primary); transform: scaleX(var(--countdown-left, 1)); transform-origin: left center; }
+.pairing-expiry-text { color: var(--muted-foreground); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.pairing-waiting { display: inline-flex; align-items: center; gap: var(--gap-2); color: var(--subtle-foreground); font-size: var(--text-sm); }
+.pairing-waiting .spinner, .pairing-step-mark .spinner { width: var(--icon-size-sm); height: var(--icon-size-sm); }
+.pairing-field-error { display: flex; align-items: center; gap: var(--gap-1); }
+.pairing-field-error svg { flex: none; width: var(--icon-size-sm); height: var(--icon-size-sm); stroke-width: var(--icon-stroke-bold); }
+
+/* Connecting, Checking the code, Saving the pairing. */
+.pairing-steps { display: grid; gap: var(--gap-2); margin: 0; padding: 0; list-style: none; }
+.pairing-step { display: grid; grid-template-columns: var(--ready-mark-size) minmax(0, 1fr); align-items: start; gap: var(--gap-3); color: var(--subtle-foreground); transition: color var(--motion-base) var(--ease-out); }
+.pairing-step[data-state="live"], .pairing-step[data-state="done"] { color: var(--foreground); }
+.pairing-step[data-state="live"] .pairing-step-mark { box-shadow: inset 0 0 0 var(--ready-mark-ring) transparent; color: var(--primary); }
+.pairing-step-copy { display: grid; gap: var(--gap-half); min-width: 0; min-height: var(--ready-mark-size); align-content: center; }
+.pairing-step-copy strong { font-size: var(--text-base); font-weight: var(--weight-medium); }
+.pairing-step-copy span { color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); }
+.pairing-step:not([data-state="live"]) .pairing-step-copy span { display: none; }
+
+/* A notice: what is happening or what went wrong, with its glyph. */
+.pairing-notice { --tone: var(--muted-foreground); display: grid; grid-template-columns: var(--icon-size) minmax(0, 1fr); align-items: start; gap: var(--gap-3); min-width: 0; border-radius: var(--radius-group); padding: var(--gap-3); background: var(--surface-inset); }
+.pairing-notice[data-tone="error"] { --tone: var(--destructive); background: color-mix(in oklab, var(--destructive) var(--mix-faint), transparent); }
+.pairing-notice[data-tone="checking"] { --tone: var(--primary); }
+.pairing-notice-glyph { display: grid; min-height: var(--leading-tight); place-items: center; color: var(--tone); }
+.pairing-notice-glyph svg { width: var(--icon-size); height: var(--icon-size); stroke-width: var(--icon-stroke); }
+.pairing-notice-copy { display: grid; gap: var(--gap-1); min-width: 0; }
+.pairing-notice-copy strong { font-size: var(--text-base); font-weight: var(--weight-semibold); }
+.pairing-notice-copy p { color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); overflow-wrap: anywhere; }
+
+/* Paired: the picture both computers show, large, with the way on. */
+.pairing-result { justify-items: center; gap: var(--gap-3); text-align: center; }
+.pairing-result-title { display: inline-flex; align-items: center; gap: var(--gap-2); font-size: var(--text-md); letter-spacing: var(--tracking-title); }
+.pairing-result-title svg { width: var(--icon-size); height: var(--icon-size); color: var(--success-text); stroke-width: var(--icon-stroke-bold); }
+.pairing-result-caption { color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); }
+.pairing-result-caption strong { color: var(--foreground); font-weight: var(--weight-medium); }
+.pairing-result > .pairing-actions { justify-content: center; width: 100%; padding-top: var(--gap-2); }
+.pairing-result > .pairing-actions > .button { flex: 1 1 0; }
+
+/* Marks pop in once as their step finishes, from where a re-render caught them. */
+@media (prefers-reduced-motion: no-preference) {
+  .pair-countdown-fill[data-running="true"] { animation: countdown-drain var(--countdown-total) linear var(--countdown-delay, 0ms) both; }
+  :is(.ready-mark, .pairing-step-mark)[data-enter="true"] > * { animation: pop-in var(--motion-spring) var(--ease-spring) var(--motion-delay, 0ms) both; }
+}

@@ -37,11 +37,12 @@
           <h1 class="toolbar-title" id="page-title" data-tauri-drag-region="deep">Arrangement</h1>
           <div class="toolbar-actions" id="toolbar-actions">
             <span class="toolbar-slot" id="network-slot">
-              <button class="chip" type="button" id="network-chip" aria-haspopup="menu" aria-expanded="false" aria-controls="network-menu" data-focus-key="network-chip">
+              <button class="chip" type="button" id="network-chip" aria-haspopup="menu" aria-expanded="false" aria-controls="network-menu" aria-describedby="network-tooltip" data-focus-key="network-chip">
                 <span class="status-dot" id="network-chip-dot" aria-hidden="true"></span>
-                <span class="chip-label" id="network-chip-label">Choose a network</span>
+                <span class="chip-label" id="network-chip-label"><span class="chip-name" id="network-chip-name">Choose a network</span><span class="chip-address" id="network-chip-address" hidden></span></span>
                 <span class="chip-chevron" id="network-chip-chevron" aria-hidden="true"></span>
               </button>
+              <span class="toolbar-tooltip" id="network-tooltip" role="tooltip"></span>
               <div class="menu" id="network-menu" role="menu" aria-label="Network connection" data-open="false" inert></div>
             </span>
             <span class="toolbar-slot" id="arrange-slot" hidden inert></span>
@@ -65,6 +66,7 @@
             </footer>
           </section>
 
+          <div class="inspector-scrim" id="inspector-scrim" data-open="false" aria-hidden="true"></div>
           <aside class="inspector" id="inspector" aria-label="Details" data-open="true">
             <button class="inspector-close icon-button button" type="button" id="inspector-close" data-variant="ghost" aria-label="Close details"><svg class="lucide lucide-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg></button>
             <div class="inspector-scroll" id="inspector-scroll"><div class="inspector-content" id="inspector-content"></div></div>
