@@ -238,8 +238,9 @@ let trail = emptyTrail();
 let swipeGesture = null;
 // Below the overlay width the details sheet can be closed; picking a row opens it again.
 let inspectorDismissed = false;
-// Which drawer above the Apply bar is open: "saved", "use" or none.
-let canvasDrawer = null;
+// The menu open over the editor: { kind: "saved" }, { kind: "use" } for every computer's
+// displays from the Apply bar, or { kind: "use", display } from a display on the canvas; or none.
+let canvasMenu = null;
 let networkMenuOpen = false;
 // This Mac's network list, opened under its checklist row with Change once a network is chosen.
 let localNetworkOpen = false;
@@ -751,7 +752,7 @@ function context() {
     studio,
     arrange: studio.arrange,
     toolbar: studio.toolbar,
-    canvasDrawer,
+    canvasMenu,
     snapshotCheck,
     localNetworkOpen,
     pairingPending,
@@ -792,7 +793,9 @@ function context() {
       leaveArrange,
       pauseSharing,
       resumeSharing,
-      toggleCanvasDrawer,
+      toggleCanvasMenu,
+      pickDisplay,
+      closeCanvasMenu,
       setTheme,
       refreshSnapshot,
       requestPermissions,
@@ -876,8 +879,12 @@ function render() {
   arrangementView = null;
   // The arrange request has done its job once the backend reports the edit.
   if (arrangeRequested && isEditingLayout(sharing)) arrangeRequested = false;
-  // An edit that ended any other way, an Apply included, keeps the computer switched on.
-  if (!arrangeRequested && !isEditingLayout(sharing)) arrangeSwitchedOn = null;
+  // An edit that ended any other way, an Apply included, keeps the computer switched on and takes
+  // its menu with it.
+  if (!arrangeRequested && !isEditingLayout(sharing)) {
+    arrangeSwitchedOn = null;
+    canvasMenu = null;
+  }
   settleLoadOnConnect();
   lastActive = activeFingerprint() ?? lastActive;
   const ctx = context();
@@ -1282,7 +1289,7 @@ function arrangeWith(fingerprint) {
   const enabled = resolveEnabledList(sharing.view, computers, activeFingerprint());
   arrangeSwitchedOn = isComputerEnabled(target, enabled) ? null : target;
   arrangeRequested = true;
-  canvasDrawer = null;
+  canvasMenu = null;
   render();
   void beginLayoutEdit(target);
 }
@@ -1293,13 +1300,26 @@ function leaveArrange() {
   arrangeSwitchedOn = null;
   arrangeRequested = false;
   loadOnConnect = null;
-  canvasDrawer = null;
+  canvasMenu = null;
   render();
   void endLayoutEdit(switchedOn);
 }
 
-function toggleCanvasDrawer(kind) {
-  canvasDrawer = canvasDrawer === kind ? null : kind;
+// The Apply bar's button closes its own menu and takes over one a display opened.
+function toggleCanvasMenu(kind) {
+  canvasMenu = canvasMenu?.kind === kind && !canvasMenu.display ? null : { kind };
+  render();
+}
+
+// A click on a display opens its computer's displays beside it; the same display again closes them.
+function pickDisplay(display) {
+  canvasMenu = canvasMenu?.display === display ? null : { kind: "use", display };
+  render();
+}
+
+function closeCanvasMenu() {
+  if (!canvasMenu) return;
+  canvasMenu = null;
   render();
 }
 

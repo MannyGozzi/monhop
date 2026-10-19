@@ -2,7 +2,6 @@ import { computerStatus, isSessionStatus } from "./computer-status.mjs";
 import { displayName, findComputer } from "./computers-model.mjs";
 import { pairingStep, platformLabel } from "./pairing-model.mjs";
 import {
-  MAX_ARRANGEMENT_NAME,
   arrangementForSharing,
   arrangementResetTarget,
   canApplySetup,
@@ -17,13 +16,15 @@ import {
   isBusySharing,
   isConnected,
   isSyncing,
-  normalizeArrangementName,
   sharedMonitorChoices,
+  storedLayoutTiles,
 } from "./sharing-model.mjs";
 import { createArrangementView } from "./arrangement-view.mjs";
+import { membersFromOptions } from "./arrangement-view-model.mjs";
+import { createCanvasMenu, createDisplaysPage, createSavedPage } from "./canvas-menus.mjs";
+import { displayOwner, displaySections } from "./canvas-menus-model.mjs";
 import { watchSize } from "./arrangement-render.mjs";
 import { newestFirst, resolveEnabledList } from "./computer-card-model.mjs";
-import { layoutChipStrip } from "./computer-card.mjs";
 import { presence } from "./accordion.mjs";
 import { createDashboardArrangement, createLocalPicture } from "./dashboard-arrangement.mjs";
 import { UPDATE_READY_NOTE, canInstall, installHint } from "./updates-model.mjs";
@@ -41,8 +42,6 @@ import {
   motionToken,
   note,
   platformIcon,
-  row,
-  rows,
   setLabel,
   sinceChanged,
   stableLabel,
@@ -85,10 +84,9 @@ export function renderCanvas(nodes, ctx) {
     view.mounted?.();
   }
   clear(nodes.canvasDock);
-  const drawer = presence("canvas-drawer", mode === "edit" ? drawerContent(ctx) : null);
-  if (drawer) nodes.canvasDock.append(drawer);
   const bar = presence("apply-bar", ctx.arrange.active ? applyBar(ctx, mode) : null);
   if (bar) nodes.canvasDock.append(bar);
+  renderMenus(nodes, ctx, mode);
   renderStatusBar(nodes, ctx);
 }
 
@@ -658,9 +656,9 @@ function resetControl({ sharing, actions, busy }) {
 }
 
 // Apply and the way out, the editor's own Reset and Fit, and the saved arrangements and the
-// displays in use a press away in the drawer above.
+// displays in use a press away in menus over the canvas.
 function applyBar(ctx, mode) {
-  const { sharing, actions, busy, arrange, canvasDrawer } = ctx;
+  const { sharing, actions, busy, arrange, canvasMenu } = ctx;
   const applying = sharing.pending?.kind === "apply" || isSyncing(sharing);
   const editing = mode === "edit";
   if (!sharing.view?.editing) draftChanged = false;
@@ -668,9 +666,9 @@ function applyBar(ctx, mode) {
     draftChanged = canResetArrangement(sharing);
   const toggles = editing
     ? [
-        drawerToggle(ctx, "saved", savedLabel(sharing)),
+        menuToggle(ctx, "saved", savedLabel(sharing)),
         Object.values(displayUseChoices(sharing)).some((list) => list.length)
-          ? drawerToggle(ctx, "use", "Displays in use")
+          ? menuToggle(ctx, "use", "Displays in use")
           : null,
       ]
     : [];
@@ -713,16 +711,18 @@ function applyBar(ctx, mode) {
       }),
     ],
   });
-  function drawerToggle(context, kind, label) {
-    const open = canvasDrawer === kind;
+  function menuToggle(context, kind, label) {
+    const open = canvasMenu?.kind === kind && !canvasMenu.display;
     const toggle = button(label, {
       variant: "ghost",
       size: "sm",
       pressed: open,
       focusKey: `apply-bar-${kind}`,
-      onClick: () => context.actions.toggleCanvasDrawer(kind),
+      onClick: () => context.actions.toggleCanvasMenu(kind),
     });
     toggle.classList.add("apply-bar-drawer-toggle");
+    toggle.dataset.menuOpener = "true";
+    toggle.setAttribute("aria-haspopup", "dialog");
     toggle.setAttribute("aria-expanded", String(open));
     const chevron = icon("chevron-right", 12);
     chevron.classList.add("apply-bar-chevron");
@@ -755,31 +755,6 @@ function leaveButton({ sharing, actions, busy }, applying) {
 function savedLabel(sharing) {
   const count = sharing.arrangements.length;
   return count ? `Saved arrangements (${count})` : "Saved arrangements";
-}
-
-function drawerContent(ctx) {
-  if (ctx.canvasDrawer === "saved")
-    return el("div", {
-      className: "canvas-drawer",
-      dataset: { kind: "saved" },
-      children: [
-        el("div", {
-          className: "canvas-drawer-heading",
-          children: [
-            el("strong", { text: "Saved arrangements" }),
-            el("span", { text: "Load one, or save the arrangement above under a name." }),
-          ],
-        }),
-        ...arrangementsContent(ctx),
-      ],
-    });
-  if (ctx.canvasDrawer === "use" && live?.usePanel)
-    return el("div", {
-      className: "canvas-drawer",
-      dataset: { kind: "use" },
-      children: [live.usePanel],
-    });
-  return null;
 }
 
 // The overall state on the left, and the way to take input back, drawn as the keys to hold.
@@ -890,10 +865,12 @@ function liveEditor(ctx) {
     onCommit: (placement, moving) => actions.commitArrangement(placement, moving),
     onReset: reset.apply,
     onShowMonitor: (monitor, side) => actions.showMonitorOn(monitor, side),
-    onUseDisplay: (id, inUse) => actions.useDisplay(id, inUse),
+    onPickDisplay: (id) => actions.pickDisplay(id),
+    onLift: () => actions.closeCanvasMenu(),
+    onScene: () => menus?.shell.reposition(),
   };
   const shared = sharedMonitorChoices(sharing);
-  const inUse = displayUseChoices(sharing);
+  const selectedDisplay = ctx.canvasMenu?.kind === "use" ? (ctx.canvasMenu.display ?? null) : null;
   const labelDetails = labelTones(ctx, setup);
   if (live?.key !== key) {
     releaseEditor();
@@ -902,19 +879,16 @@ function liveEditor(ctx) {
       ...handlers,
       arrangement,
       shared,
-      inUse,
+      selectedDisplay,
       labelDetails,
       disabled: busy,
       canReset: reset.enabled,
       resetHint: reset.hint,
     });
-    // Reset and Fit ride in the Apply bar and the display switches in its drawer; the editor still
-    // drives both wherever they sit.
+    // Reset and Fit ride in the Apply bar; the editor still drives them there.
     const controls = view.element.querySelector(".arrangement-controls");
-    const usePanel = view.element.querySelector(".arrangement-use")?.parentElement ?? null;
     controls?.remove();
-    usePanel?.remove();
-    live = { key, editor: view, handle: null, controls, usePanel };
+    live = { key, editor: view, handle: null, controls };
   }
   const editor = live.editor;
   // app.js destroys whatever view it holds on the next render; only the handle it still holds may tear the editor down.
@@ -932,7 +906,7 @@ function liveEditor(ctx) {
       editor.update({
         arrangement,
         shared,
-        inUse,
+        selectedDisplay,
         labelDetails,
         disabled: busy,
         canReset: reset.enabled,
@@ -993,129 +967,115 @@ function syncStatus(ctx, changed) {
   return line;
 }
 
-// --- saved arrangements ---------------------------------------------------
+// --- menus over the editor ---------------------------------------------------
 
-// The screen is rebuilt on every poll, so the typed name and a pending delete live outside the DOM.
-let nameDraft = "";
-let pendingDelete = null;
+// The menus and their pages, made with the pane and kept for the life of the window, and the
+// actions of the latest render, which their controls call.
+let menus = null;
+let menuActions = null;
+// Each saved entry's drawing, kept until the connected displays change.
+const previews = new WeakMap();
 
-// The library lists its oldest entry first; here and in every computer's inspector the newest leads.
-function arrangementsContent(ctx) {
-  const { sharing } = ctx;
-  const entries = newestFirst(sharing.arrangements);
-  if (pendingDelete && !entries.some((entry) => entry.name === pendingDelete)) pendingDelete = null;
-  return [
-    entries.length
-      ? rows(entries.map((entry) => arrangementRow(ctx, entry)))
-      : note(
-          "MonHop remembers each arrangement you apply, for its display configuration. You can also save one under a name to switch between several later.",
-        ),
-    saveForm(ctx),
-  ];
-}
-
-function arrangementRow(ctx, entry) {
-  const { sharing, actions, busy } = ctx;
-  // Whether it fits is the "Fits now" chip's job alone, so the line never says it twice.
-  const detail = `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`;
-  const key = rowKey(entry.name);
-  const deleting = pendingDelete === entry.name;
-  // Arming keeps the button's width, so Load and Overwrite beside it stay put.
-  const label = (armed) =>
-    stableLabel(`${key}-delete`, ["Delete", "Confirm delete"], armed ? 1 : 0);
-  const remove = button("", {
-    variant: deleting ? "destructive" : "ghost",
-    size: "sm",
-    disabled: busy,
-    focusKey: `${key}-delete`,
-    pressed: deleting,
-    onClick: () => {
-      if (pendingDelete !== entry.name) {
-        pendingDelete = entry.name;
-        remove.querySelector(".stable-label").replaceWith(label(true));
-        remove.dataset.variant = "destructive";
-        remove.setAttribute("aria-pressed", "true");
-        return;
-      }
-      pendingDelete = null;
-      void actions.deleteArrangement(entry.name);
-    },
-  });
-  remove.append(label(deleting));
-  return row({
-    title: entry.name,
-    detail,
-    leading: layoutChipStrip(key, entry),
-    actions: [
-      button("Load", {
-        variant: "outline",
-        size: "sm",
-        disabled: busy || !canLoadArrangement(sharing, entry.name),
-        focusKey: `${key}-load`,
-        onClick: () => void actions.loadSavedArrangement(entry.name),
-      }),
-      button("Overwrite", {
-        variant: "ghost",
-        size: "sm",
-        disabled: busy || !canSaveArrangement(sharing, entry.name),
-        focusKey: `${key}-overwrite`,
-        onClick: () => void actions.saveArrangement(entry.name),
-      }),
-      remove,
-    ],
-  });
-}
-
-function saveForm(ctx) {
-  const { sharing, actions, busy } = ctx;
-  const savable = !busy && canSaveArrangement(sharing, "draft");
-  const input = el("input", {
-    className: "input",
-    attrs: {
-      type: "text",
-      id: "arrangement-name",
-      placeholder: "Name this arrangement",
-      maxlength: MAX_ARRANGEMENT_NAME,
-      autocomplete: "off",
-      "aria-label": "Name for the current arrangement",
-    },
-  });
-  input.value = nameDraft;
-  input.disabled = !savable;
-  const save = button("Save current", {
-    size: "sm",
-    disabled: !savable || !normalizeArrangementName(nameDraft),
-    focusKey: "arrangement-save",
-    onClick: () => submit(),
-  });
-  input.addEventListener("input", () => {
-    nameDraft = input.value;
-    save.disabled = !savable || !normalizeArrangementName(nameDraft);
-  });
-  input.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
-    submit();
-  });
-  const submit = () => {
-    const name = normalizeArrangementName(nameDraft);
-    if (!name || save.disabled) {
-      input.focus({ preventScroll: true });
-      return;
-    }
-    nameDraft = "";
-    void actions.saveArrangement(name);
+function renderMenus(nodes, ctx, mode) {
+  menuActions = ctx.actions;
+  menus ??= {
+    shell: createCanvasMenu(nodes.canvasPane, { onDismiss: () => menuActions.closeCanvasMenu() }),
+    saved: createSavedPage(() => menuActions),
+    displays: createDisplaysPage(() => menuActions),
+    scope: null,
   };
-  return el("div", {
-    className: "arrangement-save",
-    children: [
-      el("div", { className: "arrangement-save-row", children: [input, save] }),
-      note(
-        savable
-          ? "Saves the arrangement shown above under this name. An existing name is replaced."
-          : "Arrange the displays so they touch, then save the arrangement under a name.",
-      ),
-    ],
+  const menu = mode === "edit" ? ctx.canvasMenu : null;
+  if (!menu) {
+    menus.shell.hide();
+    menus.scope = null;
+    return;
+  }
+  const animate = menus.shell.isOpen() && motionEnabled();
+  if (menu.kind === "saved") showSavedMenu(nodes, ctx, animate);
+  else showDisplaysMenu(nodes, ctx, menu.display ?? null, animate);
+}
+
+function menuToggleOf(nodes, kind) {
+  return nodes.canvasDock.querySelector(`[data-focus-key="apply-bar-${kind}"]`);
+}
+
+function memberTones(ctx) {
+  const members = membersFromOptions(liveOptions(ctx));
+  return members
+    ? Object.fromEntries(members.order.map((key) => [key, members.byKey[key].tone]))
+    : {};
+}
+
+function showSavedMenu(nodes, ctx, animate) {
+  const { sharing, busy } = ctx;
+  const items = newestFirst(sharing.arrangements).map((entry) => ({
+    key: rowKey(entry.name),
+    name: entry.name,
+    entry,
+    crossings: entry.crossings,
+    loadable: !busy && canLoadArrangement(sharing, entry.name),
+    overwritable: !busy && canSaveArrangement(sharing, entry.name),
+    tiles: previewOf(sharing, entry),
+  }));
+  const steady = menus.scope === "saved";
+  menus.scope = "saved";
+  menus.shell.show({
+    kind: "saved",
+    page: menus.saved,
+    label: "Saved arrangements",
+    anchor: () => menuToggleOf(nodes, "saved")?.getBoundingClientRect() ?? null,
+    prefer: "above",
+    align: "start",
+    openers: "[data-menu-opener]",
+    returnFocus: () => menuToggleOf(nodes, "saved"),
+    update: () =>
+      menus.saved.update({
+        items,
+        busy,
+        savable: !busy && canSaveArrangement(sharing, "draft"),
+        canSave: canSaveArrangement(sharing, "draft"),
+        tones: memberTones(ctx),
+        animate: animate && steady,
+      }),
+  });
+}
+
+function previewOf(sharing, entry) {
+  const kept = previews.get(entry);
+  if (kept?.view === sharing.view) return kept.tiles;
+  const tiles = storedLayoutTiles(sharing, entry.layout);
+  previews.set(entry, { view: sharing.view, tiles });
+  return tiles;
+}
+
+// From a display the menu lists that display's computer beside it; from the Apply bar, every
+// computer above the bar.
+function showDisplaysMenu(nodes, ctx, display, animate) {
+  const { sharing, busy } = ctx;
+  const choices = displayUseChoices(sharing);
+  const members = membersFromOptions(liveOptions(ctx));
+  const owner = display ? displayOwner(choices, display) : null;
+  const scope = owner ?? "all";
+  const swap = menus.scope !== scope;
+  menus.scope = scope;
+  const sections = displaySections({ choices, members, scope: owner, selected: display });
+  menus.shell.show({
+    kind: "displays",
+    page: menus.displays,
+    label: owner ? `${members.byKey[owner].label} displays` : "Displays in use",
+    anchor: owner
+      ? () => live?.editor.displayRect(display) ?? null
+      : () => menuToggleOf(nodes, "use")?.getBoundingClientRect() ?? null,
+    prefer: owner ? "below" : "above",
+    align: owner ? "center" : "start",
+    openers: "[data-menu-opener], .arrangement-display",
+    swap,
+    returnFocus: () =>
+      owner
+        ? nodes.canvasStage.querySelector(`[data-focus-key="arrangement-group-${owner}"]`)
+        : menuToggleOf(nodes, "use"),
+    update: () =>
+      menus.displays.update({ sections, scoped: owner !== null, busy, animate: animate && !swap }),
   });
 }
 

@@ -10,6 +10,12 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 - Arrange floats over the top right corner of the arrangement instead of sitting in the toolbar.
 - While MonHop connects to the other computer to arrange, its card shows that computer's icon with rings pulsing outward and a light running along the card's edge, in place of a spinner.
 - The arrangement shows whether sharing is running. When it starts, each crossing between displays lights up outward from its handle with a pulse, and a soft glow rises under the displays. When sharing pauses or stops, the crossings fade back to grey.
+- While arranging, clicking a display opens its computer's displays right beside it, each with a switch for whether it is in use. The display you clicked is highlighted in the list and outlined on the arrangement. Displays in use and Saved arrangements now float over the arrangement instead of squeezing it from below.
+- Each saved arrangement shows a small drawing of how it lays the displays out. Clicking one loads it. Overwrite and Delete appear when you point at it, and Delete asks once more in place before it removes anything.
+
+### Fixed
+
+- The tooltip on the refresh button beside Computers no longer slips under the computer list when you click the button.
 
 ## [0.2.12] - 2026-10-18
 

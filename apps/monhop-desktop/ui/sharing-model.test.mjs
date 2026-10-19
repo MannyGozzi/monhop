@@ -43,6 +43,7 @@ import {
   shouldPollSharing,
   setArrangement,
   setArrangements,
+  storedLayoutTiles,
   settlePending,
   validateLayout,
 } from "./sharing-model.mjs";
@@ -638,6 +639,18 @@ test("named arrangements list only well-formed entries and load only while they 
   assert.equal(canSaveArrangement(state, "   "), false);
   assert.equal(canSaveArrangement(applySharingView(state, offView), "Desk"), false);
   assert.deepEqual(applySharingView(state, offView).arrangements, []);
+});
+
+test("a stored layout previews as the boxes loading it would draw, and not once it no longer places", () => {
+  const state = place(initializeArrangement(connected()), [1512, 300]);
+  const native = layoutForSave(state);
+  const drawn = arrangementForSharing(state).tiles;
+  assert.deepEqual(
+    storedLayoutTiles(place(state, [1512, 49]), native),
+    drawn.map(({ id, group, x, y, width, height }) => ({ id, group, x, y, width, height })),
+  );
+  assert.equal(storedLayoutTiles(state, null), null);
+  assert.equal(storedLayoutTiles(applySharingView(state, offView), native), null);
 });
 
 test("an arrangement is automatic only when the native reply says so exactly", () => {

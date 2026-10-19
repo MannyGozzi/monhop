@@ -145,7 +145,6 @@
   --menu-width: 260px;
   --canvas-card-width: 420px;
   --theme-choice-width: 300px;
-  --drawer-max-height: 240px;
   --stage-min-height: 190px;
 
   /* Strokes and component sizes */
@@ -211,7 +210,6 @@
   --pair-symbol-lg: 32px;
   --scrollbar-size: 10px;
   --scrollbar-inset: 3px;
-  --use-column-min: 230px;
   --empty-copy-width: 40ch;
   --mock-width: 380px;
   --mock-sidebar-width: 104px;
@@ -464,7 +462,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .canvas-view .state-card { width: min(100%, var(--canvas-card-width)); border-radius: var(--radius-card); background: var(--panel); box-shadow: var(--shadow-panel); }
 
 /* Banners above the canvas, and the Apply bar, drawer and status bar below it, float as panels. */
-.banner, .apply-bar, .canvas-drawer, .status-bar { border-radius: var(--radius-card); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-panel); }
+.banner, .apply-bar, .status-bar { border-radius: var(--radius-card); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-panel); }
 .banner { --tone: var(--muted-foreground); display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap-2) var(--gap-3); min-width: 0; padding: var(--gap-3) var(--gap-3) var(--gap-3) var(--gap-4); }
 .banner[data-tone="danger"] { --tone: var(--destructive); }
 .banner[data-tone="warning"] { --tone: var(--warning-text); }
@@ -484,7 +482,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .apply-bar-actions { margin-left: auto; }
 .apply-bar-tools .arrangement-controls { display: contents; }
 .apply-bar-tools .arrangement-controls-spacer { display: none; }
-.canvas-drawer { display: grid; gap: var(--gap-3); max-height: var(--drawer-max-height); overflow: auto; padding: var(--gap-3) var(--gap-4); }
 .status-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--gap-1) var(--gap-4); min-width: 0; padding: var(--gap-2) var(--gap-4); color: var(--muted-foreground); font-size: var(--text-sm); }
 .status-bar-state { display: inline-flex; align-items: center; gap: var(--gap-2); min-width: 0; color: var(--foreground); font-weight: var(--weight-medium); }
 .status-bar-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -606,8 +603,8 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 /* Grouped lists: one inset container per run of rows, hairlines between them. */
 .rows { display: grid; min-width: 0; border-radius: var(--radius-group); background: var(--surface-inset); overflow: clip; }
 :not(.rows) > :is(.switch-row, .slider-row) { border-radius: var(--radius-group); background: var(--surface-inset); }
-.rows > *, .arrangement-use-group > .switch-row { position: relative; }
-.rows > * + *::before, .arrangement-use-group > .switch-row + .switch-row::before { content: ""; position: absolute; top: 0; right: 0; left: var(--gap-4); height: var(--hairline-width); background: var(--hairline); pointer-events: none; }
+.rows > * { position: relative; }
+.rows > * + *::before { content: ""; position: absolute; top: 0; right: 0; left: var(--gap-4); height: var(--hairline-width); background: var(--hairline); pointer-events: none; }
 .row, .switch-row, .slider-row { min-height: var(--row-min-height); padding: var(--gap-2) var(--gap-3); }
 .row:has(.row-copy > span), .switch-row:has(.switch-copy > small), .slider-row { padding-block: var(--gap-3); }
 .row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--gap-3); }
@@ -650,7 +647,8 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 :is(.button, .arrangement-control, .segmented-option):active:not(:disabled) { transform: scale(var(--scale-press)); transition: var(--transition-control), var(--transition-press); }
 .arrangement-control { border: 0; border-radius: var(--radius); padding: 0 var(--gap-3); font-weight: var(--weight-semibold); transition: var(--transition-control); }
 .arrangement-control.is-current:not(:disabled) { color: var(--muted-foreground); }
-.icon-button.button { position: relative; width: var(--icon-button-size); height: var(--icon-button-size); border-radius: var(--radius); padding: 0; background: transparent; color: var(--muted-foreground); box-shadow: none; }
+/* Its tooltip rides inside it and the press scale makes it a layer of its own, so it sits above the rows after it. */
+.icon-button.button { position: relative; z-index: 1; width: var(--icon-button-size); height: var(--icon-button-size); border-radius: var(--radius); padding: 0; background: transparent; color: var(--muted-foreground); box-shadow: none; }
 .icon-button.button:hover:not(:disabled) { background: var(--surface-hover); color: var(--foreground); }
 /* Busy, its glyph turns: it keeps its look and hover, since a dimmed button would trap its tooltip under the next rows. */
 .icon-button.button[aria-busy]:disabled { opacity: 1; pointer-events: auto; cursor: progress; }
@@ -867,12 +865,13 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-legend-item[data-side="peer"] .arrangement-legend-swatch { --tone: var(--display-peer); }
 /* data-tone covers members beyond local/peer (createLegend, arrangement-render.mjs); data-side only
    ever names "local"/"peer", so peer-2..6 rely on this and data-tone="peer" is kept for symmetry. */
-.arrangement-legend-item[data-tone="peer"] .arrangement-legend-swatch { --tone: var(--display-peer); }
-.arrangement-legend-item[data-tone="peer-2"] .arrangement-legend-swatch { --tone: var(--display-peer-2); }
-.arrangement-legend-item[data-tone="peer-3"] .arrangement-legend-swatch { --tone: var(--display-peer-3); }
-.arrangement-legend-item[data-tone="peer-4"] .arrangement-legend-swatch { --tone: var(--display-peer-4); }
-.arrangement-legend-item[data-tone="peer-5"] .arrangement-legend-swatch { --tone: var(--display-peer-5); }
-.arrangement-legend-item[data-tone="peer-6"] .arrangement-legend-swatch { --tone: var(--display-peer-6); }
+.canvas-menu [data-tone] { --tone: var(--display-local); }
+.arrangement-legend-item[data-tone="peer"] .arrangement-legend-swatch, .canvas-menu [data-tone="peer"] { --tone: var(--display-peer); }
+.arrangement-legend-item[data-tone="peer-2"] .arrangement-legend-swatch, .canvas-menu [data-tone="peer-2"] { --tone: var(--display-peer-2); }
+.arrangement-legend-item[data-tone="peer-3"] .arrangement-legend-swatch, .canvas-menu [data-tone="peer-3"] { --tone: var(--display-peer-3); }
+.arrangement-legend-item[data-tone="peer-4"] .arrangement-legend-swatch, .canvas-menu [data-tone="peer-4"] { --tone: var(--display-peer-4); }
+.arrangement-legend-item[data-tone="peer-5"] .arrangement-legend-swatch, .canvas-menu [data-tone="peer-5"] { --tone: var(--display-peer-5); }
+.arrangement-legend-item[data-tone="peer-6"] .arrangement-legend-swatch, .canvas-menu [data-tone="peer-6"] { --tone: var(--display-peer-6); }
 .arrangement-legend-item[data-kind="primary"] .arrangement-legend-swatch { border-radius: var(--radius-circle); background: var(--foreground); box-shadow: none; }
 .arrangement-legend-item[data-kind="seam"] .arrangement-legend-swatch { width: var(--legend-seam-width); height: var(--stroke-bold); background: var(--primary); box-shadow: none; }
 .arrangement-legend-item[data-kind="shared"] .arrangement-legend-swatch { width: var(--icon-size-sm); height: var(--icon-size-sm); background: none; box-shadow: none; color: var(--foreground); stroke-width: var(--icon-stroke-bold); }
@@ -880,16 +879,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-shared-item { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--gap-2) var(--gap-4); min-width: 0; border-radius: var(--radius-group); padding: var(--gap-2) var(--gap-2) var(--gap-2) var(--gap-4); background: var(--panel); box-shadow: var(--shadow-chip); }
 .arrangement-shared-copy { min-width: 0; color: var(--muted-foreground); font-size: var(--text-sm); }
 .arrangement-shared-copy strong { color: var(--foreground); font-weight: var(--weight-semibold); }
-.arrangement-use { display: grid; gap: var(--gap-3); min-width: 0; }
-.arrangement-use-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--gap-half) var(--gap-2); min-width: 0; color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-semibold); }
-.arrangement-use-hint { color: var(--muted-foreground); font-size: var(--text-sm); font-weight: var(--weight-regular); }
-.arrangement-use-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(var(--use-column-min), 1fr)); gap: var(--gap-4); min-width: 0; }
-.arrangement-use-group { display: grid; align-content: start; min-width: 0; }
-.arrangement-use-title { margin-bottom: var(--gap-2); padding: 0 var(--gap-1); color: var(--muted-foreground); font-size: var(--text-sm); font-weight: var(--weight-medium); }
-/* The editor draws each side's switches as siblings; they join into one grouped list here. */
-.arrangement-use-group > .switch-row { border-radius: 0; }
-.arrangement-use-group > .switch-row:first-of-type { border-top-left-radius: var(--radius-group); border-top-right-radius: var(--radius-group); }
-.arrangement-use-group > .switch-row:last-of-type { border-bottom-left-radius: var(--radius-group); border-bottom-right-radius: var(--radius-group); }
 .arrangement-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap-2); }
 .arrangement-controls-spacer { flex: 1 1 auto; }
 .arrangement-save { display: grid; gap: var(--gap-2); min-width: 0; }

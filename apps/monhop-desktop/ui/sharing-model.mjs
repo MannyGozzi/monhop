@@ -803,6 +803,18 @@ export function layoutSignature(layout) {
   return JSON.stringify([links, arrangement]);
 }
 
+// What loading a stored layout would draw: each display's box and its computer, or null when it
+// no longer places on the displays connected now.
+export function storedLayoutTiles(state, layout) {
+  const proposal = layout ? draftFromStoredLayout(layout, state) : null;
+  if (!proposal?.placement) return null;
+  const groups = currentGroups(state, { hidden: proposal.hidden });
+  const drawn = arrangementGeometry(groups, proposal.placement).tiles;
+  return drawn.length
+    ? drawn.map(({ id, group, x, y, width, height }) => ({ id, group, x, y, width, height }))
+    : null;
+}
+
 // A stored layout back into a draft: its crossings, plus the placement when the positions still fit.
 // The forward half of each pair of links is the one running from the lower-ordered member to the
 // higher-ordered one, matching how this model always emits them.

@@ -3,7 +3,6 @@ import {
   arrangementGeometry,
   constrainTransform,
   describeArrangement,
-  formatSize,
   groupRects,
   movePlacement,
   movingIds,
@@ -33,14 +32,13 @@ import {
   watchSize,
 } from "./arrangement-render.mjs";
 import { revealPanel, setRevealOpen } from "./accordion.mjs";
-import { motionEase, motionEnabled, motionMs, switchRow } from "./dom.mjs";
+import { motionEase, motionEnabled, motionMs } from "./dom.mjs";
 import { icon } from "./icons.mjs";
 import {
   cappedFit,
   groupAriaText,
   heldShift,
   membersFromOptions,
-  normalizeUseChoices,
   nudgePixels,
   nudgeTarget,
   tileAriaText,
@@ -52,8 +50,10 @@ const SNAP_PIXELS = 14;
 // Below this a group moved or resized by a rounding difference, not a change worth animating.
 const GROUP_MOVE_EPSILON = 0.5;
 const INSTRUCTIONS =
-  "Drag a computer against another; the edge where they touch is where the pointer crosses. With a computer selected, arrow keys nudge it and Shift with an arrow moves it further.";
-const HINT = "Drag a computer to move it";
+  "Drag a computer against another; the edge where they touch is where the pointer crosses. With a computer selected, arrow keys nudge it and Shift with an arrow moves it further. Click a display to choose which of its computer's displays are in use.";
+const HINT = "Drag to move, click a display for options";
+// A press lifts its group once the pointer travels this far; a release short of it is a click.
+const DRAG_SLOP = 4;
 // Room around the arrangement: a label band above, the legend strip below, air at the sides.
 const EDIT_INSETS = Object.freeze({ top: 32, right: 24, bottom: 48, left: 24 });
 const LABEL_INSETS = Object.freeze({ top: 0, right: 8, bottom: 0, left: 8 });
@@ -130,15 +130,18 @@ export function createArrangementView(options) {
   let shared = Array.isArray(options.shared) ? options.shared : [];
   let members = membersFromOptions(options) ?? membersFromOptions({});
   let { labels, platforms, tones } = memberMaps(members);
-  let inUse = normalizeUseChoices(members.order, options.inUse);
   let labelDetails = options.labelDetails ?? {};
   let disabled = options.disabled === true;
   let handlers = {
     onCommit: options.onCommit,
     onReset: options.onReset,
     onShowMonitor: options.onShowMonitor,
-    onUseDisplay: options.onUseDisplay,
+    onPickDisplay: options.onPickDisplay,
+    onLift: options.onLift,
+    onScene: options.onScene,
   };
+  // The display a menu was opened from, ringed while it stays open.
+  let selectedDisplay = options.selectedDisplay ?? null;
 
   const root = document.createElement("section");
   root.className = "arrangement-editor";
@@ -194,11 +197,6 @@ export function createArrangementView(options) {
   const sharedPanel = revealPanel(sharedRow);
   let sharedSignature = null;
 
-  // One switch per display each computer reports; off leaves it out of the picture and every route.
-  const useBlock = document.createElement("div");
-  useBlock.className = "arrangement-use";
-  const usePanel = revealPanel(useBlock);
-
   const controls = document.createElement("div");
   controls.className = "arrangement-controls";
   controls.setAttribute("aria-label", "Arrangement actions");
@@ -222,7 +220,7 @@ export function createArrangementView(options) {
   });
   controls.append(spacer, reset, fit);
 
-  root.append(heading, instructions, stage, sharedPanel, usePanel, controls);
+  root.append(heading, instructions, stage, sharedPanel, controls);
 
   if (!arrangement?.groups?.order?.length || !arrangement.placement) {
     status.textContent = arrangement?.message || "These displays cannot be arranged yet.";
@@ -254,7 +252,6 @@ export function createArrangementView(options) {
   // and a crossing on the dropped group rides with it rather than with the group it lands against.
   let landing = false;
   let dropped = null;
-  let useSignature = null;
   let groupLayer = null;
   // The crossings drawn last, where the overlay lays them.
   let places = [];
@@ -320,7 +317,6 @@ export function createArrangementView(options) {
       labelDetails,
       disabled,
       shared,
-      inUse,
     ]);
   }
 
@@ -413,67 +409,6 @@ export function createArrangementView(options) {
     }
   }
 
-  function renderUse() {
-    const withDisplays = groups.order.filter((key) => inUse[key]?.length);
-    if (!withDisplays.length) {
-      useSignature = null;
-      setRevealOpen(usePanel, false, { focusTarget: fit });
-      return;
-    }
-    const signature = JSON.stringify([withDisplays, inUse, labels, tones, disabled]);
-    if (signature === useSignature) return;
-    useSignature = signature;
-    const useHeading = document.createElement("div");
-    useHeading.className = "arrangement-use-heading";
-    const useTitle = document.createElement("span");
-    useTitle.textContent = "Displays in use";
-    const useHint = document.createElement("span");
-    useHint.className = "arrangement-use-hint";
-    useHint.textContent = "Turn off a display that is showing another computer or is not in use.";
-    useHeading.append(useTitle, useHint);
-    const columns = document.createElement("div");
-    columns.className = "arrangement-use-groups";
-    for (const key of withDisplays) {
-      const group = document.createElement("div");
-      group.className = "arrangement-use-group";
-      group.dataset.side = key;
-      const name = document.createElement("div");
-      name.className = "arrangement-legend-item arrangement-use-title";
-      name.dataset.side = key;
-      name.dataset.tone = tones[key];
-      const swatch = document.createElement("span");
-      swatch.className = "arrangement-legend-swatch";
-      swatch.setAttribute("aria-hidden", "true");
-      const text = document.createElement("span");
-      text.textContent = labels[key];
-      name.append(swatch, text);
-      group.append(name);
-      for (const display of inUse[key]) {
-        const locked = display.inUse && !display.canLeave;
-        const details = [formatSize(display.size[0], display.size[1])];
-        if (display.primary) details.push("Primary");
-        if (display.cabledToBoth) details.push("Cabled to both computers");
-        if (locked) details.push("Its computer's only display");
-        const row = switchRow(display.name, {
-          checked: display.inUse,
-          description: details.join(" · "),
-          disabled: disabled || locked,
-          focusKey: `arrangement-use-${display.id}`,
-          onChange: (next) => {
-            if (disabled || locked) return;
-            refitNext = true;
-            handlers.onUseDisplay?.(display.id, next);
-          },
-        });
-        row.dataset.useDisplay = display.id;
-        group.append(row);
-      }
-      columns.append(group);
-    }
-    useBlock.replaceChildren(useHeading, columns);
-    setRevealOpen(usePanel, true);
-  }
-
   // `force` redraws an unchanged scene, as a cancelled drag needs to put its group back.
   function renderScene({ force = false } = {}) {
     if (destroyed || drag || !root.isConnected) return;
@@ -503,7 +438,6 @@ export function createArrangementView(options) {
       seams.draw(places);
       seams.hide(false);
       renderShared();
-      renderUse();
       svg.replaceChildren(paint.defs);
       nodes = {};
       rendered = { shape: null, scale: null, disabled: null };
@@ -535,7 +469,6 @@ export function createArrangementView(options) {
     storedView = { key, transform };
     setViewBox(0, 0, size, bounds);
     renderShared();
-    renderUse();
     fit.classList.toggle("is-current", sameTransform(transform, ideal));
 
     const previousNodes = nodes;
@@ -582,8 +515,16 @@ export function createArrangementView(options) {
     drawnFor = { content, size, transform };
     refineText(svg);
     restingStatus();
+    markSelected();
     if (!disabled && focused)
       svg.querySelector(`[data-focus-key="${focused}"]`)?.focus({ preventScroll: true });
+    handlers.onScene?.();
+  }
+
+  function markSelected() {
+    for (const tile of svg.querySelectorAll(".arrangement-display"))
+      if (tile.dataset.display === selectedDisplay) tile.dataset.selected = "true";
+      else delete tile.dataset.selected;
   }
 
   // Where each group shows this frame in stage pixels, mid-glide or held, with how far it is into
@@ -805,16 +746,20 @@ export function createArrangementView(options) {
     drawPreview(drag.resolved);
   }
 
-  function startDrag(moving, keyboard) {
+  // A keyboard drag lifts at once; a pointer press waits for DRAG_SLOP, so a click on a display
+  // never lifts its group.
+  function startDrag(moving, keyboard, display = null) {
     const node = nodes[moving.group];
-    // Raising the group above the others moves it in the DOM, which drops focus: take both before the drag exists.
-    groupLayer.append(node);
-    node?.focus({ preventScroll: true });
+    // Raising the group moves it in the DOM, which drops focus and so would cancel a keyboard drag:
+    // that one is raised and focused before it exists.
+    if (keyboard) raise(node);
     const base = rects.groups[moving.group];
     drag = {
       moving,
       node,
       keyboard,
+      display,
+      lifted: false,
       pointerId: null,
       startClientX: 0,
       startClientY: 0,
@@ -825,22 +770,36 @@ export function createArrangementView(options) {
       moved: false,
       resolved: arrangement.placement,
     };
+    if (keyboard) liftGroup();
+    return node;
+  }
+
+  function raise(node) {
+    groupLayer.append(node);
+    node?.focus({ preventScroll: true });
+  }
+
+  function liftGroup() {
+    if (!drag.keyboard) raise(drag.node);
+    drag.lifted = true;
     stage.dataset.dragging = "true";
     stage.dataset.drop = "valid";
     seams.hide(true);
-    node?.classList.add("is-dragging");
-    return node;
+    drag.node?.classList.add("is-dragging");
+    handlers.onLift?.();
   }
 
   function endDrag() {
     if (!drag) return null;
     const current = drag;
     drag = null;
-    landing = true;
-    dropped = current.moving?.group ?? null;
-    stage.dataset.dragging = "false";
-    delete stage.dataset.drop;
-    current.node?.classList.remove("is-dragging");
+    if (current.lifted) {
+      landing = true;
+      dropped = current.moving?.group ?? null;
+      stage.dataset.dragging = "false";
+      delete stage.dataset.drop;
+      current.node?.classList.remove("is-dragging");
+    }
     if (current.pointerId !== null) {
       listenForPointer(false);
       try {
@@ -871,7 +830,12 @@ export function createArrangementView(options) {
   }
 
   function cancelDrag() {
-    if (!endDrag()) return;
+    const current = endDrag();
+    if (!current?.lifted) {
+      // An update held back for the press still lands.
+      if (current && pending) renderScene();
+      return;
+    }
     renderScene({ force: true });
     announce("Move cancelled. The arrangement is unchanged.");
   }
@@ -890,8 +854,9 @@ export function createArrangementView(options) {
   const beginDrag = (event, groupKey) => {
     if (destroyed || disabled || event.button !== 0 || !transform) return;
     event.preventDefault();
-    if (drag) endDrag();
-    startDrag({ group: groupKey }, false);
+    if (drag) cancelDrag();
+    const display = event.target.closest?.(".arrangement-display")?.dataset.display ?? null;
+    startDrag({ group: groupKey }, false, display);
     drag.pointerId = event.pointerId;
     drag.startClientX = event.clientX;
     drag.startClientY = event.clientY;
@@ -901,14 +866,24 @@ export function createArrangementView(options) {
 
   const onPointerMove = (event) => {
     if (destroyed || !drag || drag.keyboard || event.pointerId !== drag.pointerId) return;
-    moveDrag(
-      clampDelta(event.clientX - drag.startClientX, stageSize.width),
-      clampDelta(event.clientY - drag.startClientY, stageSize.height),
-    );
+    const deltaX = event.clientX - drag.startClientX;
+    const deltaY = event.clientY - drag.startClientY;
+    if (!drag.lifted) {
+      if (Math.hypot(deltaX, deltaY) < DRAG_SLOP) return;
+      liftGroup();
+    }
+    moveDrag(clampDelta(deltaX, stageSize.width), clampDelta(deltaY, stageSize.height));
   };
 
   const finishDrag = (event) => {
     if (destroyed || !drag || drag.keyboard || event.pointerId !== drag.pointerId) return;
+    if (!drag.lifted) {
+      const { display } = endDrag();
+      // An update held back for the press lands now that it is over.
+      if (pending) renderScene();
+      if (display) handlers.onPickDisplay?.(display);
+      return;
+    }
     moveDrag(
       clampDelta(event.clientX - drag.startClientX, stageSize.width),
       clampDelta(event.clientY - drag.startClientY, stageSize.height),
@@ -989,6 +964,10 @@ export function createArrangementView(options) {
     update(next = {}) {
       if (destroyed) return;
       if (next.handlers) handlers = { ...handlers, ...next.handlers };
+      if (next.selectedDisplay !== undefined && next.selectedDisplay !== selectedDisplay) {
+        selectedDisplay = next.selectedDisplay;
+        markSelected();
+      }
       if (Array.isArray(next.shared)) shared = next.shared;
       if (next.labelDetails) labelDetails = next.labelDetails;
       if (Array.isArray(next.members)) {
@@ -998,7 +977,6 @@ export function createArrangementView(options) {
           ({ labels, platforms, tones } = memberMaps(members));
         }
       }
-      if (next.inUse) inUse = normalizeUseChoices(groups?.order ?? members.order, next.inUse);
       if (typeof next.disabled === "boolean") disabled = next.disabled;
       reset.disabled = disabled || next.canReset !== true;
       if (next.resetHint) reset.title = next.resetHint;
@@ -1016,6 +994,16 @@ export function createArrangementView(options) {
         groups = arrangement.groups;
       }
       renderScene();
+    },
+    // Where a display rests on screen, its group's glide aside, for a menu to point at; null once
+    // it is out of the picture.
+    displayRect(id) {
+      const rect = rects.tiles[id];
+      const matrix = svg.isConnected ? svg.getScreenCTM() : null;
+      if (destroyed || !rect || !matrix) return null;
+      const start = new DOMPoint(rect.x, rect.y).matrixTransform(matrix);
+      const end = new DOMPoint(rect.x + rect.width, rect.y + rect.height).matrixTransform(matrix);
+      return new DOMRect(start.x, start.y, end.x - start.x, end.y - start.y);
     },
     destroy() {
       if (destroyed) return;
