@@ -245,12 +245,16 @@ function sameSize(a, b) {
 // --- rows --------------------------------------------------------------------
 
 // Keeps `list` holding one node per item in order, reusing each key's row: while `animate`
-// allows, a new row opens in place, a gone one closes out, and the rest slide from where they were.
+// allows, a new row opens in place, a gone one closes out, one whose content changed height grows
+// or shrinks to it, and the rest slide from where they were.
 function syncRows(list, items, rows, { keyOf, create, update, animate }) {
   const before = new Map();
   if (animate)
     for (const [key, row] of rows)
-      if (!leavingRows.has(row.node)) before.set(key, row.node.getBoundingClientRect().top);
+      if (!leavingRows.has(row.node)) {
+        const { top, height } = row.node.getBoundingClientRect();
+        before.set(key, { top, height });
+      }
   const kept = new Set(items.map(keyOf));
   for (const [key, row] of rows)
     if (!kept.has(key) && !leavingRows.has(row.node)) {
@@ -281,7 +285,12 @@ function syncRows(list, items, rows, { keyOf, create, update, animate }) {
     if (fresh && animate) openRow(row);
   }
   if (!animate) return;
-  for (const [key, top] of before) {
+  // Resized first, so the rows below are measured from where the resize starts.
+  for (const [key, { height }] of before) {
+    const row = rows.get(key);
+    if (row && !leavingRows.has(row.node) && !movingRows.has(row.motion)) resizeRow(row, height);
+  }
+  for (const [key, { top }] of before) {
     const row = rows.get(key);
     if (!row || leavingRows.has(row.node)) continue;
     // `top` included a slide still running, so the new place is read without it.
@@ -307,6 +316,17 @@ function openRow(row) {
     ],
     { duration: motionMs("--motion-base"), easing: motionEase("--ease-out") },
   );
+  track(row.motion, () => row.node.style.removeProperty("overflow"));
+}
+
+function resizeRow(row, from) {
+  const to = row.node.getBoundingClientRect().height;
+  if (Math.abs(to - from) < 0.5) return;
+  row.node.style.overflow = "clip";
+  row.motion = row.node.animate([{ height: `${from}px` }, { height: `${to}px` }], {
+    duration: motionMs("--motion-base"),
+    easing: motionEase("--ease-out"),
+  });
   track(row.motion, () => row.node.style.removeProperty("overflow"));
 }
 
@@ -671,7 +691,14 @@ export function createDisplaysPage(actions) {
   function updateRow(row, item) {
     row.item = item;
     setText(row.name, item.name);
-    setText(row.detail, item.detail);
+    // Each fact keeps to one line, so a long detail wraps between them.
+    if (row.detail.textContent !== item.detail)
+      row.detail.replaceChildren(
+        ...item.details.flatMap((part, index) => [
+          ...(index ? [" · "] : []),
+          el("span", { className: "display-row-fact", text: part }),
+        ]),
+      );
     row.node.dataset.useDisplay = item.id;
     row.node.dataset.inUse = String(item.inUse);
     row.node.dataset.selected = String(item.selected);

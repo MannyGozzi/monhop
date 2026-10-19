@@ -349,7 +349,8 @@
 .display-row-copy { display: grid; gap: var(--gap-half); min-width: 0; }
 .display-row-copy strong { overflow: hidden; font-size: var(--text-base); font-weight: var(--weight-medium); text-overflow: ellipsis; white-space: nowrap; transition: color var(--motion-base) var(--ease-out); }
 .display-row[data-in-use="false"] .display-row-copy strong { color: var(--muted-foreground); }
-.display-row-copy small { overflow: hidden; color: var(--muted-foreground); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+.display-row-copy small { color: var(--muted-foreground); font-size: var(--text-xs); }
+.display-row-fact { white-space: nowrap; }
 
 /* The status bar: the overall state on the left, the emergency stop as keys on the right. */
 .status-bar { flex-wrap: nowrap; gap: var(--gap-4); padding: var(--gap-2) var(--gap-3) var(--gap-2) var(--gap-4); container: status-bar / inline-size; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear 0s; }

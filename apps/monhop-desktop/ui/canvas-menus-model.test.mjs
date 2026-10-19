@@ -153,6 +153,11 @@ test("the displays menu lists each computer's displays, one computer when scoped
   assert.equal(all[0].rows[1].detail, "2560 × 1440 · Cabled to both");
   assert.deepEqual([all[0].rows[1].inUse, all[0].rows[1].locked], [false, false]);
   assert.equal(all[1].rows[0].detail, "2560 × 1440 · Primary · Its computer's only display");
+  assert.deepEqual(all[1].rows[0].details, [
+    "2560 × 1440",
+    "Primary",
+    "Its computer's only display",
+  ]);
   assert.equal(all[1].rows[0].locked, true);
   const scoped = displaySections({ choices, members, scope: "peer" });
   assert.deepEqual(

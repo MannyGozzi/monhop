@@ -77,10 +77,12 @@ export function displaySections({ choices, members, scope = null, selected = nul
       tone: members.byKey[key].tone,
       rows: choices[key].map((display) => {
         const locked = display.inUse && !display.canLeave;
+        const details = displayDetails(display, locked);
         return {
           id: display.id,
           name: display.name,
-          detail: displayDetail(display, locked),
+          details,
+          detail: details.join(" · "),
           inUse: display.inUse,
           locked,
           selected: display.id === selected,
@@ -90,12 +92,12 @@ export function displaySections({ choices, members, scope = null, selected = nul
     }));
 }
 
-function displayDetail(display, locked) {
+function displayDetails(display, locked) {
   const parts = [formatSize(display.size[0], display.size[1])];
   if (display.primary) parts.push("Primary");
   if (display.cabledToBoth) parts.push("Cabled to both");
   if (locked) parts.push("Its computer's only display");
-  return parts.join(" · ");
+  return parts;
 }
 
 // The computer a display belongs to, for a menu opened from that display.
