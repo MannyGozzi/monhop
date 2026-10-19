@@ -174,6 +174,8 @@
   --inspector-tile-size: 40px;
   --dot-size: 6px;
   --dot-halo: 3px;
+  /* The headline state dot of an inspector: This Mac's verdict and a computer's state. */
+  --state-dot-size: 8px;
   --radio-size: 16px;
   --radio-ring: 5px;
   --pause-bar-width: 3px;
@@ -222,14 +224,12 @@
   --grid-dot-size: .8px;
   --grid-dot-fade: 1.2px;
   --dashboard-height: 160px;
-  --dashboard-compact-height: 112px;
   --stage-height: clamp(200px, 34vh, 320px);
   --tile-label-text: 11.5px;
   --tile-meta-text: 10px;
   --seam-underlay-width: 6px;
   --legend-swatch: 8px;
   --legend-seam-width: 14px;
-  --local-display-max: 220px;
   --tile-gradient-angle: 160deg;
 
   /* Type */
@@ -242,7 +242,6 @@
   --text-lg: 17px;
   --text-code-input: 22px;
   --text-code-sm: 20px;
-  --text-code: 30px;
   --leading: 1.45;
   --leading-tight: 1.25;
   --leading-none: 1;
@@ -258,7 +257,6 @@
   --scale-press: .97;
   --rotate-open: 90deg;
   --opacity-dim: .4;
-  --opacity-breath: .5;
   --scale-pop: .8;
   --scale-enter: .96;
   --scale-sheet: .985;
@@ -285,7 +283,6 @@
   /* Materializing content fades in still soft, then comes into focus over this. */
   --motion-focus: 360ms;
   --motion-demo: 1100ms;
-  --motion-bloom: 760ms;
   /* Notch island: pointer rest before it opens, and grace before it closes once the pointer leaves. */
   --island-hover-delay: 250ms;
   --island-close-delay: 180ms;
@@ -447,7 +444,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 /* Workspace: the canvas, and the inspector docked beside it or, in a narrow window, sheeted over it. */
 .workspace-body { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) var(--inspector-width); gap: var(--shell-inset); min-width: 0; min-height: 0; padding: 0 var(--shell-inset) var(--shell-inset); }
 .studio[data-inspector="overlay"] .workspace-body { grid-template-columns: minmax(0, 1fr); }
-.canvas-pane { position: relative; isolation: isolate; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; row-gap: var(--gap-2); min-width: 0; min-height: 0; transition: opacity var(--motion-base) var(--ease-out); }
+.canvas-pane { position: relative; isolation: isolate; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; row-gap: var(--gap-2); min-width: 0; min-height: 0; transition: opacity var(--motion-base) var(--ease-out); }
 .canvas-pane::before { content: ""; position: absolute; z-index: -1; inset: 0; background-image: radial-gradient(circle, var(--grid-dot) var(--grid-dot-size), transparent var(--grid-dot-fade)); background-size: var(--canvas-grid) var(--canvas-grid); -webkit-mask-image: var(--grid-mask); mask-image: var(--grid-mask); pointer-events: none; }
 .studio[data-view="settings"] .canvas-pane { opacity: 0; }
 .canvas-banners, .canvas-dock { display: flex; flex-direction: column; gap: var(--gap-2); min-width: 0; }
@@ -462,11 +459,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .canvas-placeholder p { font-size: var(--text-sm); }
 .canvas-placeholder .card-actions { justify-content: center; padding-top: var(--gap-2); }
 .canvas-view .state-card { width: min(100%, var(--canvas-card-width)); border-radius: var(--radius-card); background: var(--panel); box-shadow: var(--shadow-panel); }
-/* With nothing paired, this computer's own displays as plain tiles in their reported proportions. */
-.local-displays { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: center; gap: var(--gap-2); width: 100%; }
-.local-display { display: flex; flex-direction: column; justify-content: flex-end; gap: var(--gap-half); width: calc(var(--local-display-max) * var(--display-share, 1)); aspect-ratio: var(--display-ratio, 16 / 10); border: var(--stroke-bold) solid var(--tile-bezel); border-radius: var(--radius-sm); padding: var(--gap-2); background: linear-gradient(var(--tile-gradient-angle), color-mix(in oklab, var(--display-local) var(--mix-tile), var(--tile-shade)), var(--tile-shade)); filter: var(--filter-tile); }
-.local-display strong { color: var(--tile-text); font-size: var(--text-xs); font-weight: var(--weight-semibold); }
-.local-display span { color: var(--tile-meta); font-family: var(--font-mono); font-size: var(--tile-meta-text); }
 
 /* Banners above the canvas, and the Apply bar, drawer and status bar below it, float as panels. */
 .banner, .apply-bar, .canvas-drawer, .status-bar { border-radius: var(--radius-card); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-panel); }
@@ -494,8 +486,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .status-bar-state { display: inline-flex; align-items: center; gap: var(--gap-2); min-width: 0; color: var(--foreground); font-weight: var(--weight-medium); }
 .status-bar-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-bar-escape { display: inline-flex; align-items: center; gap: var(--gap-2); min-width: 0; }
-.status-bar-escape-glyph { display: grid; flex: none; color: var(--subtle-foreground); }
-.status-bar-escape-glyph svg { width: var(--icon-size); height: var(--icon-size); stroke-width: var(--icon-stroke); }
 
 /* Inspector */
 .inspector { position: relative; z-index: 3; display: grid; grid-template-rows: minmax(0, 1fr); min-width: 0; min-height: 0; overflow: hidden; border-radius: var(--radius-card); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)) saturate(var(--frost-saturate)); backdrop-filter: blur(var(--panel-blur)) saturate(var(--frost-saturate)); box-shadow: var(--shadow-panel); transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear 0s; }
@@ -515,13 +505,9 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .inspector-content > [data-exit="true"] { pointer-events: none; }
 /* Sections stack flush, split by hairlines; cards inside the inspector drop their own surface. */
 .inspector-view { display: flex; flex-direction: column; min-width: 0; padding-bottom: var(--gap-2); }
-.inspector-view > :is(.card, .overview, .stack, .state-block, .inspector-section, .accordion, .glide-panel) { border-top: var(--hairline-width) solid var(--hairline); }
-.inspector-view > .stack:empty { display: none; }
+.inspector-view > :is(.card, .overview, .state-block, .inspector-section, .accordion, .glide-panel) { border-top: var(--hairline-width) solid var(--hairline); }
 .inspector-view :is(.card, .overview) { border-radius: 0; padding: var(--card-padding); background: none; box-shadow: none; }
-.inspector-view > .stack > .card { padding: var(--card-padding); }
-.inspector-view > .stack { gap: 0; }
-.inspector-view > .stack > * + * { border-top: var(--hairline-width) solid var(--hairline); }
-.inspector-view > .glide-panel > :is(.card, .stack) { border-radius: 0; }
+.inspector-view > .glide-panel > .card { border-radius: 0; }
 .inspector-header { display: grid; grid-template-columns: var(--inspector-tile-size) minmax(0, 1fr) auto; align-items: center; gap: var(--gap-3); padding: var(--gap-4) var(--card-padding); }
 .inspector[data-mode="overlay"] .inspector-header { padding-right: calc(var(--card-padding) + var(--icon-button-size)); }
 .inspector-tile { display: grid; width: var(--inspector-tile-size); height: var(--inspector-tile-size); place-items: center; border-radius: var(--radius-group); background: var(--mac-tile); box-shadow: var(--shadow-tile); color: var(--tile-glyph); }
@@ -536,9 +522,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .inspector-meta { min-width: 0; overflow: hidden; color: var(--muted-foreground); font-size: var(--text-sm); font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .inspector-header-actions { display: flex; align-items: center; gap: var(--gap-1); }
 .state-block, .inspector-section { display: grid; gap: var(--gap-2); min-width: 0; padding: var(--card-padding); }
-.state-block-heading { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--gap-2); }
-.state-block-heading strong { min-width: 0; overflow: hidden; font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); text-overflow: ellipsis; white-space: nowrap; }
-.state-block-detail { font-size: var(--text-sm); overflow-wrap: anywhere; }
 .inspector-section-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--gap-3); min-height: var(--control-height-sm); }
 .inspector-section-heading h3, .settings-section-heading h3 { color: var(--muted-foreground); font-size: var(--text-sm); font-weight: var(--weight-medium); }
 .inspector-section .note { font-size: var(--text-sm); }
@@ -560,9 +543,8 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .settings-section-body { display: flex; flex-direction: column; gap: var(--gap-3); min-width: 0; }
 /* Cards inside a section lose their surface; full-bleed disclosures in them stay flush. */
 .settings-section-body > .card { --card-padding: 0px; padding: 0; background: none; box-shadow: none; }
-.settings-section-body > .card > .card-heading h3 { font-size: var(--text-base); }
+.settings-section-body > .card > .card-heading h3 { font-size: var(--text-base); font-weight: var(--weight-medium); }
 .settings-section-body .row-copy > span { white-space: normal; }
-.about-version { color: var(--foreground); font-family: var(--font-mono); font-size: var(--text-sm); }
 .segmented.theme-choice { width: min(100%, var(--theme-choice-width)); }
 .keycaps { display: inline-flex; flex-wrap: wrap; gap: var(--gap-1); }
 .keycap { display: inline-grid; min-width: var(--badge-height); height: var(--badge-height); place-items: center; border-radius: var(--radius-sm); padding: 0 var(--gap-2); background: var(--surface-inset); box-shadow: inset 0 0 0 .5px var(--hairline-strong), 0 1px 0 var(--hairline-strong); color: var(--foreground); font-family: var(--font-mono); font-size: var(--text-xs); }
@@ -593,10 +575,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 #status-bar-dot[data-tone="active"]::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: inherit; opacity: 0; animation: live-ring var(--loop-live) var(--ease-out) infinite; }
 .sidebar-row .status-dot[data-tone="active"]::after { content: ""; position: absolute; inset: calc(var(--dot-halo) * -1); border-radius: inherit; background: color-mix(in oklab, var(--tone) var(--mix-edge), transparent); opacity: 0; animation: dot-breathe var(--loop-breathe) var(--ease-in-out) infinite; }
 
-/* Containers of blocks that come and go (accordion.mjs presence) are flex columns: a block's negative
-   margin cancels the gap it adds while it glides, where a grid row would stop at 0. */
-.stack { display: flex; flex-direction: column; gap: var(--gap-4); min-width: 0; }
-.stack > :empty { display: none; }
 /* Reveal and presence panels (accordion.mjs) clip only while they glide. */
 .glide-panel { min-width: 0; }
 .glide-panel[data-gliding="true"] { clip-path: inset(calc(var(--glide-bleed) * -1) calc(var(--glide-bleed) * -1) 0); }
@@ -756,7 +734,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .overview[data-tone="fail"] { --tone: var(--destructive); }
 .overview-copy { display: grid; gap: var(--gap-1); min-width: 0; }
 .overview-copy strong { display: flex; align-items: center; gap: var(--gap-2); }
-.overview-copy strong::before { content: ""; flex: none; width: var(--dot-size); height: var(--dot-size); border-radius: var(--radius-circle); background: var(--tone); box-shadow: 0 0 0 var(--dot-halo) color-mix(in oklab, var(--tone) var(--mix-tint-strong), transparent); }
+.overview-copy strong::before { content: ""; flex: none; width: var(--state-dot-size); height: var(--state-dot-size); border-radius: var(--radius-circle); background: var(--tone); box-shadow: 0 0 0 var(--dot-halo) color-mix(in oklab, var(--tone) var(--mix-tint-strong), transparent); }
 .overview-copy span { color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); }
 .launch-attribution { display: grid; gap: var(--gap-1); min-width: 0; color: var(--muted-foreground); font-size: var(--text-sm); line-height: var(--leading); }
 .launch-attribution code { overflow-wrap: anywhere; color: var(--foreground); }
@@ -804,12 +782,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .computer-name:hover svg, .computer-name:focus-visible svg { opacity: 1; }
 .computer-name-input { width: 100%; min-width: 0; border: var(--hairline-width) solid var(--primary); background: var(--surface-inset); box-shadow: var(--shadow-focus); }
 .computer-name-input:disabled { opacity: var(--opacity-disabled); }
-/* As tall as the pairing badge it carries, so the rename hint that replaces both never shifts the header. */
-.computer-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap-1) var(--gap-2); min-height: var(--badge-height); white-space: normal; }
-.computer-meta > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pair-picture > span:first-child { display: none; }
-.notice-line { display: flex; align-items: center; gap: var(--gap-2); min-width: 0; color: var(--muted-foreground); font-size: var(--text-sm); }
-.notice-line span:last-child { min-width: 0; overflow-wrap: anywhere; }
 .notice-dot { flex: none; width: var(--dot-size); height: var(--dot-size); border-radius: var(--radius-circle); background: var(--warning); }
 .swap { position: relative; display: inline-grid; max-width: 100%; }
 .swap[data-block="true"] { display: grid; }
@@ -847,12 +820,8 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-stage[data-dragging="true"] { cursor: grabbing; }
 .arrangement-empty { max-width: var(--empty-copy-width); margin: 0; color: var(--muted-foreground); font-size: var(--text-sm); text-align: center; }
 .arrangement-canvas { display: block; width: 100%; height: 100%; }
-/* Never give this selector `scale` or `transform: scale(...)`: the group's position comes from
-   setPosition's SVG transform="translate(...)" attribute (arrangement-view.mjs), and verified live,
-   any CSS scale on this same element pivots around a point that ignores that attribute entirely
-   (its `transform-origin` is resolved before the attribute's translate is folded in), so the group
-   jumps toward a corner instead of shrinking in place. The enter/leave rules below scale the child
-   .arrangement-monitor tiles instead, which carry no attribute transform of their own. */
+/* Never scale this selector: CSS scale ignores the group's SVG translate attribute (arrangement-view.mjs
+   setPosition), so the group would jump. Enter and leave scale its .arrangement-display tiles instead. */
 .arrangement-group { color: var(--display-local); outline: none; filter: var(--filter-tile); transition: transform var(--motion-spring) var(--ease-spring), opacity var(--motion-base) var(--ease-out), filter var(--motion-base) var(--ease-out); }
 .arrangement-group.is-local { color: var(--display-local); }
 .arrangement-group.is-peer { color: var(--display-peer); }
@@ -865,23 +834,13 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-group[data-tone="peer-4"] { color: var(--display-peer-4); }
 .arrangement-group[data-tone="peer-5"] { color: var(--display-peer-5); }
 .arrangement-group[data-tone="peer-6"] { color: var(--display-peer-6); }
-.arrangement-group[tabindex], .arrangement-monitor[tabindex] { cursor: grab; outline: none; }
-.arrangement-group[tabindex]:hover, .arrangement-monitor[tabindex]:hover { filter: var(--filter-raised); }
+.arrangement-group[tabindex] { cursor: grab; outline: none; }
+.arrangement-group[tabindex]:hover { filter: var(--filter-raised); }
 /* The dragged group follows the pointer one to one; only its lift animates. */
 .arrangement-group.is-dragging { cursor: grabbing; opacity: var(--opacity-dragging); filter: var(--filter-raised); transition: filter var(--motion-base) var(--ease-out), opacity var(--motion-base) var(--ease-out); }
-.arrangement-stage .arrangement-monitor { transform-box: fill-box; transform-origin: center; transition: transform var(--motion-spring) var(--ease-spring); }
-.arrangement-stage .arrangement-group.is-dragging .arrangement-monitor { transform: scale(var(--scale-drag)); }
-/* Each display is a screen: its computer's tone deep in dark glass, inside a bezel. */
-.arrangement-monitor rect { rx: var(--radius-sm); fill: color-mix(in oklab, currentColor var(--mix-tile), var(--tile-shade)); stroke: var(--tile-bezel); stroke-width: var(--stroke-bold); transition: fill var(--motion-fast) var(--ease-out), stroke var(--motion-fast) var(--ease-out); }
-.arrangement-group[tabindex]:hover .arrangement-monitor rect, .arrangement-monitor[tabindex]:hover rect { fill: color-mix(in oklab, currentColor calc(var(--mix-tile) + var(--mix-faint)), var(--tile-shade)); }
-.arrangement-group:focus-visible .arrangement-monitor rect, .arrangement-monitor[tabindex]:focus-visible rect { stroke: var(--primary); }
 .arrangement-stage[data-drop="none"] .is-dragging rect { stroke: var(--destructive); }
 .arrangement-group-label-text { fill: var(--foreground); font-size: var(--tile-label-text); font-weight: var(--weight-semibold); }
 .arrangement-group-label-plate { fill: var(--solid); }
-.arrangement-monitor-name { fill: var(--tile-text); font-size: var(--text-xs); font-weight: var(--weight-semibold); pointer-events: none; }
-.arrangement-monitor-size { fill: var(--tile-meta); font-size: var(--tile-meta-text); font-weight: var(--weight-medium); font-variant-numeric: tabular-nums; pointer-events: none; }
-.arrangement-primary-marker { fill: var(--tile-text); stroke: var(--tile-bezel); stroke-width: var(--hairline-width); }
-.arrangement-shared-marker { color: var(--tile-text); stroke-width: var(--icon-stroke-bold); pointer-events: none; }
 .arrangement-seams, .arrangement-preview, .arrangement-guides { pointer-events: none; }
 /* Un-isolated, so this layer paints in the same stacking context as groupLayer (svg.replaceChildren
    order in arrangement-view.mjs) instead of jumping in front of or behind live groups while it fades. */
@@ -932,24 +891,11 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .dashboard-arrangement-canvas .arrangement-group { cursor: default; }
 .dashboard-arrangement-preview figcaption, .dashboard-arrangement-unavailable { margin: 0; color: var(--muted-foreground); font-size: var(--text-sm); text-align: center; }
 .dashboard-arrangement-preview[data-state="unavailable"] { place-items: center; border-radius: var(--radius-group); padding: var(--gap-3) var(--gap-4); background: var(--panel); }
-.dashboard-arrangement-preview[data-size="compact"] .dashboard-arrangement-canvas { height: var(--dashboard-compact-height); }
-.dashboard-arrangement-preview[data-size="compact"] figcaption { font-size: var(--text-xs); }
-/* A display that moved is drawn where it belongs and offset back to where it was; clearing the
-   offset one frame later is what this transition runs. Each tile scales about its own centre. */
-.dashboard-arrangement-canvas .arrangement-monitor { transform-box: fill-box; transform-origin: center; }
 @media (prefers-reduced-motion: no-preference) {
-  /* The group only fades (verified live: any scale on it fights its SVG transform="translate(...)"
-     attribute from setPosition in arrangement-view.mjs, see the comment above .arrangement-group).
-     Its .arrangement-monitor tiles carry the scale instead, each safely around its own centre, which
-     reads as the same "block pops in/out" motion. Finite durations so leave's `animationend` fires
-     on the group either way, which is what removes the node from arrangement-view.mjs's leavingLayer. */
+  /* The group only fades; its tiles scale (studio-canvas.css). Finite, so leave's `animationend`
+     fires and arrangement-view.mjs drops the node from its leaving layer. */
   .arrangement-group[data-motion="enter"] { animation: fade-in var(--motion-slow) var(--ease-out) both; }
-  .arrangement-group[data-motion="enter"] .arrangement-monitor { animation: tile-in var(--motion-slow) var(--ease-out) both; }
   .arrangement-group[data-motion="leave"] { animation: page-out var(--motion-base) var(--ease-out) both; }
-  .arrangement-group[data-motion="leave"] .arrangement-monitor { animation: tile-out var(--motion-base) var(--ease-out) both; }
-  .dashboard-arrangement-canvas .arrangement-monitor[data-motion="settle"] { transition: transform var(--motion-spring) var(--ease-spring), opacity var(--motion-slow) var(--ease-out); }
-  .dashboard-arrangement-canvas .arrangement-monitor[data-motion="enter"] { animation: tile-in var(--motion-slow) var(--ease-out) both; }
-  .dashboard-arrangement-canvas .arrangement-seams[data-motion="enter"] { animation: fade-in var(--motion-slow) var(--ease-out) both; }
 }
 
 /* macOS settings illustration */

@@ -46,7 +46,6 @@
 
 /* The pane: banners on top, the stage filling the middle, and one dock at the bottom where the Apply
    bar takes the status bar's place while arranging. */
-.canvas-pane { grid-template-rows: auto minmax(0, 1fr) auto; }
 .canvas-dock, .status-bar { grid-row: 3; grid-column: 1; align-self: end; }
 .canvas-dock { position: relative; z-index: 1; container: canvas-dock / inline-size; }
 .canvas-banners { container: canvas-banners / inline-size; }
@@ -249,8 +248,8 @@
 .arrangement-shared-item { border-radius: var(--radius-card); padding: var(--gap-2) var(--gap-2) var(--gap-2) var(--gap-4); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-panel); }
 .arrangement-shared-copy { display: inline-flex; align-items: center; gap: var(--gap-1); white-space: nowrap; }
 .arrangement-shared-glyph { flex: none; color: var(--subtle-foreground); }
-.arrangement-shared .segmented { position: relative; isolation: isolate; background: var(--surface-inset); box-shadow: inset 0 0 0 var(--hairline-width) var(--hairline-strong); }
-.segmented-thumb { position: absolute; z-index: -1; top: var(--gap-half); bottom: var(--gap-half); left: var(--gap-half); width: calc((100% - var(--gap-half) * (var(--segment-count, 2) + 1)) / var(--segment-count, 2)); border-radius: var(--radius-sm); background: var(--solid); box-shadow: var(--shadow-chip); transform: translateX(calc(var(--segment-index, 0) * (100% + var(--gap-half)))); transition: transform var(--motion-spring) var(--ease-spring); }
+.arrangement-shared .segmented { position: relative; isolation: isolate; }
+.arrangement-shared .segmented-thumb { position: absolute; z-index: -1; top: var(--gap-half); bottom: var(--gap-half); left: var(--gap-half); width: calc((100% - var(--gap-half) * (var(--segment-count, 2) + 1)) / var(--segment-count, 2)); border-radius: var(--radius-sm); background: var(--solid); box-shadow: var(--shadow-chip); transform: translateX(calc(var(--segment-index, 0) * (100% + var(--gap-half)))); transition: transform var(--motion-spring) var(--ease-spring); }
 .arrangement-shared .segmented-option { display: inline-flex; align-items: center; justify-content: center; gap: var(--gap-2); }
 .arrangement-shared .segmented-option[aria-checked="true"] { background: transparent; box-shadow: none; }
 .segmented-swatch { --tone: var(--display-local); flex: none; width: var(--canvas-swatch); height: var(--canvas-swatch); border-radius: var(--radius-swatch); background: color-mix(in oklab, var(--tone) var(--canvas-tile-tone), var(--tile-shade)); box-shadow: inset 0 0 0 var(--hairline-width) var(--tile-bezel); }

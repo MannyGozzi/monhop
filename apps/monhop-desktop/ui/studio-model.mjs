@@ -75,7 +75,8 @@ export function inspectorPresentation({ width, kind, dismissed = false }) {
   return { mode, open: kind !== null && (mode === "docked" || !dismissed) };
 }
 
-const LOCAL_TONES = { done: "connected", fail: "checking", wait: "neutral" };
+// The verdict's own colors (`.overview` in styles.css), so the row and the inspector never disagree.
+const LOCAL_TONES = { done: "connected", fail: "error", wait: "checking" };
 
 // This Mac's row: the session's state while one runs, otherwise how far getting ready has come.
 export function localRowStatus({ verdict, session = null }) {

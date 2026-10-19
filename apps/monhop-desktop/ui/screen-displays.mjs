@@ -24,7 +24,7 @@ import { newestFirst, resolveEnabledList } from "./computer-card-model.mjs";
 import { layoutChipStrip } from "./computer-card.mjs";
 import { presence } from "./accordion.mjs";
 import { createDashboardArrangement, createLocalPicture } from "./dashboard-arrangement.mjs";
-import { canInstall, installHint } from "./updates-model.mjs";
+import { UPDATE_READY_NOTE, canInstall, installHint } from "./updates-model.mjs";
 import {
   badge,
   button,
@@ -300,7 +300,7 @@ function updateReadyBanner({ updates, actions }) {
     tone: "success",
     iconName: "refresh-cw",
     title: `MonHop ${view.availableVersion} is ready`,
-    body: hint || "It installs when you quit MonHop, or now.",
+    body: hint || UPDATE_READY_NOTE,
     actions: [
       button("Restart to update", {
         id: "canvas-updates-install",

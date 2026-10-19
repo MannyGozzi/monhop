@@ -1,6 +1,5 @@
 /* Studio inspector pane. Component rules only; shared tokens live in styles.css, pane tokens at the top here. */
 :root {
-  --inspector-state-dot: 8px;
   --inspector-spinner: 12px;
   --inspector-spinner-stroke: 1.5px;
   --inspector-fingerprint-tracking: .06em;
@@ -13,14 +12,13 @@
 /* The computer inspector: sections stack flush between hairlines, and blocks that come and go
    (accordion.mjs presence) sit in flex columns so each carries its own gap as it glides. */
 .computer-inspector .inspector-section { display: flex; flex-direction: column; gap: var(--gap-2); }
-.computer-inspector .inspector-header { padding-block: var(--gap-5) var(--gap-4); }
 .computer-subtitle { display: grid; justify-items: start; gap: var(--gap-2); min-width: 0; }
 .computer-subtitle > .swap { display: grid; max-width: 100%; }
 
 /* State: the label and its tone dot, a spinner while it is on its way, and the switch. */
 .computer-state { display: flex; flex-direction: column; gap: var(--gap-2); padding-block: var(--gap-4); }
 .computer-state-heading { display: flex; align-items: center; gap: var(--gap-2); min-width: 0; min-height: var(--switch-height); }
-.computer-state-dot { width: var(--inspector-state-dot); height: var(--inspector-state-dot); box-shadow: 0 0 0 var(--dot-halo) color-mix(in oklab, var(--tone) var(--mix-tint-strong), transparent); transition: background-color var(--motion-base) var(--ease-out), box-shadow var(--motion-base) var(--ease-out); }
+.computer-state-dot { width: var(--state-dot-size); height: var(--state-dot-size); box-shadow: 0 0 0 var(--dot-halo) color-mix(in oklab, var(--tone) var(--mix-tint-strong), transparent); transition: background-color var(--motion-base) var(--ease-out), box-shadow var(--motion-base) var(--ease-out); }
 .computer-state-label { display: grid; min-width: 0; font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); line-height: var(--leading-tight); }
 .computer-state-label > .swap { display: grid; }
 .computer-state-label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

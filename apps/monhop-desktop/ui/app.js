@@ -893,7 +893,6 @@ function pageAlertNode(ctx) {
 function mountStaticGlyphs() {
   document.querySelector("#sidebar-settings-glyph").replaceChildren(icon("settings", 15));
   document.querySelector("#network-chip-chevron").replaceChildren(icon("chevron-right", 12));
-  document.querySelector("#status-bar-escape-glyph").replaceChildren(icon("keyboard", 13));
   const refresh = iconButton({
     id: "computers-refresh",
     label: "Check the paired computers again",

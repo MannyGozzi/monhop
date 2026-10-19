@@ -28,6 +28,7 @@ import {
   listStep,
   toolbarState,
 } from "./studio-model.mjs";
+import { setupVerdict } from "./model.mjs";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
@@ -142,11 +143,28 @@ test("This Mac's row shows the session while one runs, otherwise how ready it is
     }),
     { label: "Ready", tone: "connected" },
   );
-  assert.deepEqual(localRowStatus({ verdict: { label: "Access needed", tone: "fail" } }), {
-    label: "Access needed",
-    tone: "checking",
-  });
   assert.deepEqual(localRowStatus({}), { label: "Not checked yet", tone: "neutral" });
+});
+
+// The row's dot and the inspector's verdict dot are one color: amber while waiting, red when it failed.
+test("This Mac's row takes the setup verdict's tone", () => {
+  const cases = [
+    [{ label: "Ready", tone: "done" }, "connected"],
+    [{ label: "Access needed", tone: "fail" }, "error"],
+    [{ label: "Choose a network", tone: "wait" }, "checking"],
+  ];
+  for (const [verdict, tone] of cases)
+    assert.deepEqual(localRowStatus({ verdict }), { label: verdict.label, tone });
+  const setup = setupVerdict({
+    nativeAvailable: true,
+    snapshot: {
+      platform: "macos",
+      errors: [],
+      permissions: { accessibility: false, inputMonitoring: true },
+    },
+  });
+  assert.equal(setup.label, "Access needed");
+  assert.equal(localRowStatus({ verdict: setup }).tone, "error");
 });
 
 test("the sidebar lists This Mac, every paired computer with its own state, then the add row", () => {

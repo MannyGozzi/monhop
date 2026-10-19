@@ -17,6 +17,7 @@ import {
 import { inspectorHeader } from "./screen-ready.mjs";
 import { createAccordion, presence } from "./accordion.mjs";
 import { displayName, findComputer } from "./computers-model.mjs";
+import { computerMeta } from "./computer-card-model.mjs";
 import {
   button,
   el,
@@ -128,9 +129,7 @@ function pairedHeader(ctx) {
     glyph: platformGlyph(platform === "windows" ? "windows" : "macos"),
     tone: "local",
     title: pairedName(ctx),
-    meta: [platformLabel(platform), computer?.address ?? view.peerAddress]
-      .filter(Boolean)
-      .join(" · "),
+    meta: computerMeta(platformLabel(platform), computer?.address ?? view.peerAddress),
   });
 }
 
