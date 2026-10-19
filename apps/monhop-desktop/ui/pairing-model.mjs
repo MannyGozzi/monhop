@@ -102,6 +102,33 @@ export function pairingStep(state, now = Date.now()) {
   return "error";
 }
 
+// Which way in the exchange is going, as the role switch shows it: "show", "enter", or null while
+// nothing is picked (or a handshake runs that the backend did not name).
+export function pairingRole(state, step = pairingStep(state)) {
+  if (step === "enter") return "enter";
+  if (step === "show" || step === "expired") return "show";
+  if (step !== "progress" && step !== "error") return null;
+  return { showing: "show", entering: "enter" }[state.view?.role] ?? null;
+}
+
+// The handshake's three steps, each pending, live or done, as the exchange moves through them.
+export const PAIRING_PROGRESS = Object.freeze([
+  { key: "connecting", title: "Connecting", detail: "Reaching the other computer." },
+  { key: "verifying", title: "Checking the code", detail: "Both computers confirm the same code." },
+  { key: "saving", title: "Saving the pairing", detail: "Almost done." },
+]);
+
+export function pairingProgress(view) {
+  const at = PAIRING_PROGRESS.findIndex((step) => step.key === view?.phase);
+  const finished = view?.phase === "paired";
+  return PAIRING_PROGRESS.map(({ key, title, detail }, index) => ({
+    key,
+    title,
+    detail,
+    state: finished || (at >= 0 && index < at) ? "done" : index === at ? "live" : "pending",
+  }));
+}
+
 export function canStartPairing(state) {
   return IDLE_PHASES.has(state.view?.phase) && !state.view.busy;
 }

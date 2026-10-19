@@ -1,6 +1,7 @@
 import {
   applySnapshot,
   autoSelectInterface,
+  canSelectInterface,
   errorMessages,
   initialState,
   nativeCheckState,
@@ -122,8 +123,11 @@ import {
   computerSelection,
   inspectorKind,
   inspectorPresentation,
+  listStep,
   localRowStatus,
   networkChip,
+  networkMenuItems,
+  pairedOnScreen,
   resolveSelection,
   resumeTarget,
   sameSelection,
@@ -138,21 +142,25 @@ import {
   clear,
   el,
   followDims,
+  ghostOf,
   handOffFocus,
   handedOffFocus,
   icon,
   iconButton,
+  motionEase,
+  motionEnabled,
+  motionMs,
+  motionToken,
   nativeError,
   phaseLoops,
   reducedMotion,
   setLabel,
-  swap,
   turnGlyph,
 } from "./dom.mjs";
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
 import { normalizeAutostartView } from "./autostart-model.mjs";
 import { islandContext, normalizeIslandView } from "./island-model.mjs";
-import { isSelectable, localInspector } from "./screen-ready.mjs";
+import { localInspector } from "./screen-ready.mjs";
 import { computerInspector } from "./computer-card.mjs";
 import { banner, renderCanvas } from "./screen-displays.mjs";
 import { renderSettings } from "./screen-settings.mjs";
@@ -217,6 +225,10 @@ let inspectorDismissed = false;
 // Which drawer above the Apply bar is open: "saved", "use" or none.
 let canvasDrawer = null;
 let networkMenuOpen = false;
+// This Mac's network list, opened under its checklist row with Change once a network is chosen.
+let localNetworkOpen = false;
+// The selection the inspector last drew, when that changed, and what it showed before, fading out.
+let inspectorChange = null;
 let updates = normalizeUpdatesView(null);
 let updatesPending = false;
 let autostart = normalizeAutostartView(null);
@@ -260,7 +272,9 @@ const nodes = {
   networkSlot: document.querySelector("#network-slot"),
   networkChip: document.querySelector("#network-chip"),
   networkChipDot: document.querySelector("#network-chip-dot"),
-  networkChipLabel: document.querySelector("#network-chip-label"),
+  networkChipName: document.querySelector("#network-chip-name"),
+  networkChipAddress: document.querySelector("#network-chip-address"),
+  networkTooltip: document.querySelector("#network-tooltip"),
   networkMenu: document.querySelector("#network-menu"),
   arrangeSlot: document.querySelector("#arrange-slot"),
   pauseSlot: document.querySelector("#pause-slot"),
@@ -272,6 +286,7 @@ const nodes = {
   statusBarDot: document.querySelector("#status-bar-dot"),
   statusBarText: document.querySelector("#status-bar-text"),
   inspector: document.querySelector("#inspector"),
+  inspectorScrim: document.querySelector("#inspector-scrim"),
   inspectorClose: document.querySelector("#inspector-close"),
   inspectorScroll: document.querySelector("#inspector-scroll"),
   inspectorContent: document.querySelector("#inspector-content"),
@@ -302,16 +317,23 @@ mountStaticGlyphs();
 
 nodes.sidebarSettings.addEventListener("click", () => select("settings"));
 nodes.inspectorClose.addEventListener("click", dismissInspector);
+nodes.inspectorScrim.addEventListener("click", dismissInspector);
 nodes.networkChip.addEventListener("click", () => setNetworkMenuOpen(!networkMenuOpen));
+nodes.networkMenu.addEventListener("keydown", onNetworkMenuKey);
 document.addEventListener("pointerdown", (event) => {
   if (networkMenuOpen && !nodes.networkSlot.contains(event.target)) setNetworkMenuOpen(false);
 });
+// Escape closes the network menu, else the sheet; a field or control that used the key keeps it.
 document.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape") return;
+  if (event.key !== "Escape" || event.defaultPrevented) return;
   if (networkMenuOpen) {
     setNetworkMenuOpen(false);
     nodes.networkChip.focus({ preventScroll: true });
-  } else if (nodes.inspector.dataset.mode === "overlay" && nodes.inspector.dataset.open === "true")
+  } else if (
+    nodes.inspector.dataset.mode === "overlay" &&
+    nodes.inspector.dataset.open === "true" &&
+    !event.target.closest?.("input, textarea")
+  )
     dismissInspector();
 });
 
@@ -503,6 +525,7 @@ function studioContext(status, active) {
   const canArrange =
     Boolean(canvasPrint) && canEditLayout(sharing, state.selectedInterfaceId) && !controlsBusy();
   const resume = resumeTarget({ lastActive, selection, fingerprints });
+  const step = pairingStep(pairing);
   return {
     selection,
     selectionKey: selectionKey(selection),
@@ -519,8 +542,9 @@ function studioContext(status, active) {
         session: status,
       }),
       selection,
-      pairingStep: pairingStep(pairing),
+      pairingStep: step,
       pairingPhase: pairing.view?.phase ?? null,
+      paired: pairedOnScreen({ selection, pairingStep: step, view: pairing.view }),
     }),
     canvasComputer: findComputer(computers, canvasPrint),
     canArrange,
@@ -561,6 +585,7 @@ function context() {
     toolbar: studio.toolbar,
     canvasDrawer,
     snapshotCheck,
+    localNetworkOpen,
     pairingPending,
     pairingOperation,
     computersLoadPending: computersLoad.running,
@@ -606,11 +631,13 @@ function context() {
       requestWifiPermission,
       openSettings,
       chooseInterface,
+      toggleLocalNetworkList,
       openPairing,
       beginPairing,
       dismissPairing,
       createPairingIdentity,
       choosePairingMode,
+      switchPairingRole,
       showPairingCode,
       editPairingCode,
       submitPairingCode,
@@ -700,6 +727,9 @@ function render() {
   followDims(nodes.studio, dims);
   phaseLoops();
   restoreInteraction(interaction, { resetInspector: selectionChanged });
+  // A control that moved the selection and left with it hands focus to the selected row.
+  if (selectionChanged && interaction.focused && document.activeElement === document.body)
+    nodes.sidebarIndicator.parentElement?.focus({ preventScroll: true });
   if (previousArrangementView && previousArrangementView !== arrangementView)
     previousArrangementView.destroy();
   syncArrangements();
@@ -743,10 +773,61 @@ function renderInspector(ctx) {
     nodes.inspector.dataset.open = String(open);
   }
   nodes.inspector.inert = !open;
+  nodes.inspectorScrim.dataset.open = String(open && presentation.mode === "overlay");
   nodes.inspectorClose.hidden = presentation.mode !== "overlay";
+  placeInspectorContent(content, studio.selectionKey);
+}
+
+// A new selection's content rises in while what the inspector showed fades out over it. Renders
+// during the change draw the new content at the same point of its entrance, so nothing restarts.
+function placeInspectorContent(content, key) {
+  const now = performance.now();
+  const shown = nodes.inspectorContent.querySelector(":scope > [data-inspector-live]");
+  if (inspectorChange?.key !== key) {
+    const first = inspectorChange === null;
+    inspectorChange?.ghost?.node.remove();
+    inspectorChange = { key, at: first ? -Infinity : now, ghost: null };
+    if (!first && shown && motionEnabled()) inspectorChange.ghost = leaveInspector(shown);
+  }
+  const { ghost, at } = inspectorChange;
   clear(nodes.inspectorContent);
-  if (content)
-    nodes.inspectorContent.append(swap("inspector", content, studio.selectionKey, { block: true }));
+  if (content) {
+    content.dataset.inspectorLive = "true";
+    nodes.inspectorContent.append(content);
+  }
+  if (ghost && ghost.animation.playState !== "finished") nodes.inspectorContent.append(ghost.node);
+  const duration = motionMs("--motion-slow");
+  const elapsed = now - at;
+  if (!content || !motionEnabled() || elapsed >= duration) return;
+  const rise = `translateY(${motionToken("--motion-slide") || "0px"})`;
+  const entrance = content.animate(
+    [
+      { opacity: 0, transform: rise },
+      { opacity: 1, transform: "none" },
+    ],
+    { duration, easing: motionEase("--ease-out"), fill: "backwards" },
+  );
+  entrance.currentTime = elapsed;
+}
+
+// What the inspector showed, drawn over the new content as it fades out from where it was.
+function leaveInspector(shown) {
+  const opacity = Number(getComputedStyle(shown).opacity);
+  const ghost = ghostOf(shown);
+  delete ghost.dataset.inspectorLive;
+  const animation = ghost.animate(
+    [
+      { opacity },
+      { opacity: 0, transform: `translateY(calc(${motionToken("--motion-rise")} * -1))` },
+    ],
+    { duration: motionMs("--motion-fast"), easing: motionEase("--ease-out"), fill: "forwards" },
+  );
+  const leaving = { node: ghost, animation };
+  animation.onfinish = () => {
+    ghost.remove();
+    if (inspectorChange?.ghost === leaving) inspectorChange.ghost = null;
+  };
+  return leaving;
 }
 
 // The page alert sits above whichever pane is on screen. A pairing or arranging message that its
@@ -823,18 +904,24 @@ function mountStaticGlyphs() {
   nodes.sidebarRefresh.replaceChildren(refresh);
 }
 
-// The toolbar's buttons outlive renders, so hover, focus and a label mid-change carry on.
+// The toolbar's buttons outlive renders, so hover, focus and a label mid-change carry on. Each draws
+// both of its glyphs and cross-fades between them; short of room, a tooltip names it.
 function createToolbarControls() {
-  // Labels are elements, so setLabel can fade a new word in.
   const arrange = button("", {
     variant: "secondary",
     size: "sm",
-    iconName: "monitor",
     focusKey: "toolbar-arrange",
     onClick: () => (toolbarControls.arrangeMode === "done" ? leaveArrange() : arrangeWith()),
   });
   arrange.id = "toolbar-arrange";
-  arrange.append(el("span", { className: "toolbar-label", text: "Arrange" }));
+  arrange.append(
+    el("span", {
+      className: "toolbar-glyph arrange-glyph",
+      attrs: { "aria-hidden": "true" },
+      children: [icon("monitor", 12), icon("check", 12)],
+    }),
+    el("span", { className: "toolbar-label", text: "Arrange" }),
+  );
   const pause = button("", {
     variant: "secondary",
     size: "sm",
@@ -842,18 +929,25 @@ function createToolbarControls() {
     onClick: () => (toolbarControls.pauseMode === "resume" ? resumeSharing() : pauseSharing()),
   });
   pause.id = "toolbar-pause";
-  // Both glyphs are drawn and the mode cross-fades between them: bars to pause, a triangle to resume.
-  pause.prepend(
+  // Bars to pause, a triangle to resume.
+  pause.append(
     el("span", {
-      className: "pause-glyph",
+      className: "toolbar-glyph pause-glyph",
       attrs: { "aria-hidden": "true" },
       children: [el("span", { className: "pause-bars" }), icon("play", 12)],
     }),
     el("span", { className: "toolbar-label", text: "Pause sharing" }),
   );
-  nodes.arrangeSlot.replaceChildren(arrange);
-  nodes.pauseSlot.replaceChildren(pause);
-  return { arrange, pause, arrangeMode: null, pauseMode: null };
+  const arrangeTip = toolbarTooltip("toolbar-arrange-tooltip", arrange);
+  const pauseTip = toolbarTooltip("toolbar-pause-tooltip", pause);
+  nodes.arrangeSlot.replaceChildren(arrange, arrangeTip);
+  nodes.pauseSlot.replaceChildren(pause, pauseTip);
+  return { arrange, pause, arrangeTip, pauseTip, arrangeMode: null, pauseMode: null };
+}
+
+function toolbarTooltip(id, control) {
+  control.setAttribute("aria-describedby", id);
+  return el("span", { className: "toolbar-tooltip", attrs: { id, role: "tooltip" } });
 }
 
 function renderToolbar(ctx) {
@@ -865,17 +959,20 @@ function renderToolbar(ctx) {
   turnGlyph(refresh.querySelector(":scope > svg"), "computers-refresh", computersLoad.running);
   const canvas = toolbar.canvasActions;
   const busy = ctx.busy;
-  const { arrange, pause } = toolbarControls;
+  const { arrange, pause, arrangeTip, pauseTip } = toolbarControls;
   toolbarControls.arrangeMode = toolbar.arrange;
   if (toolbar.arrange) {
-    arrange.title = toolbar.arrange === "done" ? "Done" : "Arrange";
-    setLabel(arrange.lastChild, arrange.title);
+    const label = toolbar.arrange === "done" ? "Done" : "Arrange";
+    setLabel(arrange.lastChild, label);
+    arrangeTip.textContent = label;
+    arrange.dataset.mode = toolbar.arrange;
     arrange.disabled = toolbar.arrange === "begin" && busy;
   }
   toolbarControls.pauseMode = toolbar.pause;
   if (toolbar.pause) {
-    pause.title = toolbar.pause === "resume" ? "Resume" : "Pause sharing";
-    setLabel(pause.lastChild, pause.title);
+    const label = toolbar.pause === "resume" ? "Resume" : "Pause sharing";
+    setLabel(pause.lastChild, label);
+    pauseTip.textContent = label;
     pause.dataset.mode = toolbar.pause;
     pause.disabled = busy;
   }
@@ -896,55 +993,66 @@ function renderToolbar(ctx) {
 }
 
 function eligibleNetworks() {
-  return (state.snapshot?.interfaces ?? []).filter(isSelectable);
+  return (state.snapshot?.interfaces ?? []).filter(canSelectInterface);
 }
 
-// The chip names the network MonHop uses; its menu lists every network it could use instead.
+// The chip names the network MonHop uses; its menu lists every network it could use instead, and
+// the ones it cannot with the reason. Locked, the chip says why on hover and to assistive tech.
 function renderNetworkChip(ctx) {
   const selected = selectedInterface(state);
-  const eligible = eligibleNetworks();
   const chip = networkChip({
     selected,
     label: selected ? networkLabel(selected) : "",
-    eligibleCount: eligible.length,
+    eligibleCount: eligibleNetworks().length,
     sessionActive: isSessionActive(sharing),
   });
   const width = nodes.networkChip.getBoundingClientRect().width;
-  setLabel(nodes.networkChipLabel, chip.text);
+  setLabel(nodes.networkChipName, chip.name);
+  setLabel(nodes.networkChipAddress, chip.address);
+  nodes.networkChipAddress.hidden = !chip.address;
   if (width) glideWidth(nodes.networkChip, width);
-  nodes.networkChip.title = chip.hint;
   nodes.networkChip.disabled = chip.disabled || ctx.busy;
+  nodes.networkSlot.dataset.locked = String(nodes.networkChip.disabled);
+  nodes.networkTooltip.textContent = chip.hint;
   nodes.networkChipDot.dataset.tone = selected ? "connected" : "neutral";
   if (nodes.networkChip.disabled && networkMenuOpen) setNetworkMenuOpen(false, { render: false });
+  const items = networkMenuItems(state.snapshot?.interfaces ?? [], state.selectedInterfaceId);
   clear(nodes.networkMenu);
   nodes.networkMenu.append(
-    el("p", { className: "menu-heading", text: "Network" }),
-    ...eligible.map((item) => {
-      const checked = state.selectedInterfaceId === item.id;
+    el("p", { className: "menu-heading", text: "Network connection" }),
+    ...items.map((item) => {
       const option = el("button", {
         className: "menu-item",
-        attrs: { type: "button", role: "menuitemradio", "aria-checked": String(checked) },
-        dataset: { focusKey: `network-menu-${item.id}` },
+        attrs: {
+          type: "button",
+          role: "menuitemradio",
+          "aria-checked": String(item.checked),
+          "aria-disabled": item.disabled ? "true" : null,
+          tabindex: "-1",
+        },
+        dataset: { focusKey: `network-menu-${item.id}`, disabled: String(item.disabled) },
         children: [
-          el("span", { className: "menu-check", children: [checked ? icon("check", 13) : null] }),
           el("span", {
             className: "menu-item-copy",
-            children: [
-              el("strong", { text: networkLabel(item) }),
-              el("span", { text: item.address || item.name }),
-            ],
+            children: [el("strong", { text: item.label }), el("span", { text: item.detail })],
           }),
+          el("span", { className: "menu-check", children: [icon("check", 13)] }),
         ],
       });
-      option.addEventListener("click", () => {
-        setNetworkMenuOpen(false);
-        nodes.networkChip.focus({ preventScroll: true });
-        chooseInterface(item.id);
-      });
+      if (!item.disabled)
+        option.addEventListener("click", () => {
+          setNetworkMenuOpen(false);
+          nodes.networkChip.focus({ preventScroll: true });
+          chooseInterface(item.id);
+        });
       return option;
     }),
     el("p", { className: "menu-note", text: chip.hint }),
   );
+}
+
+function menuOptions() {
+  return [...nodes.networkMenu.querySelectorAll(".menu-item:not([aria-disabled='true'])")];
 }
 
 function setNetworkMenuOpen(open, { render: draw = true } = {}) {
@@ -955,7 +1063,23 @@ function setNetworkMenuOpen(open, { render: draw = true } = {}) {
   nodes.networkMenu.dataset.open = String(next);
   nodes.networkMenu.inert = !next;
   nodes.networkChip.setAttribute("aria-expanded", String(next));
-  if (next && draw) nodes.networkMenu.querySelector("[aria-checked='true'], .menu-item")?.focus();
+  if (next && draw)
+    (
+      nodes.networkMenu.querySelector(".menu-item[aria-checked='true']") ?? menuOptions()[0]
+    )?.focus();
+}
+
+// Up and Down walk the usable networks; Tab leaves the menu closed behind it.
+function onNetworkMenuKey(event) {
+  if (event.key === "Tab") {
+    setNetworkMenuOpen(false);
+    return;
+  }
+  const options = menuOptions();
+  const index = listStep(options.length, options.indexOf(document.activeElement), event.key);
+  if (index < 0) return;
+  event.preventDefault();
+  options[index].focus();
 }
 
 // ---------- arranging and pausing ----------
@@ -1086,6 +1210,11 @@ function applySnapshotCheck(nextState, snapshot, freshness) {
   snapshotCheck = { pending: false, ...snapshotCheckResult(state.snapshot, freshness) };
 }
 
+function toggleLocalNetworkList() {
+  localNetworkOpen = !localNetworkOpen;
+  render();
+}
+
 // A new network reopens pairing on it, so a code is only ever shown or entered on the network the
 // user selected; a finished snapshot does the same from takeSnapshot.
 function chooseInterface(id) {
@@ -1200,7 +1329,7 @@ async function startPairing(mode) {
 
 // Close or Done: the exchange gives way to the computer it added, or to the default row.
 function dismissPairing() {
-  const paired = justPaired();
+  const paired = pairing.view?.phase === "paired" ? pairing.view.peerFingerprint : null;
   leavePairing();
   if (paired) chosen = computerSelection(paired);
   else if (chosen?.kind === "new") chosen = null;
@@ -1210,6 +1339,17 @@ function dismissPairing() {
 async function createPairingIdentity() {
   if (!pairingOpenGate(state).allowed) return;
   await invokePairing("pairing_create_identity", { interfaceId: state.selectedInterfaceId });
+}
+
+// The role switch: Show a code asks for a code (a fresh one once it expired); Enter a code gives
+// up a code on screen first, since only one exchange runs at a time.
+async function switchPairingRole(role) {
+  if (role === "show") {
+    await showPairingCode();
+    return;
+  }
+  if (isPairingAttemptLive(pairing)) await cancelPairing();
+  choosePairingMode("enter");
 }
 
 // Picking a way in ("choose" or "enter") is local until the user shows or submits a code.
@@ -1348,9 +1488,8 @@ function applyPairingResult(result) {
   if (key === pairedKey) return;
   pairedKey = key;
   // Only an attempt finishing here shows its badge; a paired state read back on open does not.
+  // The exchange stays selected on its result, its row already the new computer, until Done.
   pairingResultShown = isBusyPairing(current);
-  // The new computer's row takes over from the exchange once the list names it.
-  if (pairingResultShown && currentSelection().kind === "new") chosen = computerSelection(key);
   void loadComputers();
   void refreshSharingStatus();
 }

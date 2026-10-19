@@ -16,6 +16,8 @@ import {
   inspectorPresentation,
   localRowStatus,
   networkChip,
+  networkMenuItems,
+  pairedOnScreen,
   pairingRowLabel,
   resolveSelection,
   resumeTarget,
@@ -23,6 +25,7 @@ import {
   selectionFromKey,
   selectionKey,
   sidebarRows,
+  listStep,
   toolbarState,
 } from "./studio-model.mjs";
 
@@ -247,6 +250,8 @@ test("Resume brings back the computer last in use, then the selected one, then t
 test("the network chip names the connection and locks while a session runs", () => {
   const selected = { address: "192.168.1.14" };
   assert.deepEqual(networkChip({ selected, label: "Ethernet", eligibleCount: 2 }), {
+    name: "Ethernet",
+    address: "192.168.1.14",
     text: "Ethernet · 192.168.1.14",
     disabled: false,
     hint: "Both computers must be on this network.",
@@ -292,4 +297,133 @@ test("a computer's clipboard line says what the switch in Settings means for it"
     clipboardLine(null, A, "Office PC"),
     "Clipboard sharing is off. Turn it on in Settings.",
   );
+});
+
+const PAIRED_VIEW = {
+  peerFingerprint: C,
+  peerPlatform: "macos",
+  badge: { color: 2, symbols: [1, 2, 3] },
+};
+
+test("a finished pairing on screen is the computer it added, and only on the New computer row", () => {
+  assert.deepEqual(pairedOnScreen({ selection: NEW, pairingStep: "paired", view: PAIRED_VIEW }), {
+    fingerprint: C,
+    platform: "macos",
+    badge: PAIRED_VIEW.badge,
+  });
+  assert.equal(pairedOnScreen({ selection: NEW, pairingStep: "show", view: PAIRED_VIEW }), null);
+  assert.equal(
+    pairedOnScreen({ selection: computerSelection(C), pairingStep: "paired", view: PAIRED_VIEW }),
+    null,
+  );
+  assert.equal(pairedOnScreen({ selection: NEW, pairingStep: "paired", view: null }), null);
+});
+
+test("the pairing row becomes the computer it added, listed once, until Done or Pair another", () => {
+  const list = computers(A, C);
+  const base = {
+    computers: list,
+    localName: "This Mac",
+    localPlatform: "macos",
+    localStatus: { label: "Ready", tone: "connected" },
+    pairingStep: "paired",
+  };
+  const paired = pairedOnScreen({ selection: NEW, pairingStep: "paired", view: PAIRED_VIEW });
+  const rows = sidebarRows({ ...base, selection: NEW, paired });
+  assert.deepEqual(
+    rows.map((row) => row.key),
+    ["local", `computer:${A}`, `computer:${C}`],
+  );
+  const row = rows.at(-1);
+  assert.equal(row.title, "Computer 2");
+  assert.equal(row.label, "Paired");
+  assert.equal(row.platform, "macos");
+  assert.equal(row.select, "new");
+  assert.equal(row.adopt, "new");
+  assert.equal(row.badgeShown, true);
+  assert.deepEqual(row.badge, PAIRED_VIEW.badge);
+  assert.equal(rows.filter((item) => item.selected).length, 1);
+  assert.equal(row.selected, true);
+
+  // Before the list names it, the row still reads as that computer, by platform.
+  const early = sidebarRows({ ...base, computers: computers(A), selection: NEW, paired });
+  assert.equal(early.at(-1).title, "Mac");
+  assert.equal(early.at(-1).key, `computer:${C}`);
+
+  // Done selects the computer: its row keeps its key, now selecting itself, and the add row returns.
+  const done = sidebarRows({ ...base, selection: computerSelection(C) });
+  assert.deepEqual(
+    done.map((item) => item.key),
+    ["local", `computer:${A}`, `computer:${C}`, "new"],
+  );
+  assert.equal(done[2].select, `computer:${C}`);
+  assert.equal(done[2].selected, true);
+  assert.equal(done[2].adopt, undefined);
+  assert.equal(done[3].title, "Add a computer");
+
+  // Pair another goes back to choosing: the computer is a plain row and the exchange is selected.
+  const again = sidebarRows({ ...base, selection: NEW, pairingStep: "choose" });
+  assert.deepEqual(
+    again.map((item) => item.key),
+    ["local", `computer:${A}`, `computer:${C}`, "new"],
+  );
+  assert.equal(again.at(-1).title, "New computer");
+  assert.equal(again.at(-1).selected, true);
+});
+
+test("arrow keys, Home and End step through a list and hold at the ends", () => {
+  assert.equal(listStep(4, 1, "ArrowDown"), 2);
+  assert.equal(listStep(4, 3, "ArrowDown"), 3);
+  assert.equal(listStep(4, 0, "ArrowUp"), 0);
+  assert.equal(listStep(4, 2, "ArrowUp"), 1);
+  assert.equal(listStep(4, 2, "Home"), 0);
+  assert.equal(listStep(4, 0, "End"), 3);
+  assert.equal(listStep(4, -1, "ArrowDown"), 0);
+  assert.equal(listStep(4, -1, "ArrowUp"), 3);
+  assert.equal(listStep(4, 1, "Enter"), -1);
+  assert.equal(listStep(0, 0, "ArrowDown"), -1);
+});
+
+test("the network menu checks the chosen network and greys out the ones MonHop cannot use", () => {
+  const interfaces = [
+    {
+      id: "en0",
+      kind: "Wi-Fi",
+      networkName: "Gozzi Home",
+      name: "Wi-Fi",
+      address: "192.168.1.20",
+      physical: true,
+      up: true,
+      attachmentKnown: true,
+    },
+    { id: "en1", kind: "ethernet", name: "Ethernet", address: "", physical: true, up: true },
+    { id: "utun3", kind: "VPN", name: "VPN", address: "10.8.0.2", physical: false, up: true },
+    {
+      id: "en2",
+      kind: "ethernet",
+      name: "Thunderbolt Bridge",
+      address: "",
+      physical: true,
+      up: false,
+    },
+  ];
+  assert.deepEqual(networkMenuItems(interfaces, "en0"), [
+    { id: "en0", label: "Gozzi Home", detail: "192.168.1.20", checked: true, disabled: false },
+    {
+      id: "en1",
+      label: "Ethernet",
+      detail: "Ethernet · Not recognized",
+      checked: false,
+      disabled: false,
+    },
+    { id: "utun3", label: "VPN", detail: "Not a hardware network", checked: false, disabled: true },
+    {
+      id: "en2",
+      label: "Thunderbolt Bridge",
+      detail: "Not connected",
+      checked: false,
+      disabled: true,
+    },
+  ]);
+  assert.deepEqual(networkMenuItems(), []);
 });

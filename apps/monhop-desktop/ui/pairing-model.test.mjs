@@ -20,6 +20,8 @@ import {
   isPairingAttemptLive,
   normalizePairingView,
   pairingErrorPresentation,
+  pairingProgress,
+  pairingRole,
   pairingStep,
   spokenCode,
 } from "./pairing-model.mjs";
@@ -300,5 +302,38 @@ test("a Mac blocked from the local network says so and points at its settings", 
   assert.equal(
     pairingErrorPresentation({ role: "showing", message: "This code expired." }).settings,
     null,
+  );
+});
+
+test("the role switch shows the way in the user picked, or the one a running handshake names", () => {
+  const ready = applyPairingView(initialPairingState(), { phase: "ready" });
+  assert.equal(pairingRole(ready), null);
+  assert.equal(pairingRole(choosePairingMode(ready, "enter")), "enter");
+  const showing = applyPairingView(ready, {
+    phase: "showing",
+    code: CODE,
+    codeExpiresAtMs: Date.now() + 60000,
+  });
+  assert.equal(pairingRole(showing), "show");
+  assert.equal(pairingRole(showing, "expired"), "show");
+  const verifying = applyPairingView(ready, { phase: "verifying", role: "entering", busy: true });
+  assert.equal(pairingRole(verifying), "enter");
+  assert.equal(pairingRole(applyPairingView(ready, { phase: "connecting", busy: true })), null);
+  assert.equal(pairingRole(applyPairingView(ready, paired())), null);
+});
+
+const progressStates = (phaseView) => pairingProgress(phaseView).map((step) => step.state);
+
+test("the progress list marks the steps behind the handshake done and its own step live", () => {
+  const states = progressStates;
+  assert.deepEqual(states({ phase: "showing" }), ["pending", "pending", "pending"]);
+  assert.deepEqual(states({ phase: "connecting" }), ["live", "pending", "pending"]);
+  assert.deepEqual(states({ phase: "verifying" }), ["done", "live", "pending"]);
+  assert.deepEqual(states({ phase: "saving" }), ["done", "done", "live"]);
+  assert.deepEqual(states({ phase: "paired" }), ["done", "done", "done"]);
+  assert.deepEqual(states(null), ["pending", "pending", "pending"]);
+  assert.deepEqual(
+    pairingProgress(null).map((step) => step.title),
+    ["Connecting", "Checking the code", "Saving the pairing"],
   );
 });

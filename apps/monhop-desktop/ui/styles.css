@@ -67,6 +67,8 @@
   --pair-brown: light-dark(oklch(.5 .08 55), oklch(.72 .08 60));
   --pair-pink: light-dark(oklch(.6 .2 350), oklch(.76 .15 350));
   --pair-slate: light-dark(oklch(.5 .025 260), oklch(.76 .02 260));
+  /* Dims the canvas under the inspector sheet in a narrow window. */
+  --scrim: light-dark(oklch(.28 .03 262 / 16%), oklch(0 0 0 / 38%));
   --caption-close: oklch(.55 .2 27);
   --caption-close-foreground: oklch(1 0 0);
   /* Switches are monochrome: the track darkens in light mode and lightens in dark mode. */
@@ -74,19 +76,9 @@
   --switch-on: light-dark(oklch(.29 .03 262), oklch(.9 .01 262));
   --thumb: oklch(1 0 0);
   --thumb-on: light-dark(oklch(1 0 0), oklch(.2 .012 264));
-  /* Link capsule: frosted glass, a live bloom and glow, and the two computers' dots, ice and emerald. */
-  --glass-fill: linear-gradient(light-dark(oklch(.995 .002 275), oklch(1 0 0 / 9%)), light-dark(oklch(.955 .004 275), oklch(1 0 0 / 4%)));
-  --glass-edge: light-dark(oklch(.2 .01 275 / 12%), oklch(1 0 0 / 11%));
-  --glass-edge-hover: light-dark(oklch(.2 .01 275 / 26%), oklch(1 0 0 / 26%));
-  --glass-highlight: inset 0 1px 0 light-dark(oklch(1 0 0), oklch(1 0 0 / 9%));
-  --glass-lift: 0 1px 2px light-dark(oklch(.2 .01 275 / 8%), oklch(0 0 0 / 35%));
-  --live-edge: color-mix(in oklab, var(--success) var(--mix-edge), transparent);
-  --live-glow: 0 0 var(--sharing-glow-blur) light-dark(color-mix(in oklab, var(--success) var(--mix-tint), transparent), color-mix(in oklab, var(--success) var(--mix-icon), transparent));
-  --live-bloom: radial-gradient(130% 150% at calc(var(--gap-2) + var(--sharing-mark-size) / 2) 50%, color-mix(in oklab, var(--success) var(--mix-bloom), transparent), transparent 62%);
+  /* The two computers' dots the island and tray draw, ice and emerald. */
   --sharing-orbit-local: light-dark(oklch(.55 .05 240), oklch(.93 .035 230));
   --sharing-orbit-peer: light-dark(oklch(.55 .13 160), oklch(.74 .14 160));
-  --sharing-orbit-live-local: light-dark(oklch(.62 .09 168), oklch(.96 .06 160));
-  --sharing-orbit-live-peer: var(--success);
   --harness-wallpaper-dark: linear-gradient(135deg, #2b3a67 0%, #6d4c8a 35%, #c96a5c 70%, #e9b872 100%);
   --harness-wallpaper-light: linear-gradient(135deg, #9fc5e8 0%, #f2c9a6 45%, #b9dbc1 100%);
 
@@ -98,13 +90,11 @@
   --mix-tint-strong: 20%;
   --mix-icon: 26%;
   --mix-edge: 35%;
-  --mix-bloom: 42%;
   --mix-tile-edge: 45%;
   --mix-glow-strong: 50%;
   --mix-tile: 58%;
   /* Dark-mode display tones are lighter, so less of them goes into a tile to keep it as deep. */
   --mix-tile-dark: 40%;
-  --mix-dot-glow: 70%;
 
   /* Shadows */
   --shadow-panel: 0 0 0 .5px var(--hairline-strong), 0 14px 34px -20px light-dark(oklch(.28 .05 262 / 24%), oklch(0 0 0 / 56%));
@@ -165,6 +155,7 @@
   --titlebar-inset-macos: 82px;
   --row-min-height: 44px;
   --sidebar-row-height: 48px;
+  --sidebar-picture-height: 16px;
   --control-height: 30px;
   --control-height-sm: 28px;
   --input-height: 32px;
@@ -205,17 +196,10 @@
   --island-wing-min: 44px;
   --island-wing-max: 160px;
   --island-level-width: 48px;
-  /* Link capsule: two computer dots on one orbit, its radius per state, and Pause's bars. */
+  /* The island and tray's two computer dots: their mark, size and resting radius. */
   --sharing-mark-size: 14px;
   --sharing-dot-size: 5px;
   --sharing-orbit-rest: 4px;
-  --sharing-orbit-lean: 2.75px;
-  --sharing-orbit-busy: 3px;
-  --sharing-orbit-live: 3.25px;
-  --sharing-bar-offset: 2.25px;
-  --sharing-dot-glow: 8px;
-  --sharing-glow-blur: 14px;
-  --frost-blur: 16px;
   --frost-saturate: 170%;
   --panel-blur: 26px;
   --tooltip-max-width: 200px;
@@ -274,7 +258,6 @@
   --scale-press: .97;
   --rotate-open: 90deg;
   --opacity-dim: .4;
-  --opacity-busy: .6;
   --opacity-breath: .5;
   --scale-pop: .8;
   --scale-enter: .96;
@@ -284,9 +267,6 @@
   --scale-drag: 1.02;
   --scale-live-ring: 2.6;
   --opacity-live-ring: .5;
-  /* A dot becomes a pause bar by narrowing and stretching: 5px round to 2.5 by 9. */
-  --scale-bar-x: .5;
-  --scale-bar-y: 1.8;
   --scale-defocus: .94;
   --scale-inhale: .955;
   /* A computer that is switched off keeps its tile, washed out. */
@@ -354,7 +334,7 @@ code { font-family: var(--font-mono); font-size: var(--text-sm); }
 
 /* Studio shell: a floating sidebar beside the workspace, whose toolbar runs over the canvas and the
    inspector. Settings rises over both when it is selected. */
-.studio { position: relative; display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); width: 100%; height: 100%; }
+.studio { position: relative; display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); width: 100%; height: 100%; transition: grid-template-columns var(--motion-slow) var(--ease-glide); }
 @media (max-width: 900px) { .studio { grid-template-columns: var(--sidebar-width-narrow) minmax(0, 1fr); } }
 .app-mark { display: inline-block; flex: none; width: var(--tile-glyph-size); height: var(--tile-glyph-size); background: currentColor; -webkit-mask: url("./assets/monhop-mark.svg") center / contain no-repeat; mask: url("./assets/monhop-mark.svg") center / contain no-repeat; }
 
@@ -370,15 +350,16 @@ html[data-platform="macos"] .sidebar-top { justify-content: flex-end; padding-le
 .sidebar-count { font-variant-numeric: tabular-nums; }
 .sidebar-list { display: flex; flex-direction: column; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: var(--gap-1) var(--gap-2); }
 .sidebar-row { position: relative; isolation: isolate; display: grid; grid-template-columns: var(--tile-size) minmax(0, 1fr); align-items: center; gap: var(--gap-3); width: 100%; min-height: var(--sidebar-row-height); border: 0; border-radius: var(--radius-group); padding: var(--gap-2) var(--gap-2); background: transparent; color: var(--foreground); text-align: left; transition: var(--transition-control); }
-.sidebar-row:hover { background: var(--surface-inset); }
+.sidebar-row:hover:not([aria-current="true"]) { background: var(--surface-inset); }
 .sidebar-row:active { transform: scale(var(--scale-press)); transition: var(--transition-control), var(--transition-press); }
 /* One indicator for the whole sidebar, moved into the selected row; sidebar.mjs glides it between them. */
 .sidebar-indicator { position: absolute; z-index: -1; inset: 0; border-radius: inherit; background: var(--surface-hover); box-shadow: inset 0 0 0 .5px var(--hairline-strong); pointer-events: none; }
 .sidebar > .sidebar-indicator { display: none; }
 .sidebar-tile { display: grid; width: var(--tile-size); height: var(--tile-size); place-items: center; border-radius: var(--radius); background: var(--mac-tile); box-shadow: var(--shadow-tile); color: var(--tile-glyph); }
 .sidebar-tile:has(.platform-glyph[data-platform="windows"]) { background: var(--pc-tile); }
-.sidebar-tile[data-kind="new"] { background: none; box-shadow: inset 0 0 0 var(--hairline-width) var(--hairline-strong); color: var(--muted-foreground); }
-.sidebar-row[aria-current="true"] .sidebar-tile[data-kind="new"] { background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); box-shadow: inset 0 0 0 var(--hairline-width) var(--primary); color: var(--primary); }
+.sidebar-tile { transition: background-color var(--motion-base) var(--ease-out), border-color var(--motion-base) var(--ease-out), color var(--motion-base) var(--ease-out); }
+.sidebar-tile[data-kind="new"] { border: var(--hairline-width) dashed var(--hairline-strong); background: none; box-shadow: none; color: var(--muted-foreground); }
+.sidebar-row[aria-current="true"] .sidebar-tile[data-kind="new"] { border-color: var(--primary); background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); }
 .sidebar-tile .platform-glyph { width: var(--tile-glyph-size); height: var(--tile-glyph-size); }
 /* A plus drawn from two bars: the vendored icon set has none. */
 .add-glyph { position: relative; display: block; width: var(--icon-size); height: var(--icon-size); }
@@ -388,6 +369,12 @@ html[data-platform="macos"] .sidebar-top { justify-content: flex-end; padding-le
 .sidebar-row-title { min-width: 0; overflow: hidden; font-size: var(--text-base); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-row-label { display: flex; align-items: center; gap: var(--gap-2); min-width: 0; color: var(--muted-foreground); font-size: var(--text-sm); }
 .sidebar-row-label-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A computer's pairing picture shows on hover or focus; the row a pairing just turned into keeps it. */
+.sidebar-picture { display: inline-flex; flex: none; margin-left: auto; opacity: 0; transform: translateX(var(--gap-1)); transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-base) var(--ease-out); }
+.sidebar-picture:empty { display: none; }
+.sidebar-row:is(:hover, :focus-visible) .sidebar-picture, .sidebar-picture[data-shown="true"] { opacity: 1; transform: none; }
+.sidebar-picture .pair-badge { gap: var(--gap-half); height: var(--sidebar-picture-height); padding: 0 var(--gap-1); }
+.sidebar-picture .pair-badge svg { width: var(--icon-size-sm); height: var(--icon-size-sm); }
 .sidebar-row[data-kind="new"] .status-dot[data-tone="neutral"] { display: none; }
 .sidebar-foot { padding: var(--gap-2); border-top: var(--hairline-width) solid var(--hairline); }
 .sidebar-settings { grid-template-columns: var(--tile-size) minmax(0, 1fr) auto; min-height: var(--control-height); padding-block: var(--gap-1); }
@@ -410,33 +397,49 @@ html[data-platform="macos"] .sidebar-top { justify-content: flex-end; padding-le
 .chip { display: inline-flex; align-items: center; gap: var(--gap-2); min-width: 0; max-width: 100%; border: 0; padding: 0 var(--gap-2) 0 var(--gap-3); font-size: var(--text-sm); font-weight: var(--weight-medium); white-space: nowrap; transition: var(--transition-control); }
 .chip:disabled { cursor: default; opacity: var(--opacity-disabled); }
 .chip:active:not(:disabled) { transform: scale(var(--scale-press)); transition: var(--transition-control), var(--transition-press); }
-.chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chip-label { display: inline-flex; align-items: baseline; gap: var(--gap-2); min-width: 0; overflow: hidden; }
+/* Short of room the address gives way first, so the network's name stays readable. */
+.chip-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chip-address { flex: 0 1000 auto; min-width: 0; overflow: hidden; color: var(--muted-foreground); font-family: var(--font-mono); font-size: var(--text-xs); font-variant-numeric: tabular-nums; text-overflow: ellipsis; }
 .chip-chevron { display: grid; color: var(--subtle-foreground); }
 .chip-chevron svg { width: var(--icon-size-sm); height: var(--icon-size-sm); stroke-width: var(--icon-stroke-bold); transform: rotate(var(--rotate-open)); }
-.pause-glyph { position: relative; display: grid; width: var(--icon-size-sm); height: var(--icon-size-sm); place-items: center; }
-.pause-glyph > * { grid-area: 1 / 1; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring); }
+/* Each toolbar button draws both its glyphs in one cell and cross-fades between them. */
+.toolbar-glyph { position: relative; display: grid; flex: none; width: var(--icon-size-sm); height: var(--icon-size-sm); place-items: center; }
+.toolbar-glyph > * { grid-area: 1 / 1; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring); }
+.toolbar .button .toolbar-glyph svg { width: var(--icon-size-sm); height: var(--icon-size-sm); }
 .pause-bars { width: calc(var(--pause-bar-width) * 3); height: var(--pause-bar-height); border-inline: var(--pause-bar-width) solid currentColor; }
-.toolbar .button .pause-glyph svg { width: var(--icon-size-sm); height: var(--icon-size-sm); fill: currentColor; }
-#toolbar-pause:not([data-mode="resume"]) .pause-glyph svg, #toolbar-pause[data-mode="resume"] .pause-bars { opacity: 0; transform: scale(var(--scale-pop)); }
+.toolbar .button .pause-glyph svg { fill: currentColor; }
+#toolbar-pause:not([data-mode="resume"]) .pause-glyph svg, #toolbar-pause[data-mode="resume"] .pause-bars,
+#toolbar-arrange:not([data-mode="done"]) .arrange-glyph > :last-child, #toolbar-arrange[data-mode="done"] .arrange-glyph > :first-child { opacity: 0; transform: scale(var(--scale-pop)); }
+/* Tooltips under toolbar controls: why the network is locked, and each button's name once it is only a glyph. */
+.toolbar-tooltip { position: absolute; z-index: 7; top: calc(100% + var(--gap-2)); right: 0; width: max-content; max-width: var(--tooltip-max-width); border-radius: var(--radius); padding: var(--gap-1) var(--gap-2); background: var(--surface-raised); box-shadow: var(--shadow-raised); color: var(--foreground); font-size: var(--text-sm); line-height: var(--leading-tight); opacity: 0; pointer-events: none; transform: scale(var(--scale-enter)); transform-origin: top right; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
+.toolbar-tooltip:empty { display: none; }
+#network-slot[data-locked="true"]:is(:hover, :focus-within) > .toolbar-tooltip, #network-slot[data-locked="true"]:has(.chip:focus-visible) > .toolbar-tooltip { opacity: 1; transform: none; }
+#network-slot:has(.menu[data-open="true"]) > .toolbar-tooltip { opacity: 0; }
 
 /* Short of room, the toolbar's buttons keep their glyphs; the label stays for assistive technology. */
 @container toolbar-actions (max-width: 400px) {
   .toolbar-slot .button { width: var(--control-height-sm); padding: 0; }
   .toolbar-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  :is(#arrange-slot, #pause-slot):is(:hover, :focus-within) > .toolbar-tooltip { opacity: 1; transform: none; }
 }
 
-/* The network menu stays in the page; it fades and drops in, and back out, from the chip. */
-.menu { position: absolute; z-index: 6; top: calc(100% + var(--gap-2)); right: 0; display: grid; gap: var(--gap-half); width: var(--menu-width); border-radius: var(--radius-group); padding: var(--gap-1); background: var(--solid); box-shadow: var(--shadow-sheet); opacity: 1; transform: none; transform-origin: top right; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-base) var(--ease-out), visibility 0s linear 0s; }
-.menu[data-open="false"] { opacity: 0; transform: translateY(calc(var(--motion-rise) * -1)) scale(var(--scale-sheet)); visibility: hidden; pointer-events: none; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-base) var(--ease-out), visibility 0s linear var(--motion-base); }
-.menu-heading, .menu-note { padding: var(--gap-1) var(--gap-2); color: var(--subtle-foreground); font-size: var(--text-xs); font-weight: var(--weight-medium); }
-.menu-note { border-top: var(--hairline-width) solid var(--hairline); padding-top: var(--gap-2); }
-.menu-item { display: grid; grid-template-columns: var(--icon-size) minmax(0, 1fr); align-items: center; gap: var(--gap-2); width: 100%; border: 0; border-radius: var(--radius-sm); padding: var(--gap-2); background: transparent; text-align: left; transition: var(--transition-control); }
-.menu-item:hover { background: var(--surface-hover); }
-.menu-check { display: grid; color: var(--primary); }
-.menu-check svg { width: var(--icon-size-sm); height: var(--icon-size-sm); stroke-width: var(--icon-stroke-bold); }
-.menu-item-copy { display: grid; min-width: 0; }
+/* The network menu stays in the page; it fades and drops in from the chip, and back out. */
+.menu { position: absolute; z-index: 6; top: calc(100% + var(--gap-2)); right: 0; display: grid; gap: var(--gap-half); width: var(--menu-width); border-radius: var(--radius-card); padding: var(--gap-1); background: var(--solid); box-shadow: var(--shadow-sheet); opacity: 1; transform: none; transform-origin: top right; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring), visibility 0s linear 0s; }
+.menu[data-open="false"] { opacity: 0; transform: translateY(calc(var(--motion-rise) * -1)) scale(var(--scale-enter)); visibility: hidden; pointer-events: none; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-base) var(--ease-out), visibility 0s linear var(--motion-base); }
+.menu-heading, .menu-note { padding: var(--gap-2) var(--gap-3) var(--gap-1); color: var(--subtle-foreground); font-size: var(--text-xs); font-weight: var(--weight-medium); }
+.menu-note { margin-top: var(--gap-1); border-top: var(--hairline-width) solid var(--hairline); padding-block: var(--gap-2) var(--gap-1); font-weight: var(--weight-regular); line-height: var(--leading); }
+.menu-item { display: grid; grid-template-columns: minmax(0, 1fr) var(--icon-size); align-items: center; gap: var(--gap-3); width: 100%; border: 0; border-radius: var(--radius); padding: var(--gap-2) var(--gap-3); background: transparent; text-align: left; transition: var(--transition-control); }
+.menu-item:hover:not([aria-disabled="true"]) { background: var(--surface-inset); }
+.menu-item:focus-visible { box-shadow: var(--shadow-focus-inset); }
+.menu-item[aria-disabled="true"] { cursor: default; opacity: var(--opacity-disabled); }
+.menu-check { display: grid; color: var(--primary); opacity: 0; transform: scale(var(--scale-pop)); transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring); }
+.menu-item[aria-checked="true"] .menu-check { opacity: 1; transform: none; }
+.menu-check svg { width: var(--icon-size); height: var(--icon-size); stroke-width: var(--icon-stroke-bold); }
+.menu-item-copy { display: grid; gap: var(--gap-half); min-width: 0; }
 .menu-item-copy strong { overflow: hidden; font-size: var(--text-base); font-weight: var(--weight-medium); text-overflow: ellipsis; white-space: nowrap; }
 .menu-item-copy span { overflow: hidden; color: var(--muted-foreground); font-family: var(--font-mono); font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
+.menu-item[aria-disabled="true"] .menu-item-copy span { font-family: inherit; }
 
 .window-controls { display: none; align-self: stretch; margin-right: calc(var(--shell-inset) * -1); }
 html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
@@ -502,13 +505,18 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .inspector { position: relative; z-index: 3; display: grid; grid-template-rows: minmax(0, 1fr); min-width: 0; min-height: 0; overflow: hidden; border-radius: var(--radius-card); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)) saturate(var(--frost-saturate)); backdrop-filter: blur(var(--panel-blur)) saturate(var(--frost-saturate)); box-shadow: var(--shadow-panel); transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear 0s; }
 .studio[data-view="settings"] .inspector { opacity: 0; transform: translateX(var(--motion-slide)); visibility: hidden; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear var(--motion-slow); }
 /* In a narrow window the inspector is a sheet over the canvas that slides in from the right. */
-.inspector[data-mode="overlay"] { position: absolute; top: 0; right: var(--shell-inset); bottom: var(--shell-inset); width: min(var(--inspector-width), calc(100% - var(--shell-inset) * 2)); background: var(--solid); box-shadow: var(--shadow-sheet); }
-.inspector[data-mode="overlay"][data-open="false"] { opacity: 0; transform: translateX(var(--motion-slide)); visibility: hidden; pointer-events: none; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear var(--motion-slow); }
+.inspector[data-mode="overlay"] { position: absolute; top: 0; right: var(--shell-inset); bottom: var(--shell-inset); width: min(var(--inspector-width), calc(100% - var(--shell-inset) * 2)); background: var(--solid); box-shadow: var(--shadow-sheet); transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-slow) var(--ease-glide), visibility 0s linear 0s; }
+.inspector[data-mode="overlay"][data-open="false"] { opacity: 0; transform: translateX(calc(100% + var(--shell-inset))); visibility: hidden; pointer-events: none; transition: opacity var(--motion-base) var(--ease-in-out), transform var(--motion-slow) var(--ease-glide), visibility 0s linear var(--motion-slow); }
+/* The canvas dims under the sheet; a click there closes it. */
+.inspector-scrim { position: absolute; z-index: 2; inset: 0 var(--shell-inset) var(--shell-inset); border-radius: var(--radius-card); background: var(--scrim); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity var(--motion-base) var(--ease-out), visibility 0s linear var(--motion-base); }
+.studio[data-inspector="overlay"] .inspector-scrim[data-open="true"] { opacity: 1; visibility: visible; pointer-events: auto; transition: opacity var(--motion-base) var(--ease-out), visibility 0s linear 0s; }
 .inspector > .inspector-close.icon-button { position: absolute; z-index: 1; top: var(--gap-3); right: var(--gap-3); }
 .inspector-close svg { width: var(--icon-size); height: var(--icon-size); }
 .inspector-scroll { min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
-.inspector-content { min-width: 0; }
-.inspector-content > .swap { display: grid; }
+/* A selection's content and what the last one showed share one cell while the change cross-fades. */
+.inspector-content { display: grid; min-width: 0; }
+.inspector-content > * { grid-area: 1 / 1; min-width: 0; }
+.inspector-content > [data-exit="true"] { pointer-events: none; }
 /* Sections stack flush, split by hairlines; cards inside the inspector drop their own surface. */
 .inspector-view { display: flex; flex-direction: column; min-width: 0; padding-bottom: var(--gap-2); }
 .inspector-view > :is(.card, .overview, .stack, .state-block, .inspector-section, .accordion, .glide-panel) { border-top: var(--hairline-width) solid var(--hairline); }
@@ -540,7 +548,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .inspector-section .note { font-size: var(--text-sm); }
 .inspector-view > .accordion > .accordion-trigger { border-radius: 0; padding-inline: var(--card-padding); }
 .inspector-view > .accordion > .accordion-panel > .accordion-panel-inner { padding-inline: var(--card-padding); }
-.inspector-view .pair-result-card { padding-block: var(--gap-5); }
 
 /* Settings rises over the canvas and inspector, sections in two columns while it is wide enough. */
 .settings-pane { position: absolute; z-index: 5; inset: 0 var(--shell-inset) var(--shell-inset); display: grid; grid-template-rows: minmax(0, 1fr); overflow: hidden; border-radius: var(--radius-card); background: var(--solid); box-shadow: var(--shadow-sheet); opacity: 1; transform: none; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear 0s; }
@@ -587,7 +594,8 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 :is(.status-pill, .status-dot)[data-tone="error"] { --tone: var(--destructive); }
 :is(.status-pill, .status-dot):is([data-tone="connected"], [data-tone="active"]) { --tone: var(--success); }
 /* Live dot: a ring keeps leaving it. Only on dots that persist; a re-rendered one would restart it. */
-:is(#status-bar-dot, .sidebar-row .status-dot)[data-tone="active"]::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: inherit; opacity: 0; animation: live-ring var(--loop-live) var(--ease-out) infinite; }
+#status-bar-dot[data-tone="active"]::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: inherit; opacity: 0; animation: live-ring var(--loop-live) var(--ease-out) infinite; }
+.sidebar-row .status-dot[data-tone="active"]::after { content: ""; position: absolute; inset: calc(var(--dot-halo) * -1); border-radius: inherit; background: color-mix(in oklab, var(--tone) var(--mix-edge), transparent); opacity: 0; animation: dot-breathe var(--loop-breathe) var(--ease-in-out) infinite; }
 
 /* Containers of blocks that come and go (accordion.mjs presence) are flex columns: a block's negative
    margin cancels the gap it adds while it glides, where a grid row would stop at 0. */
@@ -667,6 +675,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 :is(.icon-button, .pair-picture):is(:hover, :focus-visible) .tooltip { opacity: 1; transform: none; }
 :is(.icon-button, .pair-picture)[data-tooltip-dismissed="true"] .tooltip { opacity: 0; transform: scale(var(--scale-enter)); }
 .pair-picture .tooltip, .sidebar .icon-button .tooltip { right: auto; left: 0; transform-origin: top left; }
+.sidebar-heading .icon-button .tooltip { right: 0; left: auto; transform-origin: top right; }
 /* dom.mjs stableLabel: every label in one cell, so the widest sets the control's width. */
 .stable-label { display: inline-grid; }
 .stable-label > span { grid-area: 1 / 1; text-align: center; }
@@ -719,32 +728,10 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(var(--scale-thumb-active)); box-shadow: var(--shadow-thumb), var(--shadow-focus); }
 .slider:focus-visible::-webkit-slider-thumb { box-shadow: var(--shadow-thumb), var(--shadow-focus); }
 
-/* Pairing: the two ways in, the short code, and the match badge both computers show. */
+/* Pairing: the two ways in, the code field, and the match badge both computers show. */
 .pair-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gap-2); }
 .pair-choices > .button { width: 100%; }
-.pair-choice { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: var(--gap-3); min-width: 0; border: 0; border-radius: var(--radius-group); padding: var(--gap-3); background: var(--surface-inset); color: var(--foreground); text-align: left; transition: var(--transition-control); }
-.pair-choice:hover:not(:disabled) { background: var(--surface-hover); }
-.pair-choice:active:not(:disabled) { transform: scale(var(--scale-press)); transition: var(--transition-control), var(--transition-press); }
-.pair-choice:disabled { cursor: not-allowed; opacity: var(--opacity-disabled); }
-.pair-choice-icon { display: grid; flex: none; width: var(--avatar-size); height: var(--avatar-size); place-items: center; border-radius: var(--radius-group); background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); }
-.pair-choice-icon svg { width: var(--avatar-glyph); height: var(--avatar-glyph); stroke-width: var(--icon-stroke); }
-.pair-choice-copy { display: grid; gap: var(--gap-half); min-width: 0; }
-.pair-choice-copy strong { font-size: var(--text-base); font-weight: var(--weight-semibold); }
-.pair-choice-copy span { color: var(--muted-foreground); font-size: var(--text-sm); }
-.inspector .pair-choices:has(.pair-choice) { grid-template-columns: minmax(0, 1fr); }
-.pair-code { display: grid; justify-items: center; gap: var(--gap-3); min-width: 0; border-radius: var(--radius-group); padding: var(--gap-5) var(--gap-3) var(--gap-4); background: var(--surface-inset); }
-/* The trailing tracking is padded on the left too, so the code stays optically centred. */
-.pair-code-groups, .input.pair-code-input { font-family: var(--font-mono); font-weight: var(--weight-semibold); font-variant-numeric: tabular-nums slashed-zero; letter-spacing: var(--tracking-code); }
-.pair-code-groups { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--gap-1) var(--gap-2); padding-left: var(--tracking-code); color: var(--foreground); font-size: var(--text-code); line-height: var(--leading-tight); }
-.inspector .pair-code-groups { font-size: var(--text-code-sm); }
-.pair-code-dash { color: var(--subtle-foreground); }
-.pair-code[data-pending="true"] .pair-code-groups { color: var(--subtle-foreground); }
-.pair-countdown { display: grid; gap: var(--gap-2); width: min(100%, var(--pair-countdown-width)); }
-.pair-countdown-track { display: block; height: var(--slider-track); overflow: hidden; border-radius: var(--radius-pill); background: var(--hairline-strong); }
-/* app.js holds --countdown-left at the fraction still left; motion drains it on the compositor instead. */
-.pair-countdown-fill { display: block; height: 100%; border-radius: inherit; background: var(--primary); transform: scaleX(var(--countdown-left, 1)); transform-origin: left center; }
-.pair-countdown-text { color: var(--muted-foreground); font-size: var(--text-sm); font-variant-numeric: tabular-nums; text-align: center; }
-.input.pair-code-input { height: var(--pair-code-input-height); font-size: var(--text-code-input); text-align: center; text-transform: uppercase; }
+.input.pair-code-input { height: var(--pair-code-input-height); font-family: var(--font-mono); font-size: var(--text-code-input); font-variant-numeric: tabular-nums slashed-zero; font-weight: var(--weight-semibold); letter-spacing: var(--tracking-code); text-align: center; text-transform: uppercase; }
 .input.pair-code-input[aria-invalid="true"] { border-color: color-mix(in oklab, var(--destructive) var(--mix-edge), transparent); }
 .pair-badge { --tone: var(--pair-slate); display: inline-flex; flex: none; align-items: center; gap: var(--gap-1); width: fit-content; height: var(--badge-height); border-radius: var(--radius-pill); padding: 0 var(--gap-2); background: linear-gradient(135deg, color-mix(in oklab, var(--tone) var(--mix-icon), var(--card)), color-mix(in oklab, var(--tone) var(--mix-faint), var(--card))); box-shadow: inset 0 0 0 .5px color-mix(in oklab, var(--tone) var(--mix-edge), transparent); color: var(--tone); }
 .pair-badge-symbol { display: grid; place-items: center; }
@@ -759,12 +746,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .pair-badge[data-color="brown"] { --tone: var(--pair-brown); }
 .pair-badge[data-color="pink"] { --tone: var(--pair-pink); }
 .pair-badge[data-color="slate"] { --tone: var(--pair-slate); }
-.pair-result { display: grid; justify-items: center; gap: var(--gap-3); min-width: 0; padding-top: var(--gap-2); text-align: center; }
 .pair-picture { position: relative; display: inline-flex; flex: none; align-items: center; gap: var(--gap-2); border-radius: var(--radius-pill); white-space: nowrap; }
-.pair-badge-caption { color: var(--muted-foreground); font-size: var(--text-sm); }
-.pair-result-copy { display: grid; gap: var(--gap-1); min-width: 0; }
-.pair-result-copy strong { font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); line-height: var(--leading-tight); }
-.pair-result-card .card-actions { justify-content: center; }
 
 /* Facts */
 .facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--gap-2) var(--gap-4); min-width: 0; margin: 0; }
@@ -838,59 +820,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .swap > * { grid-area: 1 / 1; min-width: 0; }
 .swap > [data-exit="true"] { pointer-events: none; }
 
-/* Link capsule: frosted glass and the two computers as dots that circle each other while connecting
-   and sharing, then stretch into Pause's bars. computer-card.mjs tweens between these looks and turns
-   the orbit. */
-.sharing-pill-wrap { position: relative; display: inline-flex; flex: none; border-radius: var(--radius-pill); }
-.sharing-pill-wrap[data-busy="true"] { cursor: progress; }
-.sharing-pill-halo { position: absolute; inset: 0; border-radius: inherit; box-shadow: var(--live-glow); opacity: 0; pointer-events: none; }
-.sharing-pill { position: relative; isolation: isolate; display: inline-flex; align-items: center; gap: var(--gap-2); height: var(--control-height-sm); overflow: hidden; border: 0; border-radius: var(--radius-pill); padding: 0 var(--gap-3) 0 var(--gap-2); background: transparent; box-shadow: var(--glass-lift); color: var(--foreground); font-size: var(--text-sm); font-weight: var(--weight-semibold); line-height: var(--leading-none); white-space: nowrap; }
-.sharing-pill:disabled { cursor: inherit; }
-.sharing-pill:focus-visible { box-shadow: var(--shadow-focus), var(--glass-lift); }
-.sharing-pill-glass, .sharing-pill-edge, .sharing-pill-glow, .sharing-pill-breath { position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; }
-.sharing-pill-glass { background: var(--glass-fill); -webkit-backdrop-filter: blur(var(--frost-blur)) saturate(var(--frost-saturate)); backdrop-filter: blur(var(--frost-blur)) saturate(var(--frost-saturate)); box-shadow: var(--glass-highlight), inset 0 0 0 var(--hairline-width) var(--glass-edge); }
-.sharing-pill-edge { box-shadow: inset 0 0 0 var(--hairline-width) var(--glass-edge-hover); opacity: 0; }
-.sharing-pill-glow { opacity: 0; }
-.sharing-pill-breath { background: var(--live-bloom); box-shadow: inset 0 0 0 var(--hairline-width) var(--live-edge); }
-/* The orbit turns the two arms; each arm holds its dot out at the radius the state asks for. */
-.sharing-pill-mark { position: relative; flex: none; width: var(--sharing-mark-size); height: var(--sharing-mark-size); }
-.sharing-pill-orbit { position: absolute; inset: 0; }
-.sharing-pill-arm { position: absolute; top: 50%; left: 50%; }
-.sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-rest) * -1)); }
-.sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-rest)); }
-.sharing-pill-dot { position: absolute; width: var(--sharing-dot-size); height: var(--sharing-dot-size); margin: calc(var(--sharing-dot-size) / -2) 0 0 calc(var(--sharing-dot-size) / -2); border-radius: var(--radius-circle); box-shadow: 0 0 0 transparent; }
-.sharing-pill-dot.local { background: var(--sharing-orbit-local); }
-.sharing-pill-dot.peer { background: var(--sharing-orbit-peer); }
-/* Labels share one cell; only the current state's labels take space, so the width follows them. */
-.sharing-pill-label { position: relative; display: grid; text-align: start; }
-.sharing-pill-label > span { grid-area: 1 / 1; opacity: 0; filter: blur(var(--motion-blur-deep)); transform: scale(var(--scale-defocus)); transform-origin: left center; }
-.sharing-pill-wrap:not([data-state="active"], [data-state="connecting"]) .sharing-pill-label > :not(.start), .sharing-pill-wrap[data-state="connecting"] .sharing-pill-label > :is(.start, .sharing), .sharing-pill-wrap[data-state="active"] .sharing-pill-label > :is(.start, .connecting) { position: absolute; top: 0; left: 0; }
-.sharing-pill-label > .start, .sharing-pill-label > .pause { color: var(--foreground); }
-.sharing-pill-label > .connecting { color: var(--muted-foreground); }
-.sharing-pill-label > .sharing { color: var(--success-text); }
-/* Idle: hover leans the dots in and brightens the edge. */
-.sharing-pill-wrap:not([data-state="active"], [data-state="connecting"]) .sharing-pill-label > .start { opacity: 1; transform: none; filter: none; }
-.sharing-pill-wrap[data-lean="true"] .sharing-pill-edge { opacity: 1; }
-.sharing-pill-wrap[data-lean="true"] .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-lean) * -1)); }
-.sharing-pill-wrap[data-lean="true"] .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-lean)); }
-/* Busy: the pair circles fast on a tighter orbit and the words step back. */
-.sharing-pill-wrap:is([data-busy="true"], [data-state="connecting"]:not([data-pause="true"])) .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-busy) * -1)); }
-.sharing-pill-wrap:is([data-busy="true"], [data-state="connecting"]:not([data-pause="true"])) .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-busy)); }
-.sharing-pill-wrap[data-state="connecting"]:not([data-pause="true"]) .sharing-pill-label > .connecting { opacity: 1; transform: none; filter: none; }
-.sharing-pill-wrap[data-busy="true"] .sharing-pill-label { opacity: var(--opacity-busy); }
-/* Live: the glass blooms green from the dots, and the pair brightens and glows on a slow orbit. */
-.sharing-pill-wrap[data-state="active"] :is(.sharing-pill-halo, .sharing-pill-glow) { opacity: 1; }
-.sharing-pill-wrap[data-state="active"]:not([data-busy="true"], [data-pause="true"]) .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-orbit-live) * -1)); }
-.sharing-pill-wrap[data-state="active"]:not([data-busy="true"], [data-pause="true"]) .sharing-pill-arm.peer { transform: translateX(var(--sharing-orbit-live)); }
-.sharing-pill-wrap[data-state="active"] .sharing-pill-dot.local { background: var(--sharing-orbit-live-local); box-shadow: 0 0 var(--sharing-dot-glow) color-mix(in oklab, var(--sharing-orbit-live-local) var(--mix-dot-glow), transparent); }
-.sharing-pill-wrap[data-state="active"] .sharing-pill-dot.peer { background: var(--sharing-orbit-live-peer); box-shadow: 0 0 var(--sharing-dot-glow) color-mix(in oklab, var(--sharing-orbit-live-peer) var(--mix-dot-glow), transparent); }
-.sharing-pill-wrap[data-state="active"]:not([data-pause="true"]) .sharing-pill-label > .sharing { opacity: 1; transform: none; filter: none; }
-/* Live and engaged: the pair stops side by side and stretches into Pause's two bars. */
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-arm.local { transform: translateX(calc(var(--sharing-bar-offset) * -1)); }
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-arm.peer { transform: translateX(var(--sharing-bar-offset)); }
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-dot:is(.local, .peer) { background: var(--foreground); box-shadow: 0 0 0 transparent; transform: scale(var(--scale-bar-x), var(--scale-bar-y)); }
-.sharing-pill-wrap[data-pause="true"] .sharing-pill-label > .pause { opacity: 1; transform: none; filter: none; }
-
 /* State changes replay from where they were when a re-render lands mid-change (--motion-delay is negative). */
 @media (prefers-reduced-motion: no-preference) {
   .switch[data-enter="true"] { animation: switch-track-off var(--motion-base) var(--ease-out) var(--motion-delay, 0ms); }
@@ -899,7 +828,6 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
   .switch[data-enter="true"][aria-checked="true"] .switch-thumb { animation-name: switch-thumb-on; }
   .computer-layouts .rows[data-enter="true"] > .row { animation: fade-up var(--motion-base) var(--ease-out) calc(var(--motion-delay, 0ms) + var(--row-index, 0) * var(--motion-stagger)) both; }
   .notice-dot { animation: notice-dot var(--loop-pulse) var(--ease-in-out) infinite; }
-  .pair-countdown-fill[data-running="true"] { animation: countdown-drain var(--countdown-total) linear var(--countdown-delay, 0ms) both; }
   .stable-label[data-enter="true"] > [data-current="true"] { animation: fade-in var(--motion-base) var(--ease-out) var(--motion-delay, 0ms) both; }
   .stable-label[data-enter="true"] > [data-current="false"] { animation: fade-out var(--motion-fast) var(--ease-out) var(--motion-delay, 0ms) both; }
   .pair-badge[data-enter="true"] { animation: pop-in var(--motion-spring) var(--ease-spring) var(--motion-delay, 0ms) both; }
@@ -1065,6 +993,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 @keyframes tile-in { from { opacity: 0; transform: scale(var(--scale-enter)); } }
 @keyframes tile-out { to { opacity: 0; transform: scale(var(--scale-pop)); } }
 @keyframes live-ring { from { opacity: var(--opacity-live-ring); transform: scale(1); } to { opacity: 0; transform: scale(var(--scale-live-ring)); } }
+@keyframes dot-breathe { 0%, 100% { opacity: 0; transform: scale(var(--scale-pop)); } 50% { opacity: 1; transform: none; } }
 @keyframes notice-dot { 0%, 100% { opacity: var(--opacity-dim); } 50% { opacity: 1; } }
 @keyframes spin { to { transform: rotate(1turn); } }
 @keyframes countdown-drain { from { transform: scaleX(1); } to { transform: scaleX(0); } }
