@@ -191,22 +191,24 @@ const ACCORDION_CHECK: &str = r#"(() => {
     if (document.hidden) window.__MONHOP_WAS_HIDDEN__ = true;
   });
   (async () => {
-    const item = document.querySelector('[data-disclosure="overview-details"]');
-    const trigger = item?.querySelector('.accordion-trigger');
-    const panel = item?.querySelector('.accordion-panel');
+    // Every render rebuilds the accordion and carries its state over by key, and the startup theme
+    // read can render mid-check, so each step reads the nodes on screen now.
+    const item = () => document.querySelector('[data-disclosure="overview-details"]');
+    const trigger = () => item()?.querySelector('.accordion-trigger');
+    const panel = () => item()?.querySelector('.accordion-panel');
     const frame = () => new Promise(requestAnimationFrame);
     const settle = async () => {
-      while (item.getAnimations({ subtree: true }).some(a => a.playState === 'running')) await frame();
+      while (item().getAnimations({ subtree: true }).some(a => a.playState === 'running')) await frame();
     };
     const midpoint = async () => {
-      const animation = panel.getAnimations().find(a => a.playState === 'running');
+      const animation = panel().getAnimations().find(a => a.playState === 'running');
       if (matchMedia('(prefers-reduced-motion: reduce)').matches) return !animation;
       if (!animation) return false;
       animation.pause();
       animation.currentTime = animation.effect.getTiming().duration / 2;
       await frame();
-      const height = panel.getBoundingClientRect().height;
-      const animated = height > 0 && height < panel.scrollHeight - 1;
+      const height = panel().getBoundingClientRect().height;
+      const animated = height > 0 && height < panel().scrollHeight - 1;
       animation.play();
       return animated;
     };
@@ -214,36 +216,36 @@ const ACCORDION_CHECK: &str = r#"(() => {
     await Promise.all(document.querySelector('#inspector').getAnimations({ subtree: true })
       .filter(a => a.effect?.getComputedTiming().iterations !== Infinity)
       .map(a => a.finished.catch(() => {})));
-    const flags = [trigger?.tagName === 'BUTTON' && panel?.getAttribute('role') === 'region'
-      && trigger.getAttribute('aria-controls') === panel.id
-      && panel.getAttribute('aria-labelledby') === trigger.id];
-    trigger.click();
+    const flags = [trigger()?.tagName === 'BUTTON' && panel()?.getAttribute('role') === 'region'
+      && trigger().getAttribute('aria-controls') === panel().id
+      && panel().getAttribute('aria-labelledby') === trigger().id];
+    trigger().click();
     flags.push(await midpoint());
     window.__MONHOP_ACCORDION_CHECK__ = 'pending:expanded';
     await settle();
     const copy = document.querySelector('.overview-copy').getBoundingClientRect();
-    const row = trigger.getBoundingClientRect();
-    const body = panel.getBoundingClientRect();
+    const row = trigger().getBoundingClientRect();
+    const body = panel().getBoundingClientRect();
     flags.push(row.top >= copy.bottom && body.top >= row.bottom - 1
       && Math.abs(row.width - body.width) < 2);
-    flags.push(trigger.getAttribute('aria-expanded') === 'true' && !panel.hidden && !panel.inert
-      && body.height >= panel.scrollHeight - 1);
-    trigger.click();
+    flags.push(trigger().getAttribute('aria-expanded') === 'true' && !panel().hidden && !panel().inert
+      && body.height >= panel().scrollHeight - 1);
+    trigger().click();
     window.__MONHOP_ACCORDION_CHECK__ = 'pending:closing';
     flags.push(await midpoint());
     await settle();
-    flags.push(trigger.getAttribute('aria-expanded') === 'false' && panel.hidden && panel.inert);
+    flags.push(trigger().getAttribute('aria-expanded') === 'false' && panel().hidden && panel().inert);
     window.__MONHOP_ACCORDION_CHECK__ = 'pending:reversal';
-    trigger.click(); await frame(); trigger.click(); await frame(); trigger.click();
+    trigger().click(); await frame(); trigger().click(); await frame(); trigger().click();
     await settle();
-    flags.push(trigger.getAttribute('aria-expanded') === 'true' && !panel.hidden && !panel.inert
-      && panel.getBoundingClientRect().height >= panel.scrollHeight - 1);
+    flags.push(trigger().getAttribute('aria-expanded') === 'true' && !panel().hidden && !panel().inert
+      && panel().getBoundingClientRect().height >= panel().scrollHeight - 1);
     const scroller = document.querySelector('#inspector-scroll');
     flags.push(scroller.scrollWidth <= scroller.clientWidth + 1);
     window.__MONHOP_ACCORDION_CHECK__ = 'pending:finishing';
-    trigger.click(); await settle();
+    trigger().click(); await settle();
     const studio = document.querySelector('#studio');
-    flags.push(panel.hidden && panel.inert && studio.dataset.checkState === 'unchecked'
+    flags.push(panel().hidden && panel().inert && studio.dataset.checkState === 'unchecked'
       && studio.dataset.selection === 'local' && document.querySelector('#pause-slot').hidden);
     window.__MONHOP_ACCORDION_CHECK__ = flags.map(v => v ? '1' : '0').join('');
   })().catch(() => { window.__MONHOP_ACCORDION_CHECK__ = '000000000'; });
