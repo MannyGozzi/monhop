@@ -8,6 +8,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 - One button at the top of the window starts, pauses and resumes sharing. It stands out while sharing is off or paused. A computer's own switch now appears only when two or more computers are paired, where it picks which of them share.
 - Arrange floats over the top right corner of the arrangement instead of sitting in the toolbar.
+- While MonHop connects to the other computer to arrange, its card shows that computer's icon with rings pulsing outward and a light running along the card's edge, in place of a spinner.
 - The arrangement shows whether sharing is running. When it starts, each crossing between displays lights up outward from its handle with a pulse, and a soft glow rises under the displays. When sharing pauses or stops, the crossings fade back to grey.
 
 ## [0.2.12] - 2026-10-18

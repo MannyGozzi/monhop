@@ -266,20 +266,23 @@ export function pairBadge(match, size = "sm") {
 
 // Enter animations key on a card's tone and title, so a status poll that changes nothing draws nothing.
 const stateSignatures = new Map();
+const BUSY_TONES = new Set(["checking", "syncing", "stopping"]);
 
+// A state on its way sends rings out from its glyph and runs a light along the card's lower edge.
 export function stateCard({ tone, iconName, title, detail, actions = [], id }) {
+  const busy = BUSY_TONES.has(tone);
+  const ripples = busy
+    ? [el("span", { className: "state-ripple" }), el("span", { className: "state-ripple" })]
+    : [];
   const glyph = el("span", {
     className: "state-glyph",
     dataset: { tone },
     attrs: { "aria-hidden": "true" },
+    children: [...ripples, icon(iconName ?? "link", 18)],
   });
-  glyph.append(
-    tone === "checking" || tone === "syncing" || tone === "stopping"
-      ? el("span", { className: "spinner" })
-      : icon(iconName ?? "link", 18),
-  );
   const node = el("section", {
     className: "card state-card",
+    dataset: { busy: String(busy) },
     children: [
       glyph,
       el("div", {
@@ -618,8 +621,12 @@ function dropLabelGhost(parent, ghost) {
   if (!parent.querySelector(":scope > [data-label-ghost]")) delete parent.dataset.labelFade;
 }
 
+export function platformIcon(platform) {
+  return platform === "macos" ? "app-window-mac" : "app-window";
+}
+
 export function platformGlyph(platform) {
-  const svg = icon(platform === "macos" ? "app-window-mac" : "app-window", 28);
+  const svg = icon(platformIcon(platform), 28);
   svg.classList.add("platform-glyph");
   svg.dataset.platform = platform;
   return svg;

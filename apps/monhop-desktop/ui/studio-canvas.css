@@ -53,9 +53,14 @@
   /* Arrange floats over the canvas on frosted glass, its glyph in an accent well that fills on hover. */
   --canvas-arrange-height: 36px;
   --canvas-arrange-well: 24px;
-  --canvas-arrange-rim: light-dark(oklch(1 0 0 / 70%), oklch(1 0 0 / 7%));
+  --canvas-glass-rim: light-dark(oklch(1 0 0 / 70%), oklch(1 0 0 / 7%));
   --canvas-arrange-lift: -1px;
   --canvas-arrange-halo: 2px;
+  /* A card on its way: accent rings leave the other computer's glyph, and a light runs along its edge. */
+  --canvas-ripple-scale: 1.6;
+  --canvas-ripple-ring: 1.5px;
+  --canvas-sweep-loop: 1800ms;
+  --canvas-sweep-height: 2px;
   --canvas-arrange-shadow-hover: 0 0 0 .5px var(--hairline-strong), 0 2px 4px light-dark(oklch(.2 .01 275 / 10%), oklch(0 0 0 / 45%)), 0 12px 28px -10px light-dark(oklch(.2 .01 275 / 22%), oklch(0 0 0 / 65%));
 }
 :root[data-theme="dark"] { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); --canvas-seam-highlight: oklch(1 0 0 / 85%); }
@@ -181,8 +186,8 @@
 /* Arrange floats in the stage's top right corner; on hover it lifts and its well fills with the accent. */
 .canvas-stage, .canvas-arrange { grid-row: 2; grid-column: 1; }
 .canvas-arrange { position: relative; z-index: 2; display: flex; align-self: start; justify-self: end; margin: var(--gap-3) var(--gap-3) 0 0; }
-#canvas-arrange { height: var(--canvas-arrange-height); gap: var(--gap-2); border-radius: var(--radius-pill); padding: 0 var(--gap-4) 0 calc((var(--canvas-arrange-height) - var(--canvas-arrange-well)) / 2); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: inset 0 1px 0 var(--canvas-arrange-rim), var(--shadow-raised); color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-medium); }
-#canvas-arrange:hover:not(:disabled) { background: var(--solid); box-shadow: inset 0 1px 0 var(--canvas-arrange-rim), var(--canvas-arrange-shadow-hover); transform: translateY(var(--canvas-arrange-lift)); }
+#canvas-arrange { height: var(--canvas-arrange-height); gap: var(--gap-2); border-radius: var(--radius-pill); padding: 0 var(--gap-4) 0 calc((var(--canvas-arrange-height) - var(--canvas-arrange-well)) / 2); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: inset 0 1px 0 var(--canvas-glass-rim), var(--shadow-raised); color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-medium); }
+#canvas-arrange:hover:not(:disabled) { background: var(--solid); box-shadow: inset 0 1px 0 var(--canvas-glass-rim), var(--canvas-arrange-shadow-hover); transform: translateY(var(--canvas-arrange-lift)); }
 #canvas-arrange:active:not(:disabled) { transform: scale(var(--scale-press)); }
 .canvas-arrange-glyph { display: grid; width: var(--canvas-arrange-well); height: var(--canvas-arrange-well); place-items: center; border-radius: 50%; background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); box-shadow: 0 0 0 0 color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); transition: background-color var(--motion-fast) var(--ease-out), color var(--motion-fast) var(--ease-out), box-shadow var(--motion-base) var(--ease-out); }
 #canvas-arrange:hover:not(:disabled) .canvas-arrange-glyph { background: var(--primary-fill); box-shadow: 0 0 0 var(--canvas-arrange-halo) color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary-foreground); }
@@ -199,7 +204,18 @@
 .canvas-card > .canvas-placeholder { max-width: none; border-radius: var(--radius-card); padding: var(--gap-5) var(--gap-6); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-panel); }
 .canvas-card > .canvas-placeholder p { text-wrap: pretty; }
 .canvas-card > .canvas-placeholder .add-glyph { width: var(--icon-size-sm); height: var(--icon-size-sm); }
-.canvas-card > .state-card { width: 100%; padding: var(--gap-4); }
+.canvas-card > .state-card { width: 100%; padding: var(--gap-4); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: inset 0 1px 0 var(--canvas-glass-rim), var(--shadow-panel); }
+.canvas-card > .state-card[data-busy="true"] { position: relative; overflow: hidden; }
+.state-card[data-busy="true"] .state-glyph { position: relative; background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); }
+.state-ripple { --scale-live-ring: var(--canvas-ripple-scale); position: absolute; inset: 0; border-radius: 50%; box-shadow: 0 0 0 var(--canvas-ripple-ring) var(--primary); opacity: 0; pointer-events: none; }
+.state-card[data-busy="true"]::after { content: ""; position: absolute; right: 0; bottom: 0; left: 0; height: var(--canvas-sweep-height); background: linear-gradient(90deg, transparent 30%, var(--primary), transparent 70%); opacity: 0; transform: translateX(-70%); pointer-events: none; }
+@media (prefers-reduced-motion: no-preference) {
+  .state-ripple { animation: live-ring var(--loop-live) var(--ease-out) infinite; }
+  .state-ripple + .state-ripple { animation-delay: calc(var(--loop-live) / -2); }
+  .state-card[data-busy="true"]::after { animation: canvas-sweep var(--canvas-sweep-loop) var(--ease-in-out) infinite; }
+  :root[data-window-idle="true"] .state-ripple, :root[data-window-idle="true"] .state-card[data-busy="true"]::after { animation-play-state: paused; }
+}
+@keyframes canvas-sweep { 0% { opacity: 0; transform: translateX(-70%); } 30%, 70% { opacity: 1; } 100% { opacity: 0; transform: translateX(70%); } }
 
 /* Banners: one refined card each at the top of the canvas, tone glyph, title, a line of body and the
    actions at the right. They glide in and out (accordion.mjs presence). */

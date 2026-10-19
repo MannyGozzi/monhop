@@ -40,6 +40,7 @@ import {
   motionMs,
   motionToken,
   note,
+  platformIcon,
   row,
   rows,
   setLabel,
@@ -589,6 +590,7 @@ function waitingView(ctx, stage) {
     });
     return { element, update() {} };
   }
+  const computer = ctx.studio.canvasComputer;
   return pictureView(ctx, stage, {
     view: "waiting",
     slot: (context) => ({ title: context.peerName, detail: "Its displays appear once connected" }),
@@ -601,7 +603,7 @@ function waitingView(ctx, stage) {
         node: stateCard({
           id: "canvas-waiting",
           tone,
-          iconName: "triangle-alert",
+          iconName: tone === "error" ? "triangle-alert" : platformIcon(computer?.platform),
           title,
           detail: status.detail,
         }),
