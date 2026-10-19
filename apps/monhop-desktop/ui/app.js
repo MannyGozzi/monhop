@@ -423,6 +423,15 @@ function glideShell() {
       ),
     ];
   });
+  // The caption buttons belong to the window's edge, so they cancel the workspace's slide.
+  const shift = before[stretched.length].left - after[stretched.length].left;
+  if (Math.abs(shift) >= 0.5 && nodes.windowControls.getClientRects().length)
+    shellGlides.push(
+      nodes.windowControls.animate(
+        [{ transform: `translateX(${-shift}px)` }, { transform: "none" }],
+        timing,
+      ),
+    );
 }
 
 // Hidden or unfocused, the window holds its endless loops still: CSS pauses them under

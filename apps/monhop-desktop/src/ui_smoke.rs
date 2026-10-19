@@ -66,9 +66,12 @@ const RENDER_CHECK: &str = r#"(() => {
   const scheme = getComputedStyle(document.documentElement).colorScheme;
   const color = getComputedStyle(document.body).color.match(/\d+/g)?.slice(0, 3).map(Number);
   const background = getComputedStyle(document.body).backgroundColor.match(/\d+/g)?.slice(0, 3).map(Number);
+  // A width change glides the shell into place, so the layout is judged once every finite motion ends.
+  const settled = document.getAnimations().every(animation => animation.playState !== 'running'
+    || animation.effect?.getTiming().iterations === Infinity);
   return [
     document.readyState === 'complete' && Math.abs(innerWidth - EXPECTED_WIDTH) < 1
-      && innerHeight > 0 && innerHeight <= MAXIMUM_HEIGHT,
+      && innerHeight > 0 && innerHeight <= MAXIMUM_HEIGHT && settled,
     visible(title) && title.textContent.trim().length > 0 && inViewport(toolbar)
       && toolbar.getBoundingClientRect().top === 0
       && document.documentElement.dataset.platform === window.__MONHOP_PLATFORM__,
