@@ -406,7 +406,7 @@ html[data-platform="macos"] .sidebar-top { justify-content: flex-end; padding-le
 .toolbar .button .toolbar-glyph svg { width: var(--icon-size-sm); height: var(--icon-size-sm); }
 .pause-bars { width: calc(var(--pause-bar-width) * 3); height: var(--pause-bar-height); border-inline: var(--pause-bar-width) solid currentColor; }
 .toolbar .button .pause-glyph svg { fill: currentColor; }
-#toolbar-pause:not([data-mode="resume"]) .pause-glyph svg, #toolbar-pause[data-mode="resume"] .pause-bars { opacity: 0; transform: scale(var(--scale-pop)); transition: opacity var(--motion-fast) var(--ease-in-out), transform var(--motion-spring) var(--ease-spring); }
+#toolbar-pause[data-mode="pause"] .pause-glyph svg, #toolbar-pause:not([data-mode="pause"]) .pause-bars { opacity: 0; transform: scale(var(--scale-pop)); transition: opacity var(--motion-fast) var(--ease-in-out), transform var(--motion-spring) var(--ease-spring); }
 /* Tooltips under toolbar controls: why the network is locked, and each button's name once it is only a glyph. */
 .toolbar-tooltip { position: absolute; z-index: 7; top: calc(100% + var(--gap-2)); right: 0; width: max-content; max-width: var(--tooltip-max-width); border-radius: var(--radius); padding: var(--gap-1) var(--gap-2); background: var(--surface-raised); box-shadow: var(--shadow-raised); color: var(--foreground); font-size: var(--text-sm); line-height: var(--leading-tight); opacity: 0; pointer-events: none; transform: scale(var(--scale-enter)); transform-origin: top right; transition: opacity var(--motion-fast) var(--ease-in-out), transform var(--motion-fast) var(--ease-out); }
 .toolbar-tooltip:empty { display: none; }
@@ -417,7 +417,7 @@ html[data-platform="macos"] .sidebar-top { justify-content: flex-end; padding-le
 @container toolbar-actions (max-width: 400px) {
   .toolbar-slot .button { width: var(--control-height-sm); padding: 0; }
   .toolbar-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-  :is(#arrange-slot, #pause-slot):is(:hover, :focus-within) > .toolbar-tooltip { opacity: 1; transform: none; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
+  #pause-slot:is(:hover, :focus-within) > .toolbar-tooltip { opacity: 1; transform: none; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
 }
 
 /* The network menu stays in the page; it fades and drops in from the chip, and back out. */

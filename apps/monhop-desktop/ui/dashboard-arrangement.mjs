@@ -391,13 +391,16 @@ export function createLocalPicture(reported, names = {}) {
 
 // `names.statuses`, keyed by member, gives each label its state dot and words, and marks a computer
 // that cannot be reached as offline. `names.quiet` lists members drawn quietly, and `names.slot`
-// ({title, detail}) adds the dashed place a computer still pairing will take. `names.motion`
-// carries dom.mjs's motion helpers; without it the picture never moves.
+// ({title, detail}) adds the dashed place a computer still pairing will take. `names.live` says
+// whether sharing runs across the crossings; left out, they are drawn lit. `names.motion` carries
+// dom.mjs's motion helpers; without it the picture never moves.
 function createPicture(content, names) {
   const root = document.createElement("figure");
   root.className = "dashboard-arrangement-preview";
   root.dataset.size = "canvas";
   root.dataset.state = "saved";
+  let live = names.live;
+  setData(root, "live", liveData(live));
   const svg = svgNode("svg");
   svg.classList.add("dashboard-arrangement-canvas");
   svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
@@ -525,6 +528,10 @@ function createPicture(content, names) {
   // A poll that changes only a computer's state restyles the nodes in place, so CSS eases the
   // change; a slot coming or going changes the fit, so the picture is redrawn and glides.
   function update(next = {}) {
+    const woke = live === false && next.live === true;
+    live = next.live;
+    setData(root, "live", liveData(live));
+    if (woke) seams.wake();
     const nextSlot = next.slot ?? null;
     looks = pictureLooks(content, next);
     if (!drawn) return;
@@ -623,6 +630,10 @@ function sameLabelPlace(a, b) {
     (a.detail?.status ?? "") === (b.detail?.status ?? "") &&
     Boolean(a.detail?.tone) === Boolean(b.detail?.tone)
   );
+}
+
+function liveData(live) {
+  return typeof live === "boolean" ? String(live) : null;
 }
 
 function setData(node, name, value) {

@@ -415,6 +415,7 @@ export function createSeamOverlay(motion = null) {
     seam.knob.dataset.axis = place.axis;
     seam.knob.hidden = !place.knob;
     if (place.knob) seam.knob.style.transform = knobTransform(place.knob);
+    seam.bar.style.setProperty("--seam-fill-at", fillOrigin(place));
   }
 
   // Lays out `places`; a crossing that is gone fades where it stands. Returns the keys drawn for
@@ -521,7 +522,26 @@ export function createSeamOverlay(motion = null) {
     hide: (hidden) => {
       element.dataset.hidden = String(hidden);
     },
+    // Sharing just started: a ring leaves each handle as its crossing lights up from there.
+    wake: () => {
+      if (!motion?.enabled()) return;
+      for (const seam of shown.values()) {
+        if (seam.knob.hidden || !seam.place?.knob) continue;
+        const ring = document.createElement("div");
+        ring.className = "seam-pulse";
+        ring.style.translate = knobTranslate(seam.place.knob);
+        lanes.knob.prepend(ring);
+        ring.addEventListener("animationend", () => ring.remove(), { once: true });
+      }
+    },
   };
+}
+
+// Where along its crossing the light fills from and drains to: the handle, else the middle.
+function fillOrigin(place) {
+  if (!place.knob || !(place.length > 0)) return "50%";
+  const along = place.axis === "v" ? place.knob.y - place.y : place.knob.x - place.x;
+  return `${round(Math.min(1, Math.max(0, along / place.length)) * 100)}%`;
 }
 
 function setSeamTone(seam, off) {
@@ -537,6 +557,10 @@ function barTransform({ x, y }, scale = null) {
 
 function knobTransform({ x, y }) {
   return `translate(${round(x)}px, ${round(y)}px)`;
+}
+
+function knobTranslate({ x, y }) {
+  return `${round(x)}px ${round(y)}px`;
 }
 
 function swapGlyph() {

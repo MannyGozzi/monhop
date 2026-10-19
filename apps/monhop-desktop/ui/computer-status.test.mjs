@@ -30,7 +30,7 @@ test("a computer nobody is using reads as paired, whatever the live connection i
   assert.equal(standby.key, "standby");
   assert.equal(standby.label, "Paired");
   assert.equal(standby.tone, "neutral");
-  assert.equal(standby.detail, "Off. Turn it on to share with it.");
+  assert.equal(standby.detail, "Not sharing with it.");
   assert.equal(isLiveStatus(standby), false);
 });
 
@@ -383,7 +383,7 @@ test("the header pill names the computer in use, or why there is nothing to repo
   );
   const none = activeStatus({ computers, sharingView: null, active: null, nativeAvailable: true });
   assert.equal(none.label, "Not sharing");
-  assert.equal(none.detail, "Turn on a computer to share with it.");
+  assert.equal(none.detail, "Press Start sharing to begin.");
   assert.equal(
     activeStatus({
       computers: initialComputers(),
@@ -615,7 +615,7 @@ test("zero and one enabled computers keep today's exact wording even with an `en
     localName: LOCAL_NAME,
   });
   assert.equal(zero.label, "Not sharing");
-  assert.equal(zero.detail, "Turn on a computer to share with it.");
+  assert.equal(zero.detail, "Press Start sharing to begin.");
 
   const one = activeStatus({
     computers,

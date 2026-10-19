@@ -232,12 +232,17 @@ test("arranging stays on while the link waits for Apply, and the toolbar's Arran
       .arrange,
     null,
   );
+  // A computer not placed yet offers Arrange on its own card instead.
+  assert.equal(
+    toolbarState({ ...canvas, arrange: arrangeState({}), canArrange: true, placed: false }).arrange,
+    null,
+  );
   // The Apply bar's own button is the one way out, so the toolbar offers nothing while arranging.
   for (const arrange of [arrangeState({ editing: true }), arrangeState({ requested: true })])
     assert.equal(toolbarState({ ...canvas, arrange, canArrange: true }).arrange, null);
 });
 
-test("the toolbar titles the view and offers Pause, Resume or neither", () => {
+test("the toolbar titles the view and offers Start, Pause, Resume or nothing", () => {
   const arrange = arrangeState({});
   const settings = toolbarState({ selection: SETTINGS, arrange, enabledCount: 1 });
   assert.equal(settings.title, "Settings");
@@ -250,7 +255,12 @@ test("the toolbar titles the view and offers Pause, Resume or neither", () => {
     toolbarState({ selection: LOCAL, arrange, enabledCount: 1, paused: true }).pause,
     "resume",
   );
-  // Nothing switched on: no group to pause or resume; the computer's own switch is the way in.
+  // Nothing switched on: Start shares with a paired computer; with none paired there is nothing to start.
+  assert.equal(toolbarState({ selection: LOCAL, arrange, pairedCount: 1 }).pause, "start");
+  assert.equal(
+    toolbarState({ selection: LOCAL, arrange, pairedCount: 2, paused: true }).pause,
+    "start",
+  );
   assert.equal(toolbarState({ selection: LOCAL, arrange }).pause, null);
   assert.equal(toolbarState({ selection: LOCAL, arrange, paused: true }).pause, null);
 });

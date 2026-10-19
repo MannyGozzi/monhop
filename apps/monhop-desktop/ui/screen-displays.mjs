@@ -336,9 +336,15 @@ function localStatus(ctx) {
   return local ? { label: local.label, tone: local.tone } : null;
 }
 
+// `live` while input crosses to this computer, which lights the crossings on the canvas.
 function peerStatus(ctx, computer) {
   const status = computerStatus(computer, ctx.sharing.view, ctx.active, localName(ctx));
-  return { label: status.label, tone: status.tone, offline: OFFLINE_KEYS.has(status.key) };
+  return {
+    label: status.label,
+    tone: status.tone,
+    offline: OFFLINE_KEYS.has(status.key),
+    live: isSessionStatus(status),
+  };
 }
 
 // A pairing on screen draws the place the new computer will take, and quiets the others; once it
@@ -358,15 +364,19 @@ function savedView(ctx, stage) {
   });
   let setupKey = null;
   let picture = null;
-  const pictureNames = (context) => ({
-    local: localName(context),
-    peer: displayName(computer),
-    localPlatform: localPlatformOf(context),
-    peerPlatform: computer.platform,
-    statuses: { local: localStatus(context), peer: peerStatus(context, computer) },
-    quiet: pairingLive(context) ? ["peer"] : [],
-    slot: pairingLive(context) ? SLOT_COPY : null,
-  });
+  const pictureNames = (context) => {
+    const peer = peerStatus(context, computer);
+    return {
+      local: localName(context),
+      peer: displayName(computer),
+      localPlatform: localPlatformOf(context),
+      peerPlatform: computer.platform,
+      statuses: { local: localStatus(context), peer },
+      live: peer.live,
+      quiet: pairingLive(context) ? ["peer"] : [],
+      slot: pairingLive(context) ? SLOT_COPY : null,
+    };
+  };
   function update(context) {
     const current = findComputer(context.computers, computer.fingerprint) ?? computer;
     const key = JSON.stringify(current.setup ?? null);

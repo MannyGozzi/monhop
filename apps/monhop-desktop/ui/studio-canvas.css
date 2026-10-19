@@ -24,7 +24,13 @@
   --canvas-seam-glow-width: 7px;
   --canvas-seam-glow-blur: 4px;
   --canvas-seam-glow-opacity: .55;
-  --canvas-seam-off-opacity: .5;
+  /* At rest the crossing drains to a quiet groove; sharing fills it back out from the handle with
+     a ring leaving the handle, and a soft accent light pools under the displays. */
+  --canvas-seam-rest: color-mix(in oklab, var(--subtle-foreground) 55%, transparent);
+  --canvas-seam-fill: 620ms;
+  --canvas-seam-pulse: 900ms;
+  --canvas-seam-pulse-ring: 1.5px;
+  --canvas-live-halo: light-dark(color-mix(in oklab, var(--primary) 8%, transparent), color-mix(in oklab, var(--primary) 13%, transparent));
   --canvas-seam-flow-loop: 2800ms;
   --canvas-seam-flow-length: 46%;
   --canvas-seam-highlight: oklch(1 0 0 / 90%);
@@ -44,6 +50,13 @@
   --canvas-chevron-open: 90deg;
   --canvas-swatch: 8px;
   --canvas-card-y: 0px;
+  /* Arrange floats over the canvas on frosted glass, its glyph in an accent well. */
+  --canvas-arrange-height: 34px;
+  --canvas-arrange-well: 24px;
+  --canvas-arrange-rim: light-dark(oklch(1 0 0 / 70%), oklch(1 0 0 / 7%));
+  --canvas-arrange-lift: -1px;
+  --canvas-arrange-tilt: -8deg;
+  --canvas-arrange-shadow-hover: 0 0 0 .5px var(--hairline-strong), 0 2px 4px light-dark(oklch(.2 .01 275 / 10%), oklch(0 0 0 / 45%)), 0 12px 28px -10px light-dark(oklch(.2 .01 275 / 22%), oklch(0 0 0 / 65%));
 }
 :root[data-theme="dark"] { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); --canvas-seam-highlight: oklch(1 0 0 / 85%); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); --canvas-seam-highlight: oklch(1 0 0 / 85%); } }
@@ -58,6 +71,8 @@
 .canvas-view:is([data-view="saved"], [data-view="empty"], [data-view="unarranged"], [data-view="waiting"], [data-view="blocked"]) { position: absolute; inset: 0; display: block; min-height: 0; padding: 0; }
 .canvas-stage > [data-exit="true"] { pointer-events: none; }
 .canvas-picture, .dashboard-arrangement-preview[data-size="canvas"] { position: absolute; inset: 0; display: block; margin: 0; }
+.dashboard-arrangement-preview[data-size="canvas"]::before { content: ""; position: absolute; inset: 0; background: radial-gradient(closest-side, var(--canvas-live-halo), transparent); opacity: 0; pointer-events: none; transition: opacity var(--motion-slow) var(--ease-in-out); }
+.dashboard-arrangement-preview[data-live="true"]::before { opacity: 1; transition: opacity var(--canvas-seam-fill) var(--ease-out); }
 .dashboard-arrangement-preview[data-size="canvas"] .dashboard-arrangement-canvas { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
 .canvas-view > .dashboard-arrangement-preview[data-state="unavailable"] { position: absolute; top: 50%; left: 50%; width: min(calc(100% - var(--gap-8)), var(--canvas-card-width)); translate: -50% -50%; border-radius: var(--radius-card); padding: var(--gap-4) var(--gap-5); background: var(--panel); box-shadow: var(--shadow-panel); }
 .arrangement-scene { transform-box: view-box; transform-origin: 0 0; }
@@ -105,25 +120,31 @@
 .seam-overlay[data-hidden="true"] { opacity: 0; transition: opacity var(--motion-fast) var(--ease-in-out); }
 .seam-layer, .seam-lane { position: absolute; inset: 0; transform-origin: 0 0; }
 .seam-bar, .seam-glow { position: absolute; top: 0; left: 0; border-radius: var(--radius-pill); transform-origin: 0 0; }
-.seam-bar { overflow: hidden; background-color: var(--primary); box-shadow: 0 0 0 calc((var(--canvas-seam-groove) - var(--canvas-seam-width)) / 2) var(--tile-bezel); transition: background-color var(--motion-base) var(--ease-out), opacity var(--motion-base) var(--ease-out); }
+.seam-bar { overflow: hidden; background-color: var(--canvas-seam-rest); box-shadow: 0 0 0 calc((var(--canvas-seam-groove) - var(--canvas-seam-width)) / 2) var(--tile-bezel); transition: opacity var(--motion-base) var(--ease-out); }
 .seam-bar[data-axis="v"] { width: var(--canvas-seam-width); margin-left: calc(var(--canvas-seam-width) / -2); }
 .seam-bar[data-axis="h"] { height: var(--canvas-seam-width); margin-top: calc(var(--canvas-seam-width) / -2); }
-.seam-glow { background-color: var(--primary); opacity: var(--canvas-seam-glow-opacity); filter: blur(var(--canvas-seam-glow-blur)); transition: opacity var(--motion-base) var(--ease-out); }
+.seam-glow { background-color: var(--primary); opacity: var(--canvas-seam-glow-opacity); filter: blur(var(--canvas-seam-glow-blur)); transition: opacity var(--motion-slow) var(--ease-out) var(--motion-base); }
 .seam-glow[data-axis="v"] { width: var(--canvas-seam-glow-width); margin-left: calc(var(--canvas-seam-glow-width) / -2); }
 .seam-glow[data-axis="h"] { height: var(--canvas-seam-glow-width); margin-top: calc(var(--canvas-seam-glow-width) / -2); }
-.seam-bar[data-tone="off"] { background-color: var(--subtle-foreground); opacity: var(--canvas-seam-off-opacity); }
-.seam-glow[data-tone="off"] { opacity: 0; }
+/* A working crossing is lit outward from its handle; one at rest or out of reach drains back to it. */
+.seam-bar::before { content: ""; position: absolute; inset: 0; background-color: var(--primary); transform-origin: 50% var(--seam-fill-at, 50%); transition: transform var(--canvas-seam-fill) var(--ease-out); }
+.seam-bar[data-axis="h"]::before { transform-origin: var(--seam-fill-at, 50%) 50%; }
+[data-live="false"] .seam-bar[data-axis="v"]::before, .seam-bar[data-axis="v"][data-tone="off"]::before { transform: scaleY(0); transition: transform var(--motion-slow) var(--ease-in-out); }
+[data-live="false"] .seam-bar[data-axis="h"]::before, .seam-bar[data-axis="h"][data-tone="off"]::before { transform: scaleX(0); transition: transform var(--motion-slow) var(--ease-in-out); }
+.seam-glow[data-tone="off"], [data-live="false"] .seam-glow { opacity: 0; transition: opacity var(--motion-fast) var(--ease-in-out); }
 .seam-knob { position: absolute; top: 0; left: 0; display: grid; width: var(--seam-knob-size); height: var(--seam-knob-size); margin: calc(var(--seam-knob-size) / -2) 0 0 calc(var(--seam-knob-size) / -2); place-items: center; border-radius: 50%; background: var(--solid); box-shadow: 0 0 0 var(--canvas-handle-stroke) var(--primary); color: var(--primary); filter: var(--canvas-handle-shadow); transition: box-shadow var(--motion-base) var(--ease-out), color var(--motion-base) var(--ease-out); }
-.seam-knob[data-tone="off"] { box-shadow: 0 0 0 var(--canvas-handle-stroke) var(--hairline-strong); color: var(--subtle-foreground); }
+.seam-knob[data-tone="off"], [data-live="false"] .seam-knob { box-shadow: 0 0 0 var(--canvas-handle-stroke) var(--hairline-strong); color: var(--subtle-foreground); }
 .seam-glyph { width: calc(var(--seam-knob-size) / 2); height: calc(var(--seam-knob-size) / 2); fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: var(--canvas-handle-glyph); }
 .seam-knob[data-axis="h"] .seam-glyph { rotate: 90deg; }
+.seam-pulse { position: absolute; top: 0; left: 0; width: var(--seam-knob-size); height: var(--seam-knob-size); margin: calc(var(--seam-knob-size) / -2) 0 0 calc(var(--seam-knob-size) / -2); border-radius: 50%; box-shadow: 0 0 0 var(--canvas-seam-pulse-ring) var(--primary); pointer-events: none; animation: live-ring var(--canvas-seam-pulse) var(--ease-out) both; }
 /* The light: a soft streak runs the length of a working crossing, then rests. */
-.seam-bar::after { content: ""; position: absolute; top: 0; left: 0; width: 100%; height: var(--canvas-seam-flow-length); background: linear-gradient(transparent, var(--canvas-seam-highlight), transparent); opacity: 0; transform: translateY(-110%); }
+.seam-bar::after { content: ""; position: absolute; top: 0; left: 0; width: 100%; height: var(--canvas-seam-flow-length); background: linear-gradient(transparent, var(--canvas-seam-highlight), transparent); opacity: 0; transform: translateY(-110%); transition: opacity var(--motion-slow) var(--ease-out); }
 .seam-bar[data-axis="h"]::after { width: var(--canvas-seam-flow-length); height: 100%; background: linear-gradient(90deg, transparent, var(--canvas-seam-highlight), transparent); transform: translateX(-110%); }
 @media (prefers-reduced-motion: no-preference) {
   .seam-bar:not([data-tone="off"])::after { opacity: 1; animation: canvas-seam-flow-v var(--canvas-seam-flow-loop) var(--ease-in-out) var(--seam-flow-phase, 0ms) infinite; }
   .seam-bar[data-axis="h"]:not([data-tone="off"])::after { animation-name: canvas-seam-flow-h; }
   :root[data-window-idle="true"] .seam-bar::after { animation-play-state: paused; }
+  [data-live="false"] .seam-bar::after { opacity: 0; animation-play-state: paused; transition: opacity var(--motion-fast) var(--ease-in-out); }
 }
 @keyframes canvas-seam-flow-v { 0% { transform: translateY(-110%); } 60%, 100% { transform: translateY(230%); } }
 @keyframes canvas-seam-flow-h { 0% { transform: translateX(-110%); } 60%, 100% { transform: translateX(230%); } }
@@ -156,6 +177,15 @@
 .arrangement-legend-item[data-kind="shared"] .arrangement-legend-swatch { color: var(--muted-foreground); }
 @container canvas-stage (max-width: 520px) { .arrangement-legend-item:is([data-kind="primary"], [data-kind="shared"], [data-kind="seam"]) { display: none; } }
 .canvas-stage { container: canvas-stage / size; }
+
+/* Arrange floats in the stage's top right corner; its glyph brightens and tips toward the pointer. */
+.canvas-stage, .canvas-arrange { grid-row: 2; grid-column: 1; }
+.canvas-arrange { position: relative; z-index: 2; display: flex; align-self: start; justify-self: end; margin: var(--gap-3) var(--gap-3) 0 0; }
+#canvas-arrange { height: var(--canvas-arrange-height); gap: var(--gap-2); border-radius: var(--radius-pill); padding: 0 var(--gap-4) 0 calc((var(--canvas-arrange-height) - var(--canvas-arrange-well)) / 2); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: inset 0 1px 0 var(--canvas-arrange-rim), var(--shadow-raised); color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-medium); }
+#canvas-arrange:hover:not(:disabled) { background: var(--solid); box-shadow: inset 0 1px 0 var(--canvas-arrange-rim), var(--canvas-arrange-shadow-hover); transform: translateY(var(--canvas-arrange-lift)); }
+#canvas-arrange:active:not(:disabled) { transform: scale(var(--scale-press)); }
+.canvas-arrange-glyph { display: grid; width: var(--canvas-arrange-well); height: var(--canvas-arrange-well); place-items: center; border-radius: 50%; background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); transition: background-color var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring); }
+#canvas-arrange:hover:not(:disabled) .canvas-arrange-glyph { background: color-mix(in oklab, var(--primary) var(--mix-tint-strong), transparent); transform: rotate(var(--canvas-arrange-tilt)); }
 
 /* A note that the arrangement just applied, floating at the top of the stage. */
 .canvas-toast { position: absolute; top: var(--gap-3); left: 50%; display: inline-flex; align-items: center; gap: var(--gap-2); max-width: calc(100% - var(--gap-8)); margin: 0; border-radius: var(--radius-pill); padding: var(--gap-1) var(--gap-3) var(--gap-1) var(--gap-1); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-chip); color: var(--muted-foreground); font-size: var(--text-sm); white-space: nowrap; translate: -50% 0; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-spring) var(--ease-spring), visibility 0s linear 0s; }

@@ -127,7 +127,7 @@ function sharingCard(ctx) {
   const pause = button("", {
     variant: "secondary",
     size: "sm",
-    disabled: busy || toolbar.pause === null,
+    disabled: busy || toolbar.pause === null || toolbar.pause === "start",
     focusKey: "settings-pause",
     onClick: resume ? actions.resumeSharing : actions.pauseSharing,
   });

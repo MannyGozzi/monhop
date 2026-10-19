@@ -15,7 +15,6 @@ import { clipboardLine } from "./studio-model.mjs";
 import { inspectorHeader } from "./screen-ready.mjs";
 import { pairBadgeLabel } from "./pair-badge-model.mjs";
 import {
-  ARRANGE_PAUSES,
   computerMeta,
   computerTone,
   controlSwitchRows,
@@ -229,8 +228,9 @@ function localName(ctx) {
 
 // --- state ----------------------------------------------------------------------
 
-// One state, one control: the label with its tone dot, a spinner while it is on its way, the
-// switch that shares with this computer, and what the state means.
+// The state: the label with its tone dot, a spinner while it is on its way, and what the state
+// means. The toolbar's button starts, pauses and resumes sharing; once two or more computers are
+// paired, a switch here picks which of them share.
 function stateBlock(ctx, computer, { name, status, enabled, on, key }) {
   const release =
     enabled && status.key === "sharing"
@@ -264,7 +264,7 @@ function stateBlock(ctx, computer, { name, status, enabled, on, key }) {
             }),
             spinning ? "spin" : "rest",
           ),
-          shareSwitch(ctx, computer, name, on),
+          ctx.computers.items.length > 1 ? shareSwitch(ctx, computer, name, on) : null,
         ],
       }),
       fadingText(`${key}-state-detail`, "computer-state-detail", status.detail),
@@ -360,18 +360,9 @@ function clipboardSection(ctx, computer, name, key) {
 // --- arrangement and saved arrangements -------------------------------------------
 
 // The canvas draws the displays; here is the way into Arrange and the arrangements kept with this computer.
+// Arrange itself floats over the canvas; the saved arrangements to load stay here.
 function arrangementSection(ctx, computer, key) {
-  const { actions, busy, arrange, studio } = ctx;
-  const arrangeButton = button("Arrange", {
-    variant: "secondary",
-    size: "sm",
-    disabled: busy || arrange.active || !studio.canArrange,
-    focusKey: `inspector-arrange-${computer.fingerprint}`,
-    onClick: () => actions.arrangeWith(computer.fingerprint),
-  });
-  if (isSessionActive(ctx.sharing)) arrangeButton.title = ARRANGE_PAUSES;
   return section("Arrangement", [layoutsDisclosure(ctx, computer, key)], {
-    actions: [arrangeButton],
     className: "computer-arrangement",
   });
 }

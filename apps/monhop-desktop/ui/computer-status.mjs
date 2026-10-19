@@ -114,8 +114,7 @@ function peerStatus(peer, sharingView, name, localName) {
 // Today's single-peer reply: `sharingView` itself names the one computer it is live with.
 function legacyStatus(fingerprint, name, phase, message, sharingView, active, localName) {
   const live = Boolean(fingerprint) && sharingView?.peerFingerprint === fingerprint;
-  if (!live && active !== fingerprint)
-    return status("standby", "Paired", "Off. Turn it on to share with it.");
+  if (!live && active !== fingerprint) return status("standby", "Paired", "Not sharing with it.");
   if (!live) {
     if (phase === "error" && message) return status("error", "Can't connect", message);
     if (phase === "off" && message) return offStatus(message);
@@ -185,9 +184,7 @@ export function activeStatus({
     return status(
       "none",
       "Not sharing",
-      computers.items.length
-        ? "Turn on a computer to share with it."
-        : "Pair a computer to get started.",
+      computers.items.length ? "Press Start sharing to begin." : "Pair a computer to get started.",
     );
   return computerStatus(computer, sharingView, single, localName);
 }

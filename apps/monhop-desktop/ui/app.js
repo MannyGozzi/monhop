@@ -223,6 +223,9 @@ let chosen = selectionFromKey(window.MONHOP_SELECT);
 let shownSelectionKey = null;
 // The computer in use before Pause, which Resume brings back.
 let lastActive = null;
+// The toolbar's one sharing button, by what it does now.
+const SHARING_LABELS = { start: "Start sharing", pause: "Pause sharing", resume: "Resume" };
+const SHARING_ACTIONS = { start: startSharing, pause: pauseSharing, resume: resumeSharing };
 // Arrange was pressed and the editor is on its way; the backend's own editing flag takes over.
 let arrangeRequested = false;
 // The computer Arrange switched on to open the link; leaving without applying switches it off again.
@@ -671,6 +674,7 @@ function studioContext(status, active) {
     requested: arrangeRequested,
   });
   const canvasPrint = canvasFingerprint({ selection, active, fingerprints });
+  const canvasComputer = findComputer(computers, canvasPrint);
   const canArrange = Boolean(canvasPrint) && canArrangeNow();
   const paused = isPaused({ sharingView: sharing.view, computers });
   const step = pairingStep(pairing);
@@ -697,10 +701,18 @@ function studioContext(status, active) {
       pairingPhase: pairing.view?.phase ?? null,
       paired: pairedOnScreen({ selection, pairingStep: step, view: pairing.view }),
     }),
-    canvasComputer: findComputer(computers, canvasPrint),
+    canvasComputer,
     canArrange,
     arrange,
-    toolbar: toolbarState({ selection, arrange, canArrange, enabledCount: enabled.length, paused }),
+    toolbar: toolbarState({
+      selection,
+      arrange,
+      canArrange,
+      placed: canvasComputer?.setup?.saved === true,
+      enabledCount: enabled.length,
+      pairedCount: fingerprints.length,
+      paused,
+    }),
     paused,
   };
 }
@@ -1062,32 +1074,32 @@ function mountStaticGlyphs() {
   nodes.sidebarRefresh.replaceChildren(refresh);
 }
 
-// The toolbar's buttons outlive renders, so hover, focus and a label mid-change carry on. Pause
-// draws both of its glyphs and cross-fades between them; short of room, a tooltip names each one.
+// The toolbar's buttons, and Arrange floating over the canvas, outlive renders, so hover, focus and
+// a label mid-change carry on. The sharing button draws both of its glyphs and cross-fades between
+// them; short of room, a tooltip names each one.
 function createToolbarControls() {
   const arrange = button("", {
     variant: "secondary",
-    size: "sm",
-    focusKey: "toolbar-arrange",
+    focusKey: "canvas-arrange-float",
     onClick: () => arrangeWith(),
   });
-  arrange.id = "toolbar-arrange";
+  arrange.id = "canvas-arrange";
   arrange.append(
     el("span", {
-      className: "toolbar-glyph",
+      className: "canvas-arrange-glyph",
       attrs: { "aria-hidden": "true" },
-      children: [icon("monitor", 12)],
+      children: [icon("monitor", 14)],
     }),
-    el("span", { className: "toolbar-label", text: "Arrange" }),
+    el("span", { className: "canvas-arrange-label", text: "Arrange" }),
   );
   const pause = button("", {
     variant: "secondary",
     size: "sm",
     focusKey: "toolbar-pause",
-    onClick: () => (toolbarControls.pauseMode === "resume" ? resumeSharing() : pauseSharing()),
+    onClick: () => SHARING_ACTIONS[toolbarControls.pauseMode]?.(),
   });
   pause.id = "toolbar-pause";
-  // Bars to pause, a triangle to resume.
+  // Bars to pause, a triangle to start or resume.
   const pauseLabel = el("span", { className: "toolbar-label", text: "Pause sharing" });
   pause.append(
     el("span", {
@@ -1097,7 +1109,7 @@ function createToolbarControls() {
     }),
     pauseLabel,
   );
-  const arrangeTip = toolbarTooltip("toolbar-arrange-tooltip", arrange);
+  const arrangeTip = toolbarTooltip("canvas-arrange-tooltip", arrange);
   const pauseTip = toolbarTooltip("toolbar-pause-tooltip", pause);
   // Below the overlay width a closed details sheet comes back from here.
   const details = iconButton({
@@ -1138,29 +1150,26 @@ function renderToolbar(ctx) {
   }
   toolbarControls.pauseMode = toolbar.pause;
   if (toolbar.pause) {
-    const label = toolbar.pause === "resume" ? "Resume" : "Pause sharing";
+    const label = SHARING_LABELS[toolbar.pause];
     setLabel(pauseLabel, label);
     pauseTip.textContent = label;
     pause.dataset.mode = toolbar.pause;
+    // While sharing the button steps back; at rest it is the way in, in the accent.
+    pause.dataset.variant = toolbar.pause === "pause" ? "secondary" : "primary";
     pause.disabled = busy;
   }
-  const movers = [nodes.networkSlot];
-  setSlotPresent(nodes.arrangeSlot, canvas && toolbar.arrange !== null, movers, {
+  setSlotPresent(nodes.arrangeSlot, canvas && toolbar.arrange !== null, [], {
     focusTarget: nodes.networkChip,
   });
-  setSlotPresent(
-    nodes.pauseSlot,
-    canvas && toolbar.pause !== null,
-    [...movers, nodes.arrangeSlot],
-    {
-      focusTarget: nodes.networkChip,
-    },
-  );
+  const movers = [nodes.networkSlot];
+  setSlotPresent(nodes.pauseSlot, canvas && toolbar.pause !== null, movers, {
+    focusTarget: nodes.networkChip,
+  });
   const sheet = presentInspector(studio.inspectorKind);
   setSlotPresent(
     nodes.detailsSlot,
     canvas && sheet.mode === "overlay" && studio.inspectorKind !== null && !sheet.open,
-    [...movers, nodes.arrangeSlot, nodes.pauseSlot],
+    [...movers, nodes.pauseSlot],
     { focusTarget: nodes.inspectorClose },
   );
   renderNetworkChip(ctx);
@@ -1305,6 +1314,16 @@ function resumeSharing() {
   const target = resumeTarget({
     lastActive,
     enabled: resolveEnabledList(sharing.view, computers, activeFingerprint()),
+  });
+  if (target) void setComputerEnabled(target, true);
+}
+
+// Nothing switched on: share with the computer on the canvas, else the one last in use.
+function startSharing() {
+  const target = canvasFingerprint({
+    selection: currentSelection(),
+    active: lastActive,
+    fingerprints: computers.items.map((item) => item.fingerprint),
   });
   if (target) void setComputerEnabled(target, true);
 }

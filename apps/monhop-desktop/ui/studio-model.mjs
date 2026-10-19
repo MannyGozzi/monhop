@@ -234,22 +234,31 @@ export function resumeTarget({ lastActive = null, enabled = [] }) {
   return enabled[0] ?? null;
 }
 
-// The toolbar: Settings keeps only its title; the canvas offers Arrange until arranging starts,
-// where the Apply bar's own button is the way out, and Pause or Resume while a group is switched on.
+// The toolbar: Settings keeps only its title; the canvas offers Arrange over a placed arrangement
+// until arranging starts, where the Apply bar's own button is the way out (an unplaced computer's
+// card has its own). Its one sharing control starts sharing with a paired computer, then pauses
+// and resumes the group that is switched on.
 export function toolbarState({
   selection,
   arrange,
   canArrange = false,
+  placed = true,
   enabledCount = 0,
+  pairedCount = 0,
   paused = false,
 }) {
   const settings = selection?.kind === "settings";
   return {
     title: settings ? "Settings" : "Arrangement",
     canvasActions: !settings,
-    arrange: !arrange.active && canArrange ? "begin" : null,
-    pause: enabledCount > 0 ? (paused ? "resume" : "pause") : null,
+    arrange: !arrange.active && canArrange && placed ? "begin" : null,
+    pause: sharingControl({ enabledCount, pairedCount, paused }),
   };
+}
+
+function sharingControl({ enabledCount, pairedCount, paused }) {
+  if (enabledCount > 0) return paused ? "resume" : "pause";
+  return pairedCount > 0 ? "start" : null;
 }
 
 // What the clipboard switch in Settings means for one computer.
