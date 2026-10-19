@@ -14,11 +14,13 @@ import {
   tileRects,
 } from "./arrangement-model.mjs";
 import {
+  carriedPlace,
   createGroupLabelNode,
   createGroupNode,
   createLegend,
   createRulerNode,
-  createSeamLayer,
+  createSeamOverlay,
+  seamPlaces,
   tileMarks,
   createSlotNode,
   createTilePaint,
@@ -405,7 +407,8 @@ function createPicture(content, names) {
   const scene = svgNode("g");
   scene.classList.add("arrangement-scene");
   svg.append(paint.defs, scene);
-  root.append(svg);
+  const seams = createSeamOverlay(names.motion ?? null);
+  root.append(svg, seams.element);
   if (content.legend.length) root.append(createLegend(content.legend, { tag: "figcaption" }));
 
   const motion = names.motion ?? null;
@@ -438,8 +441,17 @@ function createPicture(content, names) {
     const { fitted, fit } = placeFor(size);
     const { x, y } = heldShift(drawn.fit, fit, boundsOf(fitted));
     drawn.hold = Math.abs(x) < MOVE_EPSILON && Math.abs(y) < MOVE_EPSILON ? null : { size, x, y };
-    const origin = drawn.hold ? `${-x} ${-y}` : "0 0";
-    svg.setAttribute("viewBox", `${origin} ${size.width} ${size.height}`);
+    setViewBox(drawn.hold ? -x : 0, drawn.hold ? -y : 0, size, stage);
+  }
+
+  // `stage` is the canvas's own box, which the viewBox `size` may exceed on a very small canvas.
+  function setViewBox(x, y, size, stage) {
+    svg.setAttribute("viewBox", `${x} ${y} ${size.width} ${size.height}`);
+    seams.frame({ x, y, ...size }, stage);
+  }
+
+  function seamOff(place) {
+    return looks.offTiles.has(place.from) || looks.offTiles.has(place.to);
   }
 
   function draw(stage, { force = false, still = false } = {}) {
@@ -448,7 +460,7 @@ function createPicture(content, names) {
     if (!force && same && !drawn.hold) return;
     const previous = key ? lastDrawn.get(key) : drawn;
     const visual = previous?.scene?.isConnected ? visualOf(previous.scene, previous.hold) : null;
-    svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
+    setViewBox(0, 0, size, stage);
     root.dataset.slot = String(Boolean(slotCopy));
     const { slot, fit, cardTop } = placeFor(size);
     const rects = tileRects(content.tiles, fit);
@@ -475,11 +487,8 @@ function createPicture(content, names) {
         }),
       );
     }
-    const seams = createSeamLayer(content.seams, fit, {
-      offTiles: looks.offTiles,
-      keepClear: tileMarks(content.tiles, rects),
-    });
-    seams.dataset.motionId = "seams";
+    const places = seamPlaces(content.seams, fit, { keepClear: tileMarks(content.tiles, rects) });
+    seams.draw(places, { off: seamOff });
     const extent = boundsOf(rects);
     const ruler =
       content.ruler && extent
@@ -490,7 +499,7 @@ function createPicture(content, names) {
         : null;
     if (ruler) ruler.dataset.motionId = "ruler";
     const slotNode = slot ? slotNodeFor(slot, fit, slotCopy, motion) : null;
-    scene.replaceChildren(groupsLayer, seams, ...[slotNode, ruler].filter(Boolean));
+    scene.replaceChildren(groupsLayer, ...[slotNode, ruler].filter(Boolean));
     const state = {
       size,
       fit,
@@ -499,9 +508,11 @@ function createPicture(content, names) {
       rects,
       groups,
       boxes,
+      places,
       slot,
       slotCopy,
       scene,
+      seams,
       animations: [],
     };
     playMotion(previous, visual, state, still ? null : motion);
@@ -550,12 +561,7 @@ function createPicture(content, names) {
         });
     }
     drawn.boxes = boxes;
-    for (const node of scene.querySelectorAll(".arrangement-seam-run, .arrangement-seam-handle"))
-      setData(
-        node,
-        "tone",
-        looks.offTiles.has(node.dataset.from) || looks.offTiles.has(node.dataset.to) ? "off" : null,
-      );
+    seams.restyle(seamOff);
   }
 
   // The card's height is known only once it is laid out; a picture not yet on screen takes it still.
@@ -652,7 +658,10 @@ function visualOf(scene, hold) {
 // motion still running. The same arrangement refitted glides as one picture from where it is drawn.
 // A changed arrangement glides each display from where it was drawn, and fades in the rest.
 function playMotion(previous, visual, state, motion) {
-  const sceneMotion = () => state.scene.getAnimations?.() ?? [];
+  const sceneMotion = () => [
+    ...(state.scene.getAnimations?.() ?? []),
+    ...(state.seams.layer.getAnimations?.() ?? []),
+  ];
   if (!motion?.enabled()) {
     for (const animation of sceneMotion()) animation.cancel();
     return;
@@ -672,30 +681,31 @@ function playMotion(previous, visual, state, motion) {
     if (previous.scene === state.scene) return;
     for (const { id, animation } of previous.animations) {
       if (animation.playState !== "running") continue;
-      const node =
-        id === "scene" ? state.scene : state.scene.querySelector(`[data-motion-id="${id}"]`);
-      if (node) state.animations.push({ id, animation: motion.copy(animation, node) });
+      const node = id === "scene" ? state.scene : motionNode(state, id);
+      if (!node) continue;
+      // A crossing keeps its nodes across draws, so its glide carries on as it is.
+      const carried = animation.effect?.target === node ? animation : motion.copy(animation, node);
+      state.animations.push({ id, animation: carried });
     }
     return;
   }
   for (const animation of sceneMotion()) animation.cancel();
   if (sameModel) {
     const start = carryTransform(visual.scene, previous.fit, state.fit);
-    if (!restingCarry(start))
-      animate(
-        state.scene,
-        "scene",
-        [
-          { transform: `matrix(${start.scale}, 0, 0, ${start.scale}, ${start.x}, ${start.y})` },
-          { transform: "none" },
-        ],
-        "--motion-slow",
-        "--ease-out",
-      );
+    // The crossings' overlay glides with the scene it lies over.
+    const frames = [
+      { transform: `matrix(${start.scale}, 0, 0, ${start.scale}, ${start.x}, ${start.y})` },
+      { transform: "none" },
+    ];
+    if (!restingCarry(start)) {
+      animate(state.scene, "scene", frames, "--motion-slow", "--ease-out");
+      animate(state.seams.layer, "seam-layer", frames, "--motion-slow", "--ease-out");
+    }
     slotMotion(previous, state, animate, motion);
     return;
   }
   const scene = visual.scene ?? { scale: 1, x: 0, y: 0 };
+  const moved = {};
   for (const [id, rect] of Object.entries(state.rects)) {
     const node = state.scene.querySelector(`[data-motion-id="tile:${id}"]`);
     if (!node) continue;
@@ -713,6 +723,7 @@ function playMotion(previous, visual, state, motion) {
     };
     const flip = flipFrom(drawn, rect);
     if (restingFlip(flip)) continue;
+    moved[id] = drawn;
     animate(
       node,
       `tile:${id}`,
@@ -724,8 +735,19 @@ function playMotion(previous, visual, state, motion) {
       "--ease-spring",
     );
   }
+  // A crossing rides with a display of its own that moves, and fades in where it is new.
+  const known = new Set(previous.places?.map((place) => place.key));
+  for (const place of state.places) {
+    const id = [place.from, place.to].find((tile) => moved[tile]);
+    const started = id
+      ? state.seams.glide(place.key, carriedPlace(place, moved[id], state.rects[id]))
+      : known.has(place.key)
+        ? []
+        : state.seams.appear(place.key, { duration: "--motion-slow" });
+    state.animations.push(...started);
+  }
   for (const node of state.scene.querySelectorAll(
-    '[data-motion-id^="label:"], [data-motion-id="seams"], [data-motion-id="ruler"], [data-motion-id="slot"]',
+    '[data-motion-id^="label:"], [data-motion-id="ruler"], [data-motion-id="slot"]',
   ))
     animate(
       node,
@@ -734,6 +756,12 @@ function playMotion(previous, visual, state, motion) {
       "--motion-slow",
       "--ease-out",
     );
+}
+
+// A node a running animation moves, in the scene or among the crossings over it.
+function motionNode(state, id) {
+  const selector = `[data-motion-id="${id}"]`;
+  return state.scene.querySelector(selector) ?? state.seams.element.querySelector(selector);
 }
 
 // A slot that arrives fades in; one that leaves fades out where the glide carries it, starting
@@ -751,7 +779,7 @@ function slotMotion(previous, state, animate, motion) {
   state.scene.append(ghost);
   const animation = ghost.animate([{ opacity: 1 }, { opacity: 0 }], {
     duration: motion.ms("--motion-base"),
-    easing: motion.ease("--ease-out"),
+    easing: motion.ease("--ease-in-out"),
     fill: "forwards",
   });
   animation.finished.then(

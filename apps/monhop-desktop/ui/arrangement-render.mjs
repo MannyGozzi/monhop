@@ -37,8 +37,10 @@ const HANDLE_CLEARANCE = 3;
 const RULER_TICK = 4;
 const RULER_TEXT_GAP = 7;
 const SLOT_RADIUS = 6;
-// Lucide's arrow-left-right on its 24-unit grid, drawn at half size in the seam handle.
+// Lucide's arrow-left-right on its 24-unit grid, drawn in the seam handle.
 const SWAP_GLYPH = "M8 3 4 7l4 4M4 7h16M16 21l4-4-4-4M20 17H4";
+// A crossing's nodes, back to front: its glow, its lit bar, and its handle.
+const SEAM_PARTS = ["glow", "bar", "knob"];
 // Frames a box must hold its size before it counts as settled. A starting transition's first frame
 // samples its start value, so one unchanged frame does not mean the glide is over.
 const SETTLE_FRAMES = 3;
@@ -62,20 +64,15 @@ export function matrixOf(node) {
   return { scale: matrix.a, scaleY: matrix.d, x: matrix.e, y: matrix.f };
 }
 
-// Follows `node`'s box: `change(size)` on the frame after each resize, before that frame lays out,
-// and `settle(size)` once it holds still, so a drawing redraws once when a glide ends instead of on
+// Follows `node`'s box: `change(size)` as each resize lands, before that frame paints, and
+// `settle(size)` once it holds still, so a drawing redraws once when a glide ends instead of on
 // every frame of it. `settling()` is true from a resize until its settle.
 export function watchSize(node, { change, settle }) {
   if (typeof ResizeObserver !== "function") return { settling: () => false, disconnect() {} };
   let size = null;
-  let changed = false;
   let quiet = 0;
   let frame = null;
   const tick = () => {
-    if (changed) {
-      changed = false;
-      change(size);
-    }
     quiet += 1;
     if (quiet < SETTLE_FRAMES) {
       frame = requestAnimationFrame(tick);
@@ -90,9 +87,9 @@ export function watchSize(node, { change, settle }) {
       width: Math.round(border?.inlineSize ?? entry.contentRect.width),
       height: Math.round(border?.blockSize ?? entry.contentRect.height),
     };
-    changed = true;
     quiet = 0;
     frame ??= requestAnimationFrame(tick);
+    change(size);
   });
   observer.observe(node);
   return {
@@ -279,81 +276,277 @@ export function createOutlineNode(rects, className) {
   return node;
 }
 
-// Each crossing is a lit edge: the desk shows through a gap under it, a soft glow around it, and a
-// handle at its middle where it is long enough to carry one. `offTiles` names displays whose
-// computer cannot be reached; a seam touching one of them goes grey.
-export function createSeamLayer(
-  seams,
-  transform,
-  {
-    className = "arrangement-seams",
-    preview = false,
-    offTiles = null,
-    handles = !preview,
-    keepClear = [],
-  } = {},
-) {
+// The drop preview's crossings: dashed where the pointer would cross once the drag lands.
+export function createSeamPreview(seams, transform) {
   const layer = svgNode("g");
-  layer.classList.add(className);
-  if (preview) layer.classList.add("is-preview");
+  layer.classList.add("arrangement-seams", "is-preview");
   layer.setAttribute("aria-hidden", "true");
-  const knobs = [];
+  for (const place of seamPlaces(seams, transform, { handles: false })) {
+    const ends =
+      place.axis === "v"
+        ? [place.x, place.y, place.x, place.y + place.length]
+        : [place.x, place.y, place.x + place.length, place.y];
+    const run = svgNode("g");
+    run.classList.add("arrangement-seam-run");
+    run.append(seamLine("arrangement-seam-underlay", ends), seamLine("arrangement-seam", ends));
+    layer.append(run);
+  }
+  return layer;
+}
+
+// Where each crossing sits on the stage: its top or left end, its axis and length, the displays and
+// groups it joins, and its handle's centre, or none where nothing along it is clear of the displays'
+// names and marks or it is too short to carry one.
+export function seamPlaces(seams, transform, { keepClear = [], handles = true } = {}) {
+  const places = [];
+  const keys = new Map();
   for (const seam of Array.isArray(seams) ? seams : []) {
     if (!validPoint(seam?.start) || !validPoint(seam?.end)) continue;
-    const points = [
+    const [x1, y1, x2, y2] = [
       transform.originX + seam.start[0] * transform.scale,
       transform.originY + seam.start[1] * transform.scale,
       transform.originX + seam.end[0] * transform.scale,
       transform.originY + seam.end[1] * transform.scale,
     ];
-    const run = svgNode("g");
-    run.classList.add("arrangement-seam-run");
-    const ends = { from: String(seam.fromDisplay ?? ""), to: String(seam.toDisplay ?? "") };
-    Object.assign(run.dataset, ends);
-    const off = Boolean(offTiles?.has(ends.from) || offTiles?.has(ends.to));
-    if (off) run.dataset.tone = "off";
-    run.append(
-      seamLine("arrangement-seam-underlay", points),
-      seamLine("arrangement-seam-glow", points),
-      seamLine("arrangement-seam", points),
-    );
-    layer.append(run);
-    const length = Math.hypot(points[2] - points[0], points[3] - points[1]);
-    const knob = handles && length >= HANDLE_MIN_SEAM ? seamHandle(points, off, keepClear) : null;
-    if (knob) {
-      Object.assign(knob.dataset, ends);
-      knobs.push(knob);
-    }
+    const from = String(seam.fromDisplay ?? "");
+    const to = String(seam.toDisplay ?? "");
+    const base = `${from}>${to}`;
+    const seen = keys.get(base) ?? 0;
+    keys.set(base, seen + 1);
+    const length = Math.hypot(x2 - x1, y2 - y1);
+    places.push({
+      key: seen ? `${base}#${seen}` : base,
+      from,
+      to,
+      groups: [seam.fromGroup, seam.toGroup].filter(Boolean),
+      axis: Math.abs(x2 - x1) < Math.abs(y2 - y1) ? "v" : "h",
+      x: Math.min(x1, x2),
+      y: Math.min(y1, y2),
+      length,
+      knob: handles && length >= HANDLE_MIN_SEAM ? knobAt([x1, y1, x2, y2], keepClear) : null,
+    });
   }
-  layer.append(...knobs);
-  return layer;
+  return places;
 }
 
-function seamHandle([x1, y1, x2, y2], off, keepClear) {
-  const handle = svgNode("g");
-  handle.classList.add("arrangement-seam-handle");
-  if (off) handle.dataset.tone = "off";
+function knobAt([x1, y1, x2, y2], keepClear) {
   const length = Math.hypot(x2 - x1, y2 - y1);
-  const along = handleOffset(length, (t) => {
-    const cx = x1 + ((x2 - x1) * t) / length;
-    const cy = y1 + ((y2 - y1) * t) / length;
-    return !keepClear.some((zone) => overlapsDisc(zone, cx, cy));
+  const point = (along) => ({
+    x: x1 + ((x2 - x1) * along) / length,
+    y: y1 + ((y2 - y1) * along) / length,
   });
-  if (along === null) return null;
-  setPosition(handle, x1 + ((x2 - x1) * along) / length, y1 + ((y2 - y1) * along) / length);
-  const disc = svgNode("circle");
-  disc.setAttribute("r", String(HANDLE_RADIUS));
-  const glyph = svgNode("path");
-  glyph.classList.add("arrangement-seam-glyph");
-  glyph.setAttribute("d", SWAP_GLYPH);
-  // A seam across a vertical edge is crossed sideways; one across a horizontal edge, up and down.
-  const sideways = Math.abs(x2 - x1) < Math.abs(y2 - y1);
-  glyph.setAttribute(
-    "transform",
-    `${sideways ? "" : "rotate(90) "}translate(-6 -6) scale(.5)`.trim(),
+  const along = handleOffset(length, (t) => {
+    const { x, y } = point(t);
+    return !keepClear.some((zone) => overlapsDisc(zone, x, y));
+  });
+  return along === null ? null : point(along);
+}
+
+// A crossing carried by its box mid-flight: where it shows while the box it sits on is drawn at
+// `drawn` on the way to `rest`.
+export function carriedPlace(place, drawn, rest) {
+  const scaleX = drawn.width / Math.max(1e-6, rest.width);
+  const scaleY = drawn.height / Math.max(1e-6, rest.height);
+  const map = (x, y) => ({
+    x: drawn.x + (x - rest.x) * scaleX,
+    y: drawn.y + (y - rest.y) * scaleY,
+  });
+  return {
+    ...place,
+    ...map(place.x, place.y),
+    length: place.length * (place.axis === "v" ? scaleY : scaleX),
+    knob: place.knob ? map(place.knob.x, place.knob.y) : null,
+  };
+}
+
+// The crossings are HTML over the drawing's svg, so their glide and the light running along them
+// stay on the compositor. A crossing keeps its nodes across draws, keyed by the displays it joins.
+// `motion` brings the shared tokens: enabled(), ms(name) and ease(name).
+export function createSeamOverlay(motion = null) {
+  const element = document.createElement("div");
+  element.className = "seam-overlay";
+  element.setAttribute("aria-hidden", "true");
+  element.style.setProperty("--seam-knob-size", `${HANDLE_RADIUS * 2}px`);
+  const layer = document.createElement("div");
+  layer.className = "seam-layer";
+  layer.dataset.motionId = "seam-layer";
+  const lanes = Object.fromEntries(
+    SEAM_PARTS.map((part) => {
+      const lane = document.createElement("div");
+      lane.className = `seam-lane seam-lane-${part}`;
+      return [part, lane];
+    }),
   );
-  handle.append(disc, glyph);
-  return handle;
+  layer.append(...SEAM_PARTS.map((part) => lanes[part]));
+  element.append(layer);
+  let shown = new Map();
+  const moving = () => Boolean(motion?.enabled?.());
+
+  function create(key) {
+    const seam = { key, place: null, glides: [] };
+    for (const part of SEAM_PARTS) {
+      const node = document.createElement("div");
+      node.className = `seam-${part}`;
+      node.dataset.motionId = `seam-${part}:${key}`;
+      lanes[part].append(node);
+      seam[part] = node;
+    }
+    seam.knob.append(swapGlyph());
+    // The light keeps the document clock, so a crossing drawn later runs in step with the rest.
+    const period = motion?.ms?.("--canvas-seam-flow-loop") ?? 0;
+    if (period > 0)
+      seam.bar.style.setProperty(
+        "--seam-flow-phase",
+        `${-Math.round(performance.now() % period)}ms`,
+      );
+    return seam;
+  }
+
+  function lay(seam, place) {
+    seam.place = place;
+    const along = place.axis === "v" ? "height" : "width";
+    const across = place.axis === "v" ? "width" : "height";
+    for (const node of [seam.bar, seam.glow]) {
+      node.dataset.axis = place.axis;
+      node.style[along] = `${round(place.length)}px`;
+      node.style[across] = "";
+      node.style.transform = barTransform(place);
+    }
+    seam.knob.dataset.axis = place.axis;
+    seam.knob.hidden = !place.knob;
+    if (place.knob) seam.knob.style.transform = knobTransform(place.knob);
+  }
+
+  // Lays out `places`; a crossing that is gone fades where it stands. Returns the keys drawn for
+  // the first time, which the caller brings in.
+  function draw(places, { off = () => false } = {}) {
+    const next = new Map();
+    const entered = [];
+    for (const place of places) {
+      let seam = shown.get(place.key);
+      if (!seam) {
+        seam = create(place.key);
+        entered.push(place.key);
+      }
+      shown.delete(place.key);
+      next.set(place.key, seam);
+      lay(seam, place);
+      setSeamTone(seam, off(place));
+    }
+    for (const seam of shown.values()) leave(seam);
+    shown = next;
+    return entered;
+  }
+
+  // A crossing that goes while the overlay is hidden through a drag goes at once, or it would show
+  // at its old place as the overlay returns.
+  function leave(seam) {
+    const nodes = SEAM_PARTS.map((part) => seam[part]);
+    if (!moving() || element.dataset.hidden === "true") {
+      for (const node of nodes) node.remove();
+      return;
+    }
+    for (const node of nodes)
+      node
+        .animate([{ opacity: 0, offset: 1 }], {
+          duration: motion.ms("--motion-fast"),
+          easing: motion.ease("--ease-in-out"),
+          fill: "forwards",
+        })
+        .finished.then(
+          () => node.remove(),
+          () => node.remove(),
+        );
+  }
+
+  // A crossing starts where `start` puts it and springs to its place, as the group under it does.
+  // The glide ends on the node's own transform, so a place laid mid-glide becomes its new target.
+  function glide(key, start) {
+    const seam = shown.get(key);
+    if (!seam || !moving()) return [];
+    for (const animation of seam.glides) animation.cancel();
+    const timing = { duration: motion.ms("--motion-spring"), easing: motion.ease("--ease-spring") };
+    const along = start.length / Math.max(1e-6, seam.place.length);
+    const scale = seam.place.axis === "v" ? [1, along] : [along, 1];
+    const starts = [
+      [seam.bar, barTransform(start, scale)],
+      [seam.glow, barTransform(start, scale)],
+    ];
+    if (seam.place.knob && start.knob) starts.push([seam.knob, knobTransform(start.knob)]);
+    seam.glides = starts.map(([node, from]) =>
+      node.animate([{ transform: from, offset: 0 }], timing),
+    );
+    return seam.glides.map((animation, index) => ({
+      id: starts[index][0].dataset.motionId,
+      animation,
+    }));
+  }
+
+  // A crossing new to the drawing fades in where it lands.
+  function appear(key, { duration = "--motion-base" } = {}) {
+    const seam = shown.get(key);
+    if (!seam || !moving()) return [];
+    return SEAM_PARTS.map((part) => ({
+      id: seam[part].dataset.motionId,
+      animation: seam[part].animate([{ opacity: 0, offset: 0 }], {
+        duration: motion.ms(duration),
+        easing: motion.ease("--ease-out"),
+      }),
+    }));
+  }
+
+  // Lines the overlay up with its svg: the same viewBox fitted into the same box, centred.
+  function frame(view, bounds) {
+    const width = bounds?.width || view.width;
+    const height = bounds?.height || view.height;
+    const scale = Math.min(width / view.width, height / view.height) || 1;
+    const x = (width - view.width * scale) / 2 - view.x * scale;
+    const y = (height - view.height * scale) / 2 - view.y * scale;
+    element.style.transform =
+      Math.abs(scale - 1) < 1e-4 && Math.abs(x) < 0.01 && Math.abs(y) < 0.01
+        ? ""
+        : `translate(${round(x)}px, ${round(y)}px) scale(${round(scale)})`;
+  }
+
+  return {
+    element,
+    layer,
+    draw,
+    glide,
+    appear,
+    frame,
+    restyle: (off) => {
+      for (const seam of shown.values()) setSeamTone(seam, off(seam.place));
+    },
+    hide: (hidden) => {
+      element.dataset.hidden = String(hidden);
+    },
+  };
+}
+
+function setSeamTone(seam, off) {
+  for (const part of SEAM_PARTS)
+    if (off) seam[part].dataset.tone = "off";
+    else delete seam[part].dataset.tone;
+}
+
+function barTransform({ x, y }, scale = null) {
+  const scaled = scale ? ` scale(${round(scale[0])}, ${round(scale[1])})` : "";
+  return `translate(${round(x)}px, ${round(y)}px)${scaled}`;
+}
+
+function knobTransform({ x, y }) {
+  return `translate(${round(x)}px, ${round(y)}px)`;
+}
+
+function swapGlyph() {
+  const glyph = svgNode("svg");
+  glyph.setAttribute("viewBox", "0 0 24 24");
+  glyph.classList.add("seam-glyph");
+  const path = svgNode("path");
+  path.setAttribute("d", SWAP_GLYPH);
+  glyph.append(path);
+  return glyph;
 }
 
 export function createGuideLayer(guides, stage) {

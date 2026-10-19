@@ -18,11 +18,14 @@ import {
   createGroupNode,
   createGuideLayer,
   createLegend,
+  carriedPlace,
   createOutlineNode,
-  createSeamLayer,
+  createSeamOverlay,
+  createSeamPreview,
   createTilePaint,
   labelBoxes,
   matrixOf,
+  seamPlaces,
   tileMarks,
   refineText,
   setPosition,
@@ -169,7 +172,8 @@ export function createArrangementView(options) {
   svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
   const paint = createTilePaint();
   svg.append(paint.defs);
-  stage.append(svg);
+  const seams = createSeamOverlay({ enabled: motionEnabled, ms: motionMs, ease: motionEase });
+  stage.append(svg, seams.element);
 
   let legend = legendFor(false);
   stage.append(legend);
@@ -246,9 +250,14 @@ export function createArrangementView(options) {
   // The stage size the resize watch last saw, and how far a glide holding the drawing moved it.
   let observed = null;
   let held = null;
+  // A drag just ended: the next render carries each group and its crossings from where they show,
+  // and a crossing on the dropped group rides with it rather than with the group it lands against.
+  let landing = false;
+  let dropped = null;
   let useSignature = null;
   let groupLayer = null;
-  let seamLayer = null;
+  // The crossings drawn last, where the overlay lays them.
+  let places = [];
   let previewLayer = null;
   let guideLayer = null;
   // A block that leaves the group keeps fading here after `nodes`/`groupLayer` no longer hold it;
@@ -276,8 +285,10 @@ export function createArrangementView(options) {
     );
   }
 
-  function stageMetrics() {
-    return stageBox(observed ?? stage.getBoundingClientRect());
+  // `bounds` is the stage's own box, which the viewBox `size` may exceed on a very small stage.
+  function setViewBox(x, y, size, bounds) {
+    svg.setAttribute("viewBox", `${x} ${y} ${size.width} ${size.height}`);
+    seams.frame({ x, y, ...size }, bounds);
   }
 
   // While the stage glides the drawing keeps its scale and follows the centre the refit will give
@@ -293,8 +304,7 @@ export function createArrangementView(options) {
           cappedFit(arrangement.tiles, next, EDIT_INSETS),
           arrangementBounds(arrangement.tiles),
         );
-    const origin = held ? `${-held.x} ${-held.y}` : "0 0";
-    svg.setAttribute("viewBox", `${origin} ${next.width} ${next.height}`);
+    setViewBox(held ? -held.x : 0, held ? -held.y : 0, next, observed);
   }
 
   function contentSignature() {
@@ -473,7 +483,8 @@ export function createArrangementView(options) {
       pending = null;
     }
     // The stage size and every drawn position are read before the first write.
-    const size = stageMetrics();
+    const bounds = observed ?? stage.getBoundingClientRect();
+    const size = stageBox(bounds);
     const content = contentSignature();
     // While the stage glides the held drawing stands; the render once it settles refits it.
     if (drawnFor?.content === content && !force && !refitNext)
@@ -487,7 +498,10 @@ export function createArrangementView(options) {
       stageSize = size;
       held = null;
       drawnFor = { content, size, transform: null };
-      svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
+      setViewBox(0, 0, size, bounds);
+      places = [];
+      seams.draw(places);
+      seams.hide(false);
       renderShared();
       renderUse();
       svg.replaceChildren(paint.defs);
@@ -510,15 +524,16 @@ export function createArrangementView(options) {
       rendered.shape === shape &&
       rendered.scale === next.scale &&
       rendered.disabled === disabled;
-    // A rebuilt group, or one whose coordinates the held view origin moved, starts where it shows.
-    const drawn = motionEnabled() && (!sameSet || held) ? drawnGroups() : null;
+    // A rebuilt group, one the held view origin moved, or one just dropped starts where it shows.
+    const drawn = motionEnabled() && (!sameSet || held || landing) ? drawnGroups() : null;
+    landing = false;
 
     stageSize = size;
     transform = next;
     refitNext = false;
     held = null;
     storedView = { key, transform };
-    svg.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`);
+    setViewBox(0, 0, size, bounds);
     renderShared();
     renderUse();
     fit.classList.toggle("is-current", sameTransform(transform, ideal));
@@ -537,12 +552,6 @@ export function createArrangementView(options) {
     if (sameSet) {
       for (const groupKey of groups.order) refreshGroup(groupKey, boxes[groupKey], !drawn);
       replaceLayer("guideLayer", createGuideLayer([], stageSize));
-      replaceLayer(
-        "seamLayer",
-        createSeamLayer(arrangement.connected ? arrangement.seams : [], transform, {
-          keepClear: tileMarks(arrangement.tiles, rects.tiles),
-        }),
-      );
       replaceLayer("previewLayer", emptyPreview());
     } else {
       guideLayer = createGuideLayer([], stageSize);
@@ -553,21 +562,21 @@ export function createArrangementView(options) {
         nextNodes[groupKey] = buildGroup(groupKey, boxes[groupKey]);
       for (const groupKey of groups.order) groupLayer.append(nextNodes[groupKey]);
       nodes = nextNodes;
-      seamLayer = createSeamLayer(arrangement.connected ? arrangement.seams : [], transform, {
-        keepClear: tileMarks(arrangement.tiles, rects.tiles),
-      });
       previewLayer = emptyPreview();
-      svg.replaceChildren(
-        paint.defs,
-        guideLayer,
-        groupLayer,
-        leavingLayer,
-        seamLayer,
-        previewLayer,
-      );
+      svg.replaceChildren(paint.defs, guideLayer, groupLayer, leavingLayer, previewLayer);
       // A first drawing appears with its view; only later ones bring groups in one by one.
       if (drawnFor) enterAndLeave(groupChanges(previousGroups, rects.groups), previousNodes);
     }
+    places = arrangement.connected
+      ? seamPlaces(arrangement.seams, transform, {
+          keepClear: tileMarks(arrangement.tiles, rects.tiles),
+        })
+      : [];
+    const entered = seams.draw(places);
+    // Hidden through a drag, the crossings return with the render that lays them where they land.
+    seams.hide(false);
+    // A first drawing appears with its view; a crossing new to a later one fades in where it lands.
+    if (drawnFor) for (const seamKey of entered) seams.appear(seamKey);
     if (drawn) flipGroups(drawn, { rebuilt: !sameSet });
     rendered = { shape, scale: transform.scale, disabled };
     drawnFor = { content, size, transform };
@@ -607,17 +616,26 @@ export function createArrangementView(options) {
 
   // Each group starts where it shows and springs to its place, its size included, so a drop or a
   // refit never jumps. A rebuilt group carries on entering, or its displays settling from the lift
-  // they had. Once anything moves, the seams fade in as the groups land.
+  // they had. Each crossing rides with a group that moves, from where that group shows it.
   function flipGroups(drawn, { rebuilt }) {
     const starts = [];
     const lifted = [];
     const entering = [];
-    let moved = false;
+    for (const place of places) {
+      const groupKey = [dropped, ...place.groups].find(
+        (key) =>
+          place.groups.includes(key) &&
+          drawn[key] &&
+          rects.groups[key] &&
+          !resting(drawn[key], rects.groups[key]),
+      );
+      if (groupKey)
+        seams.glide(place.key, carriedPlace(place, drawn[groupKey], rects.groups[groupKey]));
+    }
     for (const [groupKey, node] of Object.entries(nodes)) {
       const from = drawn[groupKey];
       const to = rects.groups[groupKey];
       if (!from || !to?.width || !to.height) continue;
-      moved ||= !resting(from, to);
       node.style.transition = "none";
       setPosition(node, from.x, from.y, [from.width / to.width, from.height / to.height]);
       starts.push([node, to]);
@@ -646,13 +664,6 @@ export function createArrangementView(options) {
     }
     for (const tile of lifted) tile.style.removeProperty("transition");
     for (const tile of lifted) tile.style.removeProperty("transform");
-    if (moved)
-      seamLayer.animate([{ opacity: 0 }, { opacity: 1 }], {
-        duration: motionMs("--motion-base"),
-        delay: motionMs("--motion-fast"),
-        easing: motionEase(),
-        fill: "backwards",
-      });
   }
 
   // A joining group fades and scales in (`data-motion="enter"`, styled in studio-canvas.css), and a
@@ -675,10 +686,9 @@ export function createArrangementView(options) {
   }
 
   function replaceLayer(name, next) {
-    const layers = { guideLayer, seamLayer, previewLayer };
+    const layers = { guideLayer, previewLayer };
     svg.replaceChild(next, layers[name]);
     if (name === "guideLayer") guideLayer = next;
-    else if (name === "seamLayer") seamLayer = next;
     else previewLayer = next;
   }
 
@@ -767,7 +777,7 @@ export function createArrangementView(options) {
       );
       layer.append(createOutlineNode(Object.values(outline), "arrangement-drop-outline"));
       if (geometry.connected) {
-        layer.append(createSeamLayer(geometry.seams, transform, { preview: true }));
+        layer.append(createSeamPreview(geometry.seams, transform));
         for (const seam of geometry.seams) {
           const vertical =
             Math.abs(seam.start[0] - seam.end[0]) < Math.abs(seam.start[1] - seam.end[1]);
@@ -817,7 +827,7 @@ export function createArrangementView(options) {
     };
     stage.dataset.dragging = "true";
     stage.dataset.drop = "valid";
-    seamLayer.setAttribute("visibility", "hidden");
+    seams.hide(true);
     node?.classList.add("is-dragging");
     return node;
   }
@@ -826,9 +836,10 @@ export function createArrangementView(options) {
     if (!drag) return null;
     const current = drag;
     drag = null;
+    landing = true;
+    dropped = current.moving?.group ?? null;
     stage.dataset.dragging = "false";
     delete stage.dataset.drop;
-    seamLayer.removeAttribute("visibility");
     current.node?.classList.remove("is-dragging");
     if (current.pointerId !== null) {
       listenForPointer(false);

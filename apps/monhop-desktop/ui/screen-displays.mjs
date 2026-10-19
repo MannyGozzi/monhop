@@ -150,7 +150,7 @@ function showView(stage, view) {
       leaving
         .animate([{ opacity }, { opacity: 0 }], {
           duration: motionMs("--motion-fast"),
-          easing: motionEase(),
+          easing: motionEase("--ease-in-out"),
           fill: "forwards",
         })
         .finished.then(

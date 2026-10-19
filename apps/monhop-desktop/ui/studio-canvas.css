@@ -17,13 +17,17 @@
   --canvas-tile-lift-y: -3px;
   --canvas-quiet-opacity: .36;
   --canvas-quiet-saturate: .2;
-  /* The crossing: the bezel's groove, a soft accent glow, and the lit edge itself. */
+  /* The crossing: the bezel's groove, a soft accent glow, and the lit edge itself, along which a
+     streak of light runs and rests while the crossing works. */
   --canvas-seam-groove: 6px;
   --canvas-seam-width: 3px;
   --canvas-seam-glow-width: 7px;
   --canvas-seam-glow-blur: 4px;
   --canvas-seam-glow-opacity: .55;
   --canvas-seam-off-opacity: .5;
+  --canvas-seam-flow-loop: 2800ms;
+  --canvas-seam-flow-length: 46%;
+  --canvas-seam-highlight: oklch(1 0 0 / 90%);
   --canvas-handle-stroke: 1px;
   --canvas-handle-glyph: 2.4;
   --canvas-handle-shadow: drop-shadow(0 3px 5px light-dark(oklch(.28 .05 262 / 26%), oklch(0 0 0 / 55%)));
@@ -41,8 +45,8 @@
   --canvas-swatch: 8px;
   --canvas-card-y: 0px;
 }
-:root[data-theme="dark"] { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); }
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); } }
+:root[data-theme="dark"] { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); --canvas-seam-highlight: oklch(1 0 0 / 85%); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); --canvas-seam-highlight: oklch(1 0 0 / 85%); } }
 
 /* The pane: banners on top, the stage filling the middle, and one dock at the bottom where the Apply
    bar takes the status bar's place while arranging. */
@@ -90,18 +94,39 @@
 .arrangement-group-label-dot:is([data-tone="checking"], [data-tone="syncing"], [data-tone="stopping"]) { fill: var(--warning); }
 .arrangement-group-label-dot[data-tone="error"] { fill: var(--destructive); }
 
-/* The crossing glows in the accent with a handle at its middle; it goes grey with an offline computer. */
+/* The drop preview's crossing, dashed in the svg while a drag decides it. */
 .arrangement-seam-underlay { stroke: var(--tile-bezel); stroke-linecap: round; stroke-width: var(--canvas-seam-groove); }
-.arrangement-seam-glow { stroke: var(--primary); stroke-linecap: round; stroke-width: var(--canvas-seam-glow-width); opacity: var(--canvas-seam-glow-opacity); filter: blur(var(--canvas-seam-glow-blur)); transition: opacity var(--motion-base) var(--ease-out); }
-.arrangement-seam { stroke: var(--primary); stroke-linecap: round; stroke-width: var(--canvas-seam-width); filter: none; transition: stroke var(--motion-base) var(--ease-out), opacity var(--motion-base) var(--ease-out); }
-.arrangement-seam-run[data-tone="off"] .arrangement-seam { stroke: var(--subtle-foreground); opacity: var(--canvas-seam-off-opacity); }
-.arrangement-seam-run[data-tone="off"] .arrangement-seam-glow { opacity: 0; }
-.arrangement-seams.is-preview .arrangement-seam-glow { opacity: 0; }
-.arrangement-seam-handle { filter: var(--canvas-handle-shadow); }
-.arrangement-seam-handle circle { fill: var(--solid); stroke: var(--primary); stroke-width: var(--canvas-handle-stroke); transition: stroke var(--motion-base) var(--ease-out); }
-.arrangement-seam-glyph { fill: none; stroke: var(--primary); stroke-linecap: round; stroke-linejoin: round; stroke-width: var(--canvas-handle-glyph); transition: stroke var(--motion-base) var(--ease-out); }
-.arrangement-seam-handle[data-tone="off"] circle { stroke: var(--hairline-strong); }
-.arrangement-seam-handle[data-tone="off"] .arrangement-seam-glyph { stroke: var(--subtle-foreground); }
+.arrangement-seam { stroke: var(--primary); stroke-linecap: round; stroke-width: var(--canvas-seam-width); filter: none; }
+
+/* The crossings themselves are HTML over the svg (createSeamOverlay), so they glide and the light runs
+   along them on the compositor. Each glows in the accent with a handle on it, and goes grey with an
+   offline computer. */
+.seam-overlay { position: absolute; inset: 0; transform-origin: 0 0; pointer-events: none; transition: opacity var(--motion-base) var(--ease-out); }
+.seam-overlay[data-hidden="true"] { opacity: 0; transition: opacity var(--motion-fast) var(--ease-in-out); }
+.seam-layer, .seam-lane { position: absolute; inset: 0; transform-origin: 0 0; }
+.seam-bar, .seam-glow { position: absolute; top: 0; left: 0; border-radius: var(--radius-pill); transform-origin: 0 0; }
+.seam-bar { overflow: hidden; background-color: var(--primary); box-shadow: 0 0 0 calc((var(--canvas-seam-groove) - var(--canvas-seam-width)) / 2) var(--tile-bezel); transition: background-color var(--motion-base) var(--ease-out), opacity var(--motion-base) var(--ease-out); }
+.seam-bar[data-axis="v"] { width: var(--canvas-seam-width); margin-left: calc(var(--canvas-seam-width) / -2); }
+.seam-bar[data-axis="h"] { height: var(--canvas-seam-width); margin-top: calc(var(--canvas-seam-width) / -2); }
+.seam-glow { background-color: var(--primary); opacity: var(--canvas-seam-glow-opacity); filter: blur(var(--canvas-seam-glow-blur)); transition: opacity var(--motion-base) var(--ease-out); }
+.seam-glow[data-axis="v"] { width: var(--canvas-seam-glow-width); margin-left: calc(var(--canvas-seam-glow-width) / -2); }
+.seam-glow[data-axis="h"] { height: var(--canvas-seam-glow-width); margin-top: calc(var(--canvas-seam-glow-width) / -2); }
+.seam-bar[data-tone="off"] { background-color: var(--subtle-foreground); opacity: var(--canvas-seam-off-opacity); }
+.seam-glow[data-tone="off"] { opacity: 0; }
+.seam-knob { position: absolute; top: 0; left: 0; display: grid; width: var(--seam-knob-size); height: var(--seam-knob-size); margin: calc(var(--seam-knob-size) / -2) 0 0 calc(var(--seam-knob-size) / -2); place-items: center; border-radius: 50%; background: var(--solid); box-shadow: 0 0 0 var(--canvas-handle-stroke) var(--primary); color: var(--primary); filter: var(--canvas-handle-shadow); transition: box-shadow var(--motion-base) var(--ease-out), color var(--motion-base) var(--ease-out); }
+.seam-knob[data-tone="off"] { box-shadow: 0 0 0 var(--canvas-handle-stroke) var(--hairline-strong); color: var(--subtle-foreground); }
+.seam-glyph { width: calc(var(--seam-knob-size) / 2); height: calc(var(--seam-knob-size) / 2); fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: var(--canvas-handle-glyph); }
+.seam-knob[data-axis="h"] .seam-glyph { rotate: 90deg; }
+/* The light: a soft streak runs the length of a working crossing, then rests. */
+.seam-bar::after { content: ""; position: absolute; top: 0; left: 0; width: 100%; height: var(--canvas-seam-flow-length); background: linear-gradient(transparent, var(--canvas-seam-highlight), transparent); opacity: 0; transform: translateY(-110%); }
+.seam-bar[data-axis="h"]::after { width: var(--canvas-seam-flow-length); height: 100%; background: linear-gradient(90deg, transparent, var(--canvas-seam-highlight), transparent); transform: translateX(-110%); }
+@media (prefers-reduced-motion: no-preference) {
+  .seam-bar:not([data-tone="off"])::after { opacity: 1; animation: canvas-seam-flow-v var(--canvas-seam-flow-loop) var(--ease-in-out) var(--seam-flow-phase, 0ms) infinite; }
+  .seam-bar[data-axis="h"]:not([data-tone="off"])::after { animation-name: canvas-seam-flow-h; }
+  :root[data-window-idle="true"] .seam-bar::after { animation-play-state: paused; }
+}
+@keyframes canvas-seam-flow-v { 0% { transform: translateY(-110%); } 60%, 100% { transform: translateY(230%); } }
+@keyframes canvas-seam-flow-h { 0% { transform: translateX(-110%); } 60%, 100% { transform: translateX(230%); } }
 
 /* The quiet ruler under the arrangement. */
 .arrangement-ruler-line { stroke: var(--subtle-foreground); stroke-width: var(--hairline-width); opacity: var(--canvas-ruler-opacity); }
@@ -136,7 +161,7 @@
 .canvas-toast { position: absolute; top: var(--gap-3); left: 50%; display: inline-flex; align-items: center; gap: var(--gap-2); max-width: calc(100% - var(--gap-8)); margin: 0; border-radius: var(--radius-pill); padding: var(--gap-1) var(--gap-3) var(--gap-1) var(--gap-1); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-chip); color: var(--muted-foreground); font-size: var(--text-sm); white-space: nowrap; translate: -50% 0; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-spring) var(--ease-spring), visibility 0s linear 0s; }
 .canvas-toast > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .canvas-toast > span:last-child:empty { display: none; }
-.canvas-toast[data-shown="false"] { opacity: 0; transform: translateY(calc(var(--motion-rise) * -2)); visibility: hidden; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-base) var(--ease-out), visibility 0s linear var(--motion-base); }
+.canvas-toast[data-shown="false"] { opacity: 0; transform: translateY(calc(var(--motion-rise) * -2)); visibility: hidden; transition: opacity var(--motion-fast) var(--ease-in-out), transform var(--motion-base) var(--ease-in-out), visibility 0s linear var(--motion-base); }
 
 /* The card under a picture that says what comes next; alone, it sits in the middle of the stage. */
 .canvas-card { position: absolute; top: 0; left: 50%; width: min(calc(100% - var(--gap-8)), var(--canvas-card-width)); translate: -50% var(--canvas-card-y); transition: translate var(--motion-slow) var(--ease-out); }
@@ -204,7 +229,7 @@
 
 /* The status bar: the overall state on the left, the emergency stop as keys on the right. */
 .status-bar { flex-wrap: nowrap; gap: var(--gap-4); padding: var(--gap-2) var(--gap-3) var(--gap-2) var(--gap-4); container: status-bar / inline-size; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear 0s; }
-.canvas-pane:is([data-mode="edit"], [data-mode="waiting"]) .status-bar { opacity: 0; transform: translateY(var(--motion-slide)); visibility: hidden; pointer-events: none; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-base) var(--ease-out), visibility 0s linear var(--motion-base); }
+.canvas-pane:is([data-mode="edit"], [data-mode="waiting"]) .status-bar { opacity: 0; transform: translateY(var(--motion-slide)); visibility: hidden; pointer-events: none; transition: opacity var(--motion-fast) var(--ease-in-out), transform var(--motion-base) var(--ease-in-out), visibility 0s linear var(--motion-base); }
 .status-bar-state { flex: 1 1 auto; }
 .status-bar-text { display: flex; gap: var(--gap-2); }
 .status-bar-label { flex: none; }
@@ -240,7 +265,7 @@
 .arrangement-drop-outline rect { fill: color-mix(in oklab, var(--primary) var(--mix-faint), transparent); stroke: var(--primary); stroke-dasharray: var(--canvas-slot-dash); stroke-width: var(--canvas-slot-stroke); }
 @media (prefers-reduced-motion: no-preference) {
   .arrangement-group[data-motion="enter"] .arrangement-display { animation: tile-in var(--motion-slow) var(--ease-out) both; }
-  .arrangement-group[data-motion="leave"] .arrangement-display { animation: tile-out var(--motion-base) var(--ease-out) both; }
+  .arrangement-group[data-motion="leave"] .arrangement-display { animation: tile-out var(--motion-base) var(--ease-in-out) both; }
 }
 
 /* The monitor cabled to both computers: which one it shows, as a segmented control whose thumb glides. */
