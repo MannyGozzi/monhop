@@ -1,7 +1,13 @@
 // Text, options-shaping and interaction math for the arrangement editor (arrangement-view.mjs), kept
 // apart from the DOM so it runs under plain node:test. Geometry itself stays in arrangement-model.mjs;
 // this file only turns that geometry into words, keyboard deltas and the options shape the view reads.
-import { formatSize, movePlacement, resolvePlacement } from "./arrangement-model.mjs";
+import {
+  fitTransform,
+  formatSize,
+  innerBox,
+  movePlacement,
+  resolvePlacement,
+} from "./arrangement-model.mjs";
 
 export const NUDGE_PIXELS = 12;
 export const COARSE_NUDGE_PIXELS = 48;
@@ -12,6 +18,30 @@ const NUDGE_DIRECTIONS = {
   ArrowDown: [0, 1],
 };
 const LEGACY_ORDER = ["local", "peer"];
+// The longest edge any one display may draw at, in CSS pixels: past it a lone display fills the
+// canvas like a photo instead of reading as one screen on a desk.
+export const MAX_DISPLAY_EXTENT = 280;
+
+// --- fitting -----------------------------------------------------------------
+
+// fitTransform, never past the scale that draws the largest display at `maxExtent`; a capped
+// arrangement stays centred in the same inner box.
+export function cappedFit(all, stage, insets, maxExtent = MAX_DISPLAY_EXTENT) {
+  const fit = fitTransform(all, stage, insets);
+  const longest = Math.max(1, ...all.map((tile) => Math.max(tile.width, tile.height)));
+  const cap = maxExtent / longest;
+  if (!(fit.scale > cap)) return fit;
+  const left = Math.min(...all.map((tile) => tile.x));
+  const top = Math.min(...all.map((tile) => tile.y));
+  const width = Math.max(...all.map((tile) => tile.x + tile.width)) - left;
+  const height = Math.max(...all.map((tile) => tile.y + tile.height)) - top;
+  const box = innerBox(stage, insets);
+  return {
+    scale: cap,
+    originX: box.x + (box.width - width * cap) / 2 - left * cap,
+    originY: box.y + (box.height - height * cap) / 2 - top * cap,
+  };
+}
 
 // --- options ---------------------------------------------------------------
 

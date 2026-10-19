@@ -1,9 +1,7 @@
 import {
-  VIEW_INSETS,
   arrangementGeometry,
   constrainTransform,
   describeArrangement,
-  fitTransform,
   formatSize,
   groupRects,
   movePlacement,
@@ -21,14 +19,18 @@ import {
   createLegend,
   createOutlineNode,
   createSeamLayer,
+  createTilePaint,
   labelBoxes,
+  tileMarks,
   refineText,
   setPosition,
   svgNode,
 } from "./arrangement-render.mjs";
 import { revealPanel, setRevealOpen } from "./accordion.mjs";
 import { switchRow } from "./dom.mjs";
+import { icon } from "./icons.mjs";
 import {
+  cappedFit,
   groupAriaText,
   membersFromOptions,
   normalizeUseChoices,
@@ -44,6 +46,10 @@ const SNAP_PIXELS = 14;
 const GROUP_MOVE_EPSILON = 0.5;
 const INSTRUCTIONS =
   "Drag a computer against another; the edge where they touch is where the pointer crosses. With a computer selected, arrow keys nudge it and Shift with an arrow moves it further.";
+const HINT = "Drag a computer to move it";
+// Room around the arrangement: a label band above, the legend strip below, air at the sides.
+const EDIT_INSETS = Object.freeze({ top: 32, right: 24, bottom: 48, left: 24 });
+const LABEL_INSETS = Object.freeze({ top: 0, right: 8, bottom: 0, left: 8 });
 
 // Only one editor is mounted at a time, so the fitted view survives the rebuild a commit triggers.
 let storedView = null;
@@ -108,6 +114,7 @@ export function createArrangementView(options) {
   let members = membersFromOptions(options) ?? membersFromOptions({});
   let { labels, platforms, tones } = memberMaps(members);
   let inUse = normalizeUseChoices(members.order, options.inUse);
+  let labelDetails = options.labelDetails ?? {};
   let disabled = options.disabled === true;
   let handlers = {
     onCommit: options.onCommit,
@@ -130,9 +137,10 @@ export function createArrangementView(options) {
   status.setAttribute("aria-live", "polite");
   heading.append(title, status);
 
+  // The full instructions are what assistive technology reads; the stage shows a short hint.
   const instructions = document.createElement("p");
   instructions.id = "arrangement-instructions";
-  instructions.className = "arrangement-instructions";
+  instructions.className = "visually-hidden";
   instructions.textContent = INSTRUCTIONS;
 
   const stage = document.createElement("div");
@@ -145,27 +153,28 @@ export function createArrangementView(options) {
   svg.setAttribute("aria-label", "Display arrangement");
   svg.setAttribute("aria-describedby", "arrangement-instructions");
   svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  const paint = createTilePaint();
+  svg.append(paint.defs);
   stage.append(svg);
 
   let legend = legendFor(false);
+  stage.append(legend);
   function legendFor(withShared) {
-    return createLegend([
-      ...members.order.map((key) => ({
-        kind: "group",
-        label: labels[key],
-        side: key,
-        tone: tones[key],
-      })),
+    const strip = createLegend([
+      { kind: "hint", label: HINT },
       { kind: "primary", label: "Primary display" },
-      ...(withShared ? [{ kind: "shared", label: "Cabled to both computers" }] : []),
+      ...(withShared ? [{ kind: "shared", label: "Cabled to both" }] : []),
       { kind: "seam", label: "Pointer crossing" },
     ]);
+    strip.title = INSTRUCTIONS;
+    return strip;
   }
 
   // One row per monitor cabled to more than one computer: which computer shows on it decides which one draws it.
   const sharedRow = document.createElement("div");
   sharedRow.className = "arrangement-shared";
   const sharedPanel = revealPanel(sharedRow);
+  let sharedSignature = null;
 
   // One switch per display each computer reports; off leaves it out of the picture and every route.
   const useBlock = document.createElement("div");
@@ -195,7 +204,7 @@ export function createArrangementView(options) {
   });
   controls.append(spacer, reset, fit);
 
-  root.append(heading, instructions, stage, legend, sharedPanel, usePanel, controls);
+  root.append(heading, instructions, stage, sharedPanel, usePanel, controls);
 
   if (!arrangement?.groups?.order?.length || !arrangement.placement) {
     status.textContent = arrangement?.message || "These displays cannot be arranged yet.";
@@ -238,6 +247,8 @@ export function createArrangementView(options) {
     if (message === announced) return;
     announced = message;
     status.textContent = message;
+    // The status is one quiet line; the whole sentence stays a hover away.
+    status.title = message;
   }
 
   function restingStatus() {
@@ -264,46 +275,85 @@ export function createArrangementView(options) {
       legend.replaceWith(next);
       legend = next;
     }
-    // A block on its way out keeps what it last showed while it glides shut.
-    if (shared.length) sharedRow.replaceChildren();
-    for (const choice of shared) {
-      const copy = document.createElement("span");
-      copy.className = "arrangement-shared-copy";
-      const name = document.createElement("strong");
-      name.textContent = choice.name;
-      copy.append(name, document.createTextNode(" is cabled to both computers. Shows"));
-      const control = document.createElement("div");
-      control.className = "segmented is-compact";
-      control.setAttribute("role", "radiogroup");
-      control.setAttribute("aria-label", `Which computer shows on ${choice.name}`);
-      for (const key of groups.order) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "segmented-option";
-        button.dataset.focusKey = `arrangement-shared-${choice.monitor}-${key}`;
-        button.dataset.sharedMonitor = choice.monitor;
-        button.dataset.sharedSide = key;
-        button.setAttribute("role", "radio");
-        button.setAttribute("aria-checked", String(choice.side === key));
-        button.textContent = labels[key];
-        const locked = choice.side !== key && !choice.canSwap;
-        button.disabled = disabled || locked;
-        button.title = locked
-          ? `${labels[key]} would keep no display of its own.`
-          : `${choice.name} shows ${labels[key]}, so the pointer crosses onto it as that computer.`;
-        button.addEventListener("click", () => {
-          if (disabled || choice.side === key) return;
-          refitNext = true;
-          handlers.onShowMonitor?.(choice.monitor, key);
-        });
-        control.append(button);
-      }
-      const item = document.createElement("div");
-      item.className = "arrangement-shared-item";
-      item.append(copy, control);
-      sharedRow.append(item);
+    // A block on its way out keeps what it last showed while it glides shut. The same monitors
+    // and computers keep their controls, so a choice glides its thumb instead of being redrawn.
+    const signature = JSON.stringify([
+      shared.map((choice) => [choice.monitor, choice.name]),
+      groups.order.map((key) => labels[key]),
+    ]);
+    if (shared.length && signature !== sharedSignature) {
+      sharedSignature = signature;
+      sharedRow.replaceChildren(...shared.map(sharedItem));
     }
+    for (const choice of shared) refreshShared(choice);
     setRevealOpen(sharedPanel, shared.length > 0, { focusTarget: fit });
+  }
+
+  function sharedItem(choice) {
+    const copy = document.createElement("span");
+    copy.className = "arrangement-shared-copy";
+    copy.title = `${choice.name} is cabled to both computers. Choose which one it shows.`;
+    const cable = icon("link", 12);
+    cable.classList.add("arrangement-shared-glyph");
+    const name = document.createElement("strong");
+    name.textContent = choice.name;
+    copy.append(cable, name, document.createTextNode(" shows"));
+    const control = document.createElement("div");
+    control.className = "segmented is-compact";
+    control.setAttribute("role", "radiogroup");
+    control.setAttribute("aria-label", `Which computer shows on ${choice.name}`);
+    control.style.setProperty("--segment-count", String(groups.order.length));
+    const thumb = document.createElement("span");
+    thumb.className = "segmented-thumb";
+    thumb.setAttribute("aria-hidden", "true");
+    control.append(thumb);
+    for (const key of groups.order) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "segmented-option";
+      button.dataset.focusKey = `arrangement-shared-${choice.monitor}-${key}`;
+      button.dataset.sharedMonitor = choice.monitor;
+      button.dataset.sharedSide = key;
+      button.dataset.tone = tones[key];
+      button.setAttribute("role", "radio");
+      const swatch = document.createElement("span");
+      swatch.className = "segmented-swatch";
+      swatch.setAttribute("aria-hidden", "true");
+      const text = document.createElement("span");
+      text.textContent = labels[key];
+      button.append(swatch, text);
+      button.addEventListener("click", () => {
+        const current = shared.find((entry) => entry.monitor === choice.monitor);
+        if (disabled || !current || current.side === key || button.disabled) return;
+        refitNext = true;
+        handlers.onShowMonitor?.(current.monitor, key);
+      });
+      control.append(button);
+    }
+    const item = document.createElement("div");
+    item.className = "arrangement-shared-item";
+    item.dataset.sharedItem = choice.monitor;
+    item.append(copy, control);
+    return item;
+  }
+
+  function refreshShared(choice) {
+    const item = [...sharedRow.children].find((node) => node.dataset.sharedItem === choice.monitor);
+    if (!item) return;
+    const control = item.querySelector(".segmented");
+    control.style.setProperty(
+      "--segment-index",
+      String(Math.max(0, groups.order.indexOf(choice.side))),
+    );
+    for (const button of control.querySelectorAll(".segmented-option")) {
+      const key = button.dataset.sharedSide;
+      const locked = choice.side !== key && !choice.canSwap;
+      button.setAttribute("aria-checked", String(choice.side === key));
+      button.disabled = disabled || locked;
+      button.title = locked
+        ? `${labels[key]} would keep no display of its own.`
+        : `${choice.name} shows ${labels[key]}, so the pointer crosses onto it as that computer.`;
+    }
   }
 
   function renderUse() {
@@ -384,7 +434,7 @@ export function createArrangementView(options) {
     const all = arrangement.tiles;
     // Nothing to place means nothing to measure: the message alone is the scene until displays return.
     if (!all.length) {
-      svg.replaceChildren();
+      svg.replaceChildren(paint.defs);
       nodes = {};
       rendered = { shape: null, scale: null, disabled: null };
       stage.dataset.state = "empty";
@@ -394,10 +444,10 @@ export function createArrangementView(options) {
     }
     const shape = shapeOf(arrangement);
     const key = `${shape}@${stageSize.width}x${stageSize.height}`;
-    const ideal = fitTransform(all, stageSize);
+    const ideal = cappedFit(all, stageSize, EDIT_INSETS);
     const stored = storedView?.key === key && !refitNext ? storedView.transform : null;
     // Edits pan the kept view instead of rescaling it; only a layout too large for that scale is refitted.
-    transform = constrainTransform(all, stored, stageSize) ?? ideal;
+    transform = constrainTransform(all, stored, stageSize, EDIT_INSETS) ?? ideal;
     refitNext = false;
     storedView = { key, transform };
     fit.classList.toggle("is-current", sameTransform(transform, ideal));
@@ -405,7 +455,7 @@ export function createArrangementView(options) {
     const previousGroupRects = rects.groups;
     const previousNodes = nodes;
     rects = { tiles: tileRects(all, transform), groups: groupRects(all, transform) };
-    const boxes = labelBoxes(rects.groups, labels, stageSize, VIEW_INSETS);
+    const boxes = labelBoxes(rects.groups, labels, stageSize, LABEL_INSETS, labelDetails);
     stage.dataset.state = arrangement.connected
       ? "connected"
       : arrangement.valid
@@ -424,7 +474,9 @@ export function createArrangementView(options) {
       replaceLayer("guideLayer", createGuideLayer([], stageSize));
       replaceLayer(
         "seamLayer",
-        createSeamLayer(arrangement.connected ? arrangement.seams : [], transform),
+        createSeamLayer(arrangement.connected ? arrangement.seams : [], transform, {
+          keepClear: tileMarks(arrangement.tiles, rects.tiles),
+        }),
       );
       replaceLayer("previewLayer", emptyPreview());
     } else {
@@ -436,9 +488,18 @@ export function createArrangementView(options) {
         nextNodes[groupKey] = buildGroup(groupKey, boxes[groupKey]);
       for (const groupKey of groups.order) groupLayer.append(nextNodes[groupKey]);
       nodes = nextNodes;
-      seamLayer = createSeamLayer(arrangement.connected ? arrangement.seams : [], transform);
+      seamLayer = createSeamLayer(arrangement.connected ? arrangement.seams : [], transform, {
+        keepClear: tileMarks(arrangement.tiles, rects.tiles),
+      });
       previewLayer = emptyPreview();
-      svg.replaceChildren(guideLayer, groupLayer, leavingLayer, seamLayer, previewLayer);
+      svg.replaceChildren(
+        paint.defs,
+        guideLayer,
+        groupLayer,
+        leavingLayer,
+        seamLayer,
+        previewLayer,
+      );
       playGroupMotion(groupMotion(previousGroupRects, rects.groups), previousNodes);
     }
     rendered = { shape, scale: transform.scale, disabled };
@@ -502,6 +563,7 @@ export function createArrangementView(options) {
       label: labels[groupKey],
       rect: rects.groups[groupKey],
       labelBox,
+      paint,
       focusable: !disabled,
       focusTiles: false,
       ariaLabel: groupAria(groupKey),
@@ -791,6 +853,7 @@ export function createArrangementView(options) {
       if (destroyed) return;
       if (next.handlers) handlers = { ...handlers, ...next.handlers };
       if (Array.isArray(next.shared)) shared = next.shared;
+      if (next.labelDetails) labelDetails = next.labelDetails;
       if (Array.isArray(next.members)) {
         const nextMembers = membersFromOptions({ members: next.members });
         if (nextMembers) {
