@@ -1,16 +1,22 @@
-//! One MonHop per Windows session. The first copy holds a session-local named mutex for its whole
-//! life; a later launch asks that copy to show its window (at login, only whether it runs) and
-//! leaves, unless the copy is quitting, as during an update, in which case it waits to take over.
+//! One MonHop per signed-in session. The first copy holds a session-local named mutex (Windows) or
+//! a file lock (macOS) for its whole life; a later launch asks that copy to show its window (at
+//! login, only whether it runs) and leaves, unless the copy is quitting, as during an update, in
+//! which case it waits to take over.
 
 use crate::launch::Launch;
 
 #[cfg(windows)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+#[cfg(any(windows, target_os = "macos", test))]
+use std::time::Duration;
+#[cfg(any(target_os = "macos", test))]
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    time::Duration,
+    fs::{File, OpenOptions, TryLockError},
+    path::Path,
+    time::Instant,
 };
 
 #[cfg(windows)]
@@ -32,14 +38,23 @@ use windows::{
 
 /// `identifier` in tauri.conf.json; a test holds the two together.
 const BUNDLE_ID: &str = "com.manuelgozzi.monhop";
+#[cfg(any(windows, test))]
 const MUTEX: &str = "instance";
 /// Set by the running copy once it handled a request while running normally.
+#[cfg(any(windows, test))]
 const ANSWER: &str = "answered";
 
 /// Long enough for a copy still starting to reach its answer, and for one quitting (drain and
-/// installer launch, each bounded at 5 s) to let go of the mutex.
-#[cfg(windows)]
+/// installer launch, each bounded at 5 s) to let go of its claim.
+#[cfg(any(windows, target_os = "macos"))]
 const ANSWER_WAIT: Duration = Duration::from_secs(15);
+
+/// In the data folder Tauri resolves for `BUNDLE_ID`, beside the logs.
+#[cfg(target_os = "macos")]
+const LOCK_FILE: &str = "instance.lock";
+/// How often a later macOS launch retries the lock while a quitting copy lets go.
+#[cfg(any(target_os = "macos", test))]
+const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 /// Cleared once shutdown begins, so a relaunch during an update waits for the mutex instead of
 /// leaving on an answer from a copy that is about to exit.
@@ -65,6 +80,7 @@ impl Request {
         }
     }
 
+    #[cfg(any(windows, test))]
     fn object(self) -> &'static str {
         match self {
             Self::Show => "show",
@@ -77,6 +93,8 @@ impl Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Waited {
     /// The running copy handled the request while running normally.
+    // Only the Windows copy answers.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Answered,
     /// The mutex came free: released, or abandoned by a copy that exited while quitting.
     Released,
@@ -86,9 +104,9 @@ enum Waited {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Start {
-    /// This copy holds the mutex and answers later launches; `took_over` from a quitting copy.
+    /// This copy holds the claim and answers later launches; `took_over` from a quitting copy.
     Owner { took_over: bool },
-    /// No guard: `--check-ui`, or the mutex could not be made, so this runs as before.
+    /// No guard: `--check-ui`, or the claim could not be made, so this runs as before.
     Unguarded,
     /// Another copy runs: leave before anything starts.
     Exit,
@@ -104,7 +122,75 @@ fn decide(launch: Launch, waited: Waited) -> Start {
     }
 }
 
+/// Runs first in `main`, before Tauri, hooks, hotkeys or sockets exist. The login agent starts its
+/// copy straight from launchd, past LaunchServices' one-copy rule, so macOS needs this claim too.
+#[cfg(target_os = "macos")]
+pub fn claim(launch: Launch) -> Start {
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return Start::Unguarded;
+    };
+    let path = Path::new(&home)
+        .join("Library/Application Support")
+        .join(BUNDLE_ID)
+        .join(LOCK_FILE);
+    let (start, held) = claim_file(launch, &path, ANSWER_WAIT);
+    // Never closed, so this copy holds the lock until the process ends, however it ends.
+    std::mem::forget(held);
+    start
+}
+
+/// The owner holds an exclusive lock on `path`; std opens it close-on-exec, so a relaunch never
+/// inherits it. Nothing answers on macOS, so a later launch only waits for a quitting copy.
+#[cfg(any(target_os = "macos", test))]
+fn claim_file(launch: Launch, path: &Path, wait: Duration) -> (Start, Option<File>) {
+    if Request::for_launch(launch).is_none() {
+        return (Start::Unguarded, None);
+    }
+    let opened = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)
+        });
+    let Ok(file) = opened else {
+        return (Start::Unguarded, None);
+    };
+    let deadline = Instant::now() + wait;
+    let mut waited = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) if waited => return (decide(launch, Waited::Released), Some(file)),
+            Ok(()) => return (Start::Owner { took_over: false }, Some(file)),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                waited = true;
+                std::thread::sleep(LOCK_RETRY);
+            }
+            Err(TryLockError::WouldBlock) => return (decide(launch, Waited::Unanswered), None),
+            Err(TryLockError::Error(_)) => return (Start::Unguarded, None),
+        }
+    }
+}
+
+/// LaunchServices answers a later normal launch with `RunEvent::Reopen`; this only logs the claim.
+#[cfg(target_os = "macos")]
+pub fn report(start: Start) {
+    match start {
+        Start::Owner { took_over: true } => {
+            log::info!("instance: took over from a copy that was quitting");
+        }
+        Start::Unguarded => {
+            log::warn!("instance: the lock is unavailable, so a second copy could start");
+        }
+        Start::Owner { took_over: false } | Start::Exit => {}
+    }
+}
+
 /// `Local\` keeps each signed-in session's copy separate.
+#[cfg(any(windows, test))]
 fn object_name(object: &str) -> String {
     format!(r"Local\{BUNDLE_ID}.{object}")
 }
@@ -303,6 +389,53 @@ mod tests {
                 Start::Owner { took_over: true }
             );
         }
+    }
+
+    fn lock_path(test: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("monhop-instance-{test}-{}", std::process::id()))
+            .join("instance.lock")
+    }
+
+    #[test]
+    fn a_later_copy_leaves_while_the_first_holds_the_lock() {
+        let path = lock_path("held");
+        let (first, held) = claim_file(Launch::Normal, &path, Duration::ZERO);
+        let wait = Duration::from_millis(120);
+        let later = [Launch::Login, Launch::Normal].map(|launch| claim_file(launch, &path, wait).0);
+        assert_eq!(
+            (first, later),
+            (
+                Start::Owner { took_over: false },
+                [Start::Exit, Start::Exit]
+            )
+        );
+        assert!(held.is_some());
+        assert_eq!(
+            claim_file(Launch::CheckUi, &path, Duration::ZERO).0,
+            Start::Unguarded
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_later_copy_takes_over_once_the_quitting_copy_lets_go() {
+        let path = lock_path("quitting");
+        let (first, held) = claim_file(Launch::Login, &path, Duration::ZERO);
+        assert_eq!(first, Start::Owner { took_over: false });
+        let quitting = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held);
+        });
+        let (next, _held) = claim_file(Launch::Login, &path, Duration::from_secs(10));
+        quitting.join().unwrap();
+        assert_eq!(next, Start::Owner { took_over: true });
+        assert_eq!(
+            claim_file(Launch::Normal, &path, Duration::ZERO).0,
+            Start::Exit
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

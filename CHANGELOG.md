@@ -17,6 +17,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 - The window shows how to take your keyboard and mouse back at any time: hold both Control keys and Esc for two seconds.
 - The window opens larger, at 1180 by 760, and still works down to its smallest size, where the details slide over the arrangement.
 
+### Fixed
+
+- On a Mac, MonHop could start a second copy of itself when it first registered to start at login, with its own menu bar icon, that kept trying to connect in the background. Only one copy now runs at a time.
+
 ## [0.2.11] - 2026-10-17
 
 ### Fixed

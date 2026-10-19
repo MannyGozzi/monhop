@@ -29,7 +29,7 @@ mod settings;
 mod sharing;
 mod sharing_hub;
 mod sharing_preferences;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod single_instance;
 mod snapshot;
 mod swipe;
@@ -642,7 +642,7 @@ fn main() {
     let launch = launch::Launch::parse(std::env::args_os().skip(1));
     let check_ui = launch == launch::Launch::CheckUi;
     let login = launch == launch::Launch::Login;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let instance = match single_instance::claim(launch) {
         single_instance::Start::Exit => std::process::exit(0),
         start => start,
@@ -730,6 +730,10 @@ fn main() {
             }
             if login {
                 log::info!("launched at login");
+            }
+            #[cfg(target_os = "macos")]
+            if !check_ui {
+                single_instance::report(instance);
             }
             #[cfg(windows)]
             {
