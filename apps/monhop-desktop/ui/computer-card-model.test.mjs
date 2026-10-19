@@ -4,11 +4,15 @@ import test from "node:test";
 import {
   CONTROL_PAUSE_HINT,
   clearForgetFor,
+  computerMeta,
   computerTone,
   controlSwitchRows,
   displaysFreshness,
+  groupedFingerprint,
+  hostAddress,
   isComputerEnabled,
   isForgetArmed,
+  isInFlight,
   keepForgetArmed,
   keepForgetListed,
   layoutChips,
@@ -18,6 +22,7 @@ import {
   newestFirst,
   pressForget,
   resolveEnabledList,
+  shareSwitchLabel,
   toggleComputerEnabled,
 } from "./computer-card-model.mjs";
 
@@ -356,4 +361,30 @@ test("toggling a computer calls the new per-computer action, falling back to tod
   calls.length = 0;
   toggleComputerEnabled(legacyOnly, WINDOWS, true);
   assert.deepEqual(calls, [["legacy", null]]);
+});
+
+test("the header shows where a computer is without the sharing port", () => {
+  assert.equal(hostAddress("192.168.1.21:24872"), "192.168.1.21");
+  assert.equal(hostAddress("192.168.1.21"), "192.168.1.21");
+  assert.equal(hostAddress("[fe80::1c2a:3bff]:24872"), "fe80::1c2a:3bff");
+  assert.equal(hostAddress("[fe80::1]"), "fe80::1");
+  // A bare IPv6 address has no port to strip, so it stays whole.
+  assert.equal(hostAddress("fe80::1c2a:3bff:fe4e:9a10"), "fe80::1c2a:3bff:fe4e:9a10");
+  for (const missing of [null, undefined, "", 42]) assert.equal(hostAddress(missing), "");
+  assert.equal(computerMeta("Windows PC", "192.168.1.21:24872"), "Windows PC · 192.168.1.21");
+  assert.equal(computerMeta("Mac", null), "Mac");
+  assert.equal(computerMeta("", "10.0.0.4"), "10.0.0.4");
+});
+
+test("the fingerprint reads as four groups of four, and says it goes on", () => {
+  assert.equal(groupedFingerprint(`9f3a61c20b7ed4a8${"0".repeat(48)}`), "9F3A 61C2 0B7E D4A8…");
+  assert.equal(groupedFingerprint("abc"), "ABC…");
+  assert.equal(groupedFingerprint(null), "");
+});
+
+test("only a connection on its way somewhere spins, and the switch names its computer", () => {
+  for (const key of ["connecting", "reconnecting", "stopping"]) assert.ok(isInFlight(key), key);
+  for (const key of ["standby", "connected", "editing", "sharing", "paused", "attention", "error"])
+    assert.ok(!isInFlight(key), key);
+  assert.equal(shareSwitchLabel("Noctua Windows PC"), "Share with Noctua Windows PC");
 });

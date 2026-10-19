@@ -14,6 +14,9 @@ const BUSY_PHASES = new Set(["checking", "downloading", "installing"]);
 const SHARING_HINT = "Sharing is running. Turn it off first or quit MonHop to update.";
 const CHECK_FAILED = "The update check did not finish.";
 
+// Under a ready update, wherever Restart to update is offered.
+export const UPDATE_READY_NOTE = "It installs when you quit MonHop, or now.";
+
 function text(value, fallback = "") {
   return typeof value === "string" ? value : fallback;
 }

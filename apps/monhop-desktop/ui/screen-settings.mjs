@@ -1,14 +1,22 @@
-import { canCheck, canInstall, installHint, updatesStatusText } from "./updates-model.mjs";
+import {
+  UPDATE_READY_NOTE,
+  canCheck,
+  canInstall,
+  installHint,
+  updatesStatusText,
+} from "./updates-model.mjs";
 import {
   autostartDescription,
   autostartOpenLabel,
   autostartStatusText,
   showAutostartOpenSettings,
+  trayPlace,
 } from "./autostart-model.mjs";
 import { ISLAND_DESCRIPTION, ISLAND_SWITCH_LABEL, ISLAND_TITLE } from "./island-model.mjs";
 import {
   DIM_LEVEL_STEP,
   dimButtonLabel,
+  dimRowTitle,
   dimmingMessage,
   levelLabel,
   shortcutDescription,
@@ -28,18 +36,28 @@ import {
 } from "./clipboard-model.mjs";
 import { presence } from "./accordion.mjs";
 import { networkCard } from "./screen-ready.mjs";
+import { fadingText } from "./computer-card.mjs";
+import { tweenValue } from "./motion-model.mjs";
 import {
   button,
   clear,
+  copyAnimation,
   el,
+  icon,
+  motionEase,
+  motionEnabled,
+  motionMs,
   note,
   progressBar,
   row,
   rows,
+  sinceChanged,
   sliderRow,
+  stableLabel,
   statusChip,
   swap,
   switchRow,
+  text,
 } from "./dom.mjs";
 
 const THEMES = [
@@ -48,8 +66,8 @@ const THEMES = [
   ["dark", "Dark"],
 ];
 
-// One section of Settings: its title and what it is for on the left, its controls on the right.
-function section({ id, title, description, headingActions = [], children = [], actions = [] }) {
+// One section of Settings: its title and what it is for on the left, its controls as rows on the right.
+function section({ id, title, description, aside = [], children = [] }) {
   return el("section", {
     className: "settings-section",
     attrs: { id, "aria-labelledby": `${id}-title` },
@@ -59,24 +77,10 @@ function section({ id, title, description, headingActions = [], children = [], a
         children: [
           el("h3", { text: title, attrs: { id: `${id}-title` } }),
           description ? el("p", { text: description }) : null,
-          headingActions.length
-            ? el("div", { className: "row-actions", children: headingActions })
-            : null,
+          aside.length ? el("div", { className: "row-actions", children: aside }) : null,
         ],
       }),
-      el("div", {
-        className: "settings-section-body",
-        children: [
-          ...children,
-          actions.length
-            ? el("div", {
-                className: "card-actions",
-                attrs: { "data-align": "start" },
-                children: actions,
-              })
-            : null,
-        ].filter(Boolean),
-      }),
+      el("div", { className: "settings-section-body", children: children.filter(Boolean) }),
     ],
   });
 }
@@ -106,10 +110,33 @@ export function renderSettings(nodes, ctx) {
   }
 }
 
+// A row's words cross-fade in place when they change; the section around it glides to its height.
+function fadeCopy(node, key, signature) {
+  const copy = node.querySelector(":scope > .row-copy");
+  const after = copy.nextSibling;
+  node.insertBefore(swap(key, copy, signature, { block: true }), after);
+  return node;
+}
+
 // The network MonHop uses, pausing every computer at once, and the way out that always works.
 function sharingCard(ctx) {
   const { actions, busy, toolbar } = ctx;
   const resume = toolbar.pause === "resume";
+  const pause = button("", {
+    variant: "secondary",
+    size: "sm",
+    disabled: busy || toolbar.pause === null,
+    focusKey: "settings-pause",
+    onClick: resume ? actions.resumeSharing : actions.pauseSharing,
+  });
+  pause.append(stableLabel("settings-pause", ["Pause sharing", "Resume"], resume ? 1 : 0));
+  const pauseRow = row({
+    title: resume ? "Sharing is paused" : "Pause sharing",
+    detail: resume
+      ? "Resume picks up with the computer you used last."
+      : "Stops sharing with every computer. Input stays local.",
+    actions: [pause],
+  });
   return section({
     id: "settings-sharing",
     title: "Sharing",
@@ -117,21 +144,7 @@ function sharingCard(ctx) {
     children: [
       networkCard(ctx),
       rows([
-        row({
-          title: resume ? "Sharing is paused" : "Pause sharing",
-          detail: resume
-            ? "Resume picks up with the computer you used last."
-            : "Stops sharing with every computer. Input stays local.",
-          actions: [
-            button(resume ? "Resume" : "Pause sharing", {
-              variant: "secondary",
-              size: "sm",
-              disabled: busy || toolbar.pause === null,
-              focusKey: "settings-pause",
-              onClick: resume ? actions.resumeSharing : actions.pauseSharing,
-            }),
-          ],
-        }),
+        fadeCopy(pauseRow, "settings-pause-copy", resume ? "resume" : "pause"),
         row({
           title: "Take your input back",
           detail:
@@ -159,41 +172,40 @@ function clipboardCard(ctx) {
   const { clipboard, computers, actions } = ctx;
   if (!clipboard) return null;
   const view = normalizeClipboardView(clipboard.view);
-  const children = [
-    rows([
-      switchRow("Share the clipboard", {
-        checked: view.enabled,
-        description: CLIPBOARD_PRIVACY,
-        disabled: clipboard.pending || !ctx.core,
-        focusKey: "settings-clipboard-enable",
-        onChange: actions.setClipboardEnabled,
-      }),
-    ]),
-  ];
-  const status = clipboardStatusText(view);
-  const waiting = presence("settings-clipboard-status", status ? note(status) : null);
-  if (waiting) children.push(waiting);
-  for (const line of clipboardPeerLines(view, computers)) children.push(note(line));
-  const accessNotice = clipboardAccessNotice(view);
-  if (accessNotice) children.push(note(accessNotice, "danger"));
-  const skipNotice = clipboardNoticeText(view);
-  if (skipNotice) children.push(note(skipNotice));
-  const lastText = lastTransferText(view);
-  if (lastText) children.push(note(lastText));
+  const peers = clipboardPeerLines(view, computers);
   const pill = clipboardPill(view);
-  const headingActions = [
-    swap(
-      "settings-clipboard-pill",
-      pill ? statusChip(pill) : el("span", { className: "chip-slot" }),
-      pill ? pill.tone : "none",
-    ),
-  ];
   return section({
     id: "settings-clipboard",
     title: "Clipboard",
     description: "Text and images you copy, on the computers you share with.",
-    headingActions,
-    children,
+    aside: [
+      swap(
+        "settings-clipboard-pill",
+        pill ? statusChip(pill) : el("span", { className: "chip-slot" }),
+        pill ? pill.tone : "none",
+      ),
+    ],
+    children: [
+      rows([
+        switchRow("Share the clipboard", {
+          checked: view.enabled,
+          description: CLIPBOARD_PRIVACY,
+          disabled: clipboard.pending || !ctx.core,
+          focusKey: "settings-clipboard-enable",
+          onChange: actions.setClipboardEnabled,
+        }),
+      ]),
+      fadingText("settings-clipboard-status", "note", clipboardStatusText(view)),
+      presence(
+        "settings-clipboard-peers",
+        peers.length
+          ? el("div", { className: "settings-notes", children: peers.map((line) => note(line)) })
+          : null,
+      ),
+      fadingText("settings-clipboard-access", "note", clipboardAccessNotice(view), "danger"),
+      fadingText("settings-clipboard-skip", "note", clipboardNoticeText(view)),
+      fadingText("settings-clipboard-last", "note", lastTransferText(view)),
+    ],
   });
 }
 
@@ -201,7 +213,23 @@ function clipboardCard(ctx) {
 function dimmingCard({ core, dimming, actions }) {
   const view = dimming.view;
   const disabled = !core || dimming.pending;
-  const message = dimmingMessage(dimming);
+  const dimmed = view?.dimmed === true;
+  const toggle = button("", {
+    variant: "secondary",
+    size: "sm",
+    disabled,
+    busy: dimming.pending,
+    focusKey: "settings-dimming-toggle",
+    onClick: actions.toggleDimming,
+  });
+  toggle.append(
+    swap("settings-dimming-glyph", icon(dimmed ? "sun" : "moon"), dimmed ? "sun" : "moon"),
+    stableLabel(
+      "settings-dimming-toggle",
+      [dimButtonLabel({ dimmed: false }), dimButtonLabel({ dimmed: true })],
+      dimmed ? 1 : 0,
+    ),
+  );
   return section({
     id: "settings-dimming",
     title: "Screen dimming",
@@ -230,23 +258,13 @@ function dimmingCard({ core, dimming, actions }) {
           onDragStart: actions.beginDimDrag,
           onDragEnd: actions.endDimDrag,
         }),
+        fadeCopy(
+          row({ title: dimRowTitle(view), actions: [toggle] }),
+          "settings-dimming-copy",
+          dimmed,
+        ),
       ]),
-      presence("settings-dimming-message", message ? note(message, "danger") : null),
-      el("div", {
-        className: "card-actions",
-        attrs: { "data-align": "start" },
-        children: [
-          button(dimButtonLabel(view), {
-            variant: "secondary",
-            size: "sm",
-            iconName: view?.dimmed ? "sun" : "moon",
-            disabled,
-            busy: dimming.pending,
-            focusKey: "settings-dimming-toggle",
-            onClick: actions.toggleDimming,
-          }),
-        ],
-      }),
+      fadingText("settings-dimming-message", "note", dimmingMessage(dimming), "danger"),
     ],
   });
 }
@@ -279,14 +297,8 @@ function pointerCard({ core, autoscroll, swipe, actions }) {
     description: "When another computer's mouse controls this Mac, or this trackpad controls it.",
     children: [
       rows(switches),
-      presence(
-        "settings-autoscroll-message",
-        autoscroll?.view.error ? note(autoscroll.view.error, "danger") : null,
-      ),
-      presence(
-        "settings-swipe-message",
-        swipe?.view.error ? note(swipe.view.error, "danger") : null,
-      ),
+      fadingText("settings-autoscroll-message", "note", autoscroll?.view.error, "danger"),
+      fadingText("settings-swipe-message", "note", swipe?.view.error, "danger"),
     ],
   });
 }
@@ -309,15 +321,47 @@ function keyboardCard({ core, controlAsCommand, actions }) {
           onChange: actions.setControlAsCommand,
         }),
       ]),
-      presence("settings-keyboard-message", view.error ? note(view.error, "danger") : null),
+      fadingText("settings-keyboard-message", "note", view.error, "danger"),
     ],
   });
 }
 
+// The status row offers Check now, or Restart to update once a build is ready. Both share one
+// cell, so the row keeps its shape and the swap is a cross-fade.
 function updatesCard(ctx) {
   const { core, updates, actions } = ctx;
   const { view, pending } = updates;
-  const hint = installHint(view);
+  const ready = view.phase === "ready";
+  const check = button("Check now", {
+    id: "settings-updates-check",
+    variant: "secondary",
+    size: "sm",
+    disabled: pending || !canCheck(view),
+    busy: pending,
+    onClick: actions.checkForUpdates,
+  });
+  const install = button("Restart to update", {
+    id: "settings-updates-install",
+    size: "sm",
+    disabled: pending || !canInstall(view),
+    busy: pending,
+    onClick: actions.installUpdate,
+  });
+  const status = updatesStatusText(view);
+  const statusRow = row({
+    title: status,
+    detail: ready ? UPDATE_READY_NOTE : null,
+    actions: [oneOf("settings-updates-action", [check, install], ready ? 1 : 0)],
+  });
+  statusRow.classList.add("settings-status-row");
+  // Comes and goes with the phase, gliding its own height so the sections below never jump.
+  const progress = presence(
+    "settings-updates-progress",
+    view.phase === "downloading"
+      ? progressBar("settings-updates-progress", (view.progressPercent ?? 0) / 100)
+      : null,
+  );
+  if (progress) statusRow.querySelector(":scope > .row-copy").append(progress);
   return section({
     id: "settings-updates",
     title: "Updates",
@@ -333,35 +377,33 @@ function updatesCard(ctx) {
           id: "settings-updates-automatic",
           onChange: actions.setUpdatesAutomatic,
         }),
+        // Keyed by phase, so a download's rising percentage counts up in place.
+        fadeCopy(statusRow, "settings-updates-copy", view.phase),
       ]),
-      note(updatesStatusText(view)),
-      // Both come and go with the phase; each glides its own height so the sections below never jump.
-      presence(
-        "settings-updates-progress",
-        view.phase === "downloading"
-          ? progressBar("settings-updates-progress", (view.progressPercent ?? 0) / 100)
-          : null,
-      ),
-      presence("settings-updates-hint", hint ? note(hint, "danger") : null),
-    ],
-    actions: [
-      button("Check now", {
-        id: "settings-updates-check",
-        variant: "secondary",
-        size: "sm",
-        disabled: pending || !canCheck(view),
-        busy: pending,
-        onClick: actions.checkForUpdates,
-      }),
-      button("Restart to update", {
-        id: "settings-updates-install",
-        size: "sm",
-        disabled: pending || !canInstall(view),
-        busy: pending,
-        onClick: actions.installUpdate,
-      }),
+      fadingText("settings-updates-hint", "note", installHint(view), "danger"),
     ],
   });
+}
+
+// Controls that take turns in one place: every one shares a cell, so the widest sets the width and
+// nothing beside them moves; only `current` is shown and reachable, and a change cross-fades.
+function oneOf(key, controls, current) {
+  const cell = stableLabel(
+    key,
+    controls.map(() => ""),
+    current,
+  );
+  cell.classList.add("one-of");
+  cell.replaceChildren(
+    ...controls.map((control, index) => {
+      const shown = index === current;
+      control.dataset.current = String(shown);
+      control.inert = !shown;
+      if (!shown) control.setAttribute("aria-hidden", "true");
+      return control;
+    }),
+  );
+  return cell;
 }
 
 // The only place MonHop's start at login is set.
@@ -371,6 +413,7 @@ function startupCard(ctx) {
   return section({
     id: "settings-startup",
     title: "Startup",
+    description: `Closing the window keeps MonHop running in ${trayPlace(platform)}.`,
     children: [
       rows([
         switchRow("Start MonHop when you log in", {
@@ -381,7 +424,7 @@ function startupCard(ctx) {
           onChange: actions.setAutostart,
         }),
       ]),
-      note(autostartStatusText(view)),
+      fadingText("settings-autostart-status", "note", autostartStatusText(view)),
       presence(
         "settings-autostart-open",
         showAutostartOpenSettings(view)
@@ -413,6 +456,7 @@ function islandCard(ctx) {
   return section({
     id: "settings-island",
     title: ISLAND_TITLE,
+    description: "Only on a Mac whose display has a camera notch.",
     children: [
       rows([
         switchRow(ISLAND_SWITCH_LABEL, {
@@ -423,93 +467,151 @@ function islandCard(ctx) {
           onChange: actions.setIslandEnabled,
         }),
       ]),
-      presence("settings-island-error", view.error ? note(view.error, "danger") : null),
+      fadingText("settings-island-error", "note", view.error, "danger"),
     ],
   });
 }
 
-function appearanceCard({ theme, themePending, actions }) {
-  const control = el("div", {
-    className: "segmented theme-choice",
-    attrs: { role: "radiogroup", "aria-label": "Appearance" },
-    children: THEMES.map(([value, label]) => {
-      const option = el("button", {
-        className: "segmented-option",
-        text: label,
-        attrs: { type: "button", role: "radio", "aria-checked": String(theme === value) },
-        dataset: { focusKey: `settings-theme-${value}` },
-      });
-      option.disabled = themePending;
-      option.addEventListener("click", () => actions.setTheme(value));
-      return option;
-    }),
-  });
+function appearanceCard(ctx) {
   return section({
     id: "settings-appearance",
     title: "Appearance",
     description: "System follows this computer's light or dark setting.",
-    children: [control],
+    children: [rows([row({ title: "Theme", actions: [themeChoice(ctx)] })])],
   });
+}
+
+// The theme choice's thumb, by key: a render rebuilds the control, so the new thumb glides on from
+// where the last one was drawn, or carries a glide still running toward the same theme.
+const thumbGlides = new Map();
+// The theme the thumb is on and the one it left, whose words fade back as the new one's brighten.
+const themeWords = { current: null, previous: null };
+
+function themeChoice({ theme, themePending, actions }) {
+  const index = Math.max(
+    0,
+    THEMES.findIndex(([value]) => value === theme),
+  );
+  const thumb = el("span", { className: "segmented-thumb", attrs: { "aria-hidden": "true" } });
+  thumb.style.setProperty("--segment-index", String(index));
+  glideThumb(thumb, "settings-theme", index);
+  // The words trade emphasis with the thumb, carried on across the renders meanwhile.
+  if (themeWords.current !== index) themeWords.previous = themeWords.current;
+  themeWords.current = index;
+  const elapsed = sinceChanged("settings-theme-words", index);
+  const control = el("div", {
+    className: "segmented theme-choice",
+    attrs: { role: "radiogroup", "aria-label": "Appearance" },
+    children: [
+      thumb,
+      ...THEMES.map(([value, label], at) => {
+        const option = el("button", {
+          className: "segmented-option",
+          text: label,
+          attrs: { type: "button", role: "radio", "aria-checked": String(theme === value) },
+          dataset: { focusKey: `settings-theme-${value}` },
+        });
+        option.disabled = themePending;
+        option.addEventListener("click", () => actions.setTheme(value));
+        const trade = at === index ? "on" : at === themeWords.previous ? "off" : null;
+        if (trade && elapsed < motionMs("--motion-base")) {
+          option.dataset.enter = trade;
+          option.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+        }
+        return option;
+      }),
+    ],
+  });
+  control.style.setProperty("--segment-count", String(THEMES.length));
+  return control;
+}
+
+// Each step of the thumb is one segment plus the gap after it, which is the thumb's own width.
+function segmentAt(index) {
+  return `translateX(${index * 100}%)`;
+}
+
+function glideThumb(thumb, key, index) {
+  const last = thumbGlides.get(key) ?? null;
+  const running = last?.animation?.playState === "running" ? last : null;
+  const shown = running
+    ? tweenValue(running.from, running.to, running.animation.effect.getComputedTiming().progress)
+    : (last?.to ?? index);
+  if (motionEnabled() && running?.to === index) {
+    thumbGlides.set(key, { ...running, animation: copyAnimation(running.animation, thumb) });
+    return;
+  }
+  if (!motionEnabled() || shown === index) {
+    thumbGlides.set(key, { animation: null, from: index, to: index });
+    return;
+  }
+  const animation = thumb.animate(
+    { transform: [segmentAt(shown), segmentAt(index)] },
+    { duration: motionMs("--motion-spring"), easing: motionEase("--ease-spring") },
+  );
+  thumbGlides.set(key, { animation, from: shown, to: index });
 }
 
 function diagnosticsCard({ state, actions }) {
   const logPath = state.snapshot?.logPath;
+  const log = row({
+    title: "Log file",
+    detail: logPath || "Available after this computer is checked.",
+    actions: [
+      button("Show", {
+        variant: "secondary",
+        size: "sm",
+        disabled: !logPath,
+        focusKey: "settings-log-show",
+        onClick: actions.revealLogFile,
+      }),
+    ],
+  });
+  if (logPath) log.classList.add("settings-path-row");
   return section({
     id: "settings-diagnostics",
     title: "Diagnostics",
-    children: [
-      rows([
-        row({
-          title: "Log file",
-          detail: logPath || "Available after this computer is checked.",
-          actions: [
-            button("Show", {
-              variant: "secondary",
-              size: "sm",
-              disabled: !logPath,
-              focusKey: "settings-log-show",
-              onClick: actions.revealLogFile,
-            }),
-          ],
-        }),
-      ]),
-    ],
+    description: "Kept on this computer. MonHop never logs what you type.",
+    children: [rows([log])],
   });
 }
 
 function aboutCard(ctx) {
   const { view } = ctx.updates;
   const { actions } = ctx;
+  const link = (label, target, id, iconName) =>
+    button(label, {
+      id,
+      variant: "ghost",
+      size: "sm",
+      iconName,
+      onClick: () => actions.openLink(target),
+    });
   return section({
     id: "settings-about",
     title: "About",
     children: [
-      el("p", {
-        className: "about-version",
-        text: `MonHop ${view.currentVersion} (${view.buildCommit})`,
-      }),
-      note("Free software under the GNU GPL v3 or later."),
       el("div", {
-        className: "card-actions",
-        attrs: { "data-align": "start" },
+        className: "settings-about",
         children: [
-          button("Source code", {
-            id: "settings-about-source",
-            variant: "secondary",
-            size: "sm",
-            onClick: () => actions.openLink("source"),
+          el("p", {
+            className: "about-line",
+            children: [
+              el("strong", { text: `MonHop ${view.currentVersion}` }),
+              view.buildCommit ? text(" ") : null,
+              view.buildCommit
+                ? el("code", { className: "about-commit", text: `(${view.buildCommit})` })
+                : null,
+            ],
           }),
-          button("Release notes", {
-            id: "settings-about-releases",
-            variant: "secondary",
-            size: "sm",
-            onClick: () => actions.openLink("releases"),
-          }),
-          button("Support MonHop", {
-            id: "settings-about-support",
-            size: "sm",
-            iconName: "heart",
-            onClick: () => actions.openLink("support"),
+          note("Free software under the GNU GPL v3 or later."),
+          el("div", {
+            className: "settings-links",
+            children: [
+              link("Source code", "source", "settings-about-source"),
+              link("Release notes", "releases", "settings-about-releases"),
+              link("Support MonHop", "support", "settings-about-support", "heart"),
+            ],
           }),
         ],
       }),

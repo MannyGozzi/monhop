@@ -22,6 +22,53 @@ export function newestFirst(entries) {
   return Array.isArray(entries) ? entries.toReversed() : [];
 }
 
+// --- header and details -----------------------------------------------------
+
+// The recorded address may carry the sharing port, which means nothing to a person: "[fe80::1]:24872"
+// and "192.168.1.21:24872" lose it, and a bare IPv6 address, which has no port, stays whole.
+export function hostAddress(address) {
+  const value = typeof address === "string" ? address.trim() : "";
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    return end > 1 ? value.slice(1, end) : value;
+  }
+  const colon = value.indexOf(":");
+  return colon > 0 && colon === value.lastIndexOf(":") ? value.slice(0, colon) : value;
+}
+
+// "Windows PC · 192.168.1.21": what it is and where it is, either one alone when the other is unknown.
+export function computerMeta(platformName, address) {
+  return [platformName, hostAddress(address)].filter(Boolean).join(" · ");
+}
+
+const FINGERPRINT_SHOWN = 16;
+const FINGERPRINT_GROUP = 4;
+
+// The first 16 hex digits in groups of four, the way two people read one aloud to compare.
+export function groupedFingerprint(fingerprint) {
+  const head = String(fingerprint ?? "")
+    .slice(0, FINGERPRINT_SHOWN)
+    .toUpperCase();
+  if (!head) return "";
+  const groups = [];
+  for (let at = 0; at < head.length; at += FINGERPRINT_GROUP)
+    groups.push(head.slice(at, at + FINGERPRINT_GROUP));
+  return `${groups.join(" ")}…`;
+}
+
+// --- the share switch ---------------------------------------------------------
+
+// A connection on its way somewhere shows a spinner beside its label, never a second word.
+const IN_FLIGHT = new Set(["connecting", "reconnecting", "stopping"]);
+
+export function isInFlight(statusKey) {
+  return IN_FLIGHT.has(statusKey);
+}
+
+export function shareSwitchLabel(name) {
+  return `Share with ${name}`;
+}
+
 // --- displays --------------------------------------------------------------
 
 // The card draws the saved arrangement, so one word under it says whether the link is reporting

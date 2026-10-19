@@ -27,6 +27,11 @@ export function dimButtonLabel(view) {
   return view?.dimmed ? "Undim" : "Dim now";
 }
 
+// The row beside that button says what pressing it does now.
+export function dimRowTitle(view) {
+  return view?.dimmed ? "The screens are dimmed" : "Dim the screens now";
+}
+
 export function levelLabel(level) {
   return `${level}%`;
 }

@@ -1,1 +1,64 @@
 /* Studio settings pane. Component rules only; shared tokens live in styles.css, pane tokens at the top here. */
+:root {
+  --settings-slider-width: 240px;
+  --settings-theme-width: 252px;
+  --settings-content-max: 920px;
+}
+
+/* Rows in Settings and the computer inspector are flat: no tray behind them, a hairline between
+   each, the copy flush with the section title. Selectable rows keep a hover surface, inset to match. */
+:is(.settings-pane, .computer-inspector) .rows { overflow: visible; border-radius: 0; background: none; }
+:is(.settings-pane, .computer-inspector) .rows > :is(.row, .switch-row, .slider-row) { border-radius: 0; padding-inline: 0; }
+:is(.settings-pane, .computer-inspector) .rows > * + *::before { left: 0; }
+:is(.settings-pane, .computer-inspector) .rows > .switch-row:hover { background: none; }
+:is(.settings-pane, .computer-inspector) .rows > .row[data-selectable="true"] { margin-inline: calc(var(--gap-3) * -1); border-radius: var(--radius-group); padding-inline: var(--gap-3); }
+:is(.settings-pane, .computer-inspector) .rows > .row[data-selectable="true"] + *::before, :is(.settings-pane, .computer-inspector) .rows > * + .row[data-selectable="true"]::before { left: var(--gap-3); right: var(--gap-3); }
+:is(.settings-pane, .computer-inspector) .switch-copy > small { line-height: var(--leading); }
+
+/* Sections: the title and what it is for on the left, the controls on the right; stacked when narrow. */
+.settings-content { width: 100%; max-width: var(--settings-content-max); margin-inline: auto; }
+.settings-section { align-items: start; }
+.settings-section-heading { padding-top: var(--gap-3); }
+.settings-section-body { gap: var(--gap-2); }
+.settings-section-body > .card { gap: var(--gap-2); padding-top: var(--gap-3); }
+.settings-section-body > .card > .card-heading p { font-size: var(--text-sm); }
+.settings-pane .row-copy strong { white-space: normal; overflow-wrap: anywhere; }
+.settings-notes { display: grid; gap: var(--gap-1); }
+
+/* The slider sits beside its label, the readout after it. */
+.settings-pane .slider-row { grid-template-columns: minmax(0, 1fr) var(--settings-slider-width); align-items: center; column-gap: var(--gap-6); }
+
+/* Updates: the status row's progress bar under its words, and its one action cell. */
+.settings-status-row .row-copy { gap: var(--gap-1); }
+.settings-status-row .progress-bar { margin-top: var(--gap-2); }
+.one-of > * { grid-area: 1 / 1; justify-self: end; }
+
+/* Appearance: the segmented choice, its thumb gliding under the options (screen-settings.mjs). */
+.theme-choice.segmented { position: relative; isolation: isolate; width: var(--settings-theme-width); }
+.theme-choice .segmented-thumb { position: absolute; top: var(--gap-half); bottom: var(--gap-half); left: var(--gap-half); width: calc((100% - var(--gap-half)) / var(--segment-count)); transform: translateX(calc(var(--segment-index) * 100%)); pointer-events: none; }
+.theme-choice .segmented-thumb::before { content: ""; position: absolute; inset: 0 var(--gap-half) 0 0; border-radius: var(--radius-sm); background: var(--solid); box-shadow: var(--shadow-chip); }
+.theme-choice .segmented-option { z-index: 1; }
+.theme-choice .segmented-option[aria-checked="true"] { background: none; box-shadow: none; }
+/* A theme change holds the options for a moment; they stay as they look rather than flicker dim. */
+.theme-choice .segmented-option:disabled { cursor: progress; opacity: 1; }
+
+/* Diagnostics and About. */
+.settings-path-row .row-copy > span { font-family: var(--font-mono); font-size: var(--text-xs); white-space: normal; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
+.settings-about { display: grid; gap: var(--gap-1); padding-top: var(--gap-3); }
+.about-line { color: var(--foreground); font-size: var(--text-base); }
+.about-line strong { font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); }
+.about-commit { color: var(--subtle-foreground); font-size: var(--text-xs); }
+.settings-links { display: flex; flex-wrap: wrap; gap: var(--gap-1); margin: var(--gap-2) 0 0 calc(var(--gap-3) * -1); }
+#settings-about-support svg { color: var(--primary); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .theme-choice .segmented-option[data-enter="on"] { animation: settings-segment-on var(--motion-base) var(--ease-out) var(--motion-delay, 0ms) both; }
+  .theme-choice .segmented-option[data-enter="off"] { animation: settings-segment-off var(--motion-base) var(--ease-out) var(--motion-delay, 0ms) both; }
+}
+@keyframes settings-segment-on { from { color: var(--muted-foreground); } }
+@keyframes settings-segment-off { from { color: var(--foreground); } }
+
+@container (max-width: 640px) {
+  .settings-section-heading { padding-top: 0; }
+  .settings-pane .slider-row { grid-template-columns: minmax(0, 1fr); }
+}

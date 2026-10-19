@@ -6,6 +6,7 @@ import {
   beginDimming,
   clampLevel,
   dimButtonLabel,
+  dimRowTitle,
   dimmingMessage,
   failDimming,
   initialDimming,
@@ -43,6 +44,9 @@ test("a failed request keeps the last view so the controls stay usable", () => {
 test("labels follow the overlay and the shortcut state", () => {
   assert.equal(dimButtonLabel(view), "Dim now");
   assert.equal(dimButtonLabel({ ...view, dimmed: true }), "Undim");
+  assert.equal(dimRowTitle(view), "Dim the screens now");
+  assert.equal(dimRowTitle({ ...view, dimmed: true }), "The screens are dimmed");
+  assert.equal(dimRowTitle(null), "Dim the screens now");
   assert.equal(dimButtonLabel(null), "Dim now");
   assert.equal(levelLabel(35), "35%");
   assert.match(shortcutDescription(view), /^Control \+ Option \+ 0 toggles/);

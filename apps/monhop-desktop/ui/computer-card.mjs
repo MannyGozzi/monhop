@@ -14,13 +14,16 @@ import { clipboardLine } from "./studio-model.mjs";
 import { inspectorHeader } from "./screen-ready.mjs";
 import { pairedResult } from "./screen-computers.mjs";
 import {
+  computerMeta,
   computerTone,
   controlSwitchRows,
-  displaysFreshness,
+  groupedFingerprint,
   isComputerEnabled,
+  isInFlight,
   layoutChips,
   layoutRows,
   resolveEnabledList,
+  shareSwitchLabel,
   toggleComputerEnabled,
 } from "./computer-card-model.mjs";
 import {
@@ -28,17 +31,11 @@ import {
   copyFeedbackControls,
   el,
   icon,
-  motionEase,
-  motionEnabled,
   motionMs,
-  motionToken,
   note,
   pairBadge,
   platformGlyph,
-  reducedMotion,
-  row,
   rows,
-  settle,
   sinceChanged,
   stableLabel,
   statusChip,
@@ -46,111 +43,47 @@ import {
   switchRow,
   withTooltip,
 } from "./dom.mjs";
-import {
-  INHALE_LOW,
-  ORBIT_MAX_STEP,
-  loopAngle,
-  orbitMotion,
-  orbitSpeed,
-  orbitStep,
-  pillChange,
-  pillLook,
-  restAngle,
-  tweenTiming,
-} from "./sharing-pill-model.mjs";
 
 // A Layouts list rebuilt within this window is still the same entrance, stagger included.
 const LIST_ENTER_MS = 600;
 
-// A computer's inspector: who it is, its connection and the one switch that turns it on, the
-// directions of control, its displays and layouts, and the details that forget it.
+// A computer's inspector: who it is, its state with the one switch that shares with it, the
+// directions of control, its clipboard, its arrangement and layouts, its details and Forget.
 export function computerInspector(ctx, computer) {
-  const { busy, renaming, renamePending, active } = ctx;
+  const { active } = ctx;
   const fingerprint = computer.fingerprint;
   const name = displayName(computer);
   const local = localName(ctx);
   const status = computerStatus(computer, ctx.sharing.view, active, local);
   const enabledList = resolveEnabledList(ctx.sharing.view, ctx.computers, active);
   const enabled = isComputerEnabled(fingerprint, enabledList);
-  const tone = computerTone(fingerprint, enabledList);
-  const pending = renamePending === fingerprint;
-  const editing = renaming === fingerprint || pending;
+  const tone = enabled ? computerTone(fingerprint, enabledList) : "idle";
   const key = `inspector-${fingerprint}`;
-  const sharing = enabled && status.key === "sharing";
-  const release = sharing ? releaseToShareCopy(ctx.sharing.view?.blockingPresses) : "";
   const justPaired =
     ctx.pairingResultShown && ctx.pairing.view?.phase === "paired"
       ? ctx.pairing.view.peerFingerprint === fingerprint
       : false;
-
-  const children = [
-    inspectorHeader({
-      glyph: platformGlyph(computer.platform),
-      tone: enabled ? tone : "idle",
-      titleNode: swap(
-        `${key}-name`,
-        editing ? nameField(ctx, computer, name, pending) : nameButton(ctx, computer, name),
-        editing ? "edit" : "view",
-      ),
-      metaNode: el("p", {
-        className: "inspector-meta computer-meta",
-        children: [
-          el("span", {
-            text: editing
-              ? pending
-                ? "Saving…"
-                : "Enter to save · Esc to cancel"
-              : [platformLabel(computer.platform), computer.address].filter(Boolean).join(" · "),
-          }),
-          !editing && computer.badge ? pairPicture(computer, key) : null,
-        ],
-      }),
-    }),
-    presence(`${key}-paired`, justPaired ? pairedResult(ctx) : null),
-    el("section", {
-      className: "state-block",
-      dataset: { tone: status.tone },
-      children: [
-        el("div", {
-          className: "state-block-heading",
-          children: [
-            el("span", { className: "status-dot", dataset: { tone: status.tone } }),
-            el("strong", { text: status.label }),
-            sharingPill(ctx, fingerprint, name, enabled, status.key === "sharing"),
-          ],
-        }),
-        el("p", { className: "state-block-detail", text: status.detail }),
-        presence(`${key}-release`, release ? note(release, "warning") : null),
-        presence(`${key}-notice`, noticeLine(ctx, computer, enabled)),
-      ],
-    }),
-    presence(
-      `${key}-control`,
-      enabled ? section("Directions", [controlSwitches(ctx, computer, name, local)]) : null,
-    ),
-    displaysSection(ctx, computer),
-    presence(`${key}-clipboard`, clipboardSection(ctx, computer, name)),
-    layoutsDisclosure(ctx, computer, key),
-    createAccordion(
-      `inspector-computer-${fingerprint}`,
-      "computer-details",
-      "Details",
-      ...(fingerprint === active ? activeDetails(ctx, key) : []),
-      ...forgetControls(ctx, computer, name),
-    ),
-  ];
   const node = el("div", {
-    className: "inspector-view",
+    className: "inspector-view computer-inspector",
     dataset: { kind: "computer", tone: status.tone },
-    children: children.filter(Boolean),
+    children: [
+      header(ctx, computer, name, tone, key),
+      presence(`${key}-paired`, justPaired ? pairedResult(ctx) : null),
+      stateBlock(ctx, computer, { name, status, enabled, key }),
+      presence(`${key}-control`, enabled ? directions(ctx, computer, name, local) : null),
+      presence(`${key}-clipboard`, clipboardSection(ctx, computer, name, key)),
+      arrangementSection(ctx, computer, key),
+      details(ctx, computer, key),
+      forgetSection(ctx, computer, name, key),
+    ],
   });
-  if (busy) node.dataset.busy = "true";
+  if (ctx.busy) node.dataset.busy = "true";
   return node;
 }
 
-function section(title, children, actions = []) {
+function section(title, children, { actions = [], className = "" } = {}) {
   return el("section", {
-    className: "inspector-section",
+    className: ["inspector-section", className].filter(Boolean).join(" "),
     children: [
       el("div", {
         className: "inspector-section-heading",
@@ -164,435 +97,59 @@ function section(title, children, actions = []) {
   });
 }
 
-// Its displays live on the canvas; here is when they were last reported and the way to change them.
-function displaysSection(ctx, computer) {
-  const { actions, busy, arrange, studio } = ctx;
-  const saved = computer.setup?.saved === true;
-  return section(
-    "Displays",
-    [
-      note(
-        saved
-          ? displaysFreshness(computer.setup)
-          : "No layout yet. Arrange the displays to start sharing.",
-      ),
-    ],
-    [
-      button(saved ? "Change layout" : "Arrange displays", {
-        variant: "secondary",
-        size: "sm",
-        disabled: busy || arrange.active || !studio.canArrange,
-        focusKey: `inspector-arrange-${computer.fingerprint}`,
-        onClick: () => actions.arrangeWith(computer.fingerprint),
-      }),
-    ],
-  );
+// Text that changes in place: the words cross-fade and the block glides to its new height. Settings
+// draws its status lines with it too.
+export function fadingText(key, className, value, tone = null) {
+  if (!value) return presence(key, null);
+  const node = el("p", { className, text: value, dataset: tone ? { tone } : undefined });
+  return presence(key, swap(`${key}-text`, node, `${tone}|${value}`, { block: true }));
 }
 
-// The clipboard switch lives in Settings; this says what it means for this one computer.
-function clipboardSection(ctx, computer, name) {
-  if (!ctx.clipboard) return null;
-  const view = normalizeClipboardView(ctx.clipboard.view);
-  return section("Clipboard", [note(clipboardLine(view, computer.fingerprint, name))]);
-}
-
-// The last drop stays out of sight until Details opens, never in red, and always with Copy.
-function activeDetails(ctx, key) {
-  const { actions, busy, sharing, dropCopyFeedback, activeComputer } = ctx;
-  const lastFailure = sharing.view?.lastFailure;
-  const feedback = dropCopyFeedback;
-  const copy = copyFeedbackControls(feedback, {
-    disabled: busy || feedback.state === "pending",
-    focusKey: "inspector-copy-last-drop",
-    onClick: actions.copyLastDrop,
-  });
-  return [
-    activeComputer?.setup?.saved === true ? note(DRAWN_DISPLAYS_NOTE) : null,
-    presence(
-      `${key}-last-drop`,
-      lastFailure
-        ? el("div", {
-            className: "field",
-            children: [
-              note(lastFailure),
-              el("div", {
-                className: "card-actions",
-                attrs: { "data-align": "start" },
-                children: [copy.button],
-              }),
-              copy.line,
-            ],
-          })
-        : null,
-    ),
-  ];
-}
-
-// Each computer's Link capsule outlives renders: the inspector is rebuilt on every status poll, and
-// a kept node keeps its tweens, orbit, hover and focus through each rebuild.
-const pills = new Map();
-const PILL_LABELS = {
-  start: "Start sharing",
-  connecting: "Connecting…",
-  sharing: "Sharing",
-  pause: "Pause",
-};
-const GLYPH = ["opacity", "transform", "filter"];
-const DOT = ["transform", "backgroundColor", "boxShadow"];
-let pillsQueued = false;
-reducedMotion.addEventListener("change", () => {
-  for (const pill of pills.values()) {
-    stillPill(pill);
-    pill.shown = null;
-  }
-  queuePills();
-});
-
-function sharingPill(ctx, fingerprint, name, enabled, live) {
-  const pill = pills.get(fingerprint) ?? buildPill(fingerprint);
-  pills.set(fingerprint, pill);
-  const control = pill.button;
-  control.setAttribute("aria-label", `${enabled ? "Pause sharing" : "Start sharing"} with ${name}`);
-  control.setAttribute("aria-pressed", String(enabled));
-  if (ctx.busy) control.setAttribute("aria-busy", "true");
-  else control.removeAttribute("aria-busy");
-  control.disabled = ctx.busy;
-  pill.press = () => toggleComputerEnabled(ctx.actions, fingerprint, enabled);
-  pill.want = { ...pill.want, inUse: enabled, live, busy: ctx.busy };
-  pill.moved = true;
-  queuePills();
-  return pill.wrap;
-}
-
-function pillLayer(className, children) {
-  return el("span", { className, children });
-}
-
-function buildPill(fingerprint) {
-  const [halo, edge, breath] = [
-    pillLayer("sharing-pill-halo"),
-    pillLayer("sharing-pill-edge"),
-    pillLayer("sharing-pill-breath"),
-  ];
-  const glow = pillLayer("sharing-pill-glow", [breath]);
-  const arms = ["local", "peer"].map((side) => {
-    const dot = pillLayer(`sharing-pill-dot ${side}`);
-    return { arm: pillLayer(`sharing-pill-arm ${side}`, [dot]), dot };
-  });
-  const orbit = pillLayer(
-    "sharing-pill-orbit",
-    arms.map(({ arm }) => arm),
-  );
-  const labels = Object.entries(PILL_LABELS).map(([kind, text]) =>
-    el("span", { className: kind, text }),
-  );
-  const words = el("span", {
-    className: "sharing-pill-label",
-    attrs: { "aria-hidden": "true" },
-    children: labels,
-  });
-  const control = el("button", {
-    className: "sharing-pill",
-    attrs: { type: "button" },
-    dataset: { focusKey: `sharing-pill-${fingerprint}` },
+// A small line under the state: a glyph, then what it means for this computer.
+function inlineNote(value, tone, glyph, live = false) {
+  return el("p", {
+    className: "inspector-note",
+    dataset: { tone },
+    attrs: live ? { "aria-live": "polite" } : undefined,
     children: [
-      pillLayer("sharing-pill-glass"),
-      edge,
-      glow,
       el("span", {
-        className: "sharing-pill-mark",
+        className: "inspector-note-glyph",
         attrs: { "aria-hidden": "true" },
-        children: [orbit],
+        children: [glyph],
       }),
-      words,
+      el("span", { text: value }),
     ],
   });
-  const wrap = el("span", { className: "sharing-pill-wrap", children: [halo, control] });
-  const parts = [
-    [control, "capsule", ["width"]],
-    [halo, "halo"],
-    [edge, "edge"],
-    [glow, "glow"],
-    [words, "words"],
-    ...arms.flatMap(({ arm, dot }) => [
-      [arm, "arm", ["transform"]],
-      [dot, "dot", DOT],
-    ]),
-    ...labels.map((node) => [node, "label", GLYPH]),
-  ].map(([node, part, properties = ["opacity"]]) => ({ node, part, properties }));
-  const pill = {
-    key: fingerprint,
-    wrap,
-    button: control,
-    glow,
-    breath,
-    orbit,
-    parts,
-    want: { inUse: false, live: false, busy: false, hover: false, focus: false, rested: false },
-    shown: null,
-    tweens: [],
-    breathing: null,
-    spin: {
-      angle: 0,
-      speed: 0,
-      target: 0,
-      rest: null,
-      well: null,
-      lap: 0,
-      from: 0,
-      loop: null,
-      frame: 0,
-      at: null,
-    },
-    moved: false,
-    inhaleTween: null,
-    pressTween: null,
-    pressed: false,
-    press: null,
-  };
-  const engage = (change) => {
-    pill.want = { ...pill.want, ...change };
-    queuePills();
-  };
-  // A render re-inserts the kept node, which re-fires enter and focus but never a leave, so only a
-  // real leave or a move of focus elsewhere ends the rest that follows a press.
-  wrap.addEventListener("pointerenter", () => engage({ hover: true }));
-  wrap.addEventListener("pointerleave", () => engage({ hover: false, rested: false }));
-  control.addEventListener("focus", () => engage({ focus: control.matches(":focus-visible") }));
-  control.addEventListener("blur", (event) =>
-    engage(event.relatedTarget ? { focus: false, rested: false } : { focus: false }),
-  );
-  control.addEventListener("click", () => {
-    engage({ rested: true });
-    pill.press?.();
+}
+
+// --- header -------------------------------------------------------------------
+
+// The tile, the name that renames in place, what and where it is, and the pairing picture.
+function header(ctx, computer, name, tone, key) {
+  const fingerprint = computer.fingerprint;
+  const pending = ctx.renamePending === fingerprint;
+  const editing = ctx.renaming === fingerprint || pending;
+  const meta = editing
+    ? pending
+      ? "Saving…"
+      : "Enter to save · Esc to cancel"
+    : computerMeta(platformLabel(computer.platform), computer.address);
+  return inspectorHeader({
+    glyph: platformGlyph(computer.platform),
+    tone,
+    titleNode: swap(
+      `${key}-name`,
+      editing ? nameField(ctx, computer, name, pending) : nameButton(ctx, computer, name),
+      editing ? "edit" : "view",
+    ),
+    metaNode: el("div", {
+      className: "computer-subtitle",
+      children: [
+        swap(`${key}-meta`, el("p", { className: "inspector-meta", text: meta }), meta),
+        computer.badge ? pairPicture(computer, key) : null,
+      ],
+    }),
   });
-  control.addEventListener("pointerdown", (event) => {
-    if (event.button === 0) pressPill(pill, true);
-  });
-  for (const type of ["pointerup", "pointercancel", "pointerleave"])
-    control.addEventListener(type, () => pressPill(pill, false));
-  return pill;
-}
-
-// One pass after the render (or event) that asked for it, once the capsules are back in the page:
-// the look they show is read there before the new one is applied, so every change tweens from it.
-function queuePills() {
-  if (pillsQueued) return;
-  pillsQueued = true;
-  queueMicrotask(() => {
-    pillsQueued = false;
-    for (const pill of pills.values()) syncPill(pill);
-  });
-}
-
-function syncPill(pill) {
-  if (!pill.wrap.isConnected) {
-    stillPill(pill);
-    pills.delete(pill.key);
-    return;
-  }
-  const next = pillLook(pill.want);
-  const change = pillChange(pill.shown, next);
-  if (change) applyLook(pill, next, change);
-  runBreath(pill);
-  turnOrbit(pill);
-  pill.moved = false;
-}
-
-function applyLook(pill, next, change) {
-  const motion = change.animate && motionEnabled() && pill.wrap.getClientRects().length > 0;
-  const from = motion ? readParts(pill) : null;
-  for (const tween of pill.tweens) tween.cancel();
-  pill.tweens = [];
-  pill.wrap.dataset.state = next.state;
-  pill.wrap.dataset.busy = String(next.busy);
-  pill.wrap.dataset.pause = String(next.pause);
-  pill.wrap.dataset.lean = String(next.lean);
-  pill.shown = next;
-  if (motion) pill.tweens = tweenParts(pill, from, readParts(pill));
-  if (motion && change.inhale) inhale(pill);
-}
-
-function readParts(pill) {
-  return pill.parts.map(({ node, properties }) => {
-    const style = getComputedStyle(node);
-    return Object.fromEntries(properties.map((property) => [property, style[property]]));
-  });
-}
-
-// Each value that differs glides from what was on screen, so a change mid-tween retargets.
-function tweenParts(pill, from, to) {
-  const tweens = [];
-  for (const [index, { node, part, properties }] of pill.parts.entries()) {
-    const rising = Number(to[index].opacity) > Number(from[index].opacity);
-    for (const property of properties) {
-      if (from[index][property] === to[index][property]) continue;
-      const timing = tweenTiming({ part, property, rising });
-      const tween = node.animate(
-        { [property]: [from[index][property], to[index][property]] },
-        {
-          duration: motionMs(timing.duration),
-          easing: motionEase(timing.easing),
-          delay: timing.delay ? motionMs(timing.delay) : 0,
-          fill: "both",
-        },
-      );
-      void settle(tween);
-      tweens.push(tween);
-    }
-  }
-  return tweens;
-}
-
-// A change of words dips the whole capsule and lets it fill back out, from wherever it is now.
-function inhale(pill) {
-  const from = getComputedStyle(pill.wrap).transform;
-  pill.inhaleTween?.cancel();
-  pill.inhaleTween = pill.wrap.animate(
-    [
-      { transform: from },
-      { transform: `scale(${motionToken("--scale-inhale")})`, offset: INHALE_LOW },
-      { transform: "none" },
-    ],
-    { duration: motionMs("--motion-inhale"), easing: motionEase("--ease-glide") },
-  );
-}
-
-// The live glow breathes on the compositor, phased to the document clock. WebKit stops compositing a
-// running animation once its node is re-inserted, so every render rebuilds it in phase. Leaving, it
-// keeps breathing until the glow has faded.
-function runBreath(pill) {
-  if (pill.moved) stopBreath(pill);
-  if (pill.shown?.state === "active") {
-    if (!pill.breathing && !reducedMotion.matches)
-      pill.breathing = loop(
-        pill.breath,
-        { opacity: [Number(motionToken("--opacity-breath")), 1] },
-        "--loop-breathe",
-        motionEase("--ease-in-out"),
-      );
-    return;
-  }
-  const fade = pill.tweens.find((tween) => tween.effect.target === pill.glow);
-  if (!fade) {
-    stopBreath(pill);
-    return;
-  }
-  void settle(fade, () => {
-    if (pill.shown?.state !== "active") stopBreath(pill);
-  });
-}
-
-function loop(node, keyframes, duration, easing) {
-  const animation = node.animate(keyframes, {
-    duration: motionMs(duration),
-    easing,
-    iterations: Infinity,
-    direction: "alternate",
-  });
-  animation.startTime = 0;
-  return animation;
-}
-
-function stopBreath(pill) {
-  pill.breathing?.cancel();
-  pill.breathing = null;
-}
-
-// The pair's turn runs on the compositor while its speed holds; script steps it only while it speeds
-// up, slows or coasts to rest, so every change bends from the angle on screen. WebKit stops
-// compositing a re-inserted node's animation, so a render restarts a running loop at its angle.
-function turnOrbit(pill) {
-  const spin = pill.spin;
-  const motion = orbitMotion(pill.shown);
-  const lap = motion.lap ? motionMs(motion.lap) : 0;
-  const target = orbitSpeed(lap);
-  if (spin.loop && target === spin.target && !pill.moved) return;
-  if (spin.loop) {
-    spin.angle = loopAngle(spin.from, spin.loop.currentTime ?? 0, spin.lap);
-    spin.loop.cancel();
-    spin.loop = null;
-    drawOrbit(pill);
-  }
-  if (target !== spin.target || motion.rest !== spin.rest) spin.well = null;
-  spin.target = target;
-  spin.rest = motion.rest;
-  spin.lap = lap;
-  if (!motionEnabled()) {
-    cancelAnimationFrame(spin.frame);
-    spin.frame = 0;
-    if (!target) spin.angle = restAngle(spin.angle, motion.rest);
-    spin.speed = 0;
-    drawOrbit(pill);
-    return;
-  }
-  if (target && spin.speed === target) startSpin(pill);
-  else if (!spin.frame) {
-    spin.at = null;
-    spin.frame = requestAnimationFrame((now) => stepOrbit(pill, now));
-  }
-}
-
-function stepOrbit(pill, now) {
-  const spin = pill.spin;
-  spin.frame = 0;
-  if (!pill.wrap.isConnected) return;
-  const dt = spin.at === null ? 0 : Math.min((now - spin.at) / 1000, ORBIT_MAX_STEP);
-  spin.at = now;
-  const next = orbitStep(spin, spin, dt);
-  spin.angle = next.angle;
-  spin.speed = next.speed;
-  spin.well = next.well;
-  drawOrbit(pill);
-  if (next.done && spin.target) startSpin(pill);
-  else if (!next.done) spin.frame = requestAnimationFrame((time) => stepOrbit(pill, time));
-}
-
-// The angle was read at this frame's time, so the loop starts on it now; left pending, it would
-// hold the pair still for a frame on every render.
-function startSpin(pill) {
-  const spin = pill.spin;
-  spin.from = spin.angle % (2 * Math.PI);
-  spin.loop = pill.orbit.animate(
-    { transform: [`rotate(${spin.from}rad)`, `rotate(${spin.from + 2 * Math.PI}rad)`] },
-    { duration: spin.lap, iterations: Infinity },
-  );
-  spin.loop.startTime = document.timeline.currentTime;
-}
-
-function drawOrbit(pill) {
-  pill.orbit.style.transform = `rotate(${pill.spin.angle}rad)`;
-}
-
-function stillPill(pill) {
-  for (const animation of [...pill.tweens, pill.inhaleTween, pill.pressTween]) animation?.cancel();
-  pill.tweens = [];
-  stopBreath(pill);
-  const spin = pill.spin;
-  cancelAnimationFrame(spin.frame);
-  spin.frame = 0;
-  if (spin.loop) spin.angle = loopAngle(spin.from, spin.loop.currentTime ?? 0, spin.lap);
-  spin.loop?.cancel();
-  spin.loop = null;
-  spin.speed = 0;
-  drawOrbit(pill);
-}
-
-// Press is quick and release springs back, both on the kept node so a render mid-press keeps them.
-function pressPill(pill, down) {
-  if (down === pill.pressed || (down && pill.button.disabled)) return;
-  pill.pressed = down;
-  const from = getComputedStyle(pill.button).transform;
-  pill.pressTween?.cancel();
-  pill.pressTween = pill.button.animate(
-    { transform: [from, down ? `scale(${motionToken("--scale-press")})` : "none"] },
-    {
-      duration: motionEnabled() ? motionMs(down ? "--motion-instant" : "--motion-spring") : 0,
-      easing: motionEase(down ? "--ease-out" : "--ease-spring"),
-      fill: "forwards",
-    },
-  );
-  if (!down) void settle(pill.pressTween);
 }
 
 // The other computer shows this same picture in its own inspector for this one.
@@ -610,8 +167,8 @@ function pairPicture(computer, key) {
   );
 }
 
-// The name reads as text and edits in place: a pencil appears on hover and focus, and the
-// hint line below says how to finish.
+// The name reads as text and edits in place: a pencil appears on hover and focus, and the line
+// below it says how to finish.
 function nameButton(ctx, computer, name) {
   const node = el("button", {
     className: "computer-name",
@@ -667,9 +224,83 @@ function localName(ctx) {
   return platformLabel(ctx.state.snapshot?.platform ?? ctx.platform, true);
 }
 
+// --- state ----------------------------------------------------------------------
+
+// One state, one control: the label with its tone dot, a spinner while it is on its way, the
+// switch that shares with this computer, and what the state means.
+function stateBlock(ctx, computer, { name, status, enabled, key }) {
+  const release =
+    enabled && status.key === "sharing"
+      ? releaseToShareCopy(ctx.sharing.view?.blockingPresses)
+      : "";
+  const spinning = isInFlight(status.key);
+  return el("section", {
+    className: "state-block computer-state",
+    dataset: { tone: status.tone },
+    children: [
+      el("div", {
+        className: "computer-state-heading",
+        children: [
+          el("span", {
+            className: "status-dot computer-state-dot",
+            dataset: { tone: status.tone },
+            attrs: { "aria-hidden": "true" },
+          }),
+          el("strong", {
+            className: "computer-state-label",
+            children: [
+              swap(`${key}-state-label`, el("span", { text: status.label }), status.label),
+            ],
+          }),
+          swap(
+            `${key}-state-spinner`,
+            el("span", {
+              className: "computer-state-spinner",
+              attrs: { "aria-hidden": "true" },
+              children: [spinning ? el("span", { className: "spinner" }) : null],
+            }),
+            spinning ? "spin" : "rest",
+          ),
+          shareSwitch(ctx, computer, name, enabled),
+        ],
+      }),
+      fadingText(`${key}-state-detail`, "computer-state-detail", status.detail),
+      presence(`${key}-release`, release ? inlineNote(release, "warning", icon("keyboard")) : null),
+      presence(`${key}-notice`, noticeLine(ctx, computer, enabled)),
+    ],
+  });
+}
+
+// The kit's switch, lifted out of its row: the state above is its label, so the whole block is not
+// one click target. On means this computer is switched on for sharing.
+function shareSwitch(ctx, computer, name, enabled) {
+  const label = shareSwitchLabel(name);
+  const control = switchRow(label, {
+    checked: enabled,
+    disabled: ctx.busy,
+    focusKey: `share-${computer.fingerprint}`,
+    onChange: () => toggleComputerEnabled(ctx.actions, computer.fingerprint, enabled),
+  }).querySelector(".switch");
+  control.classList.add("computer-share-switch");
+  control.setAttribute("aria-label", label);
+  if (ctx.busy) control.setAttribute("aria-busy", "true");
+  return control;
+}
+
+// A display change MonHop is already settling says so here; only one the user has to act on earns
+// a banner above the canvas.
+function noticeLine(ctx, computer, enabled) {
+  const notice = ctx.sharing.view?.displayNotice;
+  if (!enabled || !notice || noticePresentation(notice.kind) !== "inline") return null;
+  const copy = displayNoticeCopy(notice.kind, displayName(computer));
+  return inlineNote(copy.body, "notice", el("span", { className: "notice-dot" }), true);
+}
+
+// --- directions -----------------------------------------------------------------
+
 // MonHop is always bidirectional: each direction of control is its own switch, keyed to its own
-// entry in the group's control record.
-function controlSwitches(ctx, computer, peerName, local) {
+// entry in the group's control record. The last one on cannot be turned off; Pause is how to stop.
+function directions(ctx, computer, peerName, local) {
   const { actions, sharing } = ctx;
   const syncing = sharing.pending?.kind === "control" || sharing.view?.control?.syncing === true;
   const controls = controlSwitchRows(
@@ -679,68 +310,67 @@ function controlSwitches(ctx, computer, peerName, local) {
     syncing,
     computer.fingerprint,
   );
-  return el("div", {
-    className: "rows control-switches",
-    children: controls.map((control) =>
-      switchRow(control.label, {
-        description: control.hint,
-        checked: control.checked,
-        disabled: control.disabled,
-        focusKey: `control-${computer.fingerprint}-${control.direction}`,
-        onChange: (checked) => actions.setControl(computer.fingerprint, control.direction, checked),
-      }),
-    ),
+  const switches = controls.map((control) => {
+    const focusKey = `control-${computer.fingerprint}-${control.direction}`;
+    const row = switchRow(control.label, {
+      description: control.hint,
+      checked: control.checked,
+      disabled: control.disabled,
+      focusKey,
+      onChange: (checked) => actions.setControl(computer.fingerprint, control.direction, checked),
+    });
+    enterHint(row, focusKey, control.hint);
+    return row;
+  });
+  return section("Directions", [rows(switches)], { className: "computer-directions" });
+}
+
+// A hint that just came or changed fades in, carried on across the renders meanwhile.
+function enterHint(row, key, hint) {
+  const small = row.querySelector(".switch-copy > small");
+  const elapsed = sinceChanged(`hint-${key}`, hint);
+  if (!small || elapsed >= motionMs("--motion-base")) return;
+  small.dataset.enter = "true";
+  small.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+}
+
+// --- clipboard ------------------------------------------------------------------
+
+// The switch lives in Settings; here is what it means for this one computer, and the way there.
+function clipboardSection(ctx, computer, name, key) {
+  if (!ctx.clipboard) return null;
+  const view = normalizeClipboardView(ctx.clipboard.view);
+  const link = el("button", {
+    className: "inspector-link",
+    text: "Clipboard settings",
+    attrs: { type: "button" },
+    dataset: { focusKey: `${key}-clipboard-settings` },
+  });
+  link.addEventListener("click", () => ctx.actions.select("settings"));
+  return section(
+    "Clipboard",
+    [fadingText(`${key}-clipboard-line`, "note", clipboardLine(view, computer.fingerprint, name))],
+    { actions: [link], className: "computer-clipboard" },
+  );
+}
+
+// --- arrangement and layouts ----------------------------------------------------
+
+// The canvas draws the displays; here is the way into Arrange and the layouts kept with this computer.
+function arrangementSection(ctx, computer, key) {
+  const { actions, busy, arrange, studio } = ctx;
+  const arrangeButton = button("Arrange", {
+    variant: "secondary",
+    size: "sm",
+    disabled: busy || arrange.active || !studio.canArrange,
+    focusKey: `inspector-arrange-${computer.fingerprint}`,
+    onClick: () => actions.arrangeWith(computer.fingerprint),
+  });
+  return section("Arrangement", [layoutsDisclosure(ctx, computer, key)], {
+    actions: [arrangeButton],
+    className: "computer-arrangement",
   });
 }
-
-function forgetControls(ctx, computer, name) {
-  const { actions, busy, forgetConfirmed } = ctx;
-  const confirmed = forgetConfirmed === computer.fingerprint;
-  return [
-    note(`Fingerprint ${computer.fingerprint.slice(0, 16)}…`),
-    rows([
-      switchRow(`Forget ${name}`, {
-        description: "Removes the pairing. This computer keeps its own identity.",
-        checked: confirmed,
-        disabled: busy,
-        focusKey: `forget-confirm-${computer.fingerprint}`,
-        onChange: (checked) => actions.confirmForget(computer.fingerprint, checked),
-      }),
-    ]),
-    el("div", {
-      className: "card-actions",
-      attrs: { "data-align": "start" },
-      children: [
-        button("Forget computer", {
-          variant: "destructive",
-          size: "sm",
-          iconName: "trash-2",
-          disabled: !confirmed || busy,
-          focusKey: `forget-${computer.fingerprint}`,
-          onClick: () => actions.forgetComputer(computer.fingerprint),
-        }),
-      ],
-    }),
-  ];
-}
-
-// A display change MonHop is already settling says so in the inspector; only one the user has to
-// act on earns a banner above the canvas.
-function noticeLine(ctx, computer, enabled) {
-  const notice = ctx.sharing.view?.displayNotice;
-  if (!enabled || !notice || noticePresentation(notice.kind) !== "inline") return null;
-  const copy = displayNoticeCopy(notice.kind, displayName(computer));
-  return el("p", {
-    className: "notice-line",
-    attrs: { "aria-live": "polite" },
-    children: [
-      el("span", { className: "notice-dot", attrs: { "aria-hidden": "true" } }),
-      el("span", { text: copy.body }),
-    ],
-  });
-}
-
-// --- layout history ---------------------------------------------------------
 
 function layoutsDisclosure(ctx, computer, key) {
   const { actions, active, sharing, busy, layoutForget } = ctx;
@@ -784,8 +414,8 @@ function layoutList(ctx, fingerprint, entries) {
   const elapsed = sinceChanged(`${fingerprint}-layout-list`, names);
   if (elapsed < LIST_ENTER_MS) {
     list.dataset.enter = "true";
-    // As the play/stop toggle does: the negative delay resumes the entrance, stagger included,
-    // so a status poll part way through it does not send every row back to the start.
+    // The negative delay resumes the entrance, stagger included, so a status poll part way
+    // through it does not send every row back to the start.
     list.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
   }
   return list;
@@ -809,16 +439,35 @@ export function layoutChipStrip(key, entry) {
   });
 }
 
+// The name over one quiet line, its crossings then its chips, with Load and Forget beside it.
 function layoutRow(ctx, fingerprint, item, index) {
   const { actions } = ctx;
   const { entry, key, armed, disabled, load } = item;
-  const node = row({
-    title: entry.name,
-    detail: `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`,
-    leading: layoutChipStrip(`layout-${key}`, entry),
-    actions: [
-      loadButton(actions, fingerprint, entry, key, load, disabled),
-      forgetButton(actions, fingerprint, entry, key, armed, disabled),
+  const node = el("div", {
+    className: "row layout-row",
+    children: [
+      el("div", {
+        className: "row-copy",
+        children: [
+          el("strong", { text: entry.name, attrs: { title: entry.name } }),
+          el("span", {
+            className: "layout-row-meta",
+            children: [
+              el("span", {
+                text: `${entry.crossings} crossing${entry.crossings === 1 ? "" : "s"}`,
+              }),
+              layoutChipStrip(`layout-${key}`, entry),
+            ],
+          }),
+        ],
+      }),
+      el("div", {
+        className: "row-actions",
+        children: [
+          loadButton(actions, fingerprint, entry, key, load, disabled),
+          forgetLayoutButton(actions, fingerprint, entry, key, armed, disabled),
+        ],
+      }),
     ],
   });
   node.style.setProperty("--row-index", String(index));
@@ -826,7 +475,7 @@ function layoutRow(ctx, fingerprint, item, index) {
 }
 
 // Arming keeps the button's width, so Load beside it stays put while the label turns into the question.
-function forgetButton(actions, fingerprint, entry, key, armed, disabled) {
+function forgetLayoutButton(actions, fingerprint, entry, key, armed, disabled) {
   const node = button("", {
     variant: armed ? "destructive" : "ghost",
     size: "sm",
@@ -851,4 +500,125 @@ function loadButton(actions, fingerprint, entry, key, load, disabled) {
   });
   if (load.reason) node.title = load.reason;
   return node;
+}
+
+// --- details --------------------------------------------------------------------
+
+// The fingerprint to compare aloud, the last drop with Copy (never in red), and how the canvas
+// drew the displays when it drew them from what each computer last reported.
+function details(ctx, computer, key) {
+  const fingerprint = computer.fingerprint;
+  const drawn = !ctx.arrange.active && computer.setup?.saved === true;
+  return createAccordion(
+    `inspector-computer-${fingerprint}`,
+    "computer-details",
+    "Details",
+    fact(
+      "Fingerprint",
+      el("code", { className: "computer-fingerprint", text: groupedFingerprint(fingerprint) }),
+    ),
+    fingerprint === ctx.active ? presence(`${key}-last-drop`, lastDrop(ctx)) : null,
+    drawn ? note(DRAWN_DISPLAYS_NOTE) : null,
+  );
+}
+
+function fact(label, ...children) {
+  return el("div", {
+    className: "computer-fact",
+    children: [el("span", { className: "computer-fact-label", text: label }), ...children],
+  });
+}
+
+function lastDrop(ctx) {
+  const failure = ctx.sharing.view?.lastFailure;
+  if (!failure) return null;
+  const feedback = ctx.dropCopyFeedback;
+  const { line } = copyFeedbackControls(feedback, {});
+  return fact(
+    "Last connection drop",
+    el("p", { className: "computer-drop-text", text: failure }),
+    el("div", {
+      className: "computer-drop-actions",
+      children: [
+        copyButton(ctx, feedback),
+        swap("inspector-copy-feedback", line, `${feedback.state}|${feedback.message}`, {
+          block: true,
+        }),
+      ],
+    }),
+  );
+}
+
+// Copy turns into Copied in place: the glyph and the word cross-fade, the width holds.
+function copyButton(ctx, feedback) {
+  const copied = feedback.state === "success";
+  const node = button("", {
+    variant: "outline",
+    size: "sm",
+    disabled: ctx.busy || feedback.state === "pending",
+    focusKey: "inspector-copy-last-drop",
+    onClick: ctx.actions.copyLastDrop,
+  });
+  node.append(
+    swap("inspector-copy-glyph", icon(copied ? "check" : "copy"), copied ? "check" : "copy"),
+    stableLabel("inspector-copy-last-drop", ["Copy", "Copied"], copied ? 1 : 0),
+  );
+  return node;
+}
+
+// --- forget ---------------------------------------------------------------------
+
+// Two presses in two places: the first opens the question above it, the second answers it there,
+// so a double click can never forget a computer.
+function forgetSection(ctx, computer, name, key) {
+  const { actions, busy, forgetConfirmed } = ctx;
+  const fingerprint = computer.fingerprint;
+  const armed = forgetConfirmed === fingerprint;
+  const arm = button("Forget this computer", {
+    variant: "ghost",
+    size: "sm",
+    iconName: "trash-2",
+    pressed: armed,
+    disabled: busy,
+    focusKey: `forget-confirm-${fingerprint}`,
+    onClick: () => actions.confirmForget(fingerprint, !armed),
+  });
+  arm.classList.add("computer-forget-arm");
+  arm.setAttribute("aria-expanded", String(armed));
+  const question = armed
+    ? el("div", {
+        className: "computer-forget-question",
+        children: [
+          el("p", {
+            className: "computer-forget-title",
+            text: `Forget ${name}?`,
+          }),
+          note("Removes the pairing. This computer keeps its own identity."),
+          el("div", {
+            className: "computer-forget-actions",
+            children: [
+              button("Keep", {
+                variant: "secondary",
+                size: "sm",
+                disabled: busy,
+                focusKey: `forget-keep-${fingerprint}`,
+                onClick: () => actions.confirmForget(fingerprint, false),
+              }),
+              button("Forget computer", {
+                variant: "destructive",
+                size: "sm",
+                iconName: "trash-2",
+                disabled: busy,
+                focusKey: `forget-${fingerprint}`,
+                onClick: () => actions.forgetComputer(fingerprint),
+              }),
+            ],
+          }),
+        ],
+      })
+    : null;
+  return el("section", {
+    className: "inspector-section computer-forget",
+    children: [presence(`${key}-forget`, question), arm],
+  });
 }
