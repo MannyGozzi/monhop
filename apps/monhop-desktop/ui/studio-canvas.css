@@ -50,12 +50,12 @@
   --canvas-chevron-open: 90deg;
   --canvas-swatch: 8px;
   --canvas-card-y: 0px;
-  /* Arrange floats over the canvas on frosted glass, its glyph in an accent well. */
-  --canvas-arrange-height: 34px;
+  /* Arrange floats over the canvas on frosted glass, its glyph in an accent well that fills on hover. */
+  --canvas-arrange-height: 36px;
   --canvas-arrange-well: 24px;
   --canvas-arrange-rim: light-dark(oklch(1 0 0 / 70%), oklch(1 0 0 / 7%));
   --canvas-arrange-lift: -1px;
-  --canvas-arrange-tilt: -8deg;
+  --canvas-arrange-halo: 2px;
   --canvas-arrange-shadow-hover: 0 0 0 .5px var(--hairline-strong), 0 2px 4px light-dark(oklch(.2 .01 275 / 10%), oklch(0 0 0 / 45%)), 0 12px 28px -10px light-dark(oklch(.2 .01 275 / 22%), oklch(0 0 0 / 65%));
 }
 :root[data-theme="dark"] { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); --canvas-seam-highlight: oklch(1 0 0 / 85%); }
@@ -178,14 +178,14 @@
 @container canvas-stage (max-width: 520px) { .arrangement-legend-item:is([data-kind="primary"], [data-kind="shared"], [data-kind="seam"]) { display: none; } }
 .canvas-stage { container: canvas-stage / size; }
 
-/* Arrange floats in the stage's top right corner; its glyph brightens and tips toward the pointer. */
+/* Arrange floats in the stage's top right corner; on hover it lifts and its well fills with the accent. */
 .canvas-stage, .canvas-arrange { grid-row: 2; grid-column: 1; }
 .canvas-arrange { position: relative; z-index: 2; display: flex; align-self: start; justify-self: end; margin: var(--gap-3) var(--gap-3) 0 0; }
 #canvas-arrange { height: var(--canvas-arrange-height); gap: var(--gap-2); border-radius: var(--radius-pill); padding: 0 var(--gap-4) 0 calc((var(--canvas-arrange-height) - var(--canvas-arrange-well)) / 2); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: inset 0 1px 0 var(--canvas-arrange-rim), var(--shadow-raised); color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-medium); }
 #canvas-arrange:hover:not(:disabled) { background: var(--solid); box-shadow: inset 0 1px 0 var(--canvas-arrange-rim), var(--canvas-arrange-shadow-hover); transform: translateY(var(--canvas-arrange-lift)); }
 #canvas-arrange:active:not(:disabled) { transform: scale(var(--scale-press)); }
-.canvas-arrange-glyph { display: grid; width: var(--canvas-arrange-well); height: var(--canvas-arrange-well); place-items: center; border-radius: 50%; background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); transition: background-color var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring); }
-#canvas-arrange:hover:not(:disabled) .canvas-arrange-glyph { background: color-mix(in oklab, var(--primary) var(--mix-tint-strong), transparent); transform: rotate(var(--canvas-arrange-tilt)); }
+.canvas-arrange-glyph { display: grid; width: var(--canvas-arrange-well); height: var(--canvas-arrange-well); place-items: center; border-radius: 50%; background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); box-shadow: 0 0 0 0 color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); transition: background-color var(--motion-fast) var(--ease-out), color var(--motion-fast) var(--ease-out), box-shadow var(--motion-base) var(--ease-out); }
+#canvas-arrange:hover:not(:disabled) .canvas-arrange-glyph { background: var(--primary-fill); box-shadow: 0 0 0 var(--canvas-arrange-halo) color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary-foreground); }
 
 /* A note that the arrangement just applied, floating at the top of the stage. */
 .canvas-toast { position: absolute; top: var(--gap-3); left: 50%; display: inline-flex; align-items: center; gap: var(--gap-2); max-width: calc(100% - var(--gap-8)); margin: 0; border-radius: var(--radius-pill); padding: var(--gap-1) var(--gap-3) var(--gap-1) var(--gap-1); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-chip); color: var(--muted-foreground); font-size: var(--text-sm); white-space: nowrap; translate: -50% 0; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-spring) var(--ease-spring), visibility 0s linear 0s; }
