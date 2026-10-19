@@ -12,7 +12,6 @@ import { DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
 import { normalizeClipboardView } from "./clipboard-model.mjs";
 import { clipboardLine } from "./studio-model.mjs";
 import { inspectorHeader } from "./screen-ready.mjs";
-import { pairedResult } from "./screen-computers.mjs";
 import {
   computerMeta,
   computerTone,
@@ -59,16 +58,11 @@ export function computerInspector(ctx, computer) {
   const enabled = isComputerEnabled(fingerprint, enabledList);
   const tone = enabled ? computerTone(fingerprint, enabledList) : "idle";
   const key = `inspector-${fingerprint}`;
-  const justPaired =
-    ctx.pairingResultShown && ctx.pairing.view?.phase === "paired"
-      ? ctx.pairing.view.peerFingerprint === fingerprint
-      : false;
   const node = el("div", {
     className: "inspector-view computer-inspector",
     dataset: { kind: "computer", tone: status.tone },
     children: [
       header(ctx, computer, name, tone, key),
-      presence(`${key}-paired`, justPaired ? pairedResult(ctx) : null),
       stateBlock(ctx, computer, { name, status, enabled, key }),
       presence(`${key}-control`, enabled ? directions(ctx, computer, name, local) : null),
       presence(`${key}-clipboard`, clipboardSection(ctx, computer, name, key)),

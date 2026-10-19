@@ -268,7 +268,6 @@
   --scale-live-ring: 2.6;
   --opacity-live-ring: .5;
   --scale-defocus: .94;
-  --scale-inhale: .955;
   /* A computer that is switched off keeps its tile, washed out. */
   --saturate-idle: .5;
 
@@ -287,7 +286,6 @@
   --motion-focus: 360ms;
   --motion-demo: 1100ms;
   --motion-bloom: 760ms;
-  --motion-inhale: 620ms;
   /* Notch island: pointer rest before it opens, and grace before it closes once the pointer leaves. */
   --island-hover-delay: 250ms;
   --island-close-delay: 180ms;
@@ -295,8 +293,6 @@
   --loop-pulse: 1500ms;
   --loop-live: 2400ms;
   --loop-breathe: 3200ms;
-  --loop-orbit: 5000ms;
-  --loop-orbit-busy: 714ms;
   --ease-out: cubic-bezier(.22, 1, .36, 1);
   --ease-in-out: cubic-bezier(.65, 0, .35, 1);
   /* Height glides: --ease-out would cover a fifth of a tall panel in the first frame. No overshoot. */
