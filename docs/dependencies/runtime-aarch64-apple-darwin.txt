@@ -153,7 +153,7 @@ rustix v1.1.4 Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 rustls v0.23.46 Apache-2.0 OR ISC OR MIT
 rustls-pki-types v1.15.1 MIT OR Apache-2.0
 rustls-platform-verifier v0.7.0 MIT OR Apache-2.0
-rustls-webpki v0.103.15 ISC
+rustls-webpki v0.103.16 ISC
 same-file v1.0.6 Unlicense/MIT
 security-framework v3.7.0 MIT OR Apache-2.0
 security-framework-sys v2.17.0 MIT OR Apache-2.0

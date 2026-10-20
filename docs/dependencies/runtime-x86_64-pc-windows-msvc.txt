@@ -133,7 +133,7 @@ rustc-hash v2.1.3 Apache-2.0 OR MIT
 rustls v0.23.46 Apache-2.0 OR ISC OR MIT
 rustls-pki-types v1.15.1 MIT OR Apache-2.0
 rustls-platform-verifier v0.7.0 MIT OR Apache-2.0
-rustls-webpki v0.103.15 ISC
+rustls-webpki v0.103.16 ISC
 same-file v1.0.6 Unlicense/MIT
 scopeguard v1.2.0 MIT OR Apache-2.0
 semver v1.0.28 MIT OR Apache-2.0

@@ -3774,9 +3774,9 @@
     {
       "type": "library",
       "name": "rustls-webpki",
-      "version": "0.103.15",
-      "bom-ref": "rustls-webpki@0.103.15",
-      "purl": "pkg:cargo/rustls-webpki@0.103.15",
+      "version": "0.103.16",
+      "bom-ref": "rustls-webpki@0.103.16",
+      "purl": "pkg:cargo/rustls-webpki@0.103.16",
       "licenses": [
         {
           "expression": "ISC"
@@ -5433,9 +5433,9 @@
     {
       "type": "library",
       "name": "webpki-root-certs",
-      "version": "1.0.9",
-      "bom-ref": "webpki-root-certs@1.0.9",
-      "purl": "pkg:cargo/webpki-root-certs@1.0.9",
+      "version": "1.0.10",
+      "bom-ref": "webpki-root-certs@1.0.10",
+      "purl": "pkg:cargo/webpki-root-certs@1.0.10",
       "licenses": [
         {
           "expression": "CDLA-Permissive-2.0"
@@ -8727,16 +8727,16 @@
         "once_cell@1.21.4",
         "rustls-native-certs@0.8.4",
         "rustls-platform-verifier-android@0.1.1",
-        "rustls-webpki@0.103.15",
+        "rustls-webpki@0.103.16",
         "rustls@0.23.46",
         "security-framework-sys@2.17.0",
         "security-framework@3.7.0",
-        "webpki-root-certs@1.0.9",
+        "webpki-root-certs@1.0.10",
         "windows-sys@0.61.2"
       ]
     },
     {
-      "ref": "rustls-webpki@0.103.15",
+      "ref": "rustls-webpki@0.103.16",
       "dependsOn": [
         "ring@0.17.14",
         "rustls-pki-types@1.15.1",
@@ -8749,7 +8749,7 @@
         "once_cell@1.21.4",
         "ring@0.17.14",
         "rustls-pki-types@1.15.1",
-        "rustls-webpki@0.103.15",
+        "rustls-webpki@0.103.16",
         "subtle@2.6.1",
         "zeroize@1.9.0"
       ]
@@ -9973,7 +9973,7 @@
       ]
     },
     {
-      "ref": "webpki-root-certs@1.0.9",
+      "ref": "webpki-root-certs@1.0.10",
       "dependsOn": [
         "rustls-pki-types@1.15.1"
       ]
