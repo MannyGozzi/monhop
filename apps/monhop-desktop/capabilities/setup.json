@@ -68,6 +68,7 @@
     "allow-autostart-set",
     "allow-autostart-open-settings",
     "allow-island-status",
-    "allow-island-set-enabled"
+    "allow-island-set-enabled",
+    "allow-island-set-clipboard-notices"
   ]
 }

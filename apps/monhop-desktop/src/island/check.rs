@@ -1,7 +1,6 @@
 //! `--check-island`: the island alone on the real screen, playing a fixed script of synthetic
-//! snapshots through the real model, plus a few hand-made changes the model never makes, while
-//! the drawn outline is sampled every frame. It starts nothing else MonHop runs, reads no saved
-//! state and saves nothing.
+//! snapshots through the real model, while the drawn outline is sampled every frame. It starts
+//! nothing else MonHop runs, reads no saved state and saves nothing.
 
 use std::{
     cell::RefCell,
@@ -13,11 +12,10 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
 use super::{
-    geometry::Outline,
     macos::{self, Context, Motion, Probe},
     model::{
-        Activity, ActivityId, ClipboardInput, ComputerInput, DimmingInput, Direction, IslandInput,
-        Model, Phase, Platform, Presentation, Row, Tone, Trailing, Transfer, TransferKind,
+        Activity, ActivityId, ComputerInput, Direction, IslandInput, Model, Phase, Transfer,
+        TransferKind,
     },
     tokens,
 };
@@ -34,10 +32,14 @@ const SAMPLE: f64 = 1.0 / 240.0;
 const JUMP_SLACK: f64 = 1.0;
 /// A settled outline lies within this many points of its target.
 const REST_TOLERANCE: f64 = 0.5;
-/// The interrupted step closes the island this long after it starts opening, about halfway.
+/// The interrupted step brings the island back to rest this long after it starts growing, about
+/// halfway.
 const INTERRUPT_AFTER: f64 = 0.08;
-/// The synthetic clock passes this between steps, so every notice has ended.
+/// The synthetic clock passes this between steps: every notice has ended, but a spinner started
+/// one step earlier still stands.
 const BETWEEN: Duration = Duration::from_secs(10);
+/// A second notice of the same kind arrives while the first is still up.
+const SOON: Duration = Duration::from_millis(500);
 
 pub fn run() -> ! {
     let Some(mtm) = MainThreadMarker::new() else {
@@ -61,10 +63,7 @@ pub fn run() -> ! {
         mtm,
         GENERATION,
         Context {
-            interactive: false,
             motion: Motion::Always,
-            hover: Box::new(|_| {}),
-            act: Box::new(|_| {}),
             showing: Box::new(|_| {}),
         },
     );
@@ -95,39 +94,18 @@ fn finish(verdict: Result<(), String>) -> ! {
 }
 
 enum Order {
-    Show(Presentation),
-    Expand(bool),
-    /// Closes the island, which must still be moving toward open.
-    Interrupt,
+    Show(Option<Activity>),
+    /// Shows this while the island must still be moving.
+    Interrupt(Option<Activity>),
 }
 
 struct Step {
     name: &'static str,
     /// Seconds after the step starts, in order.
     orders: VecDeque<(f64, Order)>,
-    expanded: bool,
-    /// The content on show updates where it is: never rebuilt, and an open island never resized
-    /// unless the step `resizes` it.
+    /// The content on show updates where it is: never rebuilt, and its band never grows or
+    /// shrinks.
     in_place: bool,
-    /// A row comes or goes, so the open island must change height in place.
-    resizes: bool,
-    /// The header's status dot keeps its place: never drawn away from it, and in the same place
-    /// at the end.
-    dot_stays: bool,
-    /// That dot changes color through a transition, seen on some frame, never at once.
-    dot_recolors: bool,
-}
-
-fn step(name: &'static str, order: Order, expanded: bool) -> Step {
-    Step {
-        name,
-        orders: VecDeque::from([(0.0, order)]),
-        expanded,
-        in_place: false,
-        resizes: false,
-        dot_stays: false,
-        dot_recolors: false,
-    }
 }
 
 /// The model fed synthetic snapshots on a clock of its own.
@@ -138,23 +116,21 @@ struct Feed {
 }
 
 impl Feed {
-    fn next(&mut self, after: Duration, change: impl FnOnce(&mut IslandInput)) -> Presentation {
+    fn next(&mut self, after: Duration, change: impl FnOnce(&mut IslandInput)) -> Option<Activity> {
         change(&mut self.input);
         self.clock += after;
         self.model.update(&self.input, self.clock)
     }
 }
 
-fn computer(name: &str, platform: Platform, tone: usize) -> ComputerInput {
+fn computer(name: &str, enabled: bool) -> ComputerInput {
     ComputerInput {
         fingerprint: name.to_ascii_lowercase(),
         name: name.to_owned(),
-        platform,
-        enabled: true,
+        enabled,
         phase: Phase::Off,
         held: false,
-        pointer_here: None,
-        tone,
+        drops: Some(0),
     }
 }
 
@@ -166,8 +142,24 @@ fn desk(input: &mut IslandInput) -> &mut ComputerInput {
     &mut input.computers[1]
 }
 
-fn shows(presentation: &Presentation, expected: Option<ActivityId>) -> Result<(), String> {
-    let shown = presentation.compact.as_ref().map(|activity| activity.id);
+/// The computer's session drops, as the sharing core counts it.
+fn lose(computer: &mut ComputerInput, phase: Phase) {
+    computer.phase = phase;
+    computer.drops = computer.drops.map(|drops| drops + 1);
+}
+
+fn copied(direction: Direction) -> Transfer {
+    Transfer {
+        direction,
+        kind: TransferKind::Image,
+        bytes: 1_468_006,
+        peer: "studio".to_owned(),
+        age_seconds: 0,
+    }
+}
+
+fn shows(activity: &Option<Activity>, expected: Option<ActivityId>) -> Result<(), String> {
+    let shown = activity.as_ref().map(|activity| activity.id);
     if shown == expected {
         Ok(())
     } else {
@@ -175,239 +167,99 @@ fn shows(presentation: &Presentation, expected: Option<ActivityId>) -> Result<()
     }
 }
 
-/// Idle, every compact activity (dimming and control of another computer also updating in place,
-/// and that control restyled by hand), the open island with two computers, dimming and clipboard,
-/// its header taking the widest status in place and then hand-made words as wide, a computer
-/// joining and leaving it, closing, and an open interrupted mid-flight by a close.
+/// Idle and every activity the model shows: connecting, connected, a copy with notices off and
+/// on (then the other way in place), a drop, reconnecting, waiting, a second computer connecting,
+/// two drops in a row in place, and a growth interrupted mid-flight by a return to rest.
 fn script() -> Result<Vec<Step>, String> {
     let mut feed = Feed {
         model: Model::default(),
         clock: Instant::now(),
         input: IslandInput {
-            computers: vec![
-                computer("Studio", Platform::Mac, 0),
-                computer("Desk PC", Platform::Windows, 1),
-            ],
+            computers: vec![computer("Studio", true), computer("Desk PC", false)],
             paused: false,
-            phase: Phase::Off,
-            sharing_active: false,
-            held: false,
-            dimming: DimmingInput {
-                dimmed: false,
-                level: 40,
-                min_level: 10,
-                max_level: 99,
-            },
-            clipboard: Some(ClipboardInput {
-                enabled: true,
-                last: None,
-            }),
-            update_ready: None,
+            editing: false,
+            transfer: None,
+            clipboard_notices: false,
         },
     };
+    use ActivityId::{Clipboard, Connected, Connecting, Dropped, Held, Reconnecting};
     let mut steps = Vec::new();
-    let show = |name, presentation: Presentation, expected| -> Result<Step, String> {
-        shows(&presentation, expected).map_err(|reason| format!("{name}: {reason}"))?;
-        Ok(step(name, Order::Show(presentation), false))
+    let mut show = |name, activity: Option<Activity>, expected, in_place| {
+        shows(&activity, expected).map_err(|reason| format!("{name}: {reason}"))?;
+        steps.push(Step {
+            name,
+            orders: VecDeque::from([(0.0, Order::Show(activity))]),
+            in_place,
+        });
+        Ok::<(), String>(())
     };
 
-    steps.push(show("idle", feed.next(Duration::ZERO, |_| {}), None)?);
-    let dimmed = feed.next(BETWEEN, |input| input.dimming.dimmed = true);
-    steps.push(show("dimming", dimmed, Some(ActivityId::Dimming))?);
-    let darker = feed.next(Duration::from_millis(500), |input| input.dimming.level = 70);
-    steps.push(Step {
-        in_place: true,
-        ..show(
-            "dimming, darker in place",
-            darker,
-            Some(ActivityId::Dimming),
-        )?
+    show("idle", feed.next(Duration::ZERO, |_| {}), None, false)?;
+    let connecting = feed.next(BETWEEN, |input| studio(input).phase = Phase::Connecting);
+    show("connecting", connecting.clone(), Some(Connecting), false)?;
+    let linked = feed.next(BETWEEN, |input| studio(input).phase = Phase::Connected);
+    shows(&linked, Some(Connecting)).map_err(|reason| format!("link up: {reason}"))?;
+    let connected = feed.next(BETWEEN, |input| studio(input).phase = Phase::Sharing);
+    show("connected", connected, Some(Connected), false)?;
+    let quiet = feed.next(BETWEEN, |input| {
+        input.transfer = Some(copied(Direction::Received))
     });
-    let connected = feed.next(BETWEEN, |input| {
-        input.phase = Phase::Sharing;
-        input.sharing_active = true;
-        let studio = studio(input);
-        studio.phase = Phase::Sharing;
-        studio.pointer_here = Some(true);
+    show("a copy with notices off", quiet, None, false)?;
+    feed.next(BETWEEN, |input| input.clipboard_notices = true);
+    let sent = feed.next(BETWEEN, |input| {
+        input.transfer = Some(copied(Direction::Sent))
     });
-    steps.push(show("connected", connected, Some(ActivityId::Connected))?);
-    let copied = feed.next(BETWEEN, |input| {
-        if let Some(clipboard) = &mut input.clipboard {
-            clipboard.last = Some(Transfer {
-                direction: Direction::Received,
-                kind: TransferKind::Image,
-                bytes: 1_468_006,
-                peer: "studio".to_owned(),
-                age_seconds: 0,
-            });
-        }
+    show("clipboard", sent, Some(Clipboard), false)?;
+    let received = feed.next(SOON, |input| {
+        input.transfer = Some(copied(Direction::Received))
     });
-    steps.push(show("clipboard", copied, Some(ActivityId::Clipboard))?);
-    let update = feed.next(BETWEEN, |input| {
-        input.update_ready = Some("9.9.9".to_owned())
-    });
-    steps.push(show("update", update, Some(ActivityId::Update))?);
-    let dropped = feed.next(BETWEEN, |input| {
-        input.phase = Phase::Reconnecting;
-        input.sharing_active = false;
-        let studio = studio(input);
-        studio.phase = Phase::Reconnecting;
-        studio.pointer_here = None;
-    });
-    steps.push(show("dropped", dropped, Some(ActivityId::Dropped))?);
+    show(
+        "clipboard, the other way in place",
+        received,
+        Some(Clipboard),
+        true,
+    )?;
+    let dropped = feed.next(BETWEEN, |input| lose(studio(input), Phase::Starting));
+    show("dropped", dropped, Some(Dropped), false)?;
     let reconnecting = feed.next(BETWEEN, |_| {});
-    steps.push(show(
-        "reconnecting",
-        reconnecting,
-        Some(ActivityId::Reconnecting),
-    )?);
+    show("reconnecting", reconnecting, Some(Reconnecting), false)?;
     feed.next(BETWEEN, |input| {
-        input.phase = Phase::Sharing;
-        input.sharing_active = true;
-        input.held = true;
         let studio = studio(input);
         studio.phase = Phase::Sharing;
         studio.held = true;
-        studio.pointer_here = Some(true);
     });
     let held = feed.next(BETWEEN, |_| {});
-    steps.push(show("held", held, Some(ActivityId::Held))?);
-    let controlling = feed.next(BETWEEN, |input| {
-        input.held = false;
-        let studio = studio(input);
-        studio.held = false;
-        studio.pointer_here = Some(false);
-    });
-    steps.push(show(
-        "controlling",
-        controlling,
-        Some(ActivityId::Controlling),
-    )?);
-    feed.next(BETWEEN, |input| {
-        let desk = desk(input);
-        desk.phase = Phase::Sharing;
-        desk.pointer_here = Some(true);
-    });
+    show("held", held, Some(Held), false)?;
+    let sharing = feed.next(BETWEEN, |input| studio(input).held = false);
+    show("sharing, at rest", sharing, None, false)?;
     let other = feed.next(BETWEEN, |input| {
-        studio(input).pointer_here = Some(true);
-        desk(input).pointer_here = Some(false);
+        let desk = desk(input);
+        desk.enabled = true;
+        desk.phase = Phase::Starting;
     });
-    let labeled = other.clone();
+    show(
+        "another computer connecting",
+        other,
+        Some(Connecting),
+        false,
+    )?;
+    let both = feed.next(BETWEEN, |input| desk(input).phase = Phase::Sharing);
+    show("both sharing", both, Some(Connected), false)?;
+    let first = feed.next(BETWEEN, |input| lose(studio(input), Phase::Starting));
+    show("one drops", first, Some(Dropped), false)?;
+    let second = feed.next(SOON, |input| lose(desk(input), Phase::Error));
+    show("the other drops, in place", second, Some(Dropped), true)?;
+    let rest = feed.next(BETWEEN, |input| studio(input).phase = Phase::Sharing);
+    shows(&rest, Some(Connected)).map_err(|reason| format!("recovered: {reason}"))?;
+    let rest = feed.next(BETWEEN, |_| {});
+    show("recovered, at rest", rest, None, false)?;
     steps.push(Step {
-        in_place: true,
-        ..show(
-            "controlling a computer of the other kind, in place",
-            other,
-            Some(ActivityId::Controlling),
-        )?
-    });
-    // The model never restyles a compact activity in place; by hand, its label becomes words.
-    let Some(Activity {
-        trailing: Trailing::Labeled(_, name),
-        ..
-    }) = &labeled.compact
-    else {
-        return Err("controlling must label the computer with its kind".to_owned());
-    };
-    let mut worded = labeled.clone();
-    if let Some(activity) = &mut worded.compact {
-        activity.trailing = Trailing::Text(name.clone());
-    }
-    steps.push(Step {
-        in_place: true,
-        ..show(
-            "controlling, its label turned to words in place",
-            worded,
-            Some(ActivityId::Controlling),
-        )?
-    });
-    steps.push(Step {
-        in_place: true,
-        ..show(
-            "controlling, its label back in place",
-            labeled,
-            Some(ActivityId::Controlling),
-        )?
-    });
-    let back = feed.next(BETWEEN, |input| {
-        studio(input).pointer_here = Some(true);
-        desk(input).pointer_here = Some(true);
-    });
-    let back_rows = back.expanded.rows.clone();
-    let rows = &back.expanded.rows;
-    let computers = rows
-        .iter()
-        .filter(|row| matches!(row, Row::Computer(_)))
-        .count();
-    let dimming = rows.iter().any(|row| matches!(row, Row::Dimming(_)));
-    let clipboard = rows.iter().any(|row| matches!(row, Row::Clipboard { .. }));
-    if (computers, dimming, clipboard) != (2, true, true) {
-        return Err("the open island needs two computers, dimming and clipboard".to_owned());
-    }
-    steps.push(show("pointer back here", back, None)?);
-
-    steps.push(step("open", Order::Expand(true), true));
-    let attention = feed.next(BETWEEN, |input| input.phase = Phase::Error);
-    shows(&attention, None).map_err(|reason| format!("status in place: {reason}"))?;
-    if attention.expanded.status != "Needs attention" || attention.expanded.rows != back_rows {
-        return Err("the status step must change only the header's status".to_owned());
-    }
-    let open_in_place = |name, presentation| Step {
-        in_place: true,
-        ..step(name, Order::Show(presentation), true)
-    };
-    steps.push(open_in_place(
-        "open, status changes in place",
-        attention.clone(),
-    ));
-    // By hand: other words exactly as wide, so the dot stays put and only changes color.
-    let mut reworded = attention.clone();
-    reworded.expanded.status.push('\u{200B}');
-    reworded.expanded.status_tone = Tone::Warning;
-    steps.push(Step {
-        dot_stays: true,
-        dot_recolors: true,
-        ..open_in_place("open, status reworded at the same width in place", reworded)
-    });
-    steps.push(Step {
-        dot_stays: true,
-        dot_recolors: true,
-        ..open_in_place("open, status back in place", attention.clone())
-    });
-    let joined = feed.next(BETWEEN, |input| {
-        input.computers.push(computer("Laptop", Platform::Mac, 2));
-    });
-    if joined.expanded.status != attention.expanded.status
-        || joined.expanded.rows.len() != back_rows.len() + 1
-    {
-        return Err("the join step must only add a row".to_owned());
-    }
-    steps.push(Step {
-        resizes: true,
-        ..open_in_place("open, a computer joins in place", joined)
-    });
-    let left = feed.next(BETWEEN, |input| {
-        input.computers.pop();
-    });
-    if left.expanded.rows != back_rows {
-        return Err("the leave step must only take that row away".to_owned());
-    }
-    steps.push(Step {
-        resizes: true,
-        ..open_in_place("open, the computer leaves in place", left)
-    });
-    steps.push(step("close", Order::Expand(false), false));
-    steps.push(Step {
-        name: "open, closed mid-flight",
+        name: "connecting, interrupted mid-flight by rest",
         orders: VecDeque::from([
-            (0.0, Order::Expand(true)),
-            (INTERRUPT_AFTER, Order::Interrupt),
+            (0.0, Order::Show(connecting)),
+            (INTERRUPT_AFTER, Order::Interrupt(None)),
         ]),
-        expanded: false,
         in_place: false,
-        resizes: false,
-        dot_stays: false,
-        dot_recolors: false,
     });
     Ok(steps)
 }
@@ -418,10 +270,8 @@ struct Running {
     /// When the last order went out.
     ordered: f64,
     rested_since: Option<Instant>,
-    /// The content, target and status dot place on show before the first order.
-    before: Option<(Option<u64>, Outline, Option<f64>)>,
-    /// The status dot was seen changing color.
-    recolored: bool,
+    /// The content on show before the first order.
+    before: Option<Option<u64>>,
 }
 
 struct Check {
@@ -465,9 +315,6 @@ impl Check {
         if !probe.fits {
             return Some(Err(format!("{name}: the outline left its window")));
         }
-        if let Some(running) = &mut self.running {
-            running.recolored |= probe.status_recoloring;
-        }
         let verdict = self.advance(mtm, now, &probe);
         self.last = Some((now, probe));
         verdict
@@ -493,20 +340,12 @@ impl Check {
 
     /// What must hold on every frame of the running step.
     fn during(&self, probe: &Probe) -> Result<(), String> {
-        let Some(step) = self.running.as_ref().map(|running| &running.step) else {
-            return Ok(());
-        };
-        if step.in_place && probe.bands_scaling {
-            return Err("a band grew or shrank while the content updated in place".to_owned());
-        }
-        if step.dot_stays
-            && let Some(drift) = probe
-                .status_drift
-                .filter(|drift| drift.abs() > REST_TOLERANCE)
-        {
-            return Err(format!(
-                "the status dot was drawn {drift:.1} pt from its place"
-            ));
+        let in_place = self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.step.in_place);
+        if in_place && probe.band_scaling {
+            return Err("the band grew or shrank while the content updated in place".to_owned());
         }
         Ok(())
     }
@@ -526,7 +365,6 @@ impl Check {
                         ordered: 0.0,
                         rested_since: None,
                         before: None,
-                        recolored: false,
                     });
                     self.advance(mtm, now, probe)
                 }
@@ -544,19 +382,16 @@ impl Check {
         {
             running.ordered = at;
             running.rested_since = None;
-            running
-                .before
-                .get_or_insert((probe.content, probe.target, probe.status_place));
+            running.before.get_or_insert(probe.content);
             match order {
-                Order::Show(presentation) => macos::render(mtm, GENERATION, presentation),
-                Order::Expand(expanded) => macos::set_expanded(mtm, expanded),
-                Order::Interrupt => {
-                    if !probe.moving || !probe.expanded {
+                Order::Show(activity) => macos::render(mtm, GENERATION, activity),
+                Order::Interrupt(activity) => {
+                    if !probe.moving {
                         return Some(Err(format!(
-                            "{name}: the island was not opening when closed"
+                            "{name}: the island was not moving when interrupted"
                         )));
                     }
-                    macos::set_expanded(mtm, false);
+                    macos::render(mtm, GENERATION, activity);
                 }
             }
             return None;
@@ -581,56 +416,17 @@ impl Check {
                 "{name}: settled {off:.2} pt away from its target"
             )));
         }
-        if probe.expanded != running.step.expanded {
+        let (height, notch) = (probe.target.bounds().height, probe.idle.bounds().height);
+        if (height - notch).abs() > REST_TOLERANCE {
             return Some(Err(format!(
-                "{name}: the island is not {}",
-                if running.step.expanded {
-                    "open"
-                } else {
-                    "closed"
-                }
+                "{name}: the island hangs {height:.1} pt, not the notch's {notch:.1} pt"
             )));
-        }
-        let open_taller = probe.target.bounds().height > probe.idle.bounds().height;
-        if running.step.expanded != open_taller {
-            return Some(Err(format!(
-                "{name}: the outline does not match the open state"
-            )));
-        }
-        if running.step.expanded {
-            match probe.status_drift {
-                None => return Some(Err(format!("{name}: no open header is on show"))),
-                Some(drift) if drift.abs() > REST_TOLERANCE => {
-                    return Some(Err(format!(
-                        "{name}: the status dot sits {drift:.1} pt from its word"
-                    )));
-                }
-                Some(_) => {}
-            }
         }
         if running.step.in_place
-            && let Some((content, target, place)) = running.before
+            && let Some(content) = running.before
+            && probe.content != content
         {
-            if probe.content != content {
-                return Some(Err(format!("{name}: the content was rebuilt")));
-            }
-            let resized = probe.target != target;
-            if running.step.expanded && resized != running.step.resizes {
-                return Some(Err(format!(
-                    "{name}: the open island {}",
-                    if resized {
-                        "changed size"
-                    } else {
-                        "kept its size"
-                    }
-                )));
-            }
-            if running.step.dot_stays && probe.status_place != place {
-                return Some(Err(format!("{name}: the status dot moved")));
-            }
-            if running.step.dot_recolors && !running.recolored {
-                return Some(Err(format!("{name}: the status dot changed color at once")));
-            }
+            return Some(Err(format!("{name}: the content was rebuilt")));
         }
         match macos::audit(mtm) {
             Some(Ok(())) => {}

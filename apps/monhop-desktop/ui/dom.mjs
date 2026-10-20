@@ -340,23 +340,37 @@ const exitMs = () => motionMs("--motion-fast");
 // Enters rise into place; exits drift half as far upward, eased in and out so the first frame is no cut.
 const rise = () => motionToken("--motion-rise") || "0px";
 const shrink = () => motionToken("--scale-enter") || "1";
-const enterFrames = () => [
-  { opacity: 0, transform: `translateY(${rise()}) scale(${shrink()})` },
+const scaled = (scale) => (scale ? ` scale(${shrink()})` : "");
+const enterFrames = (scale = true) => [
+  { opacity: 0, transform: `translateY(${rise()})${scaled(scale)}` },
   { opacity: 1, transform: "none" },
 ];
-const exitTo = () => ({
+const exitTo = (scale = true) => ({
   opacity: 0,
-  transform: `translateY(calc(${rise()} * -.5)) scale(${shrink()})`,
+  transform: `translateY(calc(${rise()} * -.5))${scaled(scale)}`,
 });
-const exitFrames = () => [{ opacity: 1, transform: "none" }, exitTo()];
+const exitFrames = (scale) => [{ opacity: 1, transform: "none" }, exitTo(scale)];
 const EXIT_EASE = "--ease-in-out";
 
 // The one reduced-motion query all UI motion reads.
 export const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 // UI motion runs only when it is wanted and on screen.
+// A block built fresh, such as a Settings page shown again, lands as it is: everything built inside
+// records its current state without animating, so nothing replays what changed while it was away.
+let settling = false;
+
 export function motionEnabled() {
-  return !reducedMotion.matches && !document.hidden;
+  return !settling && !reducedMotion.matches && !document.hidden;
+}
+
+export function settled(build) {
+  settling = true;
+  try {
+    return build();
+  } finally {
+    settling = false;
+  }
 }
 
 // Where each container that turned inert sent the focus it held, so focus never drops to <body>.
@@ -496,6 +510,8 @@ export function progressBar(key, fraction) {
 // A visual copy of a node that left: never focusable, never announced, never a duplicate id.
 export function ghostOf(node) {
   const ghost = node.cloneNode(true);
+  // A copy cannot carry a nested fade's running state, so what was leaving inside it goes now.
+  for (const nested of ghost.querySelectorAll("[data-exit]")) nested.remove();
   ghost.dataset.exit = "true";
   ghost.setAttribute("aria-hidden", "true");
   ghost.inert = true;
@@ -507,28 +523,70 @@ export function ghostOf(node) {
 }
 
 // A control whose state changed cross-fades in place. Width stays natural so text never drives
-// a layout animation.
-export function swap(key, node, signature, { block = false } = {}) {
+// a layout animation. `scale: false` keeps a large block (a whole page) at its size as it fades.
+export function swap(key, node, signature, { block = false, scale = true } = {}) {
   const now = performance.now();
   const entry = motionMemory.get(key) ?? { signature, changedAt: -Infinity };
+  // Every state still fading out keeps its own timeline; one that was still fading in when it was
+  // replaced leaves from where it was drawn.
+  const leavers = (entry.leavers ?? []).filter((leaver) => now - leaver.at < exitMs());
   if (entry.signature !== signature) {
     entry.signature = signature;
-    entry.changedAt = now;
-    entry.leaving = entry.ghost;
+    entry.changedAt = settling ? -Infinity : now;
+    if (entry.ghost && !settling)
+      leavers.push({ node: entry.ghost, from: drawnMidEnter(entry.live), at: now });
   }
+  entry.leavers = leavers;
   entry.ghost = node.cloneNode(true);
+  entry.live = null;
   motionMemory.set(key, entry);
   const wrapper = el(block ? "div" : "span", { className: "swap", children: [node] });
   if (block) wrapper.dataset.block = "true";
   const elapsed = now - entry.changedAt;
   if (elapsed >= enterMs() || !motionEnabled()) return wrapper;
-  play(node, enterFrames(), enterMs(), elapsed);
-  if (entry.leaving && elapsed < exitMs()) {
-    const ghost = ghostOf(entry.leaving);
+  // Kept only while it fades in, the one stretch a change could catch it mid-way.
+  entry.live = node;
+  play(node, enterFrames(scale), enterMs(), elapsed);
+  for (const leaver of leavers) {
+    const ghost = ghostOf(leaver.node);
     wrapper.append(ghost);
-    play(ghost, exitFrames(), exitMs(), elapsed, () => ghost.remove(), EXIT_EASE);
+    const frames = leaver.from ? [leaver.from, exitTo(scale)] : exitFrames(scale);
+    play(ghost, frames, exitMs(), now - leaver.at, () => ghost.remove(), EXIT_EASE);
   }
   return wrapper;
+}
+
+function drawnMidEnter(node) {
+  if (!node?.isConnected || !node.getAnimations().some((run) => run.playState === "running"))
+    return null;
+  const { opacity, transform } = getComputedStyle(node);
+  return { opacity, transform };
+}
+
+// A list's one selection indicator moves into the selected item and slides over from wherever it was
+// drawn, so a change mid-slide carries on from there.
+const indicatorGlides = new WeakMap();
+
+export function glideIndicator(indicator, target) {
+  if (!target) {
+    indicator.hidden = true;
+    return;
+  }
+  indicator.hidden = false;
+  if (indicator.parentElement === target) return;
+  const from = indicator.getClientRects().length ? indicator.getBoundingClientRect() : null;
+  indicatorGlides.get(indicator)?.cancel();
+  indicatorGlides.delete(indicator);
+  target.prepend(indicator);
+  if (!from || !motionEnabled()) return;
+  const to = indicator.getBoundingClientRect();
+  if (!to.width || !to.height) return;
+  const transform = `translate(${from.left - to.left}px, ${from.top - to.top}px) scale(${from.width / to.width}, ${from.height / to.height})`;
+  const animation = indicator.animate([{ transform }, { transform: "none" }], {
+    duration: motionMs("--motion-slow"),
+    easing: motionEase("--ease-glide"),
+  });
+  indicatorGlides.set(indicator, animation);
 }
 
 // How long ago a keyed value last changed (Infinity before any change), for a node the next render
@@ -538,7 +596,7 @@ export function changedAgo(key, signature) {
   const entry = motionMemory.get(key) ?? { signature, changedAt: -Infinity };
   if (entry.signature !== signature) {
     entry.signature = signature;
-    entry.changedAt = now;
+    entry.changedAt = settling ? -Infinity : now;
   }
   motionMemory.set(key, entry);
   return now - entry.changedAt;

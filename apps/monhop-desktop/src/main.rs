@@ -720,7 +720,8 @@ fn main() {
             autostart::autostart_set,
             autostart::autostart_open_settings,
             island::island_status,
-            island::island_set_enabled
+            island::island_set_enabled,
+            island::island_set_clipboard_notices
         ])
         .setup(move |app| {
             if check_ui {
@@ -1105,7 +1106,8 @@ mod tests {
                 "allow-autostart-set",
                 "allow-autostart-open-settings",
                 "allow-island-status",
-                "allow-island-set-enabled"
+                "allow-island-set-enabled",
+                "allow-island-set-clipboard-notices"
             ])
         );
         let config: serde_json::Value =

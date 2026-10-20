@@ -1,6 +1,7 @@
-//! The notch island: MonHop's status and quick controls around the MacBook camera. macOS only,
-//! shown only on a display with a camera notch, and on until the user turns it off; while off,
-//! nothing of it runs. Without a notch the commands report it as unsupported.
+//! The notch island: MonHop's connection status around the MacBook camera, and clipboard copies
+//! when the user asks for them. macOS only, shown only on a display with a camera notch, and on
+//! until the user turns it off; while off, nothing of it runs. Without a notch the commands report
+//! it as unsupported.
 
 #[cfg(target_os = "macos")]
 pub mod check;
@@ -34,6 +35,8 @@ pub struct IslandView {
     /// A display with a camera notch is connected; the card shows only then.
     supported: bool,
     enabled: bool,
+    /// Clipboard copies show beside the notch; off until the user turns it on.
+    clipboard_notices: bool,
     error: Option<String>,
 }
 
@@ -62,6 +65,16 @@ pub async fn island_set_enabled(
     enabled::set_enabled(app, enabled).await
 }
 
+/// Starts or stops clipboard notices at once, even when saving fails.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn island_set_clipboard_notices(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<IslandView, String> {
+    enabled::set_clipboard_notices(app, enabled).await
+}
+
 #[cfg(target_os = "macos")]
 mod enabled {
     use std::sync::{Arc, OnceLock};
@@ -78,18 +91,38 @@ mod enabled {
         logged: "notch island",
     };
 
+    const CLIPBOARD_NAMES: SwitchNames = SwitchNames {
+        file: "island-clipboard.json",
+        setting: "clipboard notices",
+        logged: "notch island clipboard notices",
+    };
+
     /// The handle the switch's apply function starts the island with.
     static APP: OnceLock<AppHandle> = OnceLock::new();
 
-    pub struct Island(SwitchPreference);
+    pub struct Island {
+        shown: SwitchPreference,
+        clipboard: SwitchPreference,
+    }
 
     impl Island {
-        /// Loads the switch, on until the user turns it off, and starts the island if it is on.
-        /// Without `show` (the window check) the switch is kept but never shows anything.
+        /// Loads both switches, the island on and its clipboard notices off until the user
+        /// changes them, and starts the island if it is on. Without `show` (the window check) the
+        /// switches are kept but the island never shows anything.
         pub fn start(app: &AppHandle, show: bool) -> Arc<Self> {
             let _ = APP.set(app.clone());
+            // Loaded first, so a feed the island's switch starts reads it from its first snapshot.
+            let clipboard = SwitchPreference::start(
+                app,
+                CLIPBOARD_NAMES,
+                false,
+                super::driver::set_clipboard_notices,
+            );
             let apply: fn(bool) = if show { apply } else { |_| {} };
-            Arc::new(Self(SwitchPreference::start(app, NAMES, true, apply)))
+            Arc::new(Self {
+                shown: SwitchPreference::start(app, NAMES, true, apply),
+                clipboard,
+            })
         }
     }
 
@@ -114,10 +147,15 @@ mod enabled {
         error: Option<String>,
     }
 
-    async fn view_of(app: &AppHandle, switch: SwitchView) -> Result<IslandView, String> {
-        let switch: Switch = serde_json::to_value(&switch)
+    fn switch(view: SwitchView, names: &SwitchNames) -> Result<Switch, String> {
+        serde_json::to_value(&view)
             .and_then(serde_json::from_value)
-            .map_err(|_| NAMES.not_saved())?;
+            .map_err(|_| names.not_saved())
+    }
+
+    async fn view_of(app: &AppHandle, island: &Island) -> Result<IslandView, String> {
+        let shown = switch(island.shown.view(), &NAMES)?;
+        let clipboard = switch(island.clipboard.view(), &CLIPBOARD_NAMES)?;
         let supported = crate::run_on_main_thread_for_result(
             app,
             super::macos::has_notch,
@@ -125,28 +163,42 @@ mod enabled {
             "The notch island could not read the displays. Try again.",
         )
         .await?;
-        let error = switch.error.or_else(|| {
-            (switch.enabled && super::tokens::tokens().is_err())
+        let error = shown.error.or(clipboard.error).or_else(|| {
+            (shown.enabled && super::tokens::tokens().is_err())
                 .then(|| "The notch island could not start.".to_owned())
         });
         Ok(IslandView {
             supported,
-            enabled: switch.enabled,
+            enabled: shown.enabled,
+            clipboard_notices: clipboard.enabled,
             error,
         })
     }
 
     pub async fn status(app: AppHandle) -> Result<IslandView, String> {
-        let switch = app.state::<Arc<Island>>().0.view();
-        view_of(&app, switch).await
+        let island = app.state::<Arc<Island>>().inner().clone();
+        view_of(&app, &island).await
     }
 
     pub async fn set_enabled(app: AppHandle, enabled: bool) -> Result<IslandView, String> {
         let island = app.state::<Arc<Island>>().inner().clone();
-        let switch = tauri::async_runtime::spawn_blocking(move || island.0.set_enabled(enabled))
+        let changing = Arc::clone(&island);
+        tauri::async_runtime::spawn_blocking(move || changing.shown.set_enabled(enabled))
             .await
             .map_err(|_| NAMES.not_saved())?;
-        view_of(&app, switch).await
+        view_of(&app, &island).await
+    }
+
+    pub async fn set_clipboard_notices(
+        app: AppHandle,
+        enabled: bool,
+    ) -> Result<IslandView, String> {
+        let island = app.state::<Arc<Island>>().inner().clone();
+        let changing = Arc::clone(&island);
+        tauri::async_runtime::spawn_blocking(move || changing.clipboard.set_enabled(enabled))
+            .await
+            .map_err(|_| CLIPBOARD_NAMES.not_saved())?;
+        view_of(&app, &island).await
     }
 }
 
@@ -154,6 +206,7 @@ mod enabled {
 const UNSUPPORTED: IslandView = IslandView {
     supported: false,
     enabled: false,
+    clipboard_notices: false,
     error: None,
 };
 
@@ -171,6 +224,16 @@ pub async fn island_set_enabled(app: AppHandle, enabled: bool) -> Result<IslandV
     Ok(UNSUPPORTED)
 }
 
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub async fn island_set_clipboard_notices(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<IslandView, String> {
+    let _ = (app, enabled);
+    Ok(UNSUPPORTED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,11 +243,17 @@ mod tests {
         let view = IslandView {
             supported: true,
             enabled: false,
+            clipboard_notices: true,
             error: None,
         };
         assert_eq!(
             serde_json::to_value(view).unwrap(),
-            serde_json::json!({ "supported": true, "enabled": false, "error": null })
+            serde_json::json!({
+                "supported": true,
+                "enabled": false,
+                "clipboardNotices": true,
+                "error": null
+            })
         );
     }
 }

@@ -2864,6 +2864,7 @@ mod tests {
         assert_eq!(sharing["enabled"], serde_json::json!([key('B')]));
         assert_eq!(sharing["paused"], false);
         assert_eq!(own_fields(&sharing["peers"][0]), own_fields(&sharing));
+        assert_eq!(sharing["peers"][0]["drops"], 0);
         // A drop: the reconnect wait reads exactly as it did.
         fake.end('B', Err(SessionFailure::Wire), LinkClose::Transport);
         let dropped = status_when(&app, |view| {
@@ -2886,6 +2887,7 @@ mod tests {
             )
         );
         assert_eq!(own_fields(&dropped["peers"][0]), own_fields(&dropped));
+        assert_eq!(dropped["peers"][0]["drops"], 1);
         // Stopped: input is local, and nothing of the session is left but its drop line.
         app.sharing.stop_with(NOT_CONNECTED);
         eventually(|| app.sharing.live_peers().is_empty());

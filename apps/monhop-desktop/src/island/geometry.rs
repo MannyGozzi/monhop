@@ -151,10 +151,6 @@ impl Placement {
         Size::new(self.fit(self.core + 2.0 * wing), self.idle.height)
     }
 
-    pub fn open(&self, width: f64, height: f64) -> Size {
-        Size::new(self.fit(width), ceil_to_pixel(height, self.scale))
-    }
-
     pub fn outline(&self, size: Size) -> Outline {
         Outline::hanging(size)
     }
@@ -359,16 +355,13 @@ mod tests {
                 assert!(on_pixels(place.center_x - size.width / 2.0, scale));
                 assert!(on_pixels(place.center_x + size.width / 2.0, scale));
             }
-            let open = place.open(440.0, 301.3);
-            assert!(on_pixels(place.center_x - open.width / 2.0, scale));
-            assert!(on_pixels(open.height, scale));
         }
     }
 
     #[test]
     fn every_outline_shares_one_element_sequence_and_hangs_from_its_top() {
         let place = placement(&notched()).unwrap();
-        for size in [place.idle, place.compact(44.0), place.open(440.0, 300.0)] {
+        for size in [place.idle, place.compact(44.0), Size::new(440.0, 300.0)] {
             let outline = place.outline(size);
             assert_eq!(outline.points.len(), 17);
             assert_eq!(
@@ -426,7 +419,7 @@ mod tests {
     #[test]
     fn the_envelope_leaves_room_for_the_swing_with_even_margins() {
         let place = placement(&notched()).unwrap();
-        let open = place.open(440.0, 300.0);
+        let open = Size::new(440.0, 300.0);
         let envelope = place.envelope(place.idle, open, 0.038);
         assert!(envelope.width >= 440.0 + 0.038 * 240.0);
         assert!(envelope.height >= 300.0 + 0.038 * 268.0);

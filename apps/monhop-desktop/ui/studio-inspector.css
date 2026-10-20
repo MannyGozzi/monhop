@@ -36,7 +36,17 @@
 .inspector-note-glyph svg { width: var(--icon-size-sm); height: var(--icon-size-sm); stroke-width: var(--icon-stroke); }
 .inspector-note .notice-dot { background: var(--tone); }
 
-/* Directions: the kit's switch rows, flat between hairlines (studio-settings.css draws them for both panes). */
+/* Rows in the inspector are flat: no tray behind them, a hairline between each, the copy flush with the
+   section title. Selectable rows keep a hover surface, inset to match. */
+.computer-inspector .rows { overflow: visible; border-radius: 0; background: none; }
+.computer-inspector .rows > :is(.row, .switch-row, .slider-row) { border-radius: 0; padding-inline: 0; }
+.computer-inspector .rows > * + *::before { left: 0; }
+.computer-inspector .rows > .switch-row:hover { background: none; }
+.computer-inspector .rows > .row[data-selectable="true"] { margin-inline: calc(var(--gap-3) * -1); border-radius: var(--radius-group); padding-inline: var(--gap-3); }
+.computer-inspector .rows > .row[data-selectable="true"] + *::before, .computer-inspector .rows > * + .row[data-selectable="true"]::before { left: var(--gap-3); right: var(--gap-3); }
+.computer-inspector .switch-copy > small { line-height: var(--leading); }
+
+/* Directions: the kit's switch rows, flat between hairlines. */
 .computer-directions .rows > .switch-row { min-height: var(--row-min-height); }
 
 /* Clipboard: one status line and the quiet way to its switch in Settings. */

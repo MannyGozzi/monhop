@@ -19,8 +19,8 @@ use objc2_foundation::{
 };
 use objc2_quartz_core::{
     CAAnimation, CABasicAnimation, CACurrentMediaTime, CALayer, CAMediaTiming,
-    CAMediaTimingFunction, CASpringAnimation, CATextLayer, CATransaction, kCAAlignmentLeft,
-    kCAAlignmentRight, kCAFillModeBackwards, kCATruncationEnd,
+    CAMediaTimingFunction, CASpringAnimation, CATextLayer, CATransaction, kCAAlignmentRight,
+    kCAFillModeBackwards, kCATruncationEnd,
 };
 
 use super::super::{
@@ -31,9 +31,6 @@ use super::super::{
 /// The blur filter's name, and the key path of its radius.
 pub const BLUR: &str = "blur";
 pub const BLUR_RADIUS: &str = "filters.blur.inputRadius";
-/// The key paths of a layer's fill and of a line of text's color.
-pub const BACKGROUND_COLOR: &str = "backgroundColor";
-const FOREGROUND_COLOR: &str = "foregroundColor";
 /// A layer's own key (CALayer stores any key) for when its blur has cleared and may be dropped.
 const SHARP_AT: &str = "monhopSharpAt";
 /// Timers may fire a hair before the media clock reads the time they were set for.
@@ -64,18 +61,6 @@ pub fn group(area: Rect) -> Retained<CALayer> {
     let layer = CALayer::new();
     span(&layer, area);
     layer.setPosition(NSPoint::new(0.0, 0.0));
-    layer
-}
-
-/// A group like [`group`] that scales about `pivot`, a point in island coordinates.
-pub fn group_about(area: Rect, pivot: NSPoint) -> Retained<CALayer> {
-    let layer = group(area);
-    let bounds = layer.bounds();
-    layer.setAnchorPoint(NSPoint::new(
-        (pivot.x - bounds.origin.x) / bounds.size.width,
-        (pivot.y - bounds.origin.y) / bounds.size.height,
-    ));
-    layer.setPosition(pivot);
     layer
 }
 
@@ -188,12 +173,6 @@ pub fn read_outline(path: &CGPath) -> Option<Outline> {
         points[at + 3] = end;
     }
     Some(Outline { points })
-}
-
-/// A color as the `id` Core Animation values take.
-pub fn color_value(color: &CGColor) -> &AnyObject {
-    // SAFETY: every CoreFoundation object is an Objective-C object (toll-free bridged).
-    unsafe { &*(std::ptr::from_ref(color).cast::<AnyObject>()) }
 }
 
 /// A path as the `id` Core Animation values take.
@@ -432,67 +411,13 @@ pub fn text_ghost(layer: &CATextLayer) -> Retained<CATextLayer> {
     ghost
 }
 
-/// A copy of a plain layer as it shows now: its size, place, fill, corners and opacity.
-pub fn ghost(layer: &CALayer) -> Retained<CALayer> {
-    let ghost = CALayer::new();
-    ghost.setBounds(layer.bounds());
-    ghost.setAnchorPoint(layer.anchorPoint());
-    ghost.setPosition(shown_position(layer));
-    ghost.setCornerRadius(layer.cornerRadius());
-    // SAFETY: the presentation layer is a read-only copy of this one.
-    let color = unsafe { layer.presentationLayer() }
-        .and_then(|shown| shown.backgroundColor())
-        .or_else(|| layer.backgroundColor());
-    ghost.setBackgroundColor(color.as_deref());
-    ghost.setOpacity(shown_number(layer, "opacity", f64::from(layer.opacity())) as f32);
-    ghost
-}
-
-/// Gives a glyph the symbol `image` and returns a copy of it as it showed, keeping the old symbol.
-pub fn hand_over_glyph(layer: &CALayer, image: &NSImage, scale: f64) -> Retained<CALayer> {
-    let ghost = ghost(layer);
-    let old = layer.mask();
-    let size = image.size();
-    layer.setBounds(NSRect::new(NSPoint::new(0.0, 0.0), size));
-    // SAFETY: each mask is a plain layer only its own glyph uses; the old one moves to the ghost.
-    unsafe {
-        layer.setMask(Some(&glyph_mask(image, scale)));
-        ghost.setMask(old.as_deref());
-    }
-    ghost
-}
-
-/// The color a line of text shows now, which a retint may have taken from its model color.
+/// The color a line of text shows now, from its presentation layer.
 fn shown_foreground(layer: &CATextLayer) -> Option<Retained<CGColor>> {
     // SAFETY: the presentation layer is a read-only copy of this one.
     unsafe { layer.presentationLayer() }
         .and_then(|shown| shown.downcast::<CATextLayer>().ok())
         .and_then(|shown| shown.foregroundColor())
         .or_else(|| layer.foregroundColor())
-}
-
-/// Recolors a line of text from the color it shows now, over `duration`.
-pub fn retint(layer: &CATextLayer, to: Color, duration: f64, easing: [f64; 4]) {
-    let from = shown_foreground(layer);
-    let target = cg(to);
-    layer.setForegroundColor(Some(&target));
-    if let Some(from) = from {
-        let change = tween(
-            FOREGROUND_COLOR,
-            color_value(&from),
-            color_value(&target),
-            duration,
-            easing,
-            0.0,
-        );
-        add(layer, FOREGROUND_COLOR, &change);
-    }
-}
-
-/// Gives a line of text `color` at once, ending a retint under way.
-pub fn tint(layer: &CATextLayer, color: Color) {
-    remove(layer, FOREGROUND_COLOR);
-    layer.setForegroundColor(Some(&cg(color)));
 }
 
 /// A system font at a CSS weight (400, 500 or 600).
@@ -527,26 +452,16 @@ pub fn measure(text: &str, font: &NSFont) -> f64 {
     string.size().width.ceil()
 }
 
-/// A line of text in `font`: its height fits the font's line, so centering the layer centers the
-/// text.
-pub fn text_layer(
-    text: &str,
-    font: &NSFont,
-    color: Color,
-    right: bool,
-    scale: f64,
-) -> Retained<CATextLayer> {
+/// A right-aligned line of text in `font`: its height fits the font's line, so centering the layer
+/// centers the text.
+pub fn text_layer(text: &str, font: &NSFont, color: Color, scale: f64) -> Retained<CATextLayer> {
     let layer = CATextLayer::new();
     // SAFETY: the font is the CTFont `setFont` takes, and the string an NSString.
     unsafe {
         layer.setFont(Some(as_ct_font(font)));
         layer.setString(Some(&NSString::from_str(text)));
         layer.setTruncationMode(kCATruncationEnd);
-        layer.setAlignmentMode(if right {
-            kCAAlignmentRight
-        } else {
-            kCAAlignmentLeft
-        });
+        layer.setAlignmentMode(kCAAlignmentRight);
     }
     layer.setFontSize(font.pointSize());
     layer.setForegroundColor(Some(&cg(color)));
@@ -600,7 +515,7 @@ pub fn glyph(image: &NSImage, color: Color, scale: f64) -> Retained<CALayer> {
     layer
 }
 
-pub fn glyph_mask(image: &NSImage, scale: f64) -> Retained<CALayer> {
+fn glyph_mask(image: &NSImage, scale: f64) -> Retained<CALayer> {
     let size = image.size();
     let mask = CALayer::new();
     mask.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
@@ -608,13 +523,6 @@ pub fn glyph_mask(image: &NSImage, scale: f64) -> Retained<CALayer> {
     // SAFETY: an image's layer contents for this scale is what `contents` takes.
     unsafe { mask.setContents(Some(&image.layerContentsForContentsScale(scale))) };
     mask
-}
-
-/// Swaps a glyph layer's symbol at once.
-pub fn set_glyph(layer: &CALayer, image: &NSImage, scale: f64) {
-    layer.setBounds(NSRect::new(NSPoint::new(0.0, 0.0), image.size()));
-    // SAFETY: the mask is a plain layer this glyph owns.
-    unsafe { layer.setMask(Some(&glyph_mask(image, scale))) };
 }
 
 /// A filled circle `diameter` wide.
@@ -645,36 +553,6 @@ pub fn fade_to(layer: &CALayer, to: f64, duration: f64, easing: [f64; 4], delay:
             delay,
         ),
     );
-}
-
-/// Gives a layer's background `color` at once, ending a recolor under way.
-pub fn paint(layer: &CALayer, color: Color) {
-    remove(layer, BACKGROUND_COLOR);
-    layer.setBackgroundColor(Some(&cg(color)));
-}
-
-/// Recolors a layer's background from what shows now, over `duration`.
-pub fn recolor(layer: &CALayer, to: Color, duration: f64, easing: [f64; 4]) {
-    // SAFETY: the presentation layer is a read-only copy of this one.
-    let from = unsafe { layer.presentationLayer() }
-        .and_then(|presentation| presentation.backgroundColor())
-        .or_else(|| layer.backgroundColor());
-    let target = cg(to);
-    layer.setBackgroundColor(Some(&target));
-    if let Some(from) = from {
-        add(
-            layer,
-            BACKGROUND_COLOR,
-            &tween(
-                BACKGROUND_COLOR,
-                color_value(&from),
-                color_value(&target),
-                duration,
-                easing,
-                0.0,
-            ),
-        );
-    }
 }
 
 /// Moves a layer from where it shows now to `to` along `spring`.

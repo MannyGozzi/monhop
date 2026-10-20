@@ -1,22 +1,14 @@
-//! What the island shows, from snapshots of the app's state: a compact activity (a short-lived
-//! notice, else a standing one, else nothing) and the open island's rows. Pure and clock-injected.
+//! What the island shows, from snapshots of the app's state: a short-lived notice, else a standing
+//! activity, else nothing. Pure and clock-injected.
 
 use std::time::{Duration, Instant};
 
-const MAX_COMPUTER_ROWS: usize = 3;
-
 /// How long each notice shows, and which may replace which.
-const DIMMING: (u8, Duration) = (3, Duration::from_millis(1600));
 const DROPPED: (u8, Duration) = (2, Duration::from_secs(4));
 const CONNECTED: (u8, Duration) = (2, Duration::from_millis(2500));
 const CLIPBOARD: (u8, Duration) = (1, Duration::from_millis(2500));
-const UPDATE: (u8, Duration) = (1, Duration::from_secs(6));
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Platform {
-    Mac,
-    Windows,
-}
+/// The longest a connecting or reconnecting spinner stands in one episode.
+const SPINNER: Duration = Duration::from_secs(15);
 
 /// A computer's connection, as the sharing view names its phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +38,11 @@ impl Phase {
             _ => Self::Off,
         }
     }
+
+    /// On its way to a connection.
+    fn linking(self) -> bool {
+        matches!(self, Self::Connecting | Self::Starting | Self::Reconnecting)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,24 +50,13 @@ pub struct ComputerInput {
     /// Lowercase.
     pub fingerprint: String,
     pub name: String,
-    pub platform: Platform,
     pub enabled: bool,
     pub phase: Phase,
     /// The session is up but the other computer stopped answering.
     pub held: bool,
-    /// Where this computer's session routes the pointer: false while this Mac's keyboard and
-    /// pointer are on the other computer; true while input lands here, from either side.
-    pub pointer_here: Option<bool>,
-    /// Position among the computers switched on, for the Home card's tone.
-    pub tone: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DimmingInput {
-    pub dimmed: bool,
-    pub level: u8,
-    pub min_level: u8,
-    pub max_level: u8,
+    /// Sessions the sharing core counted as dropped; None while its view does not list the
+    /// computer.
+    pub drops: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,34 +91,23 @@ impl Transfer {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClipboardInput {
-    pub enabled: bool,
-    pub last: Option<Transfer>,
-}
-
 /// One snapshot of everything the island reads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct IslandInput {
     /// Paired computers, those switched on first.
     pub computers: Vec<ComputerInput>,
     pub paused: bool,
-    /// The sharing view's lead phase, whether a session shares input, and whether one is held.
-    pub phase: Phase,
-    pub sharing_active: bool,
-    pub held: bool,
-    pub dimming: DimmingInput,
-    /// None where clipboard sharing does not exist.
-    pub clipboard: Option<ClipboardInput>,
-    /// The version an update is ready to install, while one is.
-    pub update_ready: Option<String>,
+    /// The user is arranging displays; the island rests idle meanwhile.
+    pub editing: bool,
+    /// The last clipboard transfer, while the clipboard reports one.
+    pub transfer: Option<Transfer>,
+    /// The user turned clipboard notices on; while off, transfers raise nothing.
+    pub clipboard_notices: bool,
 }
 
-/// Text and indicator tones, each a dark-theme token.
+/// The dots' tones, each a dark-theme token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
-    Foreground,
-    Subtle,
     Success,
     Warning,
     Destructive,
@@ -140,130 +115,57 @@ pub enum Tone {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Symbol {
-    MoonFill,
-    SunMax,
     DocOnClipboard,
-    ArrowDownCircle,
-    ArrowRight,
-    Laptop,
-    Pc,
-    OpenApp,
-    Plus,
 }
 
 impl Symbol {
     pub fn system_name(self) -> &'static str {
         match self {
-            Self::MoonFill => "moon.fill",
-            Self::SunMax => "sun.max",
             Self::DocOnClipboard => "doc.on.clipboard",
-            Self::ArrowDownCircle => "arrow.down.circle",
-            Self::ArrowRight => "arrow.right",
-            Self::Laptop => "laptopcomputer",
-            Self::Pc => "pc",
-            Self::OpenApp => "arrow.up.forward.app",
-            Self::Plus => "plus",
-        }
-    }
-
-    pub fn for_platform(platform: Platform) -> Self {
-        match platform {
-            Platform::Mac => Self::Laptop,
-            Platform::Windows => Self::Pc,
         }
     }
 }
 
-/// The left wing.
+/// The left wing; a symbol takes the text's color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leading {
-    Symbol(Symbol, Tone),
+    Symbol(Symbol),
     Dot(Tone),
     Spinner,
 }
 
-/// The right wing.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Trailing {
-    Text(String),
-    /// A share of the bar filled, 0..=1.
-    Level(f64),
-    Labeled(Symbol, String),
-}
-
-/// Which activity is up; a change of id replays the entrance, a change of content does not.
+/// Which activity is up; a change of id replays the entrance, a change of words does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivityId {
-    Dimming,
     Dropped,
     Connected,
     Clipboard,
-    Update,
     Reconnecting,
     Held,
-    Controlling,
+    Connecting,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Activity {
     pub id: ActivityId,
     pub leading: Leading,
-    pub trailing: Trailing,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ComputerRow {
-    pub fingerprint: String,
-    pub name: String,
-    pub platform: Platform,
-    pub tone: usize,
-    pub status: String,
-    pub enabled: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Row {
-    Computer(ComputerRow),
-    SetUp,
-    Dimming(DimmingInput),
-    Clipboard {
-        enabled: bool,
-        detail: Option<String>,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Expanded {
-    pub status: String,
-    pub status_tone: Tone,
-    pub rows: Vec<Row>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Presentation {
-    pub compact: Option<Activity>,
-    pub expanded: Expanded,
-    /// This Mac's keyboard and pointer are on another computer: hover and clicks never open it.
-    pub input_away: bool,
+    /// The right wing's words.
+    pub text: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoticeKind {
-    Dimming,
     Dropped,
     Connected,
     Clipboard,
-    Update,
 }
 
 impl NoticeKind {
     fn rule(self) -> (u8, Duration) {
         match self {
-            Self::Dimming => DIMMING,
             Self::Dropped => DROPPED,
             Self::Connected => CONNECTED,
             Self::Clipboard => CLIPBOARD,
-            Self::Update => UPDATE,
         }
     }
 }
@@ -272,18 +174,40 @@ impl NoticeKind {
 struct Notice {
     kind: NoticeKind,
     activity: Activity,
-    /// None while the pointer holds it.
-    until: Option<Instant>,
+    until: Instant,
+}
+
+/// What the model remembers of one computer between snapshots.
+#[derive(Clone, Debug, PartialEq)]
+struct Track {
+    fingerprint: String,
+    /// The last phase other than `Stopping`, which only passes through.
+    phase: Phase,
+    /// Switched on, with sharing not paused.
+    on: bool,
+    /// As the sharing view listed it, so a count reappearing after an unlisted stretch is no drop.
+    drops: Option<u64>,
+    /// It left sharing without a drop and has not shared since: a deliberate restart, which starts
+    /// no spinner. An error, a drop, switching it off or pausing ends it.
+    restarting: bool,
+    episode: Option<Episode>,
+}
+
+/// A stretch of linking a spinner may stand for: from rest or a drop until the computer shares, is
+/// switched off or paused. Retries and further drops inside it neither end nor restart it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Episode {
+    /// It began with a drop.
+    reconnecting: bool,
+    since: Instant,
 }
 
 /// The parts of a snapshot later snapshots are compared with.
 #[derive(Clone, Debug, PartialEq)]
 struct Seen {
-    /// Each computer's last phase other than `Stopping`, which only passes through.
-    phases: Vec<(String, Phase)>,
-    enabled: Vec<String>,
-    paused: bool,
-    dimming: DimmingInput,
+    at: Instant,
+    /// In the snapshot's order.
+    computers: Vec<Track>,
     transfer: Option<Transfer>,
 }
 
@@ -291,147 +215,165 @@ struct Seen {
 pub struct Model {
     seen: Option<Seen>,
     notice: Option<Notice>,
-    hovering: bool,
-    update_shown: Option<String>,
 }
 
 impl Model {
-    /// A model that stays quiet about the update version an earlier one already announced.
-    pub fn remembering(update_shown: Option<String>) -> Self {
-        Self {
-            update_shown,
-            ..Self::default()
-        }
-    }
-
-    /// The update version announced so far, for the next model to remember.
-    pub fn update_shown(&self) -> Option<&str> {
-        self.update_shown.as_deref()
-    }
-
-    /// Takes a snapshot: compares it with the last one to raise notices, then presents both.
-    pub fn update(&mut self, input: &IslandInput, now: Instant) -> Presentation {
+    /// Takes a snapshot: compares it with the last one to raise notices, then shows the notice up,
+    /// else the standing activity. Arranging shows nothing and leaves no notice behind.
+    pub fn update(&mut self, input: &IslandInput, now: Instant) -> Option<Activity> {
         self.expire(now);
-        let seen = Seen::of(input, self.seen.as_ref());
-        if let Some(previous) = self.seen.take() {
-            for (kind, activity) in notices(&previous, &seen, input) {
+        let previous = self.seen.take();
+        let seen = Seen::of(input, previous.as_ref(), now);
+        if input.editing {
+            self.notice = None;
+        } else if let Some(previous) = &previous {
+            for (kind, activity) in notices(previous, &seen, input) {
                 self.raise(kind, activity, now);
             }
         }
+        let shown = if input.editing {
+            None
+        } else {
+            self.notice
+                .as_ref()
+                .map(|notice| notice.activity.clone())
+                .or_else(|| standing(input, &seen, now))
+        };
         self.seen = Some(seen);
-        if let Some(version) = &input.update_ready
-            && self.update_shown.as_ref() != Some(version)
-            && self.raise(NoticeKind::Update, update_activity(), now)
-        {
-            self.update_shown = Some(version.clone());
-        }
-        self.present(input)
+        shown
     }
 
-    /// The pointer resting on the island holds a notice; leaving gives it its full time again.
-    pub fn set_hovering(&mut self, hovering: bool, now: Instant) {
-        self.expire(now);
-        if self.hovering == hovering {
-            return;
-        }
-        self.hovering = hovering;
-        if let Some(notice) = &mut self.notice {
-            notice.until = (!hovering).then(|| now + notice.kind.rule().1);
-        }
-    }
-
-    /// When the shown notice ends, so the driver wakes then.
+    /// When the shown notice ends or a spinner reaches its limit, so the driver wakes then.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.notice.as_ref().and_then(|notice| notice.until)
+        let limits = self.seen.iter().flat_map(|seen| {
+            seen.computers
+                .iter()
+                .filter_map(|track| track.episode)
+                .map(|episode| episode.since + SPINNER)
+                .filter(|limit| *limit > seen.at)
+        });
+        self.notice
+            .as_ref()
+            .map(|notice| notice.until)
+            .into_iter()
+            .chain(limits)
+            .min()
     }
 
     fn expire(&mut self, now: Instant) {
         if self
             .notice
             .as_ref()
-            .and_then(|notice| notice.until)
-            .is_some_and(|until| until <= now)
+            .is_some_and(|notice| notice.until <= now)
         {
             self.notice = None;
         }
     }
 
-    /// True when the notice is now showing.
-    fn raise(&mut self, kind: NoticeKind, activity: Activity, now: Instant) -> bool {
+    fn raise(&mut self, kind: NoticeKind, activity: Activity, now: Instant) {
         let (priority, duration) = kind.rule();
         if self
             .notice
             .as_ref()
             .is_some_and(|shown| shown.kind.rule().0 > priority)
         {
-            return false;
+            return;
         }
         self.notice = Some(Notice {
             kind,
             activity,
-            until: (!self.hovering).then(|| now + duration),
+            until: now + duration,
         });
-        true
-    }
-
-    fn present(&self, input: &IslandInput) -> Presentation {
-        let compact = self
-            .notice
-            .as_ref()
-            .map(|notice| notice.activity.clone())
-            .or_else(|| standing(input));
-        Presentation {
-            compact,
-            expanded: expanded(input),
-            input_away: controlled(input).is_some(),
-        }
     }
 }
 
 impl Seen {
-    fn of(input: &IslandInput, previous: Option<&Seen>) -> Self {
-        let phases = input
+    fn of(input: &IslandInput, previous: Option<&Seen>, now: Instant) -> Self {
+        let computers = input
             .computers
             .iter()
             .map(|computer| {
-                let earlier = previous.and_then(|seen| phase_of(seen, &computer.fingerprint));
-                let phase = match (computer.phase, earlier) {
-                    (Phase::Stopping, Some(earlier)) => earlier,
-                    (phase, _) => phase,
-                };
-                (computer.fingerprint.clone(), phase)
+                let earlier = previous.and_then(|seen| seen.track(&computer.fingerprint));
+                Track::of(computer, earlier, input, now)
             })
             .collect();
         Self {
-            phases,
-            enabled: input
-                .computers
-                .iter()
-                .filter(|computer| computer.enabled)
-                .map(|computer| computer.fingerprint.clone())
-                .collect(),
-            paused: input.paused,
-            dimming: input.dimming,
-            transfer: input
-                .clipboard
-                .as_ref()
-                .and_then(|clipboard| clipboard.last.clone()),
+            at: now,
+            computers,
+            transfer: input.transfer.clone(),
+        }
+    }
+
+    fn track(&self, fingerprint: &str) -> Option<&Track> {
+        self.computers
+            .iter()
+            .find(|track| track.fingerprint == fingerprint)
+    }
+}
+
+impl Track {
+    fn of(
+        computer: &ComputerInput,
+        earlier: Option<&Track>,
+        input: &IslandInput,
+        now: Instant,
+    ) -> Self {
+        let phase = match (computer.phase, earlier) {
+            (Phase::Stopping, Some(earlier)) => earlier.phase,
+            (phase, _) => phase,
+        };
+        let on = computer.enabled && !input.paused;
+        let lost = !input.editing && earlier.is_some_and(|before| lost(before, computer, on));
+        let restarting = on
+            && !lost
+            && !matches!(phase, Phase::Sharing | Phase::Error)
+            && earlier.is_some_and(|before| {
+                before.restarting || (before.on && before.phase == Phase::Sharing)
+            });
+        // Sharing counts as rest too: leaving it is either a drop or a restart.
+        let from_rest = earlier.is_none_or(|before| !before.on || !before.phase.linking());
+        let episode = if !on || phase == Phase::Sharing {
+            None
+        } else if lost {
+            Some(Episode {
+                reconnecting: true,
+                since: now,
+            })
+        } else {
+            earlier.and_then(|before| before.episode).or_else(|| {
+                (!input.editing && !restarting && from_rest && phase.linking()).then_some(Episode {
+                    reconnecting: false,
+                    since: now,
+                })
+            })
+        };
+        Self {
+            fingerprint: computer.fingerprint.clone(),
+            phase,
+            on,
+            drops: computer.drops,
+            restarting,
+            episode,
         }
     }
 }
 
-fn phase_of(seen: &Seen, fingerprint: &str) -> Option<Phase> {
-    seen.phases
-        .iter()
-        .find(|(key, _)| key == fingerprint)
-        .map(|(_, phase)| *phase)
+/// The sharing core counted a new drop for a computer the user still has on, outside an episode:
+/// a session that keeps failing before it shares is lost once. Phases never tell, since a
+/// deliberate restart passes through the same ones.
+fn lost(before: &Track, computer: &ComputerInput, on: bool) -> bool {
+    on && before.episode.is_none()
+        && before
+            .drops
+            .zip(computer.drops)
+            .is_some_and(|(before, now)| now > before)
 }
 
 /// Notices a pair of snapshots raises, lowest priority first so a later, higher one wins.
 fn notices(previous: &Seen, seen: &Seen, input: &IslandInput) -> Vec<(NoticeKind, Activity)> {
     let mut raised = Vec::new();
-    if let (Some(transfer), Some(clipboard)) = (&seen.transfer, &input.clipboard)
-        && clipboard.last.is_some()
+    if input.clipboard_notices
+        && let Some(transfer) = &seen.transfer
         && previous
             .transfer
             .as_ref()
@@ -446,77 +388,39 @@ fn notices(previous: &Seen, seen: &Seen, input: &IslandInput) -> Vec<(NoticeKind
             NoticeKind::Clipboard,
             Activity {
                 id: ActivityId::Clipboard,
-                leading: Leading::Symbol(Symbol::DocOnClipboard, Tone::Foreground),
-                trailing: Trailing::Text(text),
+                leading: Leading::Symbol(Symbol::DocOnClipboard),
+                text,
             },
         ));
     }
-    for computer in &input.computers {
-        let Some(before) = phase_of(previous, &computer.fingerprint) else {
+    for (computer, track) in input.computers.iter().zip(&seen.computers) {
+        let Some(before) = previous.track(&computer.fingerprint) else {
             continue;
         };
-        let Some(now) = phase_of(seen, &computer.fingerprint) else {
-            continue;
-        };
-        if before != Phase::Sharing && now == Phase::Sharing {
-            raised.push((
-                NoticeKind::Connected,
-                Activity {
-                    id: ActivityId::Connected,
-                    leading: Leading::Dot(Tone::Success),
-                    trailing: Trailing::Text(computer.name.clone()),
-                },
-            ));
-        }
-        let user_stopped =
-            !computer.enabled || seen.paused || !previous.enabled.contains(&computer.fingerprint);
-        let lost = matches!(
-            now,
-            Phase::Reconnecting | Phase::Error | Phase::Off | Phase::Connecting
-        );
-        if before == Phase::Sharing && lost && !user_stopped {
+        let lost = lost(before, computer, track.on);
+        if lost {
             raised.push((
                 NoticeKind::Dropped,
                 Activity {
                     id: ActivityId::Dropped,
                     leading: Leading::Dot(Tone::Destructive),
-                    trailing: Trailing::Text(format!("Lost {}", computer.name)),
+                    text: format!("Lost {}", computer.name),
+                },
+            ));
+        }
+        // A drop already shared again by this snapshot ends as a connection.
+        if track.phase == Phase::Sharing && (before.phase != Phase::Sharing || lost) {
+            raised.push((
+                NoticeKind::Connected,
+                Activity {
+                    id: ActivityId::Connected,
+                    leading: Leading::Dot(Tone::Success),
+                    text: computer.name.clone(),
                 },
             ));
         }
     }
-    let (was, is) = (previous.dimming, seen.dimming);
-    if was.dimmed != is.dimmed || (is.dimmed && was.level != is.level) {
-        raised.push((NoticeKind::Dimming, dimming_activity(is)));
-    }
     raised
-}
-
-fn dimming_activity(dimming: DimmingInput) -> Activity {
-    Activity {
-        id: ActivityId::Dimming,
-        leading: Leading::Symbol(
-            if dimming.dimmed {
-                Symbol::MoonFill
-            } else {
-                Symbol::SunMax
-            },
-            Tone::Foreground,
-        ),
-        trailing: if dimming.dimmed {
-            Trailing::Level(f64::from(dimming.level) / 100.0)
-        } else {
-            Trailing::Text("Off".to_owned())
-        },
-    }
-}
-
-fn update_activity() -> Activity {
-    Activity {
-        id: ActivityId::Update,
-        leading: Leading::Symbol(Symbol::ArrowDownCircle, Tone::Foreground),
-        trailing: Trailing::Text("Update ready".to_owned()),
-    }
 }
 
 fn name_of(input: &IslandInput, fingerprint: &str) -> String {
@@ -528,25 +432,22 @@ fn name_of(input: &IslandInput, fingerprint: &str) -> String {
         .unwrap_or_else(|| "another computer".to_owned())
 }
 
-/// The computer this Mac's keyboard and pointer are on now.
-fn controlled(input: &IslandInput) -> Option<&ComputerInput> {
-    input.computers.iter().find(|computer| {
-        computer.phase == Phase::Sharing && !computer.held && computer.pointer_here == Some(false)
-    })
-}
-
-/// The activity shown while no notice is up: the first that applies.
-fn standing(input: &IslandInput) -> Option<Activity> {
-    if input
-        .computers
-        .iter()
-        .any(|computer| computer.enabled && computer.phase == Phase::Reconnecting)
-    {
-        return Some(Activity {
-            id: ActivityId::Reconnecting,
-            leading: Leading::Spinner,
-            trailing: Trailing::Text("Reconnecting".to_owned()),
-        });
+/// The activity shown while no notice is up: the first that applies. A spinner stands only for the
+/// start of its episode.
+fn standing(input: &IslandInput, seen: &Seen, now: Instant) -> Option<Activity> {
+    let spinning = |reconnecting: bool| {
+        seen.computers
+            .iter()
+            .filter_map(|track| track.episode)
+            .any(|episode| episode.reconnecting == reconnecting && now < episode.since + SPINNER)
+    };
+    let spinner = |id, text: &str| Activity {
+        id,
+        leading: Leading::Spinner,
+        text: text.to_owned(),
+    };
+    if spinning(true) {
+        return Some(spinner(ActivityId::Reconnecting, "Reconnecting"));
     }
     if let Some(computer) = input
         .computers
@@ -556,189 +457,10 @@ fn standing(input: &IslandInput) -> Option<Activity> {
         return Some(Activity {
             id: ActivityId::Held,
             leading: Leading::Dot(Tone::Warning),
-            trailing: Trailing::Text(format!("Waiting for {}", computer.name)),
+            text: format!("Waiting for {}", computer.name),
         });
     }
-    controlled(input).map(|computer| Activity {
-        id: ActivityId::Controlling,
-        leading: Leading::Symbol(Symbol::ArrowRight, Tone::Success),
-        trailing: Trailing::Labeled(
-            Symbol::for_platform(computer.platform),
-            computer.name.clone(),
-        ),
-    })
-}
-
-/// The header's status, worded and toned as the tray and the window's pill word it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Status {
-    Attention,
-    Reconnecting,
-    Sharing,
-    Connecting,
-    Connected,
-    Stopping,
-    Paused,
-    NotConnected,
-}
-
-impl Status {
-    const ALL: [Self; 8] = [
-        Self::Attention,
-        Self::Reconnecting,
-        Self::Sharing,
-        Self::Connecting,
-        Self::Connected,
-        Self::Stopping,
-        Self::Paused,
-        Self::NotConnected,
-    ];
-
-    fn of(input: &IslandInput) -> Self {
-        match input.phase {
-            Phase::Error => Self::Attention,
-            _ if input.sharing_active && input.held => Self::Reconnecting,
-            _ if input.sharing_active => Self::Sharing,
-            Phase::Reconnecting => Self::Reconnecting,
-            Phase::Connecting | Phase::Starting => Self::Connecting,
-            Phase::Connected => Self::Connected,
-            Phase::Stopping => Self::Stopping,
-            _ if input.paused => Self::Paused,
-            _ => Self::NotConnected,
-        }
-    }
-
-    fn word(self) -> &'static str {
-        match self {
-            Self::Attention => "Needs attention",
-            Self::Reconnecting => "Reconnecting",
-            Self::Sharing => "Sharing",
-            Self::Connecting => "Connecting…",
-            Self::Connected => "Connected",
-            Self::Stopping => "Stopping…",
-            Self::Paused => "Paused",
-            Self::NotConnected => "Not connected",
-        }
-    }
-
-    fn tone(self) -> Tone {
-        match self {
-            Self::Attention => Tone::Destructive,
-            Self::Reconnecting | Self::Connecting | Self::Stopping => Tone::Warning,
-            Self::Sharing | Self::Connected => Tone::Success,
-            Self::Paused | Self::NotConnected => Tone::Subtle,
-        }
-    }
-}
-
-/// Every word the header can show, so the open island makes room for the widest once.
-pub fn status_words() -> impl Iterator<Item = &'static str> {
-    Status::ALL.into_iter().map(Status::word)
-}
-
-/// One computer's line, in the window's words for the same state.
-fn computer_status(computer: &ComputerInput, paused: bool) -> String {
-    if !computer.enabled {
-        return "Off".to_owned();
-    }
-    if paused {
-        return "Paused".to_owned();
-    }
-    match computer.phase {
-        Phase::Sharing if computer.held => "Reconnecting…".to_owned(),
-        Phase::Sharing if computer.pointer_here == Some(false) => {
-            format!("Pointer on {}", computer.name)
-        }
-        Phase::Sharing => "Pointer on this Mac".to_owned(),
-        Phase::Reconnecting => "Reconnecting…".to_owned(),
-        Phase::Connected => "Connected".to_owned(),
-        Phase::Stopping => "Stopping…".to_owned(),
-        Phase::Error => "Can't connect".to_owned(),
-        Phase::NotPaired => "Not paired".to_owned(),
-        Phase::Off | Phase::Connecting | Phase::Starting => "Connecting…".to_owned(),
-    }
-}
-
-fn expanded(input: &IslandInput) -> Expanded {
-    let status = Status::of(input);
-    let mut rows: Vec<Row> = input
-        .computers
-        .iter()
-        .take(MAX_COMPUTER_ROWS)
-        .map(|computer| {
-            Row::Computer(ComputerRow {
-                fingerprint: computer.fingerprint.clone(),
-                name: computer.name.clone(),
-                platform: computer.platform,
-                tone: computer.tone,
-                status: computer_status(computer, input.paused),
-                enabled: computer.enabled,
-            })
-        })
-        .collect();
-    if rows.is_empty() {
-        rows.push(Row::SetUp);
-    }
-    rows.push(Row::Dimming(input.dimming));
-    if let Some(clipboard) = &input.clipboard {
-        rows.push(Row::Clipboard {
-            enabled: clipboard.enabled,
-            detail: clipboard.last.as_ref().map(transfer_text),
-        });
-    }
-    Expanded {
-        status: status.word().to_owned(),
-        status_tone: status.tone(),
-        rows,
-    }
-}
-
-/// "Sent an image (1.4 MB) 12 s ago", as the Home card words the last transfer.
-pub fn transfer_text(transfer: &Transfer) -> String {
-    let verb = match transfer.direction {
-        Direction::Sent => "Sent",
-        Direction::Received => "Received",
-    };
-    let kind = match transfer.kind {
-        TransferKind::Text => "text",
-        TransferKind::Image => "an image",
-    };
-    format!(
-        "{verb} {kind} ({}) {}",
-        human_bytes(transfer.bytes),
-        age_text(transfer.age_seconds)
-    )
-}
-
-fn human_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    value /= 1024.0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    let rounded = if value < 10.0 {
-        (value * 10.0).round() / 10.0
-    } else {
-        value.round()
-    };
-    format!("{rounded} {}", UNITS[unit])
-}
-
-fn age_text(seconds: u64) -> String {
-    if seconds < 60 {
-        return format!("{seconds} s ago");
-    }
-    let minutes = (seconds as f64 / 60.0).round() as u64;
-    if minutes < 60 {
-        return format!("{minutes} min ago");
-    }
-    format!("{} h ago", (minutes as f64 / 60.0).round() as u64)
+    spinning(false).then(|| spinner(ActivityId::Connecting, "Connecting"))
 }
 
 #[cfg(test)]
@@ -749,12 +471,10 @@ mod tests {
         ComputerInput {
             fingerprint: name.to_ascii_lowercase(),
             name: name.to_owned(),
-            platform: Platform::Windows,
             enabled: true,
             phase,
             held: false,
-            pointer_here: (phase == Phase::Sharing).then_some(true),
-            tone: 0,
+            drops: Some(0),
         }
     }
 
@@ -762,184 +482,591 @@ mod tests {
         IslandInput {
             computers,
             paused: false,
-            phase: Phase::Off,
-            sharing_active: false,
-            held: false,
-            dimming: DimmingInput {
-                dimmed: false,
-                level: 50,
-                min_level: 10,
-                max_level: 99,
-            },
-            clipboard: Some(ClipboardInput {
-                enabled: true,
-                last: None,
-            }),
-            update_ready: None,
+            editing: false,
+            transfer: None,
+            clipboard_notices: true,
         }
     }
 
-    fn shown(presentation: &Presentation) -> Option<ActivityId> {
-        presentation.compact.as_ref().map(|activity| activity.id)
+    /// The sharing core counts a drop of the computer's session.
+    fn lose(computer: &mut ComputerInput) {
+        computer.drops = computer.drops.map(|drops| drops + 1);
     }
 
-    fn text(presentation: &Presentation) -> String {
-        match presentation
-            .compact
+    fn shown(activity: &Option<Activity>) -> Option<ActivityId> {
+        activity.as_ref().map(|activity| activity.id)
+    }
+
+    fn text(activity: &Option<Activity>) -> &str {
+        activity
             .as_ref()
-            .map(|activity| &activity.trailing)
-        {
-            Some(Trailing::Text(text) | Trailing::Labeled(_, text)) => text.clone(),
-            Some(Trailing::Level(level)) => format!("{level}"),
-            None => String::new(),
+            .map_or("", |activity| activity.text.as_str())
+    }
+
+    fn received(peer: &str) -> Transfer {
+        Transfer {
+            direction: Direction::Received,
+            kind: TransferKind::Image,
+            bytes: 1_468_006,
+            peer: peer.to_owned(),
+            age_seconds: 0,
         }
+    }
+
+    /// Feeds the phases in turn on one clock, returning what each snapshot shows.
+    fn walk(
+        model: &mut Model,
+        state: &mut IslandInput,
+        now: Instant,
+        phases: &[Phase],
+    ) -> Vec<Option<ActivityId>> {
+        phases
+            .iter()
+            .map(|phase| {
+                state.computers[0].phase = *phase;
+                shown(&model.update(state, now))
+            })
+            .collect()
     }
 
     #[test]
     fn the_first_snapshot_raises_nothing_and_rests_idle() {
         let mut model = Model::default();
         let now = Instant::now();
-        let presentation = model.update(&input(vec![computer("PC", Phase::Sharing)]), now);
-        assert_eq!(presentation.compact, None);
-        assert!(!presentation.input_away);
+        let mut state = input(vec![computer("PC", Phase::Sharing)]);
+        state.transfer = Some(received("pc"));
+        assert_eq!(model.update(&state, now), None);
         assert_eq!(model.next_deadline(), None);
     }
 
     #[test]
-    fn dimming_shows_for_its_time_and_updates_in_place() {
-        let mut model = Model::default();
-        let start = Instant::now();
-        let mut state = input(vec![]);
-        model.update(&state, start);
-        state.dimming.dimmed = true;
-        let presentation = model.update(&state, start);
-        assert_eq!(shown(&presentation), Some(ActivityId::Dimming));
-        assert_eq!(text(&presentation), "0.5");
-        assert_eq!(model.next_deadline(), Some(start + DIMMING.1));
-        // A new level updates the same notice in place and restarts its time.
-        let later = start + Duration::from_millis(1000);
-        state.dimming.level = 70;
-        let presentation = model.update(&state, later);
-        assert_eq!(shown(&presentation), Some(ActivityId::Dimming));
-        assert_eq!(text(&presentation), "0.7");
-        assert_eq!(model.next_deadline(), Some(later + DIMMING.1));
-        // Undimming says Off; the level of an undimmed screen raises nothing.
-        state.dimming.dimmed = false;
-        assert_eq!(text(&model.update(&state, later)), "Off");
-        let gone = later + DIMMING.1;
-        assert_eq!(shown(&model.update(&state, gone)), None);
-        state.dimming.level = 20;
-        assert_eq!(shown(&model.update(&state, gone)), None);
+    fn a_computer_linking_at_launch_shows_connecting_from_the_first_snapshot() {
+        let now = Instant::now();
+        for phase in [Phase::Connecting, Phase::Starting] {
+            let activity = Model::default().update(&input(vec![computer("PC", phase)]), now);
+            assert_eq!(
+                (shown(&activity), text(&activity)),
+                (Some(ActivityId::Connecting), "Connecting")
+            );
+        }
     }
 
     #[test]
-    fn a_higher_or_equal_priority_replaces_and_a_lower_one_is_dropped() {
+    fn connecting_shows_from_switching_on_until_sharing_then_connected_names_it() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Off)]);
+        state.computers[0].enabled = false;
+        assert_eq!(model.update(&state, now), None);
+        state.computers[0].enabled = true;
+        let walked = walk(
+            &mut model,
+            &mut state,
+            now,
+            &[
+                Phase::Off,
+                Phase::Connecting,
+                Phase::Connected,
+                Phase::Starting,
+            ],
+        );
+        let connecting = Some(ActivityId::Connecting);
+        assert_eq!(walked, [None, connecting, connecting, connecting]);
+        state.computers[0].phase = Phase::Sharing;
+        let activity = model.update(&state, now);
+        assert_eq!(
+            (shown(&activity), text(&activity)),
+            (Some(ActivityId::Connected), "PC")
+        );
+        assert_eq!(model.next_deadline(), Some(now + CONNECTED.1));
+        assert_eq!(model.update(&state, now + CONNECTED.1), None);
+    }
+
+    #[test]
+    fn a_link_that_rests_up_without_connecting_first_shows_nothing() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Connected)]);
+        assert_eq!(
+            walk(
+                &mut model,
+                &mut state,
+                now,
+                &[Phase::Connected, Phase::Connected]
+            ),
+            [None, None]
+        );
+    }
+
+    #[test]
+    fn arranging_from_sharing_stays_quiet_until_done_shares_again() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Sharing)]);
+        model.update(&state, now);
+        // Arrange ends the session and opens a link; editing turns on about a second later.
+        assert_eq!(
+            walk(
+                &mut model,
+                &mut state,
+                now,
+                &[Phase::Stopping, Phase::Connecting, Phase::Connected]
+            ),
+            [None, None, None]
+        );
+        state.editing = true;
+        assert_eq!(
+            walk(
+                &mut model,
+                &mut state,
+                now,
+                &[Phase::Connected, Phase::Reconnecting, Phase::Connected]
+            ),
+            [None, None, None]
+        );
+        // Done closes the link and the supervisor starts a session.
+        state.editing = false;
+        assert_eq!(
+            walk(
+                &mut model,
+                &mut state,
+                now,
+                &[Phase::Stopping, Phase::Off, Phase::Starting]
+            ),
+            [None, None, None]
+        );
+        state.computers[0].phase = Phase::Sharing;
+        let activity = model.update(&state, now);
+        assert_eq!(
+            (shown(&activity), text(&activity)),
+            (Some(ActivityId::Connected), "PC")
+        );
+    }
+
+    #[test]
+    fn a_deliberate_restart_shows_no_drop_or_spinner_and_names_the_computer_once_it_shares() {
+        let now = Instant::now();
+        // A control change over a link, a layout change, and the other computer pausing, which
+        // leaves this one retrying.
+        let restarts: [&[Phase]; 3] = [
+            &[
+                Phase::Stopping,
+                Phase::Off,
+                Phase::Connecting,
+                Phase::Connected,
+                Phase::Stopping,
+                Phase::Off,
+                Phase::Starting,
+            ],
+            &[Phase::Stopping, Phase::Off, Phase::Starting],
+            &[Phase::Starting; 40],
+        ];
+        for phases in restarts {
+            let mut model = Model::default();
+            let mut state = input(vec![computer("PC", Phase::Sharing)]);
+            model.update(&state, now);
+            let mut at = now;
+            for phase in phases {
+                at += Duration::from_secs(1);
+                state.computers[0].phase = *phase;
+                assert_eq!(model.update(&state, at), None, "{phase:?}");
+            }
+            state.computers[0].phase = Phase::Sharing;
+            let activity = model.update(&state, at);
+            assert_eq!(
+                (shown(&activity), text(&activity)),
+                (Some(ActivityId::Connected), "PC")
+            );
+        }
+    }
+
+    #[test]
+    fn a_counted_drop_is_lost_then_reconnecting_through_retries_until_it_shares() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Sharing)]);
+        model.update(&state, now);
+        // The session reports starting a moment before the core counts its drop.
+        state.computers[0].phase = Phase::Starting;
+        assert_eq!(model.update(&state, now), None);
+        lose(&mut state.computers[0]);
+        let activity = model.update(&state, now);
+        assert_eq!(
+            (shown(&activity), text(&activity)),
+            (Some(ActivityId::Dropped), "Lost PC")
+        );
+        assert_eq!(model.next_deadline(), Some(now + DROPPED.1));
+        assert_eq!(
+            walk(
+                &mut model,
+                &mut state,
+                now + DROPPED.1,
+                &[
+                    Phase::Error,
+                    Phase::Off,
+                    Phase::Starting,
+                    Phase::Connecting,
+                    Phase::Connected
+                ]
+            ),
+            [Some(ActivityId::Reconnecting); 5]
+        );
+        // Sessions that come up and fail again before sharing raise nothing and keep the
+        // episode's start, so its spinner still rests at the limit.
+        lose(&mut state.computers[0]);
+        assert_eq!(
+            walk(&mut model, &mut state, now + DROPPED.1, &[Phase::Error]),
+            [Some(ActivityId::Reconnecting)]
+        );
+        let rested = now + SPINNER;
+        lose(&mut state.computers[0]);
+        assert_eq!(
+            walk(&mut model, &mut state, rested, &[Phase::Starting]),
+            [None]
+        );
+        assert_eq!(model.next_deadline(), None);
+        state.computers[0].phase = Phase::Sharing;
+        assert_eq!(
+            shown(&model.update(&state, rested)),
+            Some(ActivityId::Connected)
+        );
+        // Shared again, the next drop is a new loss.
+        let later = rested + CONNECTED.1;
+        lose(&mut state.computers[0]);
+        assert_eq!(
+            walk(&mut model, &mut state, later, &[Phase::Starting]),
+            [Some(ActivityId::Dropped)]
+        );
+    }
+
+    #[test]
+    fn a_drop_already_shared_again_by_the_next_snapshot_ends_as_a_connection() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Sharing)]);
+        model.update(&state, now);
+        lose(&mut state.computers[0]);
+        let activity = model.update(&state, now);
+        assert_eq!(
+            (shown(&activity), text(&activity)),
+            (Some(ActivityId::Connected), "PC")
+        );
+        assert_eq!(model.update(&state, now + CONNECTED.1), None);
+    }
+
+    #[test]
+    fn retrying_a_computer_that_is_asleep_shows_one_spinner_then_rests() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Starting)]);
+        let first = model.update(&state, now);
+        assert_eq!(shown(&first), Some(ActivityId::Connecting));
+        for second in 1..=60 {
+            let at = now + Duration::from_secs(second);
+            state.computers[0].phase = if second % 2 == 1 {
+                Phase::Error
+            } else {
+                Phase::Starting
+            };
+            // Unchanged throughout, so the island never replays its entrance.
+            let expected = if at < now + SPINNER {
+                first.clone()
+            } else {
+                None
+            };
+            assert_eq!(model.update(&state, at), expected, "after {second} s");
+        }
+        assert_eq!(model.next_deadline(), None);
+        state.computers[0].phase = Phase::Sharing;
+        assert_eq!(
+            shown(&model.update(&state, now + Duration::from_secs(61))),
+            Some(ActivityId::Connected)
+        );
+    }
+
+    #[test]
+    fn a_restart_that_errors_then_retries_shows_one_connecting_spinner_that_rests() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Sharing)]);
+        model.update(&state, now);
+        assert_eq!(
+            walk(
+                &mut model,
+                &mut state,
+                now,
+                &[Phase::Stopping, Phase::Off, Phase::Error]
+            ),
+            [None, None, None]
+        );
+        state.computers[0].phase = Phase::Starting;
+        let first = model.update(&state, now);
+        assert_eq!(shown(&first), Some(ActivityId::Connecting));
+        for second in 1..=20 {
+            let at = now + Duration::from_secs(second);
+            state.computers[0].phase = if second % 2 == 1 {
+                Phase::Error
+            } else {
+                Phase::Starting
+            };
+            let expected = if at < now + SPINNER {
+                first.clone()
+            } else {
+                None
+            };
+            assert_eq!(model.update(&state, at), expected, "after {second} s");
+        }
+    }
+
+    #[test]
+    fn a_spinner_hidden_while_arranging_shows_again_only_within_its_limit() {
+        let now = Instant::now();
+        for (back, expected) in [
+            (Duration::from_secs(10), Some(ActivityId::Connecting)),
+            (SPINNER, None),
+        ] {
+            let mut model = Model::default();
+            let mut state = input(vec![computer("PC", Phase::Connecting)]);
+            assert_eq!(
+                shown(&model.update(&state, now)),
+                Some(ActivityId::Connecting)
+            );
+            state.editing = true;
+            assert_eq!(model.update(&state, now + Duration::from_secs(5)), None);
+            state.editing = false;
+            assert_eq!(shown(&model.update(&state, now + back)), expected);
+        }
+    }
+
+    #[test]
+    fn a_count_the_view_stops_listing_is_no_drop_when_it_comes_back() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Sharing)]);
+        model.update(&state, now);
+        // Switched off, the view no longer lists it; back on, it lists a higher count.
+        let pc = &mut state.computers[0];
+        (pc.enabled, pc.phase, pc.drops) = (false, Phase::Off, None);
+        assert_eq!(model.update(&state, now), None);
+        let pc = &mut state.computers[0];
+        (pc.enabled, pc.phase, pc.drops) = (true, Phase::Starting, Some(3));
+        assert_eq!(
+            shown(&model.update(&state, now)),
+            Some(ActivityId::Connecting)
+        );
+    }
+
+    #[test]
+    fn the_next_deadline_is_the_earlier_of_a_notice_ending_and_a_spinner_resting() {
         let mut model = Model::default();
         let now = Instant::now();
         let mut state = input(vec![computer("PC", Phase::Connecting)]);
         model.update(&state, now);
-        state.dimming.dimmed = true;
-        model.update(&state, now);
-        // Connected (2) does not replace dimming (3).
-        state.computers[0].phase = Phase::Sharing;
-        assert_eq!(shown(&model.update(&state, now)), Some(ActivityId::Dimming));
-        // Once dimming ends, nothing replays.
-        let after = now + DIMMING.1;
-        assert_eq!(shown(&model.update(&state, after)), None);
-        // Dropped (2) shows; then connected (2) replaces it.
-        state.computers[0].phase = Phase::Reconnecting;
+        assert_eq!(model.next_deadline(), Some(now + SPINNER));
+        let copied = now + Duration::from_secs(1);
+        state.transfer = Some(received("pc"));
+        model.update(&state, copied);
+        assert_eq!(model.next_deadline(), Some(copied + CLIPBOARD.1));
+        // A spinner past its limit wakes nothing.
+        assert_eq!(model.update(&state, now + SPINNER), None);
+        assert_eq!(model.next_deadline(), None);
+    }
+
+    #[test]
+    fn switching_off_or_pausing_ends_an_episode_and_turning_back_on_connects_afresh() {
+        let now = Instant::now();
+        for pause in [false, true] {
+            let mut model = Model::default();
+            let mut state = input(vec![computer("PC", Phase::Sharing)]);
+            model.update(&state, now);
+            state.computers[0].phase = Phase::Error;
+            lose(&mut state.computers[0]);
+            assert_eq!(shown(&model.update(&state, now)), Some(ActivityId::Dropped));
+            let later = now + DROPPED.1;
+            assert_eq!(
+                walk(&mut model, &mut state, later, &[Phase::Starting]),
+                [Some(ActivityId::Reconnecting)]
+            );
+            let set_on = |state: &mut IslandInput, on: bool| {
+                if pause {
+                    state.paused = !on;
+                } else {
+                    state.computers[0].enabled = on;
+                }
+            };
+            set_on(&mut state, false);
+            assert_eq!(
+                walk(
+                    &mut model,
+                    &mut state,
+                    later,
+                    &[Phase::Stopping, Phase::Off]
+                ),
+                [None, None]
+            );
+            set_on(&mut state, true);
+            assert_eq!(
+                walk(
+                    &mut model,
+                    &mut state,
+                    later,
+                    &[Phase::Off, Phase::Starting]
+                ),
+                [None, Some(ActivityId::Connecting)]
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_reconnecting_by_itself_is_no_drop() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Connected)]);
         assert_eq!(
-            shown(&model.update(&state, after)),
-            Some(ActivityId::Dropped)
-        );
-        assert_eq!(text(&model.update(&state, after)), "Lost PC");
-        state.computers[0].phase = Phase::Sharing;
-        assert_eq!(
-            shown(&model.update(&state, after)),
-            Some(ActivityId::Connected)
-        );
-        // Dimming (3) replaces connected.
-        state.dimming.dimmed = false;
-        assert_eq!(
-            shown(&model.update(&state, after)),
-            Some(ActivityId::Dimming)
+            walk(
+                &mut model,
+                &mut state,
+                now,
+                &[Phase::Connected, Phase::Reconnecting, Phase::Connected]
+            ),
+            [
+                None,
+                Some(ActivityId::Connecting),
+                Some(ActivityId::Connecting)
+            ]
         );
     }
 
     #[test]
-    fn a_computer_the_user_switched_off_or_paused_is_not_lost() {
+    fn a_computer_the_user_switched_off_or_paused_is_not_lost_or_connecting() {
         let mut model = Model::default();
         let now = Instant::now();
         let mut state = input(vec![computer("PC", Phase::Sharing)]);
         model.update(&state, now);
         state.computers[0].enabled = false;
         state.computers[0].phase = Phase::Off;
-        assert_eq!(shown(&model.update(&state, now)), None);
+        // A drop counted as the switch went off is no news either.
+        lose(&mut state.computers[0]);
+        assert_eq!(model.update(&state, now), None);
         let mut state = input(vec![computer("PC", Phase::Sharing)]);
         let mut model = Model::default();
         model.update(&state, now);
         state.paused = true;
-        state.computers[0].phase = Phase::Off;
-        assert_eq!(shown(&model.update(&state, now)), None);
+        state.computers[0].phase = Phase::Starting;
+        assert_eq!(model.update(&state, now), None);
     }
 
     #[test]
-    fn stopping_passes_through_without_hiding_a_drop() {
+    fn only_the_cores_count_reports_a_drop() {
         let mut model = Model::default();
         let now = Instant::now();
         let mut state = input(vec![computer("PC", Phase::Sharing)]);
         model.update(&state, now);
-        state.computers[0].phase = Phase::Stopping;
-        assert_eq!(shown(&model.update(&state, now)), None);
-        state.computers[0].phase = Phase::Error;
+        assert_eq!(
+            walk(
+                &mut model,
+                &mut state,
+                now,
+                &[Phase::Stopping, Phase::Error, Phase::Error]
+            ),
+            [None, None, None]
+        );
+        lose(&mut state.computers[0]);
         assert_eq!(shown(&model.update(&state, now)), Some(ActivityId::Dropped));
     }
 
     #[test]
-    fn hovering_holds_a_notice_and_leaving_restarts_its_full_time() {
-        let mut model = Model::default();
-        let start = Instant::now();
-        let mut state = input(vec![computer("PC", Phase::Connecting)]);
-        model.update(&state, start);
-        state.computers[0].phase = Phase::Sharing;
-        model.update(&state, start);
-        model.set_hovering(true, start + Duration::from_millis(500));
-        assert_eq!(model.next_deadline(), None);
-        let long_after = start + Duration::from_secs(60);
-        assert_eq!(
-            shown(&model.update(&state, long_after)),
-            Some(ActivityId::Connected)
-        );
-        model.set_hovering(false, long_after);
-        assert_eq!(model.next_deadline(), Some(long_after + CONNECTED.1));
-        assert_eq!(shown(&model.update(&state, long_after + CONNECTED.1)), None);
-    }
-
-    #[test]
-    fn hovering_after_a_notice_ran_out_does_not_bring_it_back() {
-        let mut model = Model::default();
-        let start = Instant::now();
-        let mut state = input(vec![computer("PC", Phase::Connecting)]);
-        model.update(&state, start);
-        state.computers[0].phase = Phase::Sharing;
-        model.update(&state, start);
-        // The pointer arrives after the notice's time, before the next snapshot is read.
-        let late = start + CONNECTED.1 + Duration::from_millis(1);
-        model.set_hovering(true, late);
-        assert_eq!(model.next_deadline(), None);
-        assert_eq!(shown(&model.update(&state, late)), None);
-    }
-
-    #[test]
-    fn a_notice_raised_while_hovering_waits_for_the_pointer_to_leave() {
+    fn arranging_rests_idle_and_starts_no_episode() {
         let mut model = Model::default();
         let now = Instant::now();
-        let mut state = input(vec![]);
+        let mut state = input(vec![
+            computer("PC", Phase::Sharing),
+            computer("Laptop", Phase::Off),
+        ]);
+        state.computers[1].enabled = false;
         model.update(&state, now);
-        model.set_hovering(true, now);
-        state.dimming.dimmed = true;
+        state.transfer = Some(received("pc"));
+        assert_eq!(
+            shown(&model.update(&state, now)),
+            Some(ActivityId::Clipboard)
+        );
+        state.editing = true;
+        assert_eq!(model.update(&state, now), None);
+        state.computers[1].enabled = true;
+        state.computers[1].phase = Phase::Connecting;
+        assert_eq!(model.update(&state, now), None);
+        state.computers[1].phase = Phase::Connected;
+        assert_eq!(model.update(&state, now), None);
+        // Neither the notice nor a spinner comes back once arranging ends.
+        state.editing = false;
+        assert_eq!(model.update(&state, now), None);
+    }
+
+    #[test]
+    fn a_higher_or_equal_priority_replaces_and_a_lower_one_is_dropped() {
+        let mut model = Model::default();
+        let now = Instant::now();
+        let mut state = input(vec![computer("PC", Phase::Starting)]);
         model.update(&state, now);
-        assert_eq!(model.next_deadline(), None);
+        state.computers[0].phase = Phase::Sharing;
+        assert_eq!(
+            shown(&model.update(&state, now)),
+            Some(ActivityId::Connected)
+        );
+        // A copy (1) does not replace connected (2); nothing replays once connected ends.
+        state.transfer = Some(received("pc"));
+        assert_eq!(
+            shown(&model.update(&state, now)),
+            Some(ActivityId::Connected)
+        );
+        let after = now + CONNECTED.1;
+        assert_eq!(model.update(&state, after), None);
+        // Dropped (2) shows, then connected (2) replaces it.
+        state.computers[0].phase = Phase::Starting;
+        lose(&mut state.computers[0]);
+        let activity = model.update(&state, after);
+        assert_eq!(
+            (shown(&activity), text(&activity)),
+            (Some(ActivityId::Dropped), "Lost PC")
+        );
+        state.computers[0].phase = Phase::Sharing;
+        assert_eq!(
+            shown(&model.update(&state, after)),
+            Some(ActivityId::Connected)
+        );
+    }
+
+    #[test]
+    fn standing_activities_follow_their_order() {
+        let now = Instant::now();
+        let mut held = computer("Desk", Phase::Sharing);
+        held.held = true;
+        let connecting = computer("Laptop", Phase::Connecting);
+        let mut model = Model::default();
+        let mut state = input(vec![
+            computer("PC", Phase::Sharing),
+            held.clone(),
+            connecting.clone(),
+        ]);
+        model.update(&state, now);
+        state.computers[0].phase = Phase::Starting;
+        lose(&mut state.computers[0]);
+        assert_eq!(shown(&model.update(&state, now)), Some(ActivityId::Dropped));
+        let later = now + DROPPED.1;
+        assert_eq!(
+            shown(&model.update(&state, later)),
+            Some(ActivityId::Reconnecting)
+        );
+        let activity = Model::default().update(&input(vec![held.clone(), connecting.clone()]), now);
+        assert_eq!(
+            (shown(&activity), text(&activity)),
+            (Some(ActivityId::Held), "Waiting for Desk")
+        );
+        let activity = Model::default().update(&input(vec![connecting]), now);
+        assert_eq!(
+            (shown(&activity), text(&activity)),
+            (Some(ActivityId::Connecting), "Connecting")
+        );
     }
 
     #[test]
@@ -948,245 +1075,44 @@ mod tests {
         let now = Instant::now();
         let mut state = input(vec![computer("PC", Phase::Sharing)]);
         model.update(&state, now);
-        let transfer = Transfer {
-            direction: Direction::Received,
-            kind: TransferKind::Image,
-            bytes: 1_468_006,
-            peer: "pc".to_owned(),
-            age_seconds: 0,
-        };
-        state.clipboard.as_mut().unwrap().last = Some(transfer.clone());
-        let presentation = model.update(&state, now);
-        assert_eq!(shown(&presentation), Some(ActivityId::Clipboard));
-        assert_eq!(text(&presentation), "From PC");
+        let transfer = received("pc");
+        state.transfer = Some(transfer.clone());
+        let activity = model.update(&state, now);
+        assert_eq!(
+            (shown(&activity), text(&activity)),
+            (Some(ActivityId::Clipboard), "From PC")
+        );
         // Aging is the same transfer: no new notice once the first one ends.
         let later = now + CLIPBOARD.1;
-        state
-            .clipboard
-            .as_mut()
-            .unwrap()
-            .last
-            .as_mut()
-            .unwrap()
-            .age_seconds = 3;
-        assert_eq!(shown(&model.update(&state, later)), None);
+        state.transfer.as_mut().unwrap().age_seconds = 3;
+        assert_eq!(model.update(&state, later), None);
         // An identical copy sent again is new: its age starts over.
-        state.clipboard.as_mut().unwrap().last = Some(Transfer {
+        state.transfer = Some(Transfer {
             direction: Direction::Sent,
-            age_seconds: 0,
             ..transfer
         });
         assert_eq!(text(&model.update(&state, later)), "To PC");
     }
 
     #[test]
-    fn an_update_is_announced_once_per_version() {
+    fn clipboard_copies_stay_quiet_while_notices_are_off_and_after_they_turn_on() {
         let mut model = Model::default();
         let now = Instant::now();
-        let mut state = input(vec![]);
-        state.update_ready = Some("0.2.9".to_owned());
-        assert_eq!(shown(&model.update(&state, now)), Some(ActivityId::Update));
-        let later = now + UPDATE.1;
-        assert_eq!(shown(&model.update(&state, later)), None);
-        state.update_ready = Some("0.3.0".to_owned());
-        assert_eq!(
-            shown(&model.update(&state, later)),
-            Some(ActivityId::Update)
-        );
-    }
-
-    #[test]
-    fn a_new_model_stays_quiet_about_an_update_already_announced() {
-        let mut first = Model::default();
-        let now = Instant::now();
-        let mut state = input(vec![]);
-        state.update_ready = Some("0.2.9".to_owned());
-        assert_eq!(shown(&first.update(&state, now)), Some(ActivityId::Update));
-        let mut next = Model::remembering(first.update_shown().map(str::to_owned));
-        assert_eq!(shown(&next.update(&state, now)), None);
-        state.update_ready = Some("0.3.0".to_owned());
-        assert_eq!(shown(&next.update(&state, now)), Some(ActivityId::Update));
-        assert_eq!(next.update_shown(), Some("0.3.0"));
-    }
-
-    #[test]
-    fn an_update_blocked_by_a_louder_notice_shows_once_that_ends() {
-        let mut model = Model::default();
-        let now = Instant::now();
-        let mut state = input(vec![]);
+        let mut state = input(vec![computer("PC", Phase::Sharing)]);
+        state.clipboard_notices = false;
         model.update(&state, now);
-        state.dimming.dimmed = true;
-        state.update_ready = Some("0.2.9".to_owned());
-        assert_eq!(shown(&model.update(&state, now)), Some(ActivityId::Dimming));
-        assert_eq!(
-            shown(&model.update(&state, now + DIMMING.1)),
-            Some(ActivityId::Update)
-        );
-    }
-
-    #[test]
-    fn standing_activities_follow_their_order() {
-        let mut model = Model::default();
-        let now = Instant::now();
-        let mut held = computer("Desk", Phase::Sharing);
-        held.held = true;
-        let mut away = computer("PC", Phase::Sharing);
-        away.pointer_here = Some(false);
-        let reconnecting = computer("Laptop", Phase::Reconnecting);
-        let state = input(vec![away.clone(), held.clone(), reconnecting]);
+        state.transfer = Some(received("pc"));
+        assert_eq!(model.update(&state, now), None);
+        // Turned on, the copy made while off is old news; the next one shows.
+        state.clipboard_notices = true;
+        assert_eq!(model.update(&state, now), None);
+        state.transfer = Some(Transfer {
+            direction: Direction::Sent,
+            ..received("pc")
+        });
         assert_eq!(
             shown(&model.update(&state, now)),
-            Some(ActivityId::Reconnecting)
-        );
-        let state = input(vec![away.clone(), held]);
-        let presentation = Model::default().update(&state, now);
-        assert_eq!(shown(&presentation), Some(ActivityId::Held));
-        assert_eq!(text(&presentation), "Waiting for Desk");
-        let presentation = Model::default().update(&input(vec![away]), now);
-        assert_eq!(shown(&presentation), Some(ActivityId::Controlling));
-        assert!(presentation.input_away);
-        assert_eq!(
-            presentation.compact.unwrap().trailing,
-            Trailing::Labeled(Symbol::Pc, "PC".to_owned())
-        );
-    }
-
-    #[test]
-    fn input_landing_here_from_the_other_computer_is_not_away() {
-        // The receiving computer reports its pointer as local while the other keyboard drives it.
-        let presentation =
-            Model::default().update(&input(vec![computer("PC", Phase::Sharing)]), Instant::now());
-        assert!(!presentation.input_away);
-        let rows = &presentation.expanded.rows;
-        assert!(matches!(&rows[0], Row::Computer(row) if row.status == "Pointer on this Mac"));
-    }
-
-    #[test]
-    fn the_open_island_lists_three_computers_then_dimming_and_clipboard() {
-        let mut computers: Vec<ComputerInput> = ["A", "B", "C", "D"]
-            .into_iter()
-            .map(|name| computer(name, Phase::Off))
-            .collect();
-        computers[0].phase = Phase::Sharing;
-        computers[0].pointer_here = Some(false);
-        computers[1].phase = Phase::Reconnecting;
-        computers[2].enabled = false;
-        let mut state = input(computers);
-        state.sharing_active = true;
-        state.phase = Phase::Sharing;
-        state.clipboard.as_mut().unwrap().last = Some(Transfer {
-            direction: Direction::Sent,
-            kind: TransferKind::Image,
-            bytes: 1_468_006,
-            peer: "a".to_owned(),
-            age_seconds: 12,
-        });
-        let expanded = Model::default().update(&state, Instant::now()).expanded;
-        assert_eq!(
-            (expanded.status.as_str(), expanded.status_tone),
-            ("Sharing", Tone::Success)
-        );
-        let statuses: Vec<&str> = expanded
-            .rows
-            .iter()
-            .filter_map(|row| match row {
-                Row::Computer(row) => Some(row.status.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(statuses, ["Pointer on A", "Reconnecting…", "Off"]);
-        assert!(matches!(expanded.rows[3], Row::Dimming(_)));
-        assert_eq!(
-            expanded.rows[4],
-            Row::Clipboard {
-                enabled: true,
-                detail: Some("Sent an image (1.4 MB) 12 s ago".to_owned())
-            }
-        );
-        // Without paired computers the first row sets one up; without the feature, no clipboard row.
-        let mut empty = input(vec![]);
-        empty.clipboard = None;
-        let rows = Model::default()
-            .update(&empty, Instant::now())
-            .expanded
-            .rows;
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], Row::SetUp);
-    }
-
-    #[test]
-    fn the_header_words_each_state_as_the_tray_does() {
-        let mut state = input(vec![]);
-        let header = |state: &IslandInput| {
-            let expanded = Model::default().update(state, Instant::now()).expanded;
-            (expanded.status, expanded.status_tone)
-        };
-        assert_eq!(header(&state), ("Not connected".to_owned(), Tone::Subtle));
-        state.paused = true;
-        assert_eq!(header(&state).0, "Paused");
-        state.phase = Phase::Connecting;
-        assert_eq!(header(&state), ("Connecting…".to_owned(), Tone::Warning));
-        state.phase = Phase::Sharing;
-        state.sharing_active = true;
-        assert_eq!(header(&state).0, "Sharing");
-        state.held = true;
-        assert_eq!(header(&state).0, "Reconnecting");
-        state.phase = Phase::Error;
-        assert_eq!(
-            header(&state),
-            ("Needs attention".to_owned(), Tone::Destructive)
-        );
-    }
-
-    #[test]
-    fn every_header_status_is_listed_for_sizing() {
-        let phases = [
-            Phase::Off,
-            Phase::Connecting,
-            Phase::Connected,
-            Phase::Starting,
-            Phase::Sharing,
-            Phase::Reconnecting,
-            Phase::Stopping,
-            Phase::Error,
-            Phase::NotPaired,
-        ];
-        let mut reached = Vec::new();
-        for (phase, flags) in phases
-            .into_iter()
-            .flat_map(|phase| (0..8u8).map(move |flags| (phase, flags)))
-        {
-            let mut state = input(vec![]);
-            state.phase = phase;
-            state.sharing_active = flags & 1 != 0;
-            state.held = flags & 2 != 0;
-            state.paused = flags & 4 != 0;
-            let status = Status::of(&state);
-            assert!(Status::ALL.contains(&status), "{status:?}");
-            if !reached.contains(&status) {
-                reached.push(status);
-            }
-        }
-        assert_eq!(reached.len(), Status::ALL.len());
-        assert_eq!(status_words().count(), Status::ALL.len());
-    }
-
-    #[test]
-    fn transfer_lines_match_the_home_card() {
-        let line = |bytes, age_seconds| {
-            transfer_text(&Transfer {
-                direction: Direction::Received,
-                kind: TransferKind::Text,
-                bytes,
-                peer: String::new(),
-                age_seconds,
-            })
-        };
-        assert_eq!(line(512, 5), "Received text (512 B) 5 s ago");
-        assert_eq!(line(15 * 1024, 90), "Received text (15 KB) 2 min ago");
-        assert_eq!(
-            line(3 * 1024 * 1024 * 1024, 7200),
-            "Received text (3 GB) 2 h ago"
+            Some(ActivityId::Clipboard)
         );
     }
 }

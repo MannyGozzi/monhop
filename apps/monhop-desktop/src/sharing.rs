@@ -204,6 +204,8 @@ pub(crate) struct PeerView {
     displays: Vec<DisplayView>,
     diagnostics: DiagnosticsView,
     last_failure: String,
+    /// Sessions with this computer that ended in a real drop since MonHop started.
+    drops: u64,
     peer_arranging: bool,
 }
 
@@ -711,6 +713,8 @@ struct PeerState {
     /// Outlives the automatic reconnect, so Home still shows why the previous session ended.
     last_failure: Option<String>,
     last_failure_at: Option<Instant>,
+    /// Every drop that set `last_failure`; never reset, so any growth is a new drop.
+    drops: u64,
     /// When a worker last ended with a real error, and the least it waits before an automatic
     /// retry. A close, a misfit or a step change is not a failure and never sets it.
     worker_failed_at: Option<(Instant, Duration)>,
@@ -2445,6 +2449,7 @@ impl SharingController {
                                 entry.last_failure =
                                     Some(format!("Attempt {attempt}: {reason}{load}"));
                                 entry.last_failure_at = Some(Instant::now());
+                                entry.drops += 1;
                             }
                         }
                         if !await_native_settled(&network).await {
@@ -4455,6 +4460,7 @@ fn peer_views(state: &State, live: Option<bool>) -> Vec<PeerView> {
                     peer.and_then(|peer| peer.last_failure_at)
                         .map(|at| at.elapsed()),
                 ),
+                drops: peer.map_or(0, |peer| peer.drops),
                 peer_arranging: peer.is_some_and(|peer| peer.peer_arranging),
             }
         })
@@ -5957,6 +5963,7 @@ pub(crate) mod tests {
         assert_eq!(view.phase, "off");
         assert_eq!(view.message, LAYOUT_MISFIT);
         assert!(view.last_failure.is_empty());
+        assert_eq!(fixture_entry(&mut lock(&controller.state)).drops, 0);
         // The reason outlives the worker, so the supervisor opens a link instead of a session.
         assert!(controller.holds_link(fixture_peer()));
         assert!(controller.link_is_off());
@@ -6085,6 +6092,7 @@ pub(crate) mod tests {
         assert_eq!(view.phase, "off");
         assert_eq!(view.message, DISPLAYS_CHANGED);
         assert!(view.last_failure.is_empty());
+        assert_eq!(fixture_entry(&mut lock(&controller.state)).drops, 0);
         assert!(
             fixture_entry(&mut lock(&controller.state))
                 .worker_failed_at
@@ -6114,6 +6122,7 @@ pub(crate) mod tests {
         assert_eq!(view.phase, "off");
         assert_eq!(view.message, PEER_CONTROL_CHANGED);
         assert!(view.last_failure.is_empty());
+        assert_eq!(fixture_entry(&mut lock(&controller.state)).drops, 0);
         assert!(
             fixture_entry(&mut lock(&controller.state))
                 .worker_failed_at
@@ -8215,6 +8224,7 @@ pub(crate) mod tests {
                 "busy",
                 "diagnostics",
                 "displays",
+                "drops",
                 "fingerprint",
                 "held",
                 "lastFailure",
@@ -8585,6 +8595,7 @@ pub(crate) mod tests {
         assert_eq!(ended.phase, "off");
         assert_eq!(ended.message, CHANGING_CONTROL);
         assert!(ended.last_failure.is_empty());
+        assert_eq!(fixture_entry(&mut lock(&controller.state)).drops, 0);
         assert!(!controller.within_failure_backoff(fixture_peer(), Duration::from_secs(10)));
         // The flip keeps a link up instead of a session until both computers commit it.
         assert!(controller.holds_link(fixture_peer()));

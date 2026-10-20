@@ -1,7 +1,7 @@
-//! The island on screen: one non-activating panel around the camera notch, drawn with Core
-//! Animation, and hidden while no display has a notch. Main thread only. Its state lives in one
-//! thread-local that AppKit callbacks reach through `with_island`; the app's actions and hover
-//! changes leave only after that borrow ends, so nothing the app does can re-enter it.
+//! The island on screen: one non-activating panel around the camera notch that every pointer
+//! event passes through, drawn with Core Animation, and hidden while no display has a notch. Main
+//! thread only. Its state lives in one thread-local that AppKit callbacks reach through
+//! `with_island`; what it tells the feed leaves only after that borrow ends.
 
 mod classes;
 mod content;
@@ -12,20 +12,18 @@ use std::{
     iter,
     ptr::NonNull,
     rc::Rc,
-    time::{Duration, Instant},
 };
 
 use block2::RcBlock;
 use objc2::{
-    MainThreadMarker, Message,
+    MainThreadMarker, MainThreadOnly, Message,
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
     sel,
 };
 use objc2_app_kit::{
-    NSAccessibility, NSAccessibilityGroupRole, NSApplicationDidChangeScreenParametersNotification,
-    NSColor, NSEvent, NSScreen, NSStatusWindowLevel, NSWindowAnimationBehavior,
-    NSWindowCollectionBehavior, NSWorkspace,
+    NSApplicationDidChangeScreenParametersNotification, NSColor, NSScreen, NSStatusWindowLevel,
+    NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWorkspace,
     NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification, NSWorkspaceDidWakeNotification,
     NSWorkspaceScreensDidSleepNotification, NSWorkspaceScreensDidWakeNotification,
     NSWorkspaceSessionDidBecomeActiveNotification, NSWorkspaceSessionDidResignActiveNotification,
@@ -40,12 +38,12 @@ use objc2_quartz_core::{CALayer, CAShapeLayer};
 
 pub use self::draw::every;
 use self::{
-    classes::{Assist, ControlElement, IslandPanel, IslandView, LockObserver},
-    content::{CompactParts, ControlId, Grip, Look, OpenParts, Pending, Widget},
+    classes::{IslandPanel, LockObserver},
+    content::{CompactParts, Look},
 };
 use super::{
     geometry::{self, DisplayInfo, Outline, Placement, Rect, Size},
-    model::{Activity, ActivityId, Expanded, Presentation},
+    model::Activity,
     tokens::{self, IslandTokens, Spring},
 };
 
@@ -53,21 +51,6 @@ use super::{
 const SETTLE_TOLERANCE: f64 = 0.5;
 /// Screen changes arrive in bursts; the island re-places once they stop.
 const SCREENS_QUIET: f64 = 0.1;
-/// How long a control shows the user's change while the app has not reported it yet.
-const PENDING: Duration = Duration::from_secs(3);
-/// The window's own darkness slider moves by one level per step.
-const LEVEL_STEP: u8 = 1;
-
-/// What a control asks of the app; the driver carries it out.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    OpenWindow,
-    PreviewLevel(u8),
-    SetComputer { fingerprint: String, enabled: bool },
-    ToggleDimming,
-    SetLevel(u8),
-    SetClipboard(bool),
-}
 
 /// Whether Reduce Motion is honored; the island check always animates so it can measure motion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,11 +60,7 @@ pub enum Motion {
 }
 
 pub struct Context {
-    /// False for the check: the pointer neither hovers nor clicks it.
-    pub interactive: bool,
     pub motion: Motion,
-    pub hover: Box<dyn Fn(bool) + Send>,
-    pub act: Box<dyn Fn(Action) + Send>,
     /// Whether the island is on screen, so the feed rests while nothing shows it.
     pub showing: Box<dyn Fn(bool) + Send>,
 }
@@ -98,29 +77,12 @@ pub struct Probe {
     pub at_rest: bool,
     /// The drawn outline lies inside the window.
     pub fits: bool,
-    pub expanded: bool,
     /// The fastest any point of the current motion travels, in points per second.
     pub peak_speed: f64,
     /// The content tree on show; a rebuild or a new entrance changes it.
     pub content: Option<u64>,
-    /// How far the open header's status dot is drawn from its place beside the word.
-    pub status_drift: Option<f64>,
-    /// Where that dot rests beside its current word.
-    pub status_place: Option<f64>,
-    /// That dot is changing color.
-    pub status_recoloring: bool,
-    /// Some band of the content on show is growing or shrinking.
-    pub bands_scaling: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Pointer {
-    Entered,
-    Exited,
-    Moved(NSPoint),
-    Down(NSPoint),
-    Dragged(NSPoint),
-    Up(NSPoint),
+    /// The band of the content on show is growing or shrinking.
+    pub band_scaling: bool,
 }
 
 thread_local! {
@@ -153,16 +115,10 @@ pub fn stop(mtm: MainThreadMarker) {
     }
 }
 
-/// Shows a presentation from the feed that started this island.
-pub fn render(mtm: MainThreadMarker, generation: u64, presentation: Presentation) {
+/// Shows an activity, or the island at rest, from the feed that started this island.
+pub fn render(mtm: MainThreadMarker, generation: u64, activity: Option<Activity>) {
     let _ = mtm;
-    with_island_soon(move |island| island.show(generation, presentation));
-}
-
-/// Opens or closes the island as hover or a click would.
-pub fn set_expanded(mtm: MainThreadMarker, expanded: bool) {
-    let _ = mtm;
-    with_island_soon(move |island| island.set_expanded(expanded));
+    with_island_soon(move |island| island.show(generation, activity));
 }
 
 pub fn probe(mtm: MainThreadMarker) -> Option<Probe> {
@@ -220,36 +176,22 @@ fn size_of(outline: &Outline) -> Size {
     Size::new(bounds.width, bounds.height)
 }
 
-fn contains(rect: Rect, point: NSPoint) -> bool {
-    point.x >= rect.x && point.x <= rect.max_x() && point.y >= rect.y && point.y <= rect.max_y()
-}
-
 fn cancel(slot: &mut Option<Retained<NSTimer>>) {
     if let Some(timer) = slot.take() {
         timer.invalidate();
     }
 }
 
-/// Runs `work` on the island with implicit animations off, then delivers what it queued.
+/// Runs `work` on the island with implicit animations off, then tells the feed whether it shows.
 fn with_island<R>(work: impl FnOnce(&mut Island) -> R) -> Option<R> {
-    let (result, context, outbox) = ISLAND.with(|slot| {
+    let (result, context, showing) = ISLAND.with(|slot| {
         let mut slot = slot.try_borrow_mut().ok()?;
         let island = slot.as_mut()?;
         let result = draw::quietly(|| work(island));
-        Some((
-            result,
-            Rc::clone(&island.context),
-            std::mem::take(&mut island.outbox),
-        ))
+        Some((result, Rc::clone(&island.context), island.outbox.take()))
     })?;
-    if let Some(showing) = outbox.showing {
+    if let Some(showing) = showing {
         (context.showing)(showing);
-    }
-    if let Some(hovering) = outbox.hover {
-        (context.hover)(hovering);
-    }
-    for action in outbox.actions {
-        (context.act)(action);
     }
     Some(result)
 }
@@ -263,14 +205,6 @@ fn with_island_soon(work: impl FnOnce(&mut Island) + 'static) {
     } else {
         with_island(work);
     }
-}
-
-fn pointer(event: Pointer) {
-    with_island_soon(move |island| island.on_pointer(event));
-}
-
-fn assist(element: &ControlElement, kind: Assist) -> bool {
-    with_island(|island| island.assist(element, kind)).unwrap_or(false)
 }
 
 /// The distributed center may call on any thread; the change always lands on the main one.
@@ -291,19 +225,10 @@ fn screen_locked(generation: u64, locked: bool) {
     }
 }
 
-/// What leaves the island once its borrow ends.
-#[derive(Default)]
-struct Outbox {
-    hover: Option<bool>,
-    showing: Option<bool>,
-    actions: Vec<Action>,
-}
-
 enum Content {
     /// At rest the island is the notch's own black, with nothing inside.
     Idle,
-    Compact(ActivityId, CompactParts),
-    Open(OpenParts),
+    Compact(CompactParts),
 }
 
 impl Content {
@@ -311,27 +236,16 @@ impl Content {
     fn group(&self) -> Option<&CALayer> {
         match self {
             Self::Idle => None,
-            Self::Compact(_, parts) => Some(&parts.group),
-            Self::Open(parts) => Some(&parts.group),
+            Self::Compact(parts) => Some(&parts.group),
         }
     }
 
-    /// Arrive one after another, top to bottom.
-    fn bands(&self) -> Vec<&CALayer> {
+    /// What arrives inside the group.
+    fn band(&self) -> Option<&CALayer> {
         match self {
-            Self::Idle => Vec::new(),
-            Self::Compact(_, parts) => parts.bands(),
-            Self::Open(parts) => parts.bands(),
+            Self::Idle => None,
+            Self::Compact(parts) => Some(&parts.band),
         }
-    }
-
-    /// Every layer an entrance or exit animates: the bands, and the open rows' bodies in theirs.
-    fn animated(&self) -> Vec<&CALayer> {
-        let mut layers = self.bands();
-        if let Self::Open(parts) = self {
-            layers.extend(parts.bodies());
-        }
-        layers
     }
 }
 
@@ -353,19 +267,6 @@ struct Swing {
     peak: f64,
 }
 
-struct Press {
-    index: usize,
-    over: bool,
-}
-
-/// What the pointer holds before an update that may move rows.
-struct Held {
-    pressed: Option<Grip>,
-    hovered: Option<Grip>,
-    /// The level a slider drag has reached.
-    level: Option<u8>,
-}
-
 #[derive(Default)]
 struct Hidden {
     asleep: bool,
@@ -383,16 +284,8 @@ impl Hidden {
 
 #[derive(Default)]
 struct Timers {
-    open: Option<Retained<NSTimer>>,
-    close: Option<Retained<NSTimer>>,
     settle: Option<Retained<NSTimer>>,
     screens: Option<Retained<NSTimer>>,
-}
-
-enum Want {
-    Idle,
-    Compact(Activity),
-    Open(Expanded),
 }
 
 type Observer = (
@@ -404,26 +297,22 @@ struct Island {
     mtm: MainThreadMarker,
     generation: u64,
     context: Rc<Context>,
-    outbox: Outbox,
+    /// Whether it is on screen, once that changed, for the feed after the borrow ends.
+    outbox: Option<bool>,
     tokens: &'static IslandTokens,
     panel: Retained<IslandPanel>,
-    view: Retained<IslandView>,
     root: Retained<CALayer>,
     stage: Retained<CALayer>,
     fill: Retained<CAShapeLayer>,
     content: Retained<CALayer>,
     mask: Retained<CAShapeLayer>,
     look: Look,
-    presentation: Option<Presentation>,
-    expanded: bool,
+    activity: Option<Activity>,
     shown: Option<Piece>,
     leaving: Vec<Piece>,
     target: Outline,
     swing: Option<Swing>,
     envelope: Size,
-    inside: bool,
-    hovered: Option<usize>,
-    press: Option<Press>,
     hidden: Hidden,
     next_id: u64,
     timers: Timers,
@@ -463,13 +352,13 @@ impl Island {
         root.addSublayer(&stage);
 
         let size = NSSize::new(envelope.width, envelope.height);
-        let view = IslandView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), size), fill.clone());
+        let view = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), size),
+        );
         view.setLayer(Some(&root));
         view.setWantsLayer(true);
         view.setLayerUsesCoreImageFilters(true);
-        // SAFETY: AppKit's exported role constant.
-        view.setAccessibilityRole(Some(unsafe { NSAccessibilityGroupRole }));
-        view.setAccessibilityLabel(Some(ns_string!("MonHop")));
 
         let panel = IslandPanel::new(mtm, draw::rect(place.frame(envelope)));
         // SAFETY: the Retained handle owns the panel; AppKit must not release it on close.
@@ -487,33 +376,29 @@ impl Island {
         panel.setHidesOnDeactivate(false);
         panel.setCanHide(false);
         panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
-        panel.setIgnoresMouseEvents(!context.interactive);
+        // Nothing in it takes the pointer: clicks reach the menu bar and the apps below.
+        panel.setIgnoresMouseEvents(true);
         panel.setContentView(Some(&view));
 
         Self {
             mtm,
             generation,
             context: Rc::new(context),
-            outbox: Outbox::default(),
+            outbox: None,
             tokens,
             panel,
-            view,
             root,
             stage,
             fill,
             content,
             mask,
             look,
-            presentation: None,
-            expanded: false,
+            activity: None,
             shown: None,
             leaving: Vec::new(),
             target,
             swing: None,
             envelope,
-            inside: false,
-            hovered: None,
-            press: None,
             hidden: Hidden {
                 no_display: found.is_none(),
                 ..Hidden::default()
@@ -534,7 +419,6 @@ impl Island {
         self.observe();
         self.lay_out_stage();
         self.apply(false);
-        self.update_tracking();
         self.update_visibility();
         if !self.look.reduce {
             draw::add(
@@ -552,10 +436,8 @@ impl Island {
         }
     }
 
-    /// Stops observing at once; the panel fades out and leaves, letting every click through.
+    /// Stops observing at once; the panel fades out and leaves.
     fn end(mut self) {
-        self.panel.setIgnoresMouseEvents(true);
-        self.view.detach();
         for (center, observer) in self.observers.drain(..) {
             let observer: &AnyObject = observer.as_ref();
             // SAFETY: the observer was registered with this center by `watch`.
@@ -566,14 +448,8 @@ impl Island {
             // SAFETY: the observer was registered with this center by `observe`.
             unsafe { NSDistributedNotificationCenter::defaultCenter().removeObserver(observer) };
         }
-        for slot in [
-            &mut self.timers.open,
-            &mut self.timers.close,
-            &mut self.timers.settle,
-            &mut self.timers.screens,
-        ] {
-            cancel(slot);
-        }
+        cancel(&mut self.timers.settle);
+        cancel(&mut self.timers.screens);
         let panel = self.panel.clone();
         let leave = move || {
             panel.orderOut(None);
@@ -757,8 +633,6 @@ impl Island {
                 group.removeFromSuperlayer();
             }
         }
-        self.press = None;
-        self.hovered = None;
         self.swing = None;
         cancel(&mut self.timers.settle);
         let target = place.outline(place.idle);
@@ -772,138 +646,31 @@ impl Island {
         self.envelope = Size::new(0.0, 0.0);
         self.set_envelope(place.envelope(place.idle, place.idle, 0.0));
         self.apply(false);
-        self.update_tracking();
     }
 
     fn update_visibility(&mut self) {
-        self.outbox.showing = Some(!self.hidden.any());
+        self.outbox = Some(!self.hidden.any());
         if self.hidden.any() {
-            if self.expanded {
-                self.end_press();
-                self.expanded = false;
-                self.apply(false);
-            }
-            if self.inside {
-                self.set_inside(false);
-            }
             self.panel.orderOut(None);
         } else if !self.panel.isVisible() {
             self.panel.orderFrontRegardless();
-            self.update_tracking();
         }
     }
 
-    fn input_away(&self) -> bool {
-        self.presentation
-            .as_ref()
-            .is_some_and(|presentation| presentation.input_away)
-    }
-
-    fn show(&mut self, generation: u64, presentation: Presentation) {
-        if generation != self.generation || self.presentation.as_ref() == Some(&presentation) {
+    fn show(&mut self, generation: u64, activity: Option<Activity>) {
+        if generation != self.generation || self.activity == activity {
             return;
         }
-        let away = presentation.input_away;
-        self.presentation = Some(presentation);
-        if away {
-            cancel(&mut self.timers.open);
-            cancel(&mut self.timers.close);
-            if self.expanded {
-                self.end_press();
-                self.expanded = false;
-            }
-        }
+        self.activity = activity;
         self.apply(true);
-    }
-
-    fn set_expanded(&mut self, expanded: bool) {
-        cancel(&mut self.timers.open);
-        cancel(&mut self.timers.close);
-        if self.expanded == expanded || (expanded && (self.input_away() || self.hidden.any())) {
-            return;
-        }
-        if !expanded {
-            self.end_press();
-        }
-        self.expanded = expanded;
-        self.apply(true);
-    }
-
-    fn want(&self) -> Want {
-        let Some(presentation) = &self.presentation else {
-            return Want::Idle;
-        };
-        if self.expanded {
-            return Want::Open(presentation.expanded.clone());
-        }
-        presentation
-            .compact
-            .clone()
-            .map_or(Want::Idle, Want::Compact)
     }
 
     fn apply(&mut self, animate: bool) {
         let animate = animate && !self.look.reduce;
-        match self.want() {
-            Want::Open(expanded) => self.show_open(&expanded, animate),
-            Want::Compact(activity) => self.show_compact(&activity, animate),
-            Want::Idle => self.show_idle(animate),
+        match self.activity.clone() {
+            Some(activity) => self.show_compact(&activity, animate),
+            None => self.show_idle(animate),
         }
-        self.place_accessibility();
-    }
-
-    fn show_open(&mut self, expanded: &Expanded, animate: bool) {
-        let now = Instant::now();
-        let dragging = self.dragging();
-        let held = self.held();
-        let mtm = self.mtm;
-        let updated = match &mut self.shown {
-            Some(Piece {
-                content: Content::Open(parts),
-                ..
-            }) => content::update_open(&self.look, parts, expanded, dragging, now, mtm)
-                .then_some(parts.size),
-            _ => None,
-        };
-        if let Some(size) = updated {
-            self.hold(held);
-            self.set_shape(self.look.place.outline(size), animate);
-            return;
-        }
-        let mut revived = None;
-        for (index, piece) in self.leaving.iter_mut().enumerate() {
-            if let Content::Open(parts) = &mut piece.content
-                && content::update_open(&self.look, parts, expanded, false, now, mtm)
-            {
-                revived = Some(index);
-                break;
-            }
-        }
-        self.end_press();
-        self.dismiss_shown(animate);
-        let piece = match revived {
-            Some(index) => {
-                let mut piece = self.leaving.remove(index);
-                self.revive(&mut piece, animate);
-                piece
-            }
-            None => {
-                let parts = content::build_open(&self.look, expanded, self.mtm);
-                self.content.addSublayer(&parts.group);
-                let mut piece = Piece {
-                    id: 0,
-                    content: Content::Open(parts),
-                };
-                self.reveal(&mut piece, animate);
-                piece
-            }
-        };
-        self.shown = Some(piece);
-        let place = self.look.place;
-        self.set_shape(
-            place.outline(content::open_size(&self.look, expanded)),
-            animate,
-        );
     }
 
     fn show_compact(&mut self, activity: &Activity, animate: bool) {
@@ -911,24 +678,23 @@ impl Island {
         let wing = content::compact_wing(&self.look, activity);
         let target = place.outline(place.compact(wing));
         if let Some(Piece {
-            content: Content::Compact(id, parts),
+            content: Content::Compact(parts),
             ..
         }) = &mut self.shown
-            && *id == activity.id
+            && parts.continues(activity)
         {
             content::update_compact(&self.look, parts, activity, wing);
             self.set_shape(target, animate);
             return;
         }
         let revived = self.leaving.iter().position(
-            |piece| matches!(&piece.content, Content::Compact(id, _) if *id == activity.id),
+            |piece| matches!(&piece.content, Content::Compact(parts) if parts.continues(activity)),
         );
-        self.end_press();
         self.dismiss_shown(animate);
         let piece = match revived {
             Some(index) => {
                 let mut piece = self.leaving.remove(index);
-                if let Content::Compact(_, parts) = &mut piece.content {
+                if let Content::Compact(parts) = &mut piece.content {
                     content::update_compact(&self.look, parts, activity, wing);
                 }
                 self.revive(&mut piece, animate);
@@ -939,7 +705,7 @@ impl Island {
                 self.content.addSublayer(&parts.group);
                 let mut piece = Piece {
                     id: 0,
-                    content: Content::Compact(activity.id, parts),
+                    content: Content::Compact(parts),
                 };
                 self.reveal(&mut piece, animate);
                 piece
@@ -958,7 +724,6 @@ impl Island {
                 ..
             })
         ) {
-            self.end_press();
             self.dismiss_shown(animate);
             self.shown = Some(Piece {
                 id: self.next(),
@@ -968,16 +733,11 @@ impl Island {
         self.set_shape(place.outline(place.idle), animate);
     }
 
-    /// Materializes new content band by band, top to bottom, each a stagger after the last and
-    /// the first a stagger after the shape starts.
+    /// Materializes new content a stagger after the shape starts.
     fn reveal(&mut self, piece: &mut Piece, animate: bool) {
         piece.id = self.next();
-        if !animate {
-            return;
-        }
-        let stagger = self.tokens.stagger;
-        for (index, band) in piece.content.bands().into_iter().enumerate() {
-            content::materialize(&self.look, band, stagger * (index as f64 + 1.0));
+        if let Some(band) = piece.content.band().filter(|_| animate) {
+            content::materialize(&self.look, band, self.tokens.stagger);
         }
     }
 
@@ -990,7 +750,7 @@ impl Island {
         if animate {
             content::refocus(&self.look, group);
         } else {
-            for layer in iter::once(group).chain(piece.content.animated()) {
+            for layer in iter::once(group).chain(piece.content.band()) {
                 content::rest(layer);
             }
         }
@@ -1061,7 +821,6 @@ impl Island {
             self.swing = None;
             let size = size_of(&target);
             self.set_envelope(place.envelope(size, size, 0.0));
-            self.update_tracking();
             return;
         }
         let tokens = self.tokens;
@@ -1117,7 +876,6 @@ impl Island {
         self.timers.settle = Some(self.later(lead + duration + 1.0 / 60.0, move |island| {
             island.settle(id)
         }));
-        self.update_tracking();
     }
 
     /// The motion ended: the window shrinks to the shape at rest.
@@ -1129,7 +887,6 @@ impl Island {
         self.timers.settle = None;
         let size = size_of(&self.target);
         self.set_envelope(self.look.place.envelope(size, size, 0.0));
-        self.update_tracking();
     }
 
     /// The window and every layer in it change together, so the island never moves on screen.
@@ -1141,7 +898,6 @@ impl Island {
         let frame = self.look.place.frame(envelope);
         self.panel.setFrame_display(draw::rect(frame), true);
         self.lay_out_stage();
-        self.place_accessibility();
     }
 
     /// Island coordinates (origin at the top center, y up) for every layer under the stage.
@@ -1163,420 +919,6 @@ impl Island {
         draw::share_space(&self.fill, area);
         draw::share_space(&self.content, area);
         draw::share_space(&self.mask, area);
-    }
-
-    /// Hover follows the target outline; a pointer already inside a new area counts as inside.
-    fn update_tracking(&mut self) {
-        let bounds = self.target.bounds();
-        let origin = self.view.origin();
-        let rect = NSRect::new(
-            NSPoint::new(origin.x + bounds.x, origin.y + bounds.y),
-            NSSize::new(bounds.width, bounds.height),
-        );
-        self.view.set_hover_rect(rect);
-        if !self.context.interactive || self.hidden.any() {
-            return;
-        }
-        let mouse = NSEvent::mouseLocation();
-        let frame = self.panel.frame();
-        let local = Rect::new(
-            rect.origin.x,
-            rect.origin.y,
-            rect.size.width,
-            rect.size.height,
-        );
-        let inside = contains(
-            local,
-            NSPoint::new(mouse.x - frame.origin.x, mouse.y - frame.origin.y),
-        );
-        self.set_inside(inside);
-    }
-
-    fn open_parts(&self) -> Option<&OpenParts> {
-        match &self.shown {
-            Some(Piece {
-                content: Content::Open(parts),
-                ..
-            }) if self.expanded => Some(parts),
-            _ => None,
-        }
-    }
-
-    fn dragging(&self) -> bool {
-        self.press.as_ref().is_some_and(|press| {
-            self.open_parts()
-                .and_then(|parts| parts.controls.get(press.index))
-                .is_some_and(|control| control.id == ControlId::Level)
-        })
-    }
-
-    fn control_at(&self, point: NSPoint) -> Option<usize> {
-        self.open_parts()?
-            .controls
-            .iter()
-            .position(|control| contains(control.hit, point))
-    }
-
-    fn place_accessibility(&self) {
-        let children = match self.open_parts() {
-            Some(parts) => {
-                let view: &AnyObject = &self.view;
-                content::place_elements(parts, self.view.origin(), view);
-                parts
-                    .controls
-                    .iter()
-                    .filter_map(|control| control.element.clone())
-                    .collect()
-            }
-            None => Vec::new(),
-        };
-        self.view.set_accessibility_children(children);
-    }
-
-    fn on_pointer(&mut self, event: Pointer) {
-        if !self.context.interactive {
-            return;
-        }
-        match event {
-            Pointer::Entered => self.set_inside(true),
-            Pointer::Exited => self.set_inside(false),
-            Pointer::Moved(point) => self.hover_at(Some(point)),
-            Pointer::Down(point) => self.press_at(point),
-            Pointer::Dragged(point) => self.drag_to(point),
-            Pointer::Up(point) => self.release_at(point),
-        }
-    }
-
-    /// Dwelling opens the island; leaving it open closes it after a grace period.
-    fn set_inside(&mut self, inside: bool) {
-        if self.inside == inside {
-            return;
-        }
-        self.inside = inside;
-        self.outbox.hover = Some(inside);
-        cancel(&mut self.timers.open);
-        cancel(&mut self.timers.close);
-        if inside {
-            if !self.expanded && !self.input_away() {
-                self.timers.open = Some(self.later(self.tokens.hover_delay, |island| {
-                    island.timers.open = None;
-                    if island.inside {
-                        island.set_expanded(true);
-                    }
-                }));
-            }
-        } else {
-            self.hover_at(None);
-            self.close_soon();
-        }
-    }
-
-    fn close_soon(&mut self) {
-        if !self.expanded || self.inside || self.press.is_some() {
-            return;
-        }
-        cancel(&mut self.timers.close);
-        self.timers.close = Some(self.later(self.tokens.close_delay, |island| {
-            island.timers.close = None;
-            if !island.inside && island.press.is_none() {
-                island.set_expanded(false);
-            }
-        }));
-    }
-
-    /// Buttons light up and the slider's thumb grows under the pointer, as in the window.
-    fn hover_at(&mut self, point: Option<NSPoint>) {
-        if self.press.is_some() {
-            return;
-        }
-        let index = point
-            .and_then(|point| self.control_at(point))
-            .filter(|index| {
-                self.open_parts().is_some_and(|parts| {
-                    !matches!(parts.controls[*index].widget, Widget::Switch { .. })
-                })
-            });
-        if index == self.hovered {
-            return;
-        }
-        let previous = std::mem::replace(&mut self.hovered, index);
-        for (index, on) in [(previous, false), (index, true)] {
-            if let Some(index) = index {
-                self.light(index, on);
-            }
-        }
-    }
-
-    fn light(&self, index: usize, on: bool) {
-        let Some(control) = self
-            .open_parts()
-            .and_then(|parts| parts.controls.get(index))
-        else {
-            return;
-        };
-        let tokens = self.tokens;
-        match &control.widget {
-            Widget::Button { .. } => content::set_button_hover(&self.look, &control.widget, on),
-            Widget::Slider { .. } => {
-                let scale = if on { tokens.scale_thumb_hover } else { 1.0 };
-                content::set_thumb_scale(&self.look, &control.widget, scale);
-            }
-            Widget::Switch { .. } => {}
-        }
-    }
-
-    fn press_at(&mut self, point: NSPoint) {
-        if !self.expanded {
-            if !self.input_away() {
-                self.set_expanded(true);
-            }
-            return;
-        }
-        cancel(&mut self.timers.close);
-        let Some(index) = self.control_at(point) else {
-            return;
-        };
-        self.press = Some(Press { index, over: true });
-        let tokens = self.tokens;
-        let Some(control) = self
-            .open_parts()
-            .and_then(|parts| parts.controls.get(index))
-        else {
-            return;
-        };
-        if matches!(control.widget, Widget::Slider { .. }) {
-            content::set_thumb_scale(&self.look, &control.widget, tokens.scale_thumb_active);
-            self.slide(index, point.x);
-        } else {
-            content::scale_to(
-                &self.look,
-                &control.root,
-                tokens.scale_press,
-                tokens.instant,
-            );
-        }
-    }
-
-    /// Moves the slider under the pointer and previews that darkness, as the window's slider does.
-    fn slide(&mut self, index: usize, x: f64) {
-        let look = &self.look;
-        let Some(Piece {
-            content: Content::Open(parts),
-            ..
-        }) = &mut self.shown
-        else {
-            return;
-        };
-        let Some(control) = parts.controls.get_mut(index) else {
-            return;
-        };
-        let Some(level) = content::slider_level(look, &control.widget, x - control.hit.x) else {
-            return;
-        };
-        if control.value() == level {
-            return;
-        }
-        content::set_slider(look, &mut control.widget, level, true);
-        control.pending = Some(Pending {
-            value: level,
-            until: Instant::now() + PENDING,
-        });
-        if let Some(element) = &control.element {
-            content::refresh_element_value(control, element);
-        }
-        self.outbox.actions.push(Action::PreviewLevel(level));
-    }
-
-    fn drag_to(&mut self, point: NSPoint) {
-        let Some(press) = &self.press else {
-            return;
-        };
-        let index = press.index;
-        let was_over = press.over;
-        let Some(control) = self
-            .open_parts()
-            .and_then(|parts| parts.controls.get(index))
-        else {
-            return;
-        };
-        if matches!(control.widget, Widget::Slider { .. }) {
-            self.slide(index, point.x);
-            return;
-        }
-        let over = contains(control.hit, point);
-        if over != was_over {
-            let tokens = self.tokens;
-            let scale = if over { tokens.scale_press } else { 1.0 };
-            content::scale_to(&self.look, &control.root, scale, tokens.instant);
-            if let Some(press) = &mut self.press {
-                press.over = over;
-            }
-        }
-    }
-
-    fn release_at(&mut self, point: NSPoint) {
-        let Some(press) = self.press.take() else {
-            return;
-        };
-        let tokens = self.tokens;
-        let Some(control) = self
-            .open_parts()
-            .and_then(|parts| parts.controls.get(press.index))
-        else {
-            return;
-        };
-        let over = contains(control.hit, point);
-        if matches!(control.widget, Widget::Slider { .. }) {
-            let scale = if over { tokens.scale_thumb_hover } else { 1.0 };
-            content::set_thumb_scale(&self.look, &control.widget, scale);
-            let level = control.value();
-            self.hovered = over.then_some(press.index);
-            self.outbox.actions.push(Action::SetLevel(level));
-        } else {
-            content::scale_to(&self.look, &control.root, 1.0, tokens.instant);
-            if over {
-                self.activate(press.index);
-            }
-        }
-        self.close_soon();
-    }
-
-    /// What the pointer holds, to find again once rows move.
-    fn held(&self) -> Held {
-        let grip = |index: usize| self.open_parts()?.grip(index);
-        Held {
-            pressed: self.press.as_ref().and_then(|press| grip(press.index)),
-            hovered: self.hovered.and_then(grip),
-            level: self.dragged_level(),
-        }
-    }
-
-    /// A press whose control left with its row ends as a release away from it would: a drag
-    /// saves its level, and an island the pointer already left closes.
-    fn hold(&mut self, held: Held) {
-        let find = |grip: Option<Grip>| self.open_parts()?.find(&grip?);
-        let (pressed, hovered) = (find(held.pressed), find(held.hovered));
-        self.hovered = hovered;
-        match (pressed, &mut self.press) {
-            (Some(index), Some(press)) => press.index = index,
-            (None, Some(_)) => {
-                self.outbox.actions.extend(held.level.map(Action::SetLevel));
-                self.press = None;
-                self.close_soon();
-            }
-            (_, None) => {}
-        }
-    }
-
-    /// The level a slider drag has reached, while one is under way.
-    fn dragged_level(&self) -> Option<u8> {
-        self.press
-            .as_ref()
-            .filter(|_| self.dragging())
-            .and_then(|press| self.open_parts()?.controls.get(press.index))
-            .map(|control| control.value())
-    }
-
-    /// A drag that the island stops tracking (it closed or rebuilt) still saves its level.
-    fn end_press(&mut self) {
-        self.outbox
-            .actions
-            .extend(self.dragged_level().map(Action::SetLevel));
-        self.press = None;
-        self.hovered = None;
-    }
-
-    /// A switch flips at once and holds the new value until the app reports it; buttons act.
-    fn activate(&mut self, index: usize) {
-        let look = &self.look;
-        let Some(Piece {
-            content: Content::Open(parts),
-            ..
-        }) = &mut self.shown
-        else {
-            return;
-        };
-        let Some(control) = parts.controls.get_mut(index) else {
-            return;
-        };
-        let turning_on = control.value() == 0;
-        let action = match &control.id {
-            ControlId::OpenWindow | ControlId::SetUp => Some(Action::OpenWindow),
-            ControlId::Computer(fingerprint) => Some(Action::SetComputer {
-                fingerprint: fingerprint.clone(),
-                enabled: turning_on,
-            }),
-            ControlId::Dimming => Some(Action::ToggleDimming),
-            ControlId::Clipboard => Some(Action::SetClipboard(turning_on)),
-            ControlId::Level => None,
-        };
-        if matches!(control.widget, Widget::Switch { .. }) {
-            content::set_switch(look, &mut control.widget, turning_on);
-            control.pending = Some(Pending {
-                value: u8::from(turning_on),
-                until: Instant::now() + PENDING,
-            });
-            if let Some(element) = &control.element {
-                content::refresh_element_value(control, element);
-            }
-        }
-        self.outbox.actions.extend(action);
-    }
-
-    /// Only the element the shown controls own acts; one an assistive app kept from rebuilt or
-    /// ended content does nothing.
-    fn assist(&mut self, element: &ControlElement, kind: Assist) -> bool {
-        let index = element.control();
-        let Some(control) = self
-            .open_parts()
-            .and_then(|parts| parts.controls.get(index))
-            .filter(|control| {
-                control
-                    .element
-                    .as_deref()
-                    .is_some_and(|own| std::ptr::eq(own, element))
-            })
-        else {
-            return false;
-        };
-        let slider = match &control.widget {
-            Widget::Slider {
-                min, max, level, ..
-            } => Some((*min, *max, *level)),
-            _ => None,
-        };
-        match (slider, kind) {
-            (None, Assist::Press) => {
-                self.activate(index);
-                true
-            }
-            (Some((min, max, level)), Assist::Increment | Assist::Decrement) => {
-                let next = if kind == Assist::Increment {
-                    level.saturating_add(LEVEL_STEP).min(max)
-                } else {
-                    level.saturating_sub(LEVEL_STEP).max(min)
-                };
-                let look = &self.look;
-                if let Some(Piece {
-                    content: Content::Open(parts),
-                    ..
-                }) = &mut self.shown
-                    && let Some(control) = parts.controls.get_mut(index)
-                {
-                    content::set_slider(look, &mut control.widget, next, false);
-                    control.pending = Some(Pending {
-                        value: next,
-                        until: Instant::now() + PENDING,
-                    });
-                    if let Some(element) = &control.element {
-                        content::refresh_element_value(control, element);
-                    }
-                }
-                self.outbox.actions.push(Action::SetLevel(next));
-                true
-            }
-            _ => false,
-        }
     }
 
     fn probe(&self) -> Probe {
@@ -1601,15 +943,8 @@ impl Island {
                     .content
                     .group()
                     .is_none_or(|group| group.opacity() == 1.0 && still(group))
-                    && piece.content.animated().into_iter().all(still)
+                    && piece.content.band().is_none_or(still)
             });
-        let open = match &self.shown {
-            Some(Piece {
-                content: Content::Open(parts),
-                ..
-            }) => Some(parts),
-            _ => None,
-        };
         Probe {
             shown,
             target: self.target,
@@ -1620,16 +955,13 @@ impl Island {
                 && self.envelope == place.envelope(size, size, 0.0)
                 && content_rest,
             fits,
-            expanded: self.expanded,
             peak_speed: self.swing.as_ref().map_or(0.0, |swing| swing.peak),
             content: self.shown.as_ref().map(|piece| piece.id),
-            status_drift: open.map(|parts| content::status_drift(&self.look, parts)),
-            status_place: open.map(|parts| content::status_place(&self.look, parts)),
-            status_recoloring: open.is_some_and(content::status_recoloring),
-            bands_scaling: self
+            band_scaling: self
                 .shown
                 .as_ref()
-                .is_some_and(|piece| piece.content.bands().into_iter().any(content::scaling)),
+                .and_then(|piece| piece.content.band())
+                .is_some_and(content::scaling),
         }
     }
 
@@ -1646,14 +978,14 @@ impl Island {
                 "the island holds {held} content groups, not {groups}"
             ));
         }
-        match (self.shown.as_ref().map(|piece| &piece.content), self.want()) {
-            (Some(Content::Open(parts)), Want::Open(expanded)) => {
-                content::audit_open(&self.look, parts, &expanded)
+        match (
+            self.shown.as_ref().map(|piece| &piece.content),
+            &self.activity,
+        ) {
+            (Some(Content::Compact(parts)), Some(activity)) => {
+                content::audit_compact(&self.look, parts, activity)
             }
-            (Some(Content::Compact(_, parts)), Want::Compact(activity)) => {
-                content::audit_compact(&self.look, parts, &activity)
-            }
-            (Some(Content::Idle), Want::Idle) => Ok(()),
+            (Some(Content::Idle), None) => Ok(()),
             _ => Err("the content on show is not what the island wants".to_owned()),
         }
     }

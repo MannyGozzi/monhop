@@ -276,7 +276,6 @@ impl Dimming {
     fn announce(&self, app: &AppHandle, state: &State) -> DimmingView {
         let view = view_of(state);
         let _ = app.emit(EVENT, view.clone());
-        crate::island::notify();
         view
     }
 }

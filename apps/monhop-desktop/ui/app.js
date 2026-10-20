@@ -167,7 +167,7 @@ import { islandContext, normalizeIslandView } from "./island-model.mjs";
 import { localInspector } from "./screen-ready.mjs";
 import { computerInspector } from "./computer-card.mjs";
 import { banner, renderCanvas } from "./screen-displays.mjs";
-import { renderSettings } from "./screen-settings.mjs";
+import { renderSettings, showSettingsPage } from "./screen-settings.mjs";
 import { renderSidebar } from "./sidebar.mjs";
 import { MOUSE_STEPS, emptyTrail, step as stepTrail, trackSwipe, visit } from "./history-model.mjs";
 
@@ -515,6 +515,12 @@ function showsReadiness(selection) {
   return selection.kind === "local" || selection.kind === "new";
 }
 
+// A link to one control in Settings opens Settings on the page that holds it.
+function openSettingsPage(page) {
+  showSettingsPage(page);
+  select("settings");
+}
+
 // Returns the pairing it opened on the way into the New computer row, if any.
 function select(key, { fromHistory = false } = {}) {
   const next = selectionFromKey(key);
@@ -788,6 +794,7 @@ function context() {
     gate: pairingOpenGate(state),
     actions: {
       select,
+      openSettingsPage,
       startPairing,
       arrangeWith,
       leaveArrange,
@@ -858,6 +865,7 @@ function context() {
       setAutostart,
       openAutostartSettings,
       setIslandEnabled,
+      setIslandClipboardNotices,
       openLink,
       setArrangementView(view) {
         arrangementView = view;
@@ -2217,6 +2225,20 @@ async function setIslandEnabled(enabled) {
   render();
   try {
     island = normalizeIslandView(await core.invoke("island_set_enabled", { enabled }));
+  } catch (error) {
+    state = { ...state, messages: [nativeError(error)] };
+  } finally {
+    islandPending = false;
+    render();
+  }
+}
+
+async function setIslandClipboardNotices(enabled) {
+  if (!core?.invoke || islandPending) return;
+  islandPending = true;
+  render();
+  try {
+    island = normalizeIslandView(await core.invoke("island_set_clipboard_notices", { enabled }));
   } catch (error) {
     state = { ...state, messages: [nativeError(error)] };
   } finally {

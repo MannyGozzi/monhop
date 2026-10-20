@@ -85,30 +85,6 @@ impl Color {
         });
         [r, g, b, self.alpha.clamp(0.0, 1.0)]
     }
-
-    /// `color-mix(in oklab, self share, other)` for opaque or equally translucent colors.
-    pub fn mix(self, other: Self, share: f64) -> Self {
-        let keep = 1.0 - share;
-        Self {
-            l: self.l * share + other.l * keep,
-            a: self.a * share + other.a * keep,
-            b: self.b * share + other.b * keep,
-            alpha: self.alpha * share + other.alpha * keep,
-        }
-    }
-
-    pub fn with_alpha(self, alpha: f64) -> Self {
-        Self { alpha, ..self }
-    }
-}
-
-/// A CSS box shadow's first layer.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Shadow {
-    pub x: f64,
-    pub y: f64,
-    pub blur: f64,
-    pub color: Color,
 }
 
 /// The custom properties of the stylesheet's first `:root` block, comments stripped.
@@ -169,13 +145,6 @@ impl Sheet {
         number_with_unit(self.raw(name)?, "").ok_or_else(|| problem(name, "not a plain number"))
     }
 
-    /// A share of 1 from a `N%` token.
-    pub fn percent(&self, name: &str) -> Result<f64, TokenError> {
-        number_with_unit(self.raw(name)?, "%")
-            .map(|percent| percent / 100.0)
-            .ok_or_else(|| problem(name, "not a percentage"))
-    }
-
     /// The dark value: the island is always drawn on black.
     pub fn color(&self, name: &str) -> Result<Color, TokenError> {
         color(self.raw(name)?)
@@ -222,44 +191,6 @@ impl Sheet {
             }
         }
         peak.ok_or_else(|| problem(name, "linear() has no stops"))
-    }
-
-    pub fn shadow(&self, name: &str) -> Result<Shadow, TokenError> {
-        let first = split_top_level(self.raw(name)?, ',')
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let mut lengths = Vec::new();
-        let mut shade = None;
-        for part in split_top_level(first, ' ')
-            .into_iter()
-            .filter(|part| !part.is_empty())
-        {
-            if let Some(found) = color(part) {
-                shade = Some(found);
-            } else if let Some(length) =
-                number_with_unit(part, "px").or_else(|| number_with_unit(part, ""))
-            {
-                lengths.push(length);
-            } else {
-                return fail(
-                    name,
-                    "the shadow has a part that is neither a length nor a color",
-                );
-            }
-        }
-        let Some(color) = shade else {
-            return fail(name, "the shadow has no color");
-        };
-        match lengths.as_slice() {
-            [x, y, blur, ..] => Ok(Shadow {
-                x: *x,
-                y: *y,
-                blur: *blur,
-                color,
-            }),
-            _ => fail(name, "the shadow needs x, y and blur"),
-        }
     }
 }
 
@@ -525,71 +456,28 @@ pub fn ratio_for_overshoot(overshoot: f64) -> f64 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct IslandTokens {
     pub foreground: Color,
-    pub muted: Color,
-    pub subtle: Color,
     pub success: Color,
     pub warning: Color,
     pub destructive: Color,
-    pub primary: Color,
-    pub primary_fill: Color,
-    pub switch_track_off: Color,
-    pub thumb: Color,
-    pub hairline_strong: Color,
-    pub control_fill: Color,
-    pub control_fill_hover: Color,
-    pub card: Color,
     pub island_fill: Color,
-    pub display_peers: [Color; 6],
-    pub orbit_local: Color,
-    pub orbit_peer: Color,
-    pub mix_icon: f64,
-    pub mix_faint: f64,
-    pub mix_tint: f64,
-    pub thumb_shadow: Shadow,
 
-    pub gap_half: f64,
-    pub gap_1: f64,
     pub gap_2: f64,
     pub gap_3: f64,
-    pub gap_4: f64,
-    pub radius: f64,
-    pub radius_group: f64,
-    pub text_xs: f64,
-    pub text_sm: f64,
     pub text_base: f64,
-    pub weight_regular: f64,
     pub weight_medium: f64,
-    pub weight_semibold: f64,
-    pub switch_width: f64,
-    pub switch_height: f64,
-    pub switch_thumb: f64,
-    pub slider_track: f64,
-    pub slider_thumb: f64,
-    pub icon_button_size: f64,
     pub icon_size: f64,
     pub dot_size: f64,
-    pub avatar_size: f64,
-    pub avatar_glyph: f64,
-    pub row_min_height: f64,
-    pub sharing_mark_size: f64,
-    pub sharing_dot_size: f64,
-    pub orbit_rest: f64,
     pub stroke_bold: f64,
 
-    pub island_width: f64,
     pub wing_min: f64,
     pub wing_max: f64,
-    pub level_width: f64,
 
     /// Seconds.
-    pub instant: f64,
     pub fast: f64,
     pub base: f64,
     pub slow: f64,
     pub spring: f64,
     pub stagger: f64,
-    pub hover_delay: f64,
-    pub close_delay: f64,
     pub loop_spin: f64,
     pub blur: f64,
     pub blur_deep: f64,
@@ -599,85 +487,30 @@ pub struct IslandTokens {
     pub spring_overshoot: f64,
     pub spring_peak_at: f64,
     pub scale_defocus: f64,
-    pub scale_press: f64,
-    pub scale_thumb_hover: f64,
-    pub scale_thumb_active: f64,
-    pub opacity_disabled: f64,
 }
 
 impl IslandTokens {
     pub fn from_sheet(sheet: &Sheet) -> Result<Self, TokenError> {
-        let peer = |name| sheet.color(name);
         Ok(Self {
             foreground: sheet.color("--foreground")?,
-            muted: sheet.color("--muted-foreground")?,
-            subtle: sheet.color("--subtle-foreground")?,
             success: sheet.color("--success")?,
             warning: sheet.color("--warning")?,
             destructive: sheet.color("--destructive")?,
-            primary: sheet.color("--primary")?,
-            primary_fill: sheet.color("--primary-fill")?,
-            switch_track_off: sheet.color("--switch-track-off")?,
-            thumb: sheet.color("--thumb")?,
-            hairline_strong: sheet.color("--hairline-strong")?,
-            control_fill: sheet.color("--control-fill")?,
-            control_fill_hover: sheet.color("--control-fill-hover")?,
-            card: sheet.color("--card")?,
             island_fill: sheet.color("--island-fill")?,
-            display_peers: [
-                peer("--display-peer")?,
-                peer("--display-peer-2")?,
-                peer("--display-peer-3")?,
-                peer("--display-peer-4")?,
-                peer("--display-peer-5")?,
-                peer("--display-peer-6")?,
-            ],
-            orbit_local: sheet.color("--sharing-orbit-local")?,
-            orbit_peer: sheet.color("--sharing-orbit-peer")?,
-            mix_icon: sheet.percent("--mix-icon")?,
-            mix_faint: sheet.percent("--mix-faint")?,
-            mix_tint: sheet.percent("--mix-tint")?,
-            thumb_shadow: sheet.shadow("--shadow-thumb")?,
-            gap_half: sheet.px("--gap-half")?,
-            gap_1: sheet.px("--gap-1")?,
             gap_2: sheet.px("--gap-2")?,
             gap_3: sheet.px("--gap-3")?,
-            gap_4: sheet.px("--gap-4")?,
-            radius: sheet.px("--radius")?,
-            radius_group: sheet.px("--radius-group")?,
-            text_xs: sheet.px("--text-xs")?,
-            text_sm: sheet.px("--text-sm")?,
             text_base: sheet.px("--text-base")?,
-            weight_regular: sheet.number("--weight-regular")?,
             weight_medium: sheet.number("--weight-medium")?,
-            weight_semibold: sheet.number("--weight-semibold")?,
-            switch_width: sheet.px("--switch-width")?,
-            switch_height: sheet.px("--switch-height")?,
-            switch_thumb: sheet.px("--switch-thumb")?,
-            slider_track: sheet.px("--slider-track")?,
-            slider_thumb: sheet.px("--slider-thumb")?,
-            icon_button_size: sheet.px("--icon-button-size")?,
             icon_size: sheet.px("--icon-size")?,
             dot_size: sheet.px("--dot-size")?,
-            avatar_size: sheet.px("--avatar-size")?,
-            avatar_glyph: sheet.px("--avatar-glyph")?,
-            row_min_height: sheet.px("--row-min-height")?,
-            sharing_mark_size: sheet.px("--sharing-mark-size")?,
-            sharing_dot_size: sheet.px("--sharing-dot-size")?,
-            orbit_rest: sheet.px("--sharing-orbit-rest")?,
             stroke_bold: sheet.px("--stroke-bold")?,
-            island_width: sheet.px("--island-width")?,
             wing_min: sheet.px("--island-wing-min")?,
             wing_max: sheet.px("--island-wing-max")?,
-            level_width: sheet.px("--island-level-width")?,
-            instant: sheet.ms("--motion-instant")?,
             fast: sheet.ms("--motion-fast")?,
             base: sheet.ms("--motion-base")?,
             slow: sheet.ms("--motion-slow")?,
             spring: sheet.ms("--motion-spring")?,
             stagger: sheet.ms("--motion-stagger")?,
-            hover_delay: sheet.ms("--island-hover-delay")?,
-            close_delay: sheet.ms("--island-close-delay")?,
             loop_spin: sheet.ms("--loop-spin")?,
             blur: sheet.px("--motion-blur")?,
             blur_deep: sheet.px("--motion-blur-deep")?,
@@ -687,10 +520,6 @@ impl IslandTokens {
             spring_overshoot: sheet.linear_peak("--ease-spring")?.0 - 1.0,
             spring_peak_at: sheet.linear_peak("--ease-spring")?.1,
             scale_defocus: sheet.number("--scale-defocus")?,
-            scale_press: sheet.number("--scale-press")?,
-            scale_thumb_hover: sheet.number("--scale-thumb-hover")?,
-            scale_thumb_active: sheet.number("--scale-thumb-active")?,
-            opacity_disabled: sheet.number("--opacity-disabled")?,
         })
     }
 
@@ -728,7 +557,6 @@ mod tests {
         assert_eq!(tokens.slow, 0.34);
         assert_eq!(tokens.base, 0.22);
         assert_eq!(tokens.fast, 0.14);
-        assert_eq!(tokens.instant, 0.09);
         assert_eq!(tokens.stagger, 0.04);
         assert_eq!((tokens.blur, tokens.blur_deep), (3.0, 14.0));
         assert_eq!(tokens.focus, 0.36);
@@ -736,31 +564,13 @@ mod tests {
         assert_eq!(tokens.ease_focus, [0.3, 0.0, 0.2, 1.0]);
         assert!(close(tokens.spring_overshoot, 0.038, 1e-9));
         assert!(close(tokens.spring_peak_at, 0.44, 1e-9));
-        assert_eq!((tokens.scale_defocus, tokens.scale_press), (0.94, 0.97));
+        assert_eq!(tokens.scale_defocus, 0.94);
         assert_eq!(
-            (
-                tokens.switch_width,
-                tokens.switch_height,
-                tokens.switch_thumb
-            ),
-            (38.0, 22.0, 18.0)
-        );
-        assert_eq!(
-            (tokens.island_width, tokens.wing_min, tokens.wing_max),
-            (440.0, 44.0, 160.0)
-        );
-        assert_eq!(
-            (tokens.level_width, tokens.orbit_rest, tokens.stroke_bold),
-            (48.0, 4.0, 2.0)
+            (tokens.wing_min, tokens.wing_max, tokens.stroke_bold),
+            (44.0, 160.0, 2.0)
         );
         assert_eq!(tokens.island_fill.srgb(), [0.0, 0.0, 0.0, 1.0]);
-        assert_eq!(tokens.mix_tint, 0.14);
-        assert_eq!((tokens.hover_delay, tokens.close_delay), (0.25, 0.18));
-        assert_eq!(tokens.weight_semibold, 600.0);
-        assert_eq!(tokens.mix_icon, 0.26);
-        assert_eq!(tokens.thumb_shadow.y, 1.0);
-        assert_eq!(tokens.thumb_shadow.blur, 3.0);
-        assert!(close(tokens.thumb_shadow.color.alpha, 0.28, 1e-9));
+        assert_eq!(tokens.weight_medium, 500.0);
     }
 
     #[test]
@@ -770,10 +580,6 @@ mod tests {
         let [r, g, b, a] = tokens.foreground.srgb();
         assert!(close(r * 255.0, 245.0, 0.01) && close(g * 255.0, 245.0, 0.01));
         assert!(close(b * 255.0, 246.0, 0.01) && a == 1.0);
-        // oklch(1 0 0 / 15%) is white at 15%.
-        let [r, g, b, a] = tokens.switch_track_off.srgb();
-        assert!(close(r, 1.0, 1e-3) && close(g, 1.0, 1e-3) && close(b, 1.0, 1e-3));
-        assert!(close(a, 0.15, 1e-9));
         // The tray's hand-converted dark --destructive is rgb(255 99 103).
         let [r, g, b, _] = tokens.destructive.srgb();
         assert!(
@@ -790,21 +596,18 @@ mod tests {
              --num: .97; --pct: 26%; --alias: var(--len); --deep: var(--alias); \
              --rgb: light-dark(rgb(0 0 0), rgb(255 0 0)); --ok: oklch(.7 .19 28 / 50%); \
              --ease: cubic-bezier(.22, 1, .36, 1); --spring: linear(0, 1.2 30%, 0.9 60%, 1); \
-             --shadow: 0 1px 3px oklch(0 0 0 / 28%), 0 0 0 .5px oklch(0 0 0 / 6%); --word: auto; }",
+             --word: auto; }",
         )
         .unwrap();
         assert_eq!(sheet.px("--len"), Ok(12.0));
         assert_eq!(sheet.px("--deep"), Ok(12.0));
         assert_eq!(sheet.ms("--dur"), Ok(0.09));
         assert_eq!(sheet.number("--num"), Ok(0.97));
-        assert_eq!(sheet.percent("--pct"), Ok(0.26));
         let [r, g, b, _] = sheet.color("--rgb").unwrap().srgb();
         assert!(close(r, 1.0, 1e-6) && close(g, 0.0, 1e-6) && close(b, 0.0, 1e-6));
         assert!(close(sheet.color("--ok").unwrap().alpha, 0.5, 1e-9));
         assert_eq!(sheet.bezier("--ease"), Ok([0.22, 1.0, 0.36, 1.0]));
         assert_eq!(sheet.linear_peak("--spring"), Ok((1.2, 0.3)));
-        let shadow = sheet.shadow("--shadow").unwrap();
-        assert_eq!((shadow.x, shadow.y, shadow.blur), (0.0, 1.0, 3.0));
         assert!(sheet.px("--x").is_err(), "only :root counts");
         assert!(sheet.px("--missing").is_err());
         assert!(sheet.px("--dur").is_err());

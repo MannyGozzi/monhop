@@ -15,11 +15,24 @@ export const ICONS = {
     ["path", { d: "M10 8h.01" }],
     ["path", { d: "M14 8h.01" }],
   ],
+  "arrow-up-right": [
+    ["path", { d: "M7 7h10v10" }],
+    ["path", { d: "M7 17 17 7" }],
+  ],
   check: [["path", { d: "M20 6 9 17l-5-5" }]],
+  clipboard: [
+    ["rect", { width: "8", height: "4", x: "8", y: "2", rx: "1", ry: "1" }],
+    ["path", { d: "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" }],
+  ],
   "chevron-right": [["path", { d: "m9 18 6-6-6-6" }]],
   copy: [
     ["rect", { width: "14", height: "14", x: "8", y: "8", rx: "2", ry: "2" }],
     ["path", { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" }],
+  ],
+  download: [
+    ["path", { d: "M12 15V3" }],
+    ["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }],
+    ["path", { d: "m7 10 5 5 5-5" }],
   ],
   heart: [
     [
@@ -58,6 +71,10 @@ export const ICONS = {
     ["rect", { width: "20", height: "14", x: "2", y: "3", rx: "2" }],
     ["line", { x1: "8", x2: "16", y1: "21", y2: "21" }],
     ["line", { x1: "12", x2: "12", y1: "17", y2: "21" }],
+  ],
+  mouse: [
+    ["rect", { x: "5", y: "2", width: "14", height: "20", rx: "7" }],
+    ["path", { d: "M12 6v4" }],
   ],
   moon: [["path", { d: "M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" }]],
   play: [["polygon", { points: "6 3 20 12 6 21 6 3" }]],

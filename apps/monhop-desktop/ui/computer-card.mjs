@@ -349,7 +349,7 @@ function clipboardSection(ctx, computer, name, key) {
     attrs: { type: "button" },
     dataset: { focusKey: `${key}-clipboard-settings` },
   });
-  link.addEventListener("click", () => ctx.actions.select("settings"));
+  link.addEventListener("click", () => ctx.actions.openSettingsPage("clipboard"));
   return section(
     "Clipboard",
     [fadingText(`${key}-clipboard-line`, "note", clipboardLine(view, computer.fingerprint, name))],

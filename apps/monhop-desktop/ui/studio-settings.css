@@ -1,32 +1,86 @@
 /* Studio settings pane. Component rules only; shared tokens live in styles.css, pane tokens at the top here. */
 :root {
+  --settings-nav-width: 200px;
+  --settings-page-max: 620px;
+  --settings-nav-row: 32px;
+  --settings-nav-tile: 22px;
+  --settings-nav-glyph: 13px;
+  --settings-keycap-height: 30px;
+  --settings-keycap-depth: 2px;
   --settings-slider-width: 240px;
   --settings-theme-width: 252px;
-  --settings-content-max: 920px;
+  /* Each page's tile takes a tone the app already uses: the seam's rose for sharing, the canvas's
+     teal for this computer's own mouse and keyboard, a neutral slate for the app itself. */
+  --settings-tone-sharing: var(--primary);
+  --settings-tone-clipboard: var(--pair-sky);
+  --settings-tone-dimming: var(--pair-violet);
+  --settings-tone-input: var(--display-local);
+  --settings-tone-general: var(--pair-slate);
+  --settings-tone-updates: var(--success);
+  --settings-tone-about: var(--display-peer);
+  /* How much of its tone each end of a tile's gradient keeps: brighter than the canvas's screens. */
+  --settings-tile-light: 92%;
+  --settings-tile-deep: 64%;
+  --settings-strip-fade: linear-gradient(to right, transparent, black var(--gap-5), black calc(100% - var(--gap-5)), transparent);
 }
 
-/* Rows in Settings and the computer inspector are flat: no tray behind them, a hairline between
-   each, the copy flush with the section title. Selectable rows keep a hover surface, inset to match. */
-:is(.settings-pane, .computer-inspector) .rows { overflow: visible; border-radius: 0; background: none; }
-:is(.settings-pane, .computer-inspector) .rows > :is(.row, .switch-row, .slider-row) { border-radius: 0; padding-inline: 0; }
-:is(.settings-pane, .computer-inspector) .rows > * + *::before { left: 0; }
-:is(.settings-pane, .computer-inspector) .rows > .switch-row:hover { background: none; }
-:is(.settings-pane, .computer-inspector) .rows > .row[data-selectable="true"] { margin-inline: calc(var(--gap-3) * -1); border-radius: var(--radius-group); padding-inline: var(--gap-3); }
-:is(.settings-pane, .computer-inspector) .rows > .row[data-selectable="true"] + *::before, :is(.settings-pane, .computer-inspector) .rows > * + .row[data-selectable="true"]::before { left: var(--gap-3); right: var(--gap-3); }
-:is(.settings-pane, .computer-inspector) .switch-copy > small { line-height: var(--leading); }
+/* The rail of pages beside the page it opens; a narrow pane runs the rail across the top. */
+.settings-content { display: grid; grid-template-columns: var(--settings-nav-width) minmax(0, var(--settings-page-max)); justify-content: center; align-items: start; column-gap: var(--gap-10); min-width: 0; padding: var(--gap-6) var(--gap-6) var(--gap-10); }
+.settings-nav { position: sticky; z-index: 1; top: var(--gap-6); display: flex; flex-direction: column; gap: var(--gap-half); min-width: 0; }
+.settings-nav-item { position: relative; isolation: isolate; display: grid; grid-template-columns: var(--settings-nav-tile) minmax(0, 1fr); align-items: center; gap: var(--gap-3); width: 100%; min-height: var(--settings-nav-row); border: 0; border-radius: var(--radius); padding: var(--gap-1) var(--gap-2) var(--gap-1) var(--gap-1); background: transparent; color: var(--muted-foreground); font-size: var(--text-base); font-weight: var(--weight-medium); text-align: left; user-select: none; -webkit-user-select: none; transition: var(--transition-control); }
+.settings-nav-item:hover:not([aria-current="page"]) { background: var(--surface-inset); color: var(--foreground); }
+.settings-nav-item[aria-current="page"] { color: var(--foreground); }
+.settings-nav-item:active { transform: scale(var(--scale-press)); transition: var(--transition-control), var(--transition-press); }
+.settings-nav-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-nav-divider { flex: none; height: var(--hairline-width); margin: var(--gap-2); background: var(--hairline); }
 
-/* Sections: the title and what it is for on the left, the controls on the right; stacked when narrow. */
-.settings-content { width: 100%; max-width: var(--settings-content-max); margin-inline: auto; }
-.settings-section { align-items: start; }
-.settings-section-heading { padding-top: var(--gap-3); }
-.settings-section-body { gap: var(--gap-2); }
-.settings-section-body > .card { gap: var(--gap-2); padding-top: var(--gap-3); }
-.settings-section-body > .card > .card-heading p { font-size: var(--text-sm); }
-.settings-pane .row-copy strong { white-space: normal; overflow-wrap: anywhere; }
+/* A page's tile: the canvas's screen tiles, in the page's own tone. */
+.settings-tile { --tone: var(--settings-tone-general); display: grid; flex: none; width: var(--settings-nav-tile); height: var(--settings-nav-tile); place-items: center; border-radius: var(--radius-sm); background: linear-gradient(var(--tile-gradient-angle), color-mix(in oklab, var(--tone) var(--settings-tile-light), var(--tile-shade)), color-mix(in oklab, var(--tone) var(--settings-tile-deep), var(--tile-shade))); box-shadow: var(--shadow-tile); color: var(--tile-glyph); }
+.settings-tile :is(svg, .app-mark) { width: var(--settings-nav-glyph); height: var(--settings-nav-glyph); stroke-width: var(--icon-stroke); }
+.settings-tile[data-size="lg"] { width: var(--inspector-tile-size); height: var(--inspector-tile-size); border-radius: var(--radius-group); }
+.settings-tile[data-size="lg"] :is(svg, .app-mark) { width: var(--avatar-glyph); height: var(--avatar-glyph); }
+.settings-tile[data-page="sharing"] { --tone: var(--settings-tone-sharing); }
+.settings-tile[data-page="clipboard"] { --tone: var(--settings-tone-clipboard); }
+.settings-tile[data-page="dimming"] { --tone: var(--settings-tone-dimming); }
+.settings-tile:is([data-page="pointer"], [data-page="keyboard"]) { --tone: var(--settings-tone-input); }
+.settings-tile[data-page="updates"] { --tone: var(--settings-tone-updates); }
+.settings-tile[data-page="about"] { --tone: var(--settings-tone-about); }
+
+/* A page: its tile and title, then groups of rows, each under its own heading when there are several. */
+.settings-column { display: flex; flex-direction: column; gap: var(--gap-4); min-width: 0; }
+.settings-column > .glide-panel > .banner { margin: 0; }
+.settings-page { display: flex; flex-direction: column; gap: var(--gap-6); min-width: 0; }
+.settings-page-header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--gap-4); }
+.settings-page-heading { display: grid; gap: var(--gap-half); min-width: 0; }
+.settings-page-heading h2 { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--gap-1) var(--gap-2); font-size: var(--text-xl); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); line-height: var(--leading-tight); }
+.settings-page-heading p { font-size: var(--text-sm); }
+.settings-group, .settings-page .card { display: flex; flex-direction: column; gap: var(--gap-2); min-width: 0; }
+.settings-group-heading, .settings-page .card-heading { display: grid; gap: var(--gap-half); padding-inline: var(--gap-3); }
+:is(.settings-group-heading, .settings-page .card-heading) h3 { font-size: var(--text-base); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); line-height: var(--leading-tight); }
+:is(.settings-group-heading, .settings-page .card-heading) p { font-size: var(--text-sm); }
+.settings-page :is(.settings-group, .card) .note { padding-inline: var(--gap-3); }
 .settings-notes { display: grid; gap: var(--gap-1); }
 
-/* The slider sits beside its label, the readout after it. */
-.settings-pane .slider-row { grid-template-columns: minmax(0, 1fr) var(--settings-slider-width); align-items: center; column-gap: var(--gap-6); }
+/* Rows sit in inset groups; their hairlines start where their words do. */
+.settings-page .rows > * + *::before { left: var(--gap-3); }
+.settings-page .row-copy strong { white-space: normal; overflow-wrap: anywhere; }
+.settings-page .row-copy > span { white-space: normal; }
+.settings-page .switch-copy > small { line-height: var(--leading); }
+.settings-page .slider-row { grid-template-columns: minmax(0, 1fr) var(--settings-slider-width); align-items: center; column-gap: var(--gap-6); }
+
+/* The network card keeps its own heading as the group's; its other networks open in a group of their own. */
+.settings-page .card { --card-padding: 0px; padding: 0; background: none; box-shadow: none; }
+.settings-page .card > .accordion { overflow: clip; border-top: 0; border-radius: var(--radius-group); background: var(--surface-inset); }
+.settings-page .card > .accordion > .accordion-trigger { padding-inline: var(--gap-3); }
+.settings-page .card > .accordion > .accordion-panel > .accordion-panel-inner { padding: var(--gap-1) var(--gap-3) var(--gap-3); }
+.settings-page .card-actions { justify-content: flex-start; }
+
+/* The way out, drawn as the keys to hold: raised caps on a quiet well. */
+.settings-escape { display: grid; justify-items: start; gap: var(--gap-3); border-radius: var(--radius-group); padding: var(--gap-4) var(--gap-3); background: var(--surface-inset); }
+.settings-escape-keys { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap-2); }
+.settings-escape .keycap { min-width: var(--settings-keycap-height); height: var(--settings-keycap-height); margin-bottom: var(--settings-keycap-depth); border-radius: var(--radius); padding: 0 var(--gap-3); background: var(--solid); box-shadow: var(--ring-hairline), 0 var(--settings-keycap-depth) 0 var(--hairline-strong); font-family: inherit; font-size: var(--text-sm); font-weight: var(--weight-medium); }
+.settings-escape-plus { color: var(--subtle-foreground); font-size: var(--text-sm); }
+.settings-escape p { font-size: var(--text-sm); }
 
 /* Updates: the status row's progress bar under its words, and its one action cell. */
 .settings-status-row .row-copy { gap: var(--gap-1); }
@@ -42,14 +96,17 @@
 /* A theme change holds the options for a moment; they stay as they look rather than flicker dim. */
 .theme-choice .segmented-option:disabled { cursor: progress; opacity: 1; }
 
-/* Diagnostics and About. */
-.settings-path-row .row-copy > span { font-family: var(--font-mono); font-size: var(--text-xs); white-space: normal; overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
-.settings-about { display: grid; gap: var(--gap-1); padding-top: var(--gap-3); }
-.about-line { color: var(--foreground); font-size: var(--text-base); }
-.about-line strong { font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); }
-.about-commit { color: var(--subtle-foreground); font-size: var(--text-xs); }
-.settings-links { display: flex; flex-wrap: wrap; gap: var(--gap-1); margin: var(--gap-2) 0 0 calc(var(--gap-3) * -1); }
-#settings-about-support svg { color: var(--primary); }
+/* About: the build beside the version, links out, and the log's path. */
+.about-commit { color: var(--subtle-foreground); font-size: var(--text-xs); font-weight: var(--weight-regular); letter-spacing: normal; }
+.settings-link-row { width: 100%; border: 0; background: transparent; color: var(--foreground); font: inherit; text-align: left; transition: var(--transition-control); }
+.settings-link-row:hover { background: var(--surface-hover); }
+.settings-link-row:focus-visible { box-shadow: var(--shadow-focus-inset); }
+.settings-link-row .row-copy strong { display: inline-flex; align-items: center; gap: var(--gap-2); }
+.settings-link-row svg { width: var(--icon-size); height: var(--icon-size); stroke-width: var(--icon-stroke); }
+.settings-link-row .row-copy svg { color: var(--primary); }
+.settings-link-row .row-actions svg { color: var(--subtle-foreground); transition: color var(--motion-fast) var(--ease-out), transform var(--motion-spring) var(--ease-spring); }
+.settings-link-row:hover .row-actions svg { color: var(--foreground); transform: translate(var(--gap-half), calc(var(--gap-half) * -1)); }
+.settings-path-row .row-copy > span { font-family: var(--font-mono); font-size: var(--text-xs); overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
 
 @media (prefers-reduced-motion: no-preference) {
   .theme-choice .segmented-option[data-enter="on"] { animation: settings-segment-on var(--motion-base) var(--ease-out) var(--motion-delay, 0ms) both; }
@@ -58,7 +115,14 @@
 @keyframes settings-segment-on { from { color: var(--muted-foreground); } }
 @keyframes settings-segment-off { from { color: var(--foreground); } }
 
-@container (max-width: 640px) {
-  .settings-section-heading { padding-top: 0; }
-  .settings-pane .slider-row { grid-template-columns: minmax(0, 1fr); }
+@container (max-width: 720px) {
+  .settings-content { grid-template-columns: minmax(0, 1fr); row-gap: var(--gap-5); padding: 0 var(--gap-5) var(--gap-8); }
+  /* Items fade out under the strip's ends instead of being cut at the pane's edge. */
+  .settings-nav { top: 0; flex-direction: row; gap: var(--gap-1); margin-inline: calc(var(--gap-5) * -1); overflow-x: auto; padding: var(--gap-3) var(--gap-5); background: var(--solid); box-shadow: 0 var(--hairline-width) 0 var(--hairline); scrollbar-width: none; -webkit-mask-image: var(--settings-strip-fade); mask-image: var(--settings-strip-fade); }
+  .settings-nav::-webkit-scrollbar { display: none; }
+  .settings-nav > * { flex: none; }
+  .settings-nav-item { grid-template-columns: minmax(0, auto); width: auto; padding-inline: var(--gap-3); }
+  .settings-nav-item > .settings-tile { display: none; }
+  .settings-nav-divider { align-self: stretch; width: var(--hairline-width); height: auto; margin: var(--gap-1); }
+  .settings-page .slider-row { grid-template-columns: minmax(0, 1fr); }
 }

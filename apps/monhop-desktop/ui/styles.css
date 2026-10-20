@@ -77,9 +77,6 @@
   --switch-on: light-dark(oklch(.29 .03 262), oklch(.9 .01 262));
   --thumb: oklch(1 0 0);
   --thumb-on: light-dark(oklch(1 0 0), oklch(.2 .012 264));
-  /* The two computers' dots the island and tray draw, ice and emerald. */
-  --sharing-orbit-local: light-dark(oklch(.55 .05 240), oklch(.93 .035 230));
-  --sharing-orbit-peer: light-dark(oklch(.55 .13 160), oklch(.74 .14 160));
   --harness-wallpaper-dark: linear-gradient(135deg, #2b3a67 0%, #6d4c8a 35%, #c96a5c 70%, #e9b872 100%);
   --harness-wallpaper-light: linear-gradient(135deg, #9fc5e8 0%, #f2c9a6 45%, #b9dbc1 100%);
 
@@ -102,6 +99,8 @@
   --shadow-sheet: 0 0 0 .5px var(--hairline-strong), 0 26px 60px -24px light-dark(oklch(.28 .05 262 / 32%), oklch(0 0 0 / 70%));
   --shadow-chip: 0 0 0 .5px var(--hairline-strong), 0 1px 2px light-dark(oklch(.3 .04 262 / 12%), oklch(0 0 0 / 32%));
   --shadow-raised: 0 0 0 .5px var(--hairline-strong), 0 1px 2px light-dark(oklch(.2 .01 275 / 8%), oklch(0 0 0 / 40%)), 0 6px 16px -6px light-dark(oklch(.2 .01 275 / 16%), oklch(0 0 0 / 55%));
+  /* The half-point ring that edges an inset surface. */
+  --ring-hairline: inset 0 0 0 .5px var(--hairline-strong);
   --shadow-thumb: 0 1px 3px oklch(0 0 0 / 28%), 0 0 0 .5px oklch(0 0 0 / 6%);
   --shadow-focus: 0 0 0 3px color-mix(in oklab, var(--primary) 38%, transparent);
   /* Full-bleed rows sit flush with a clipped edge, so their focus ring is drawn inside. */
@@ -141,10 +140,8 @@
   --sidebar-width: 232px;
   --sidebar-width-narrow: 204px;
   --inspector-width: 304px;
-  --settings-title-width: 200px;
   --menu-width: 260px;
   --canvas-card-width: 420px;
-  --theme-choice-width: 300px;
   --stage-min-height: 190px;
 
   /* Strokes and component sizes */
@@ -191,17 +188,10 @@
   --slider-track: 4px;
   --slider-thumb: 18px;
   --slider-value-width: 40px;
-  /* Notch island: its fill (the camera housing's black), open width, how narrow or wide a compact
-     activity's wing may be, and a wing's level bar. */
+  /* Notch island: its fill (the camera housing's black) and how narrow or wide a wing may be. */
   --island-fill: rgb(0 0 0);
-  --island-width: 440px;
   --island-wing-min: 44px;
   --island-wing-max: 160px;
-  --island-level-width: 48px;
-  /* The island and tray's two computer dots: their mark, size and resting radius. */
-  --sharing-mark-size: 14px;
-  --sharing-dot-size: 5px;
-  --sharing-orbit-rest: 4px;
   --frost-saturate: 170%;
   --panel-blur: 26px;
   --tooltip-max-width: 200px;
@@ -239,6 +229,7 @@
   --text-base: 13px;
   --text-md: 15px;
   --text-lg: 17px;
+  --text-xl: 20px;
   --text-code-input: 22px;
   --text-code-sm: 20px;
   --leading: 1.45;
@@ -282,9 +273,6 @@
   /* Materializing content fades in still soft, then comes into focus over this. */
   --motion-focus: 360ms;
   --motion-demo: 1100ms;
-  /* Notch island: pointer rest before it opens, and grace before it closes once the pointer leaves. */
-  --island-hover-delay: 250ms;
-  --island-close-delay: 180ms;
   --loop-spin: 800ms;
   --loop-pulse: 1500ms;
   --loop-live: 2400ms;
@@ -347,8 +335,8 @@ html[data-platform="macos"] .sidebar-top { justify-content: flex-end; padding-le
 .sidebar-row { position: relative; isolation: isolate; display: grid; grid-template-columns: var(--tile-size) minmax(0, 1fr); align-items: center; gap: var(--gap-3); width: 100%; min-height: var(--sidebar-row-height); border: 0; border-radius: var(--radius-group); padding: var(--gap-2) var(--gap-2); background: transparent; color: var(--foreground); text-align: left; transition: var(--transition-control); }
 .sidebar-row:hover:not([aria-current="true"]) { background: var(--surface-inset); }
 .sidebar-row:active { transform: scale(var(--scale-press)); transition: var(--transition-control), var(--transition-press); }
-/* One indicator for the whole sidebar, moved into the selected row; sidebar.mjs glides it between them. */
-.sidebar-indicator { position: absolute; z-index: -1; inset: 0; border-radius: inherit; background: var(--surface-hover); box-shadow: inset 0 0 0 .5px var(--hairline-strong); pointer-events: none; }
+/* One indicator for the whole sidebar, and one for the Settings rail, moved into the selected row (dom.mjs glideIndicator). */
+.sidebar-indicator, .settings-nav-indicator { position: absolute; z-index: -1; inset: 0; border-radius: inherit; background: var(--surface-hover); box-shadow: var(--ring-hairline); pointer-events: none; }
 .sidebar > .sidebar-indicator { display: none; }
 .sidebar-tile { display: grid; width: var(--tile-size); height: var(--tile-size); place-items: center; border-radius: var(--radius); background: var(--peer-tile); box-shadow: var(--shadow-tile); color: var(--tile-glyph); }
 .sidebar-tile[data-kind="local"] { background: var(--local-tile); }
@@ -524,35 +512,17 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .inspector-header-actions { display: flex; align-items: center; gap: var(--gap-1); }
 .state-block, .inspector-section { display: grid; gap: var(--gap-2); min-width: 0; padding: var(--card-padding); }
 .inspector-section-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--gap-3); min-height: var(--control-height-sm); }
-.inspector-section-heading h3, .settings-section-heading h3 { color: var(--muted-foreground); font-size: var(--text-sm); font-weight: var(--weight-medium); }
+.inspector-section-heading h3 { color: var(--muted-foreground); font-size: var(--text-sm); font-weight: var(--weight-medium); }
 .inspector-section .note { font-size: var(--text-sm); }
 .inspector-view > .accordion > .accordion-trigger { border-radius: 0; padding-inline: var(--card-padding); }
 .inspector-view > .accordion > .accordion-panel > .accordion-panel-inner { padding-inline: var(--card-padding); }
 
-/* Settings rises over the canvas and inspector, sections in two columns while it is wide enough. */
+/* Settings rises over the canvas and inspector; its rail and pages are drawn by studio-settings.css. */
 .settings-pane { position: absolute; z-index: 5; inset: 0 var(--shell-inset) var(--shell-inset); display: grid; grid-template-rows: minmax(0, 1fr); overflow: hidden; border-radius: var(--radius-card); background: var(--solid); box-shadow: var(--shadow-sheet); opacity: 1; transform: none; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear 0s; }
 .settings-pane[data-open="false"] { opacity: 0; transform: translateY(var(--motion-slide)) scale(var(--scale-sheet)); visibility: hidden; pointer-events: none; transition: opacity var(--motion-fast) var(--ease-in-out), transform var(--motion-base) var(--ease-out), visibility 0s linear var(--motion-base); }
 .settings-scroll { container-type: inline-size; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
-.settings-content { display: flex; flex-direction: column; min-width: 0; padding: var(--gap-2) var(--gap-8) var(--gap-8); }
-.settings-content > .glide-panel > .banner { margin-top: var(--gap-4); }
-.settings-section { display: grid; grid-template-columns: var(--settings-title-width) minmax(0, 1fr); gap: var(--gap-3) var(--gap-8); padding: var(--gap-6) 0; }
-.settings-content > .glide-panel + .glide-panel > .settings-section { border-top: var(--hairline-width) solid var(--hairline); }
-.settings-section-heading { display: grid; align-content: start; gap: var(--gap-1); }
-.settings-section-heading h3 { color: var(--foreground); font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-title); }
-.settings-section-heading p { font-size: var(--text-sm); }
-.settings-section-heading .row-actions { padding-top: var(--gap-1); }
-.settings-section-body { display: flex; flex-direction: column; gap: var(--gap-3); min-width: 0; }
-/* Cards inside a section lose their surface; full-bleed disclosures in them stay flush. */
-.settings-section-body > .card { --card-padding: 0px; padding: 0; background: none; box-shadow: none; }
-.settings-section-body > .card > .card-heading h3 { font-size: var(--text-base); font-weight: var(--weight-medium); }
-.settings-section-body .row-copy > span { white-space: normal; }
-.segmented.theme-choice { width: min(100%, var(--theme-choice-width)); }
 .keycaps { display: inline-flex; flex-wrap: wrap; gap: var(--gap-1); }
-.keycap { display: inline-grid; min-width: var(--badge-height); height: var(--badge-height); place-items: center; border-radius: var(--radius-sm); padding: 0 var(--gap-2); background: var(--surface-inset); box-shadow: inset 0 0 0 .5px var(--hairline-strong), 0 1px 0 var(--hairline-strong); color: var(--foreground); font-family: var(--font-mono); font-size: var(--text-xs); }
-@container (max-width: 640px) {
-  .settings-content { padding-inline: var(--gap-5); }
-  .settings-section { grid-template-columns: minmax(0, 1fr); }
-}
+.keycap { display: inline-grid; min-width: var(--badge-height); height: var(--badge-height); place-items: center; border-radius: var(--radius-sm); padding: 0 var(--gap-2); background: var(--surface-inset); box-shadow: var(--ring-hairline), 0 1px 0 var(--hairline-strong); color: var(--foreground); font-family: var(--font-mono); font-size: var(--text-xs); }
 
 /* Segmented controls: the theme choice and the shared-monitor chooser share one look. */
 .segmented { display: inline-grid; grid-auto-flow: column; grid-auto-columns: 1fr; align-items: center; gap: var(--gap-half); width: 100%; border-radius: var(--radius); padding: var(--gap-half); background: var(--surface-hover); }
@@ -636,7 +606,7 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .button:where([data-variant="ghost"]):hover:not(:disabled) { background: var(--surface-hover); }
 .button:where([data-variant="destructive"]) { background: color-mix(in oklab, var(--destructive) var(--mix-tint), transparent); color: var(--destructive); box-shadow: none; }
 .button:where([data-variant="destructive"]):hover:not(:disabled) { background: color-mix(in oklab, var(--destructive) var(--mix-tint-strong), transparent); }
-.button:where([aria-pressed="true"]:not([data-variant="destructive"])) { background: var(--surface-hover); color: var(--foreground); box-shadow: inset 0 0 0 .5px var(--hairline-strong); }
+.button:where([aria-pressed="true"]:not([data-variant="destructive"])) { background: var(--surface-hover); color: var(--foreground); box-shadow: var(--ring-hairline); }
 .button:where([aria-pressed="true"]:not([data-variant="destructive"])):hover:not(:disabled) { background: var(--control-fill-hover); }
 .button:disabled, .arrangement-control:disabled { opacity: var(--opacity-disabled); pointer-events: none; }
 .button[aria-busy="true"] { pointer-events: none; }

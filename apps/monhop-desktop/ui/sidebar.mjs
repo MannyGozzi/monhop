@@ -3,6 +3,7 @@
 import { presence } from "./accordion.mjs";
 import {
   el,
+  glideIndicator,
   motionEase,
   motionEnabled,
   motionMs,
@@ -21,7 +22,6 @@ let placed = [];
 let drawn = [];
 let slots = 0;
 let listLoaded = false;
-let indicatorAnimation = null;
 let mounted = false;
 
 export function renderSidebar(nodes, ctx) {
@@ -54,7 +54,7 @@ export function renderSidebar(nodes, ctx) {
   const selected = settingsSelected
     ? nodes.sidebarSettings
     : (live.find((row) => row.node.getAttribute("aria-current") === "true")?.node ?? null);
-  placeIndicator(nodes.sidebarIndicator, selected);
+  glideIndicator(nodes.sidebarIndicator, selected);
   listLoaded = listLoaded || computers.loaded;
 }
 
@@ -153,29 +153,6 @@ function placeRows(list, live) {
   list.replaceChildren(...panels);
   drawn = next;
   placed = live;
-}
-
-// The one indicator moves into the selected row and slides over from wherever it was drawn, so a
-// change mid-slide carries on from there.
-function placeIndicator(indicator, row) {
-  if (!row) {
-    indicator.hidden = true;
-    return;
-  }
-  indicator.hidden = false;
-  if (indicator.parentElement === row) return;
-  const from = indicator.getClientRects().length ? indicator.getBoundingClientRect() : null;
-  indicatorAnimation?.cancel();
-  indicatorAnimation = null;
-  row.prepend(indicator);
-  if (!from || !motionEnabled()) return;
-  const to = indicator.getBoundingClientRect();
-  if (!to.width || !to.height) return;
-  const transform = `translate(${from.left - to.left}px, ${from.top - to.top}px) scale(${from.width / to.width}, ${from.height / to.height})`;
-  indicatorAnimation = indicator.animate([{ transform }, { transform: "none" }], {
-    duration: motionMs("--motion-slow"),
-    easing: motionEase("--ease-glide"),
-  });
 }
 
 // Up and Down (and Home and End) walk the rows, Settings last; Enter and Space select, as buttons do.
