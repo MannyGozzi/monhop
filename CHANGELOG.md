@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-10-19
+
 ### Added
 
 - The arrangement shows whether sharing is running. When it starts, each crossing between displays lights up outward from its handle with a pulse, and a soft glow rises under the displays. When sharing pauses or stops, the crossings fade back to grey.
@@ -307,7 +309,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.12...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.13...HEAD
+[0.2.13]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.13
 [0.2.12]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.12
 [0.2.11]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.11
 [0.2.10]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.10
