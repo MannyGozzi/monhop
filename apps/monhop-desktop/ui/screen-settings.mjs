@@ -41,7 +41,7 @@ import {
   lastTransferText,
   normalizeClipboardView,
 } from "./clipboard-model.mjs";
-import { presence } from "./accordion.mjs";
+import { glideMove, presence } from "./accordion.mjs";
 import { listStep } from "./studio-model.mjs";
 import { networkCard } from "./screen-ready.mjs";
 import { ESCAPE_SENTENCE, escapeKeys } from "./escape-model.mjs";
@@ -164,6 +164,12 @@ function placeRail(pages) {
   const keys = pages.map((page) => page.key);
   if (keys.join() === frame.order.join()) return;
   const first = frame.order.length === 0;
+  // A presence glides height, so in the strip, where items sit side by side, the ones that stay
+  // slide over from where they were drawn instead of jumping.
+  const strip = !first && getComputedStyle(frame.nav).flexDirection === "row";
+  const drawn = new Map(
+    strip ? [...frame.items].map(([key, item]) => [key, item.getBoundingClientRect()]) : [],
+  );
   const order = PAGES.filter((page) => keys.includes(page.key) || frame.order.includes(page.key));
   const children = [];
   for (const page of order) {
@@ -182,6 +188,13 @@ function placeRail(pages) {
   }
   frame.nav.replaceChildren(...children);
   frame.order = keys;
+  // After the presence panels open, which they do in a microtask of their own, so each slide ends
+  // where its item lands.
+  if (drawn.size)
+    queueMicrotask(() => {
+      for (const [key, from] of drawn)
+        if (frame.items.has(key)) glideMove(frame.items.get(key), from);
+    });
 }
 
 function railItem(page) {
