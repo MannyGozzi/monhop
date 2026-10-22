@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-live-pointer-set-enabled"
+description = "Enables the live_pointer_set_enabled command without any pre-configured scope."
+commands.allow = ["live_pointer_set_enabled"]
+
+[[permission]]
+identifier = "deny-live-pointer-set-enabled"
+description = "Denies the live_pointer_set_enabled command without any pre-configured scope."
+commands.deny = ["live_pointer_set_enabled"]

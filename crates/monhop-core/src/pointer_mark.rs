@@ -169,6 +169,70 @@ pub fn bloom_reach() -> Point {
         })
 }
 
+/// How the live pointer's marks look and move: the dimmed copy of an idle cursor, and the ring
+/// where control lands. The app reads every value from its stylesheet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkStyle {
+    /// The copy's opacity once dimmed; it starts fully opaque.
+    pub idle_opacity: f64,
+    pub idle_fade: Duration,
+    /// The `cubic-bezier` both the fade and the ring follow.
+    pub ease: [f64; 4],
+    pub ring_diameter: f64,
+    pub ring_stroke: f64,
+    /// Gamma-encoded sRGB, each 0..=1.
+    pub ring_rgb: [f64; 3],
+    /// The fill's opacity as a share of the stroke's.
+    pub ring_fill: f64,
+    /// From and to.
+    pub ring_scale: (f64, f64),
+    pub ring_opacity: (f64, f64),
+    pub ring_duration: Duration,
+}
+
+/// One moment of the arrival ring, around its center.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RingFrame {
+    pub scale: f64,
+    pub opacity: f64,
+}
+
+/// The ring `elapsed` into its run, or None once it is over.
+pub fn ring_frame(style: &MarkStyle, elapsed: Duration) -> Option<RingFrame> {
+    if elapsed >= style.ring_duration {
+        return None;
+    }
+    let progress = ease(
+        style.ease,
+        elapsed.as_secs_f64() / style.ring_duration.as_secs_f64(),
+    );
+    let mix = |(from, to): (f64, f64)| from + (to - from) * progress;
+    Some(RingFrame {
+        scale: mix(style.ring_scale),
+        opacity: mix(style.ring_opacity),
+    })
+}
+
+/// The copy's opacity `elapsed` after it went up: fully opaque, easing to `idle_opacity`, which
+/// `still` (reduced motion) shows at once.
+pub fn idle_alpha(style: &MarkStyle, elapsed: Duration, still: bool) -> f64 {
+    if still || elapsed >= style.idle_fade {
+        return style.idle_opacity;
+    }
+    let progress = ease(
+        style.ease,
+        elapsed.as_secs_f64() / style.idle_fade.as_secs_f64(),
+    );
+    1.0 + (style.idle_opacity - 1.0) * progress
+}
+
+/// Half the side of a square around the ring's center that no frame's stroke ever leaves, whether
+/// the renderer scales the stroke with the ring or not.
+pub fn ring_reach(style: &MarkStyle) -> f64 {
+    let largest = style.ring_scale.0.max(style.ring_scale.1).max(1.0);
+    largest * (style.ring_diameter + style.ring_stroke) / 2.0
+}
+
 /// CSS `cubic-bezier` easing of progress `t`.
 pub fn ease([x1, y1, x2, y2]: [f64; 4], t: f64) -> f64 {
     if t <= 0.0 || t >= 1.0 {
@@ -257,6 +321,76 @@ mod tests {
             assert!(frame.scale * (half_height + ink) + 3.0 * frame.blur <= reach.y + 1e-9);
         }
         assert!(reach.x < 90.0 && reach.y < 50.0);
+    }
+
+    /// The design's numbers; the app's stylesheet test pins the same ones.
+    const STYLE: MarkStyle = MarkStyle {
+        idle_opacity: 0.3,
+        idle_fade: Duration::from_millis(220),
+        ease: [0.22, 1.0, 0.36, 1.0],
+        ring_diameter: 44.0,
+        ring_stroke: 2.0,
+        ring_rgb: [1.0, 0.4, 0.6],
+        ring_fill: 0.16,
+        ring_scale: (0.35, 1.6),
+        ring_opacity: (0.95, 0.0),
+        ring_duration: Duration::from_millis(720),
+    };
+
+    #[test]
+    fn the_ring_grows_and_fades_once_then_ends() {
+        assert_eq!(
+            ring_frame(&STYLE, Duration::ZERO),
+            Some(RingFrame {
+                scale: 0.35,
+                opacity: 0.95
+            })
+        );
+        let late = ring_frame(&STYLE, Duration::from_millis(719)).unwrap();
+        assert!((late.scale - 1.6).abs() < 1e-3 && late.opacity < 1e-3);
+        assert_eq!(ring_frame(&STYLE, Duration::from_millis(720)), None);
+        let mut last = ring_frame(&STYLE, Duration::ZERO).unwrap();
+        for ms in 1..720 {
+            let frame = ring_frame(&STYLE, Duration::from_millis(ms)).unwrap();
+            assert!(frame.scale >= last.scale && frame.opacity <= last.opacity);
+            last = frame;
+        }
+        // An ease-out: most of the growth is done by the halfway mark.
+        let half = ring_frame(&STYLE, Duration::from_millis(360)).unwrap();
+        assert!(half.scale > 0.35 + 0.8 * (1.6 - 0.35));
+    }
+
+    #[test]
+    fn the_copy_dims_from_opaque_over_the_fade_and_at_once_when_still() {
+        assert_eq!(idle_alpha(&STYLE, Duration::ZERO, false), 1.0);
+        assert_eq!(idle_alpha(&STYLE, Duration::ZERO, true), 0.3);
+        assert_eq!(idle_alpha(&STYLE, Duration::from_millis(220), false), 0.3);
+        assert_eq!(idle_alpha(&STYLE, Duration::from_secs(5), false), 0.3);
+        let mut last = 1.0;
+        for ms in 1..220 {
+            let alpha = idle_alpha(&STYLE, Duration::from_millis(ms), false);
+            assert!(alpha <= last && alpha >= 0.3);
+            last = alpha;
+        }
+        let instant = MarkStyle {
+            idle_fade: Duration::ZERO,
+            ring_duration: Duration::ZERO,
+            ..STYLE
+        };
+        assert_eq!(idle_alpha(&instant, Duration::ZERO, false), 0.3);
+        assert_eq!(ring_frame(&instant, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn the_ring_reach_covers_every_frame_and_its_stroke() {
+        let reach = ring_reach(&STYLE);
+        for ms in 0..720 {
+            let frame = ring_frame(&STYLE, Duration::from_millis(ms)).unwrap();
+            let scaled = frame.scale * (STYLE.ring_diameter + STYLE.ring_stroke) / 2.0;
+            let unscaled = frame.scale * STYLE.ring_diameter / 2.0 + STYLE.ring_stroke / 2.0;
+            assert!(scaled.max(unscaled) <= reach + 1e-9);
+        }
+        assert!((reach - 1.6 * 23.0).abs() < 1e-9);
     }
 
     #[test]

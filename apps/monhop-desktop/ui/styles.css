@@ -255,6 +255,14 @@
   --scale-drag: 1.02;
   --scale-live-ring: 2.6;
   --opacity-live-ring: .5;
+  /* The live pointer, drawn by the native renderers: an idle computer's cursor copy dims to this,
+     and a ring in the dark --primary grows and fades where control lands. */
+  --opacity-idle-pointer: .3;
+  --arrival-ring-size: 44px;
+  --scale-arrival-ring-from: .35;
+  --scale-arrival-ring-to: 1.6;
+  --opacity-arrival-ring: .95;
+  --opacity-arrival-fill: .16;
   --scale-defocus: .94;
   /* A computer that is switched off keeps its tile, washed out. */
   --saturate-idle: .5;
@@ -273,6 +281,7 @@
   /* Materializing content fades in still soft, then comes into focus over this. */
   --motion-focus: 360ms;
   --motion-demo: 1100ms;
+  --motion-arrival: 720ms;
   --loop-spin: 800ms;
   --loop-pulse: 1500ms;
   --loop-live: 2400ms;

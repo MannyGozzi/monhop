@@ -20,9 +20,9 @@ mod geometry;
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod model;
-#[cfg(any(target_os = "macos", test))]
+// Every target: the live pointer's marks read their style here too.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod tokens;
+pub(crate) mod tokens;
 
 use serde::Serialize;
 #[cfg(not(target_os = "macos"))]

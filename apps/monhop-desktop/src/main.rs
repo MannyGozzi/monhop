@@ -7,6 +7,7 @@ mod autostart;
 mod clipboard;
 mod computers;
 mod control_as_command;
+mod cursor_mark;
 mod dimming;
 #[cfg(target_os = "macos")]
 mod display_labels;
@@ -707,6 +708,8 @@ fn main() {
             swipe::swipe_set_enabled,
             control_as_command::control_as_command_status,
             control_as_command::control_as_command_set_enabled,
+            cursor_mark::live_pointer_status,
+            cursor_mark::live_pointer_set_enabled,
             window_hide,
             computers_load,
             computers_rename,
@@ -765,6 +768,7 @@ fn main() {
             app.manage(dimming::Dimming::start(app.handle(), !check_ui));
             app.manage(autoscroll::Autoscroll::start(app.handle()));
             page_turn::register(app.handle());
+            app.manage(cursor_mark::CursorMark::start(app.handle(), !check_ui));
             app.manage(swipe::Swipe::start(app.handle()));
             app.manage(control_as_command::ControlAsCommand::start(app.handle()));
             app.manage(updates::Updates::start(app.handle(), !check_ui));
@@ -938,6 +942,8 @@ fn on_app_event(handle: &tauri::AppHandle, event: tauri::RunEvent) {
         tauri::RunEvent::Exit => {
             #[cfg(windows)]
             single_instance::stop_answering();
+            // The drain can take seconds; the real cursor must not wait on it.
+            cursor_mark::reveal_for_exit();
             // This callback is irreversible. Installation must finish before exit is approved.
             handle.state::<Arc<AppController>>().drain_for_exit();
         }
@@ -1085,6 +1091,8 @@ mod tests {
                 "allow-swipe-set-enabled",
                 "allow-control-as-command-status",
                 "allow-control-as-command-set-enabled",
+                "allow-live-pointer-status",
+                "allow-live-pointer-set-enabled",
                 "core:window:allow-start-dragging",
                 "core:window:allow-internal-toggle-maximize",
                 "core:window:allow-minimize",

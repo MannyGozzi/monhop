@@ -31,6 +31,7 @@ import {
 import { AUTOSCROLL_LABEL, AUTOSCROLL_NOTE } from "./autoscroll-model.mjs";
 import { SWIPE_LABEL, SWIPE_NOTE } from "./swipe-model.mjs";
 import { CONTROL_AS_COMMAND_LABEL, CONTROL_AS_COMMAND_NOTE } from "./keyboard-model.mjs";
+import { LIVE_POINTER_LABEL, LIVE_POINTER_NOTE } from "./live-pointer-model.mjs";
 import {
   CLIPBOARD_PRIVACY,
   clipboardAccessNotice,
@@ -335,9 +336,10 @@ function fadeCopy(node, key, signature) {
   return node;
 }
 
-// The network MonHop uses, pausing every computer at once, and the way out that always works.
+// The network MonHop uses, pausing every computer at once, which pointer is live, and the way out
+// that always works.
 function sharingPage(ctx) {
-  const { actions, busy, toolbar } = ctx;
+  const { actions, busy, toolbar, livePointer } = ctx;
   const resume = toolbar.pause === "resume";
   const pause = button("", {
     variant: "secondary",
@@ -362,6 +364,31 @@ function sharingPage(ctx) {
         id: "settings-pause",
         children: [rows([fadeCopy(pauseRow, "settings-pause-copy", resume ? "resume" : "pause")])],
       }),
+      presence(
+        "settings-live-pointer",
+        livePointer
+          ? group({
+              id: "settings-live-pointer",
+              children: [
+                rows([
+                  switchRow(LIVE_POINTER_LABEL, {
+                    checked: livePointer.view.enabled,
+                    description: LIVE_POINTER_NOTE,
+                    disabled: !ctx.core || livePointer.pending,
+                    focusKey: "settings-live-pointer-enable",
+                    onChange: actions.setLivePointerEnabled,
+                  }),
+                ]),
+                fadingText(
+                  "settings-live-pointer-message",
+                  "note",
+                  livePointer.view.error,
+                  "danger",
+                ),
+              ],
+            })
+          : null,
+      ),
       group({
         id: "settings-escape",
         title: "Take your input back",
