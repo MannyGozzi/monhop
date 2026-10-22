@@ -1,17 +1,19 @@
-//! Windows-style middle-button autoscroll for a Mac driven by a Windows mouse. The state machine is
-//! pure: the destination feeds it every action and the clock, then posts what it routes, the scroll
-//! each tick asks for, and the marker it reports.
+//! Windows-style middle-button autoscroll for a Mac driven by a Windows mouse: holding the button
+//! and moving scrolls, and a click stays a click. The state machine is pure: the destination feeds
+//! it every action and the clock, then posts what it routes, the scroll each tick asks for, and the
+//! marker it reports.
 
 use std::time::{Duration, Instant};
 
-use monhop_core::{HidUsage, MouseButton, Point};
+use monhop_core::{MouseButton, Point};
 
 use crate::{
     session_native::MAC_POINTS_PER_DETENT,
     session_receiver::{DestinationAction, DestinationFailure},
 };
 
-/// Pointer travel from the origin, in points, that turns a held middle button into a drag.
+/// Pointer travel from the origin, in points, past which a held middle button scrolls instead of
+/// clicking.
 const DRAG_THRESHOLD: f64 = 5.0;
 /// Offset from the origin on each axis, in points, that scrolls nothing.
 const DEAD_ZONE: f64 = 12.0;
@@ -23,27 +25,18 @@ const MAX_SPEED: f64 = 4000.0;
 const EMIT_INTERVAL: Duration = Duration::from_millis(8);
 /// The most time one post covers, so a stalled injection thread never jumps the page.
 const MAX_STEP: Duration = Duration::from_millis(50);
-const ESCAPE: HidUsage = HidUsage(0x29);
-const MIDDLE: usize = MouseButton::Middle.index();
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
-    /// Scrolls while the middle button stays down.
-    Drag,
-    /// Entered by a middle click; the next button or non-modifier key press ends it.
-    Toggle,
-}
 
 #[derive(Clone, Copy, Debug)]
 enum Phase {
     Idle,
-    /// The middle button is down and held back; its release decides between a click and a drag.
+    /// The middle button is down and held back: travel past `DRAG_THRESHOLD` scrolls, and a
+    /// release before that is a click.
     Pressed {
         origin: Point,
         controller: u64,
     },
+    /// Scrolls while the middle button stays down.
     Scrolling {
-        mode: Mode,
         origin: Point,
         controller: u64,
         started: Instant,
@@ -61,11 +54,8 @@ pub(crate) struct Step {
 pub(crate) struct Autoscroll {
     phase: Phase,
     pointer: Option<Point>,
-    /// Presses kept from the app whose releases must be kept from it too.
-    withheld_buttons: [bool; 5],
-    withheld_escape: bool,
-    /// An Escape press reached the app, so a repeat of it is not a new press to swallow.
-    escape_delivered: bool,
+    /// A middle press kept from the app whose release must be kept from it too.
+    withheld_middle: bool,
 }
 
 impl Autoscroll {
@@ -73,13 +63,11 @@ impl Autoscroll {
         Self {
             phase: Phase::Idle,
             pointer: None,
-            withheld_buttons: [false; 5],
-            withheld_escape: false,
-            escape_delivered: false,
+            withheld_middle: false,
         }
     }
 
-    /// The origin while either mode scrolls, where the marker belongs.
+    /// The origin while scrolling, where the marker belongs.
     pub(crate) fn marker(&self) -> Option<Point> {
         match self.phase {
             Phase::Scrolling { origin, .. } => Some(origin),
@@ -103,13 +91,10 @@ impl Autoscroll {
         match action {
             DestinationAction::MoveTo(point) => {
                 self.pointer = Some(point);
-                if let Phase::Pressed {
-                    origin, controller, ..
-                } = self.phase
+                if let Phase::Pressed { origin, controller } = self.phase
                     && (point.x - origin.x).hypot(point.y - origin.y) > DRAG_THRESHOLD
                 {
                     self.phase = Phase::Scrolling {
-                        mode: Mode::Drag,
                         origin,
                         controller,
                         started: now,
@@ -124,25 +109,17 @@ impl Autoscroll {
             }
             DestinationAction::ReleaseAll => {
                 self.stop(now);
-                self.withheld_buttons = [false; 5];
-                self.withheld_escape = false;
-                self.escape_delivered = false;
+                self.withheld_middle = false;
                 post(action)
             }
             DestinationAction::Button {
-                button,
+                button: MouseButton::Middle,
                 pressed: true,
                 ..
             } => {
-                let index = button.index();
-                if self.mode() == Some(Mode::Toggle) {
-                    self.finish(now);
-                    self.withheld_buttons[index] = true;
-                    return Ok(());
-                }
-                self.withheld_buttons[index] = false;
-                match (button, self.phase, starts, self.pointer) {
-                    (MouseButton::Middle, Phase::Idle, Some(controller), Some(origin)) => {
+                self.withheld_middle = false;
+                match (self.phase, starts, self.pointer) {
+                    (Phase::Idle, Some(controller), Some(origin)) => {
                         self.phase = Phase::Pressed { origin, controller };
                         Ok(())
                     }
@@ -150,22 +127,16 @@ impl Autoscroll {
                 }
             }
             DestinationAction::Button {
-                button,
+                button: MouseButton::Middle,
                 pressed: false,
                 ..
             } => {
-                if std::mem::take(&mut self.withheld_buttons[button.index()]) {
+                if std::mem::take(&mut self.withheld_middle) {
                     return Ok(());
                 }
-                match (button, self.phase) {
-                    (MouseButton::Middle, Phase::Pressed { origin, controller }) => {
-                        self.phase = Phase::Scrolling {
-                            mode: Mode::Toggle,
-                            origin,
-                            controller,
-                            started: now,
-                            emitted: now,
-                        };
+                match self.phase {
+                    Phase::Pressed { .. } => {
+                        self.phase = Phase::Idle;
                         // A single click where the pointer is: moving it, or a multi-click count that
                         // snaps it back, would drag any other held button.
                         for pressed in [true, false] {
@@ -177,50 +148,16 @@ impl Autoscroll {
                         }
                         Ok(())
                     }
-                    (
-                        MouseButton::Middle,
-                        Phase::Scrolling {
-                            mode: Mode::Drag, ..
-                        },
-                    ) => {
+                    Phase::Scrolling { .. } => {
                         self.finish(now);
                         Ok(())
                     }
-                    _ => post(action),
+                    Phase::Idle => post(action),
                 }
             }
-            DestinationAction::Key {
-                usage,
-                pressed: true,
-            } => {
-                // Escape's auto-repeat follows its swallowed press.
-                if usage == ESCAPE && self.withheld_escape {
-                    return Ok(());
-                }
-                if self.mode() == Some(Mode::Toggle) && !usage.is_modifier() {
-                    self.finish(now);
-                    if usage == ESCAPE && !self.escape_delivered {
-                        self.withheld_escape = true;
-                        return Ok(());
-                    }
-                }
-                post(action)?;
-                self.escape_delivered |= usage == ESCAPE;
-                Ok(())
-            }
-            DestinationAction::Key {
-                usage,
-                pressed: false,
-            } => {
-                if usage == ESCAPE && std::mem::take(&mut self.withheld_escape) {
-                    return Ok(());
-                }
-                if usage == ESCAPE {
-                    self.escape_delivered = false;
-                }
-                post(action)
-            }
-            DestinationAction::Scroll { .. }
+            DestinationAction::Button { .. }
+            | DestinationAction::Key { .. }
+            | DestinationAction::Scroll { .. }
             | DestinationAction::Gesture(_)
             | DestinationAction::System(_) => post(action),
         }
@@ -269,18 +206,11 @@ impl Autoscroll {
         })
     }
 
-    /// Ends any episode from outside the input stream; a middle button still held back keeps its
+    /// Ends any episode from outside the input stream; the middle button it held back keeps its
     /// release from the app.
     pub(crate) fn stop(&mut self, now: Instant) {
-        if matches!(
-            self.phase,
-            Phase::Pressed { .. }
-                | Phase::Scrolling {
-                    mode: Mode::Drag,
-                    ..
-                }
-        ) {
-            self.withheld_buttons[MIDDLE] = true;
+        if self.owner().is_some() {
+            self.withheld_middle = true;
         }
         self.finish(now);
     }
@@ -295,23 +225,10 @@ impl Autoscroll {
         }
     }
 
-    fn mode(&self) -> Option<Mode> {
-        match self.phase {
-            Phase::Scrolling { mode, .. } => Some(mode),
-            Phase::Idle | Phase::Pressed { .. } => None,
-        }
-    }
-
     fn finish(&mut self, now: Instant) {
-        if let Phase::Scrolling { mode, started, .. } =
-            std::mem::replace(&mut self.phase, Phase::Idle)
-        {
+        if let Phase::Scrolling { started, .. } = std::mem::replace(&mut self.phase, Phase::Idle) {
             log::info!(
-                "autoscroll: {} mode ended after {} ms",
-                match mode {
-                    Mode::Drag => "drag",
-                    Mode::Toggle => "toggle",
-                },
+                "autoscroll: drag ended after {} ms",
                 now.saturating_duration_since(started).as_millis()
             );
         }
@@ -329,11 +246,16 @@ fn speed(offset: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use monhop_core::HidUsage;
+
     use super::*;
 
     const WINDOWS: Option<u64> = Some(7);
-    const SHIFT: HidUsage = HidUsage(0xe1);
+    const ESCAPE: HidUsage = HidUsage(0x29);
     const A: HidUsage = HidUsage(0x04);
+    const LEFT: MouseButton = MouseButton::Left;
+    const ORIGIN: Point = Point::new(100.0, 100.0);
+    const CLICK: [DestinationAction; 2] = [middle(true), middle(false)];
 
     struct Harness {
         machine: Autoscroll,
@@ -378,13 +300,30 @@ mod tests {
             self.machine.tick(now, WINDOWS, true)
         }
 
-        /// A Windows source's middle click at (100, 100), entering toggle autoscroll.
-        fn toggled() -> Self {
+        /// A middle press and its release at `millis`, returning what reached the app.
+        fn click(&mut self, starts: Option<u64>, millis: u64) -> Vec<DestinationAction> {
+            let mut posted = self.send(middle(true), starts, millis);
+            posted.extend(self.send(middle(false), starts, millis + 1));
+            posted
+        }
+
+        /// A Windows source's middle button held at the origin, not yet a click or a drag.
+        fn pressed() -> Self {
             let mut harness = Self::new();
-            harness.send(move_to(100.0, 100.0), WINDOWS, 0);
-            harness.send(middle(true), WINDOWS, 1);
-            harness.send(middle(false), WINDOWS, 2);
-            assert_eq!(harness.machine.marker(), Some(Point::new(100.0, 100.0)));
+            harness.send(DestinationAction::MoveTo(ORIGIN), WINDOWS, 0);
+            assert_eq!(
+                harness.send(middle(true), WINDOWS, 1),
+                [],
+                "the press is held back"
+            );
+            harness
+        }
+
+        /// `pressed`, then dragged straight down past the threshold at 2 ms.
+        fn dragging() -> Self {
+            let mut harness = Self::pressed();
+            harness.send(move_to(100.0, 300.0), WINDOWS, 2);
+            assert_eq!(harness.machine.marker(), Some(ORIGIN));
             harness
         }
     }
@@ -393,7 +332,7 @@ mod tests {
         DestinationAction::MoveTo(Point::new(x, y))
     }
 
-    fn button(button: MouseButton, pressed: bool) -> DestinationAction {
+    const fn button(button: MouseButton, pressed: bool) -> DestinationAction {
         DestinationAction::Button {
             button,
             pressed,
@@ -401,7 +340,7 @@ mod tests {
         }
     }
 
-    fn middle(pressed: bool) -> DestinationAction {
+    const fn middle(pressed: bool) -> DestinationAction {
         button(MouseButton::Middle, pressed)
     }
 
@@ -424,14 +363,60 @@ mod tests {
     }
 
     #[test]
-    fn a_held_middle_button_dragged_past_the_threshold_scrolls_until_released() {
-        let mut h = Harness::new();
-        h.send(move_to(100.0, 100.0), WINDOWS, 0);
+    fn a_quick_middle_click_is_one_click_and_leaves_nothing_behind() {
+        let mut h = Harness::pressed();
+        assert_eq!(h.send(middle(false), WINDOWS, 2), CLICK);
+        assert_eq!(h.machine.marker(), None, "no marker");
+
+        let double = |pressed| DestinationAction::Button {
+            button: MouseButton::Middle,
+            pressed,
+            click_count: 2,
+        };
+        assert_eq!(h.send(double(true), WINDOWS, 3), []);
         assert_eq!(
-            h.send(middle(true), WINDOWS, 1),
-            [],
-            "the press is held back"
+            h.send(double(false), WINDOWS, 4),
+            CLICK,
+            "a single click each time, so the pointer never snaps back"
         );
+
+        assert_eq!(
+            h.send(move_to(100.0, 400.0), WINDOWS, 5),
+            [move_to(100.0, 400.0)]
+        );
+        assert_eq!(h.tick(40), None, "moving afterwards scrolls nothing");
+        assert_eq!(h.machine.marker(), None);
+        for action in [
+            button(LEFT, true),
+            button(LEFT, false),
+            key(ESCAPE, true),
+            key(ESCAPE, false),
+        ] {
+            assert_eq!(
+                h.send(action, WINDOWS, 50),
+                [action],
+                "nothing after the click is withheld"
+            );
+        }
+    }
+
+    #[test]
+    fn a_press_moved_no_further_than_the_threshold_is_still_a_click() {
+        let mut h = Harness::pressed();
+        assert_eq!(
+            h.send(move_to(103.0, 104.0), WINDOWS, 2),
+            [move_to(103.0, 104.0)]
+        );
+        assert_eq!(h.machine.marker(), None, "exactly the threshold away");
+        assert_eq!(h.tick(20), None);
+        assert_eq!(h.send(middle(false), WINDOWS, 30), CLICK);
+        assert_eq!(h.machine.marker(), None);
+        assert_eq!(h.tick(60), None);
+    }
+
+    #[test]
+    fn a_held_middle_button_dragged_past_the_threshold_scrolls_until_released() {
+        let mut h = Harness::pressed();
         assert_eq!(
             h.send(move_to(103.0, 101.0), WINDOWS, 2),
             [move_to(103.0, 101.0)]
@@ -447,143 +432,134 @@ mod tests {
             [move_to(100.0, 200.0)],
             "the pointer keeps moving"
         );
-        assert_eq!(h.machine.marker(), Some(Point::new(100.0, 100.0)));
+        assert_eq!(h.machine.marker(), Some(ORIGIN));
         let step = h.tick(46).expect("a scroll after the emit interval");
-        assert_eq!(step.at, Point::new(100.0, 100.0), "placed at the origin");
+        assert_eq!(step.at, ORIGIN, "placed at the origin");
         let (horizontal, vertical) = scroll(Some(step));
         assert_eq!(horizontal, 0.0);
         assert!(vertical < 0.0, "below the origin scrolls down");
         assert_eq!(
             h.send(middle(false), WINDOWS, 50),
             [],
-            "no middle button reaches the app"
+            "no click reaches the app"
         );
         assert_eq!(h.machine.marker(), None);
         assert_eq!(h.tick(100), None);
-        assert_eq!(h.send(middle(true), None, 110), [middle(true)]);
-        assert_eq!(h.send(middle(false), None, 120), [middle(false)]);
+        assert_eq!(h.click(WINDOWS, 110), CLICK, "the next click is a click");
     }
 
     #[test]
-    fn a_middle_click_is_delivered_at_the_pointer_then_toggles_autoscroll() {
-        let mut h = Harness::new();
-        h.send(move_to(100.0, 100.0), WINDOWS, 0);
-        h.send(middle(true), WINDOWS, 1);
-        h.send(move_to(102.0, 101.0), WINDOWS, 2);
+    fn keys_and_other_buttons_pass_through_while_dragging() {
+        let mut h = Harness::dragging();
+        for action in [
+            key(ESCAPE, true),
+            key(ESCAPE, false),
+            key(A, true),
+            key(A, false),
+            button(LEFT, true),
+            button(LEFT, false),
+        ] {
+            assert_eq!(h.send(action, WINDOWS, 10), [action]);
+        }
         assert_eq!(
-            h.send(middle(false), WINDOWS, 3),
-            [middle(true), middle(false)]
+            h.machine.marker(),
+            Some(ORIGIN),
+            "only the middle release ends a drag"
         );
-        assert_eq!(h.machine.marker(), Some(Point::new(100.0, 100.0)));
+        assert_eq!(h.send(middle(false), WINDOWS, 20), []);
+        assert_eq!(h.machine.marker(), None);
     }
 
     #[test]
     fn a_held_back_middle_click_never_moves_the_pointer_under_another_held_button() {
-        let mut h = Harness::new();
-        h.send(move_to(100.0, 100.0), WINDOWS, 0);
-        h.send(middle(true), WINDOWS, 1);
+        let mut h = Harness::pressed();
         h.send(move_to(104.0, 100.0), WINDOWS, 2);
-        assert_eq!(
-            h.send(button(MouseButton::Left, true), WINDOWS, 3),
-            [button(MouseButton::Left, true)]
-        );
+        assert_eq!(h.send(button(LEFT, true), WINDOWS, 3), [button(LEFT, true)]);
         assert_eq!(
             h.send(middle(false), WINDOWS, 4),
-            [middle(true), middle(false)],
+            CLICK,
             "no move that would drag the held left button"
         );
+        assert_eq!(h.machine.marker(), None);
         assert_eq!(
-            h.send(button(MouseButton::Left, false), WINDOWS, 5),
-            [button(MouseButton::Left, false)]
+            h.send(button(LEFT, false), WINDOWS, 5),
+            [button(LEFT, false)]
         );
     }
 
     #[test]
-    fn input_after_the_switch_turns_off_never_waits_for_a_tick() {
-        let mut pressed = Harness::new();
-        pressed.send(move_to(100.0, 100.0), WINDOWS, 0);
-        pressed.send(middle(true), WINDOWS, 1);
-        assert_eq!(
-            pressed.send(middle(false), None, 2),
-            [],
-            "no click and no toggle once off"
-        );
-        assert_eq!(pressed.machine.marker(), None);
+    fn release_all_while_pressed_posts_only_itself_and_the_next_click_works() {
+        let release = DestinationAction::ReleaseAll;
+        let mut h = Harness::pressed();
+        assert_eq!(h.send(release, WINDOWS, 2), [release], "no click, no press");
+        assert_eq!(h.machine.marker(), None);
+        assert_eq!(h.tick(20), None);
+        assert_eq!(h.click(WINDOWS, 30), CLICK);
+        assert_eq!(h.machine.marker(), None);
 
-        let mut toggled = Harness::toggled();
-        let left = MouseButton::Left;
+        let mut h = Harness::pressed();
+        h.send(release, WINDOWS, 2);
         assert_eq!(
-            toggled.send(button(left, true), None, 10),
-            [button(left, true)]
+            h.send(middle(false), WINDOWS, 3),
+            [middle(false)],
+            "a release of everything forgets what it held back"
         );
-        assert_eq!(toggled.machine.marker(), None);
-        assert_eq!(
-            toggled.send(button(left, false), None, 11),
-            [button(left, false)]
-        );
+        assert_eq!(h.click(WINDOWS, 10), CLICK);
     }
 
     #[test]
-    fn a_button_press_ends_toggle_autoscroll_and_it_and_its_release_are_swallowed() {
-        for ending in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
-            let mut h = Harness::toggled();
-            assert_eq!(h.send(button(ending, true), WINDOWS, 10), []);
-            assert_eq!(h.machine.marker(), None, "{ending:?}");
-            assert_eq!(h.tick(40), None);
-            assert_eq!(h.send(button(ending, false), WINDOWS, 20), []);
-            assert_eq!(
-                h.send(button(ending, true), None, 30),
-                [button(ending, true)],
-                "the next press reaches the app"
-            );
-            assert_eq!(
-                h.send(button(ending, false), None, 40),
-                [button(ending, false)]
-            );
+    fn a_controller_change_or_the_switch_off_mid_press_or_drag_posts_no_middle_button() {
+        let starts_from = [Harness::pressed, Harness::dragging];
+        // Seen by the next input (a move) or by the tick, before the release arrives.
+        let endings: [fn(&mut Harness); 5] = [
+            |h| {
+                assert_eq!(
+                    h.send(move_to(90.0, 90.0), Some(8), 5),
+                    [move_to(90.0, 90.0)]
+                )
+            },
+            |h| assert_eq!(h.send(move_to(90.0, 90.0), None, 5), [move_to(90.0, 90.0)]),
+            |h| assert_eq!(h.machine.tick(h.at(20), Some(8), true), None),
+            |h| assert_eq!(h.machine.tick(h.at(20), None, true), None),
+            |h| assert_eq!(h.machine.tick(h.at(20), WINDOWS, false), None),
+        ];
+        for start in starts_from {
+            for (case, end) in endings.iter().enumerate() {
+                let mut h = start();
+                end(&mut h);
+                assert_eq!(h.machine.marker(), None, "case {case}");
+                assert_eq!(h.tick(40), None, "case {case}: never scrolls again");
+                assert_eq!(
+                    h.send(middle(false), WINDOWS, 50),
+                    [],
+                    "case {case}: its release stays held back"
+                );
+                assert_eq!(h.click(None, 60), CLICK, "case {case}: plain clicks pass");
+                assert_eq!(h.click(WINDOWS, 70), CLICK, "case {case}: and so do ours");
+            }
         }
     }
 
     #[test]
-    fn escape_is_swallowed_another_key_ends_and_is_delivered_and_a_modifier_does_neither() {
-        let mut h = Harness::toggled();
-        assert_eq!(h.send(key(SHIFT, true), WINDOWS, 10), [key(SHIFT, true)]);
-        assert_eq!(h.send(key(SHIFT, false), WINDOWS, 11), [key(SHIFT, false)]);
-        assert!(h.machine.marker().is_some(), "a modifier keeps the mode");
-        assert_eq!(h.send(key(ESCAPE, true), WINDOWS, 12), []);
-        assert_eq!(h.machine.marker(), None);
-        assert_eq!(h.send(key(ESCAPE, true), WINDOWS, 13), [], "its repeat");
-        assert_eq!(h.send(key(ESCAPE, false), WINDOWS, 14), []);
-        assert_eq!(h.send(key(ESCAPE, true), WINDOWS, 15), [key(ESCAPE, true)]);
-        assert_eq!(
-            h.send(key(ESCAPE, false), WINDOWS, 16),
-            [key(ESCAPE, false)]
-        );
+    fn end_gestures_or_a_stop_mid_press_or_drag_holds_back_the_release() {
+        for start in [Harness::pressed, Harness::dragging] {
+            let mut h = start();
+            let end = DestinationAction::EndGestures;
+            assert_eq!(h.send(end, WINDOWS, 10), [end]);
+            assert_eq!(h.machine.marker(), None);
+            assert_eq!(h.tick(40), None);
+            assert_eq!(
+                h.send(middle(false), WINDOWS, 50),
+                [],
+                "no click after the end"
+            );
 
-        let mut h = Harness::toggled();
-        assert_eq!(h.send(key(A, true), WINDOWS, 10), [key(A, true)]);
-        assert_eq!(h.machine.marker(), None);
-        assert_eq!(h.send(key(A, false), WINDOWS, 11), [key(A, false)]);
-    }
-
-    #[test]
-    fn an_escape_already_down_ends_toggle_autoscroll_and_its_release_still_arrives() {
-        let mut h = Harness::new();
-        h.send(move_to(100.0, 100.0), WINDOWS, 0);
-        assert_eq!(h.send(key(ESCAPE, true), WINDOWS, 1), [key(ESCAPE, true)]);
-        h.send(middle(true), WINDOWS, 2);
-        h.send(middle(false), WINDOWS, 3);
-        assert!(h.machine.marker().is_some());
-        assert_eq!(
-            h.send(key(ESCAPE, true), WINDOWS, 4),
-            [key(ESCAPE, true)],
-            "a repeat of a delivered press"
-        );
-        assert_eq!(h.machine.marker(), None);
-        assert_eq!(
-            h.send(key(ESCAPE, false), WINDOWS, 5),
-            [key(ESCAPE, false)],
-            "so the app never keeps Escape down"
-        );
+            let mut h = start();
+            h.machine.stop(h.at(10));
+            assert_eq!(h.machine.marker(), None);
+            assert_eq!(h.send(middle(false), WINDOWS, 50), []);
+            assert_eq!(h.click(WINDOWS, 60), CLICK);
+        }
     }
 
     #[test]
@@ -591,10 +567,10 @@ mod tests {
         for offset in [0.0, 5.0, -DEAD_ZONE, DEAD_ZONE] {
             assert_eq!(speed(offset), 0.0, "{offset}");
         }
-        let mut h = Harness::toggled();
-        h.send(move_to(111.0, 89.0), WINDOWS, 5);
+        let mut h = Harness::pressed();
+        h.send(move_to(111.0, 89.0), WINDOWS, 2);
         assert_eq!(h.tick(20), None);
-        assert!(h.machine.marker().is_some());
+        assert_eq!(h.machine.marker(), Some(ORIGIN));
     }
 
     #[test]
@@ -604,8 +580,8 @@ mod tests {
         assert_eq!(speed(-100.0), -speed(100.0));
         assert_eq!(speed(1.0e6), MAX_SPEED);
 
-        let mut h = Harness::toggled();
-        h.send(move_to(200.0, 200.0), WINDOWS, 3);
+        let mut h = Harness::pressed();
+        h.send(move_to(200.0, 200.0), WINDOWS, 2);
         assert_eq!(h.tick(5), None, "paced by the emit interval");
         let (horizontal, vertical) = scroll(h.tick(18));
         assert!(horizontal > 0.0, "right of the origin scrolls right");
@@ -626,60 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn release_yield_or_the_switch_turning_off_ends_the_mode_and_hides_the_marker() {
-        for release in [
-            DestinationAction::EndGestures,
-            DestinationAction::ReleaseAll,
-        ] {
-            let mut h = Harness::toggled();
-            assert_eq!(h.send(release, WINDOWS, 10), [release]);
-            assert_eq!(h.machine.marker(), None);
-            assert_eq!(h.tick(40), None);
-        }
-
-        let yielded = [(Some(8), true), (None, true), (WINDOWS, false)];
-        for (controller, enabled) in yielded {
-            let mut h = Harness::toggled();
-            assert_eq!(h.machine.tick(h.at(20), controller, enabled), None);
-            assert_eq!(h.machine.marker(), None);
-            assert_eq!(h.tick(40), None, "and never scrolls again");
-        }
-
-        let mut dragging = Harness::new();
-        dragging.send(move_to(100.0, 100.0), WINDOWS, 0);
-        dragging.send(middle(true), WINDOWS, 1);
-        dragging.send(move_to(100.0, 300.0), WINDOWS, 2);
-        assert_eq!(dragging.machine.tick(dragging.at(20), WINDOWS, false), None);
-        assert_eq!(dragging.machine.marker(), None);
-        assert_eq!(
-            dragging.send(middle(false), WINDOWS, 30),
-            [],
-            "its release stays held back"
-        );
-
-        let mut pressed = Harness::new();
-        pressed.send(move_to(100.0, 100.0), WINDOWS, 0);
-        pressed.send(middle(true), WINDOWS, 1);
-        pressed.machine.stop(pressed.at(2));
-        assert_eq!(
-            pressed.send(middle(false), WINDOWS, 3),
-            [],
-            "no click after the end"
-        );
-        assert_eq!(pressed.machine.marker(), None);
-
-        let mut released = Harness::new();
-        released.send(move_to(100.0, 100.0), WINDOWS, 0);
-        released.send(middle(true), WINDOWS, 1);
-        released.send(DestinationAction::ReleaseAll, WINDOWS, 2);
-        assert_eq!(
-            released.send(middle(false), WINDOWS, 3),
-            [middle(false)],
-            "a release of everything forgets what it held back"
-        );
-    }
-
-    #[test]
     fn a_mac_source_or_the_switch_off_passes_the_middle_button_through() {
         let mut h = Harness::new();
         h.send(move_to(100.0, 100.0), None, 0);
@@ -691,6 +613,5 @@ mod tests {
         assert_eq!(h.machine.marker(), None);
         assert_eq!(h.tick(40), None);
         assert_eq!(h.send(middle(false), None, 50), [middle(false)]);
-        assert_eq!(h.send(key(ESCAPE, true), None, 60), [key(ESCAPE, true)]);
     }
 }

@@ -13,6 +13,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 - Settings is split into pages you pick from a list beside them: Sharing, Clipboard, Screen dimming, Mouse and trackpad on a Mac or Keyboard on Windows, General, Updates and About. Each page groups its controls under short headings, the keys that take your keyboard and mouse back are drawn as keys on the Sharing page, and About leads with the version. In a narrow window the list runs across the top. The Clipboard settings link beside a computer opens the Clipboard page.
 - The notch island now only shows what is happening with your connections: a computer connecting, connected, reconnecting, waiting for an answer, or dropped. Pointing at the notch no longer opens sharing, dimming and clipboard controls, and the island no longer takes clicks near the notch. Dimming, update-ready and which computer has the pointer no longer show there.
 
+### Fixed
+
+- A middle click from a Windows mouse on a Mac is now just a middle click: it opens links in new tabs and closes tabs without starting autoscroll or swallowing your next click. Hold the middle button and move to autoscroll.
+
 ## [0.2.13] - 2026-10-19
 
 ### Added

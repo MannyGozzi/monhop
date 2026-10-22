@@ -225,9 +225,9 @@ MonHop must fail local when elevated Windows targets reject SendInput. It must n
 
 Autoscroll tests drive a Windows mouse on a Mac. They cover:
 
-- hold-and-drag and click-then-move in a browser, with the marker appearing and fading;
+- hold-and-drag in a browser, with the marker appearing and fading;
 - a middle click on a link and on a tab;
-- a click or key ending toggle mode, with Escape held before the click;
+- a quick middle click staying a plain click, with the next click reaching the app;
 - take-back and a pulled cable mid-scroll leaving no button or key down;
 - the Home switch off restoring plain middle drags;
 - a Mac source never autoscrolling.

@@ -1347,8 +1347,7 @@ mod landing_tests {
             for (millis, action) in [
                 (0, move_to(100.0, 100.0)),
                 (1, middle(true)),
-                (2, middle(false)),
-                (3, move_to(100.0, 400.0)),
+                (2, move_to(100.0, 400.0)),
             ] {
                 let at = start + Duration::from_millis(millis);
                 autoscroll
@@ -1361,12 +1360,7 @@ mod landing_tests {
             }
             assert_eq!(
                 delivered,
-                [
-                    Posted::Move(100.0, 100.0),
-                    Posted::Button(MouseButton::Middle, true, 1),
-                    Posted::Button(MouseButton::Middle, false, 1),
-                    Posted::Move(100.0, 400.0)
-                ]
+                [Posted::Move(100.0, 100.0), Posted::Move(100.0, 400.0)]
             );
             assert!(!gate.injected_held());
             let owed = start + Duration::from_millis(20);
@@ -1426,6 +1420,8 @@ mod landing_tests {
             delivered,
             [
                 Posted::Move(100.0, 100.0),
+                Posted::Button(MouseButton::Middle, true, 1),
+                Posted::Button(MouseButton::Middle, false, 1),
                 Posted::Button(MouseButton::Middle, true, 1),
                 Posted::Button(MouseButton::Middle, false, 1),
                 Posted::Move(104.0, 100.0),

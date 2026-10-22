@@ -137,7 +137,7 @@ The `--check-ui` smoke run loads the dimming preference without registering the 
 
 ## Middle-button autoscroll
 
-A Mac destination runs every action through `session_autoscroll::Autoscroll`, a pure state machine, and only while the peer holding the floor is Windows (`SourcePlatforms`, one entry per floor slot; an unknown slot never autoscrolls) and the desktop `autoscroll` switch (`autoscroll.json`, default on) is on. A held-back middle press becomes a drag past 5 pt or, on release, a middle click at the pointer followed by toggle mode. Scroll is posted from the destination tick through the same `Sequencer` gates as other input, placed at the origin. An episode ends on release, take-back, a floor change, the switch turning off or the destination dropping. The origin marker is a click-through window drawn by `autoscroll/macos.rs` on the main thread, fed by a non-blocking sink.
+A Mac destination runs every action through `session_autoscroll::Autoscroll`, a pure state machine, and only while the peer holding the floor is Windows (`SourcePlatforms`, one entry per floor slot; an unknown slot never autoscrolls) and the desktop `autoscroll` switch (`autoscroll.json`, default on) is on. A held-back middle press becomes a drag past 5 pt or, on release, a plain middle click at the pointer. Scroll is posted from the destination tick through the same `Sequencer` gates as other input, placed at the origin. An episode ends on release, take-back, a floor change, the switch turning off or the destination dropping. The origin marker is a click-through window drawn by `autoscroll/macos.rs` on the main thread, fed by a non-blocking sink.
 
 ## Ctrl as Command
 
