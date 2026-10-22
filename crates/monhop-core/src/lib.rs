@@ -6,7 +6,6 @@ pub mod capture_physical;
 pub mod chord;
 pub mod clicks;
 pub mod control_as_command;
-pub mod cursor_park;
 pub mod dimming;
 pub mod floor;
 pub mod gesture_latch;

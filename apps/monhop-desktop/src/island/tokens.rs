@@ -1,10 +1,7 @@
 //! The island's design values, read from the window's own stylesheet so there is one home for
-//! every duration, easing, size and color, plus the springs those tokens describe. The live
-//! pointer's marks read theirs here too.
+//! every duration, easing, size and color, plus the springs those tokens describe.
 
-use std::{collections::BTreeMap, f64::consts::PI, fmt, sync::OnceLock, time::Duration};
-
-use monhop_core::pointer_mark::MarkStyle;
+use std::{collections::BTreeMap, f64::consts::PI, fmt, sync::OnceLock};
 
 const STYLESHEET: &str = include_str!("../../ui/styles.css");
 
@@ -142,11 +139,6 @@ impl Sheet {
         number_with_unit(self.raw(name)?, "ms")
             .map(|millis| millis / 1000.0)
             .ok_or_else(|| problem(name, "not a ms duration"))
-    }
-
-    pub fn duration(&self, name: &str) -> Result<Duration, TokenError> {
-        Duration::try_from_secs_f64(self.ms(name)?)
-            .map_err(|_| problem(name, "not a non-negative duration"))
     }
 
     pub fn number(&self, name: &str) -> Result<f64, TokenError> {
@@ -550,34 +542,6 @@ pub fn tokens() -> Result<&'static IslandTokens, &'static TokenError> {
         .as_ref()
 }
 
-/// The live pointer's copy and ring, parsed once. The ring takes the dark `--primary`, which reads
-/// on any content behind it; it fades out entirely.
-pub fn mark_style() -> Result<&'static MarkStyle, &'static TokenError> {
-    static STYLE: OnceLock<Result<MarkStyle, TokenError>> = OnceLock::new();
-    STYLE
-        .get_or_init(|| Sheet::parse(STYLESHEET).and_then(|sheet| mark_style_from(&sheet)))
-        .as_ref()
-}
-
-fn mark_style_from(sheet: &Sheet) -> Result<MarkStyle, TokenError> {
-    let [red, green, blue, _] = sheet.color("--primary")?.srgb();
-    Ok(MarkStyle {
-        idle_opacity: sheet.number("--opacity-idle-pointer")?,
-        idle_fade: sheet.duration("--motion-base")?,
-        ease: sheet.bezier("--ease-out")?,
-        ring_diameter: sheet.px("--arrival-ring-size")?,
-        ring_stroke: sheet.px("--stroke-bold")?,
-        ring_rgb: [red, green, blue],
-        ring_fill: sheet.number("--opacity-arrival-fill")?,
-        ring_scale: (
-            sheet.number("--scale-arrival-ring-from")?,
-            sheet.number("--scale-arrival-ring-to")?,
-        ),
-        ring_opacity: (sheet.number("--opacity-arrival-ring")?, 0.0),
-        ring_duration: sheet.duration("--motion-arrival")?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,30 +718,6 @@ mod tests {
         let blur_left = 1.0 - ease_at(tokens.ease_focus, faded_in / tokens.focus);
         assert!(blur_left > 0.5, "blur left {blur_left} at {faded_in} s");
         assert!(close(ease_at(tokens.ease_focus, 1.0), 1.0, 1e-9));
-    }
-
-    #[test]
-    fn the_live_pointer_marks_take_the_design_numbers_from_the_real_stylesheet() {
-        let style = mark_style().expect("every live pointer token parses from styles.css");
-        assert_eq!(style.idle_opacity, 0.3);
-        assert_eq!(style.idle_fade, Duration::from_millis(220));
-        assert_eq!(style.ease, [0.22, 1.0, 0.36, 1.0]);
-        assert_eq!((style.ring_diameter, style.ring_stroke), (44.0, 2.0));
-        assert_eq!(style.ring_fill, 0.16);
-        assert_eq!(style.ring_scale, (0.35, 1.6));
-        assert_eq!(style.ring_opacity, (0.95, 0.0));
-        assert_eq!(style.ring_duration, Duration::from_millis(720));
-        // The dark --primary, oklch(.72 .17 356): the rose accent.
-        let [r, g, b, _] = Color::from_oklch(0.72, 0.17, 356.0, 1.0).srgb();
-        assert_eq!(style.ring_rgb, [r, g, b]);
-        assert!(r > g && b > g, "rose, not gray");
-    }
-
-    #[test]
-    fn a_negative_duration_is_a_token_error() {
-        let sheet = Sheet::parse(":root { --back: -5ms; --fine: 5ms; }").unwrap();
-        assert!(sheet.duration("--back").is_err());
-        assert_eq!(sheet.duration("--fine"), Ok(Duration::from_millis(5)));
     }
 
     #[test]

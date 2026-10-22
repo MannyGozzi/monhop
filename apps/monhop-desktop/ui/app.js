@@ -111,7 +111,6 @@ import { clipboardContext, invokeSetComputerEnabled, pollFingerprint } from "./a
 import { autoscrollContext } from "./autoscroll-model.mjs";
 import { swipeContext } from "./swipe-model.mjs";
 import { controlAsCommandContext } from "./keyboard-model.mjs";
-import { livePointerContext } from "./live-pointer-model.mjs";
 import { forgetArrangementMotion } from "./dashboard-arrangement.mjs";
 import {
   applyDimmingView,
@@ -213,8 +212,6 @@ const pointerSwitches = {
 };
 // Windows's keyboard switch, undefined until its status answers.
 const controlAsCommand = { view: undefined, pending: false };
-// Which pointer is live, on a Mac and on Windows; undefined until its status answers.
-const livePointer = { view: undefined, pending: false };
 let theme = "system";
 let themePending = false;
 let dimmingRequest = 0;
@@ -481,7 +478,6 @@ if (!uiCheck) {
   listenClipboard();
   if (platform === "macos") void loadPointerSwitches();
   if (platform === "windows") void loadControlAsCommand();
-  void loadLivePointer();
   void loadUpdatesStatus();
   void loadAutostartStatus();
   if (platform === "macos") void loadIslandStatus();
@@ -788,7 +784,6 @@ function context() {
       controlAsCommand.view,
       controlAsCommand.pending,
     ),
-    livePointer: livePointerContext(platform, livePointer.view, livePointer.pending),
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
     island: islandContext(platform, island, islandPending),
@@ -838,7 +833,6 @@ function context() {
       setAutoscrollEnabled,
       setSwipeEnabled,
       setControlAsCommand,
-      setLivePointerEnabled,
       startRename,
       draftRename,
       cancelRename,
@@ -2123,19 +2117,6 @@ async function loadControlAsCommand() {
 
 function setControlAsCommand(enabled) {
   void setSavedSwitch(controlAsCommand, "control_as_command_set_enabled", enabled);
-}
-
-// ---------- live pointer ----------
-
-async function loadLivePointer() {
-  if (!core?.invoke) return;
-  // A backend without the command leaves the row out.
-  livePointer.view = await core.invoke("live_pointer_status").catch(() => undefined);
-  render();
-}
-
-function setLivePointerEnabled(enabled) {
-  void setSavedSwitch(livePointer, "live_pointer_set_enabled", enabled);
 }
 
 // ---------- updates ----------

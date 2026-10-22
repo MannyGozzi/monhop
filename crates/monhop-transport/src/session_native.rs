@@ -9,7 +9,6 @@ use monhop_core::{
     DeviceId, DisplayId, FloorPeer, GesturePhase, InjectionPermit, MAX_GROUP_PEERS, Platform,
     Point, PointerGesture, RevocationSignal, TakeBackGate,
     clicks::{ClickLanding, FALLBACK_DOUBLE_CLICK_INTERVAL},
-    cursor_park::{PARK, ParkKind, ParkSignal, ParkTracker},
     pointer_mark::{PageDirection, PageTurn},
 };
 use monhop_protocol::{DisplayDescription, DisplayTopology};
@@ -34,7 +33,6 @@ pub fn last_destination_step() -> u8 {
 static AUTOSCROLL: AtomicBool = AtomicBool::new(false);
 static AUTOSCROLL_MARKER: MarkSink<AutoscrollMarker> = MarkSink::new();
 static PAGE_TURN_MARK: MarkSink<PageTurn> = MarkSink::new();
-static ARRIVAL_MARK: MarkSink<Point> = MarkSink::new();
 
 /// A pointer mark's one app-registered sink. It runs on the injection thread, so it must hand the
 /// change to its own thread and return without waiting.
@@ -79,12 +77,6 @@ pub fn set_page_turn_mark(sink: impl Fn(PageTurn) + Send + Sync + 'static) -> bo
     PAGE_TURN_MARK.set(sink)
 }
 
-/// Registers the sink told where control lands as a source's pointer enters this computer with no
-/// destination idle open; an open idle ends through the park signal instead. See `MarkSink`.
-pub fn set_arrival_mark(sink: impl Fn(Point) + Send + Sync + 'static) -> bool {
-    ARRIVAL_MARK.set(sink)
-}
-
 /// The platform of the peer in each floor slot, so a destination knows which computer drives it.
 #[derive(Clone, Default)]
 pub(crate) struct SourcePlatforms(Arc<[AtomicU8; MAX_GROUP_PEERS]>);
@@ -107,7 +99,8 @@ impl SourcePlatforms {
         }
     }
 
-    /// None for an unknown or empty slot, which never starts autoscroll and ends a destination idle.
+    /// None for an unknown or empty slot, which never starts autoscroll.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn of(&self, slot: FloorPeer) -> Option<Platform> {
         match self.cell(slot)?.load(Ordering::Acquire) {
             1 => Some(Platform::Windows),
@@ -224,8 +217,6 @@ pub(crate) struct NativeDestination {
     sequencer: Sequencer,
     #[cfg(target_os = "macos")]
     autoscroll: MacAutoscroll,
-    idle: DestinationIdle,
-    arrival: ArrivalLatch,
 }
 
 /// A Windows mouse's middle button autoscrolls this Mac while the switch is on.
@@ -294,6 +285,8 @@ impl NativeDestination {
         if revocation.is_stopping() {
             return Err(note_step(1));
         }
+        #[cfg(not(target_os = "macos"))]
+        let _ = sources;
         #[cfg(windows)]
         let (left, top, right, bottom) = displays.displays().iter().fold(
             (
@@ -336,34 +329,11 @@ impl NativeDestination {
             #[cfg(target_os = "macos")]
             autoscroll: MacAutoscroll {
                 machine: crate::session_autoscroll::Autoscroll::new(),
-                sources: sources.clone(),
+                sources,
                 shown: None,
             },
-            idle: DestinationIdle::new(&PARK, sources),
-            arrival: ArrivalLatch::default(),
         };
         Ok(result)
-    }
-
-    /// Posts the autoscroll owed since the last tick, behind the same gates as any other input.
-    #[cfg(target_os = "macos")]
-    fn tick_autoscroll(&mut self) {
-        let now = std::time::Instant::now();
-        let (controller, enabled) = (
-            self.sequencer.controller(),
-            AUTOSCROLL.load(Ordering::Acquire),
-        );
-        if let Some(step) = self.autoscroll.machine.tick(now, controller, enabled) {
-            let native = &mut self.native;
-            if self
-                .sequencer
-                .apply(step.scroll, |post| native.post_scroll_at(post, step.at))
-                .is_err()
-            {
-                self.autoscroll.machine.stop(now);
-            }
-        }
-        self.autoscroll.signal_marker();
     }
 }
 
@@ -387,14 +357,30 @@ impl WatchedDestination for NativeDestination {
             permission_checked: None,
         }
     }
-    /// The idle's beat comes first, so a slow native step never delays it. Windows then releases
-    /// again any key or button whose release it silently dropped.
+    /// Releases again any key or button whose release Windows silently dropped.
+    #[cfg(windows)]
     fn tick(&mut self) {
-        self.idle.tick();
-        #[cfg(windows)]
         self.native.injector.tick(std::time::Instant::now());
-        #[cfg(target_os = "macos")]
-        self.tick_autoscroll();
+    }
+    /// Posts the autoscroll owed since the last tick, behind the same gates as any other input.
+    #[cfg(target_os = "macos")]
+    fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        let (controller, enabled) = (
+            self.sequencer.controller(),
+            AUTOSCROLL.load(Ordering::Acquire),
+        );
+        if let Some(step) = self.autoscroll.machine.tick(now, controller, enabled) {
+            let native = &mut self.native;
+            if self
+                .sequencer
+                .apply(step.scroll, |post| native.post_scroll_at(post, step.at))
+                .is_err()
+            {
+                self.autoscroll.machine.stop(now);
+            }
+        }
+        self.autoscroll.signal_marker();
     }
 }
 
@@ -436,15 +422,10 @@ impl InputDestination for NativeDestination {
         let native = &mut self.native;
         let displays = &self.displays;
         let mut turned = None;
-        let mut moved = None;
         let mut post = |post: DestinationAction| {
             native.post(displays, post)?;
-            match post {
-                DestinationAction::System(gesture) => turned = PageDirection::of(gesture),
-                DestinationAction::MoveTo(at) => {
-                    moved.get_or_insert(at);
-                }
-                _ => {}
+            if let DestinationAction::System(gesture) = post {
+                turned = PageDirection::of(gesture);
             }
             Ok(())
         };
@@ -463,105 +444,12 @@ impl InputDestination for NativeDestination {
         };
         #[cfg(not(target_os = "macos"))]
         let applied = self.sequencer.apply(action, &mut post);
-        let sequencer = &self.sequencer;
-        self.arrival.after_apply(
-            moved,
-            || sequencer.controller(),
-            &mut self.idle,
-            |at| ARRIVAL_MARK.signal(at),
-        );
         if let Some(direction) = turned
             && let Some(at) = current_pointer_position()
         {
             PAGE_TURN_MARK.signal(PageTurn { direction, at });
         }
         applied
-    }
-
-    /// One cursor read, while the floor still names the source that left.
-    fn control_left(&mut self) {
-        let slot = self.sequencer.admission.gate.floor().snapshot().peer;
-        self.idle.left(current_pointer_position(), slot);
-    }
-}
-
-/// Tells arrival apart from motion: true for one move per floor generation.
-#[derive(Default)]
-struct ArrivalLatch {
-    last: Option<u64>,
-}
-
-impl ArrivalLatch {
-    fn landed(&mut self, controller: Option<u64>) -> bool {
-        match controller {
-            Some(generation) if self.last != Some(generation) => {
-                self.last = Some(generation);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// The first move posted under a new controller lands control here: it ends an open idle,
-    /// whose release then rings, or else tells `sink`. `controller` is read only after a move.
-    fn after_apply(
-        &mut self,
-        moved: Option<Point>,
-        controller: impl FnOnce() -> Option<u64>,
-        idle: &mut DestinationIdle,
-        sink: impl FnOnce(Point),
-    ) {
-        if let Some(at) = moved
-            && self.landed(controller())
-            && !idle.arrive(at)
-        {
-            sink(at);
-        }
-    }
-}
-
-/// This computer idle since control left it, held at the cursor's point until control lands again,
-/// the source's link closes or the destination goes away. Local input is the consumer's to see.
-struct DestinationIdle {
-    park: ParkTracker,
-    sources: SourcePlatforms,
-    /// Where the cursor was as control left, and for which floor slot.
-    open: Option<(Point, FloorPeer)>,
-}
-
-impl DestinationIdle {
-    fn new(signal: &'static ParkSignal, sources: SourcePlatforms) -> Self {
-        Self {
-            park: ParkTracker::new(signal, ParkKind::Destination),
-            sources,
-            open: None,
-        }
-    }
-
-    /// No cursor reading, no idle.
-    fn left(&mut self, at: Option<Point>, slot: FloorPeer) {
-        self.open = at.map(|at| (at, slot));
-        self.park.observe(at, || None);
-    }
-
-    /// True when an idle was open, which its release now rings for.
-    fn arrive(&mut self, at: Point) -> bool {
-        if self.open.take().is_none() {
-            return false;
-        }
-        self.park.observe(None, || Some(at));
-        true
-    }
-
-    /// Ends the idle once its source's link is gone; beats either way.
-    fn tick(&mut self) {
-        if self
-            .open
-            .is_some_and(|(_, slot)| self.sources.of(slot).is_none())
-        {
-            self.open = None;
-        }
-        self.park.observe(self.open.map(|(at, _)| at), || None);
     }
 }
 
@@ -655,6 +543,7 @@ impl Sequencer {
     }
 
     /// The floor generation now in control, which a take-back or a new claim changes.
+    #[cfg(any(target_os = "macos", test))]
     fn controller(&self) -> Option<u64> {
         self.still_in_control()
             .then(|| self.admission.gate.floor().snapshot().generation)
@@ -1566,217 +1455,5 @@ mod landing_tests {
             assert!(!sequencer.admission.buttons[MouseButton::Left.index()]);
             assert!(!gate.injected_held(), "the refused press is un-counted");
         }
-    }
-}
-
-#[cfg(test)]
-mod arrival_tests {
-    use super::*;
-    use monhop_core::{FloorState, SharedFloor, cursor_park::Park};
-
-    const LEFT_AT: Point = Point::new(300.0, 400.0);
-    const ENTRY: Point = Point::new(10.0, 20.0);
-
-    fn signal() -> &'static ParkSignal {
-        Box::leak(Box::new(ParkSignal::new()))
-    }
-
-    fn published(signal: &ParkSignal) -> (u64, Park) {
-        let read = signal.read().destination;
-        (read.seq, read.park)
-    }
-
-    fn idle_on(signal: &'static ParkSignal) -> DestinationIdle {
-        DestinationIdle::new(signal, SourcePlatforms::sole(Platform::MacOs))
-    }
-
-    #[test]
-    fn an_idle_holds_where_control_left_and_its_ticks_only_beat() {
-        let signal = signal();
-        let mut idle = idle_on(signal);
-        idle.left(Some(LEFT_AT), FloorPeer::SOLE);
-        assert_eq!(
-            published(signal),
-            (
-                1,
-                Park::Held {
-                    at: LEFT_AT,
-                    epoch: 1
-                }
-            )
-        );
-        idle.tick();
-        idle.tick();
-        assert_eq!(published(signal).0, 1);
-    }
-
-    #[test]
-    fn no_cursor_reading_means_no_idle() {
-        let signal = signal();
-        let mut idle = idle_on(signal);
-        idle.left(None, FloorPeer::SOLE);
-        idle.tick();
-        assert_eq!(published(signal).0, 0);
-        assert!(!idle.arrive(ENTRY), "nothing open, so the sink rings");
-    }
-
-    #[test]
-    fn a_closed_link_ends_the_idle_without_home() {
-        let sources = SourcePlatforms::sole(Platform::Windows);
-        let signal = signal();
-        let mut idle = DestinationIdle::new(signal, sources.clone());
-        idle.left(Some(LEFT_AT), FloorPeer::SOLE);
-        idle.tick();
-        sources.set(FloorPeer::SOLE, None);
-        idle.tick();
-        assert_eq!(
-            published(signal),
-            (
-                2,
-                Park::Free {
-                    epoch: 1,
-                    home: None
-                }
-            )
-        );
-        assert!(!idle.arrive(ENTRY));
-    }
-
-    #[test]
-    fn control_landing_on_an_open_idle_releases_it_at_the_entry() {
-        let signal = signal();
-        let mut idle = idle_on(signal);
-        idle.left(Some(LEFT_AT), FloorPeer::SOLE);
-        assert!(idle.arrive(ENTRY));
-        assert_eq!(
-            published(signal),
-            (
-                2,
-                Park::Free {
-                    epoch: 1,
-                    home: Some(ENTRY)
-                }
-            )
-        );
-        assert!(!idle.arrive(ENTRY));
-        idle.tick();
-        assert_eq!(published(signal).0, 2);
-    }
-
-    #[test]
-    fn a_destination_going_away_releases_its_idle_without_home() {
-        let signal = signal();
-        let mut idle = idle_on(signal);
-        idle.left(Some(LEFT_AT), FloorPeer::SOLE);
-        drop(idle);
-        assert_eq!(
-            published(signal),
-            (
-                2,
-                Park::Free {
-                    epoch: 1,
-                    home: None
-                }
-            )
-        );
-    }
-
-    /// A sequencer on one 1920x1080 display whose floor no source claims yet.
-    fn sequencer() -> (Sequencer, SharedFloor, TakeBackGate) {
-        let floor = SharedFloor::new();
-        let gate = TakeBackGate::new(floor.clone());
-        let displays = DisplayTopology::new(vec![DisplayDescription {
-            id: DisplayId(1),
-            name: "fixture".into(),
-            native_width: 1920,
-            native_height: 1080,
-            logical_origin: Point::new(0.0, 0.0),
-            logical_size: Point::new(1920.0, 1080.0),
-            scale_factor: 1.0,
-            is_primary: true,
-            monitor: None,
-        }])
-        .unwrap();
-        let sequencer = Sequencer::new(gate.clone(), RevocationSignal::default(), &displays);
-        (sequencer, floor, gate)
-    }
-
-    fn claim(floor: &SharedFloor, gate: &TakeBackGate) {
-        let receiving = floor
-            .transition(floor.snapshot(), FloorState::Receiving)
-            .unwrap();
-        gate.open_injection(receiving.generation);
-    }
-
-    fn move_to(x: f64, y: f64) -> DestinationAction {
-        DestinationAction::MoveTo(Point::new(x, y))
-    }
-
-    /// Applies `action` as `NativeDestination::apply` does; returns what reached the sink.
-    fn apply(
-        sequencer: &mut Sequencer,
-        latch: &mut ArrivalLatch,
-        idle: &mut DestinationIdle,
-        action: DestinationAction,
-    ) -> Vec<Point> {
-        let mut moved = None;
-        let _ = sequencer.apply(action, |post| {
-            if let DestinationAction::MoveTo(at) = post {
-                moved.get_or_insert(at);
-            }
-            Ok(())
-        });
-        let mut rung = Vec::new();
-        latch.after_apply(moved, || sequencer.controller(), idle, |at| rung.push(at));
-        rung
-    }
-
-    #[test]
-    fn the_first_move_of_each_claim_lands_once_at_its_posted_point() {
-        let signal = signal();
-        let (mut sequencer, floor, gate) = sequencer();
-        let (mut latch, mut idle) = (ArrivalLatch::default(), idle_on(signal));
-        let mut run = |action| apply(&mut sequencer, &mut latch, &mut idle, action);
-        claim(&floor, &gate);
-        assert_eq!(run(move_to(10.0, 20.0)), [Point::new(10.0, 20.0)]);
-        assert_eq!(run(move_to(11.0, 20.0)), []);
-        assert_eq!(
-            run(move_to(1500.0, 20.0)),
-            [],
-            "a reanchor in the same claim"
-        );
-
-        // A take-back ends the claim, and a move refused meanwhile lands nothing.
-        floor.reset();
-        assert_eq!(run(move_to(12.0, 20.0)), []);
-        claim(&floor, &gate);
-        assert_eq!(run(move_to(13.0, 20.0)), [Point::new(13.0, 20.0)]);
-        assert_eq!(published(signal).0, 0, "with no idle open, no park moves");
-    }
-
-    #[test]
-    fn the_first_move_after_control_left_ends_the_idle_instead_of_the_sink() {
-        let signal = signal();
-        let (mut sequencer, floor, gate) = sequencer();
-        let (mut latch, mut idle) = (ArrivalLatch::default(), idle_on(signal));
-        claim(&floor, &gate);
-        apply(&mut sequencer, &mut latch, &mut idle, move_to(10.0, 20.0));
-        idle.left(Some(LEFT_AT), FloorPeer::SOLE);
-        floor.reset();
-        claim(&floor, &gate);
-        assert_eq!(
-            apply(&mut sequencer, &mut latch, &mut idle, move_to(30.0, 40.0)),
-            []
-        );
-        assert_eq!(
-            published(signal),
-            (
-                2,
-                Park::Free {
-                    epoch: 1,
-                    home: Some(Point::new(30.0, 40.0))
-                }
-            )
-        );
     }
 }

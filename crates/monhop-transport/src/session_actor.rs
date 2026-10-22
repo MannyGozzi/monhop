@@ -571,13 +571,6 @@ impl<D: WatchedDestination> InputDestination for DestinationGuard<D> {
             }
         }
     }
-
-    fn control_left(&mut self) {
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.destination.control_left())) {
-            std::mem::forget(payload);
-            self.status.stop(ActorFailure::Panicked);
-        }
-    }
 }
 
 /// A panicking check stops the session like a panicking injection.
@@ -1600,96 +1593,6 @@ mod tests {
         assert_eq!(actor.failure(), Some(ActorFailure::Panicked));
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert!(!actor.cleanup_pending());
-        assert!(!monhop_core::NativeSessionClaim::is_claimed());
-    }
-
-    struct LeavingProbe {
-        _ownership: InjectionPermit,
-        left: SyncSender<()>,
-        panics: bool,
-    }
-
-    impl InputDestination for LeavingProbe {
-        fn apply(&mut self, _: DestinationAction) -> Result<(), DestinationFailure> {
-            Ok(())
-        }
-
-        fn control_left(&mut self) {
-            let _ = self.left.try_send(());
-            assert!(!self.panics, "fixture failure as control leaves");
-        }
-    }
-
-    impl WatchedDestination for LeavingProbe {
-        type Environment = ProbeEnvironment;
-        fn environment(&mut self) -> ProbeEnvironment {
-            ProbeEnvironment::steady()
-        }
-    }
-
-    /// An actor whose source activated and then returned.
-    fn returned_to(panics: bool) -> (DestinationActor, Receiver<()>) {
-        let (left, departures) = mpsc::sync_channel(4);
-        let ownership = monhop_core::NativeSessionClaim::claim()
-            .expect("test owns native input")
-            .split()
-            .1;
-        let actor = DestinationActor::start_after_local_enable(
-            displays(),
-            RevocationSignal::default(),
-            ownership,
-            TakeBackGate::new(monhop_core::SharedFloor::new()),
-            false,
-            true,
-            move |ownership| {
-                Ok(LeavingProbe {
-                    _ownership: ownership,
-                    left,
-                    panics,
-                })
-            },
-        )
-        .unwrap();
-        wait_until(|| actor.is_native_ready());
-        actor
-            .handoff_ready(
-                ready_control(SessionEpoch::new(1).unwrap(), 3),
-                SessionClock::try_now().unwrap(),
-            )
-            .unwrap();
-        wait_until(|| actor.is_started());
-        actor.try_submit(activation()).unwrap();
-        actor
-            .try_submit(Frame::new(
-                SessionEpoch::new(2).unwrap(),
-                1,
-                Message::ReleaseAll,
-            ))
-            .unwrap();
-        (actor, departures)
-    }
-
-    #[test]
-    fn the_guard_forwards_control_left_once() {
-        let _test = lock_test();
-        let (mut actor, departures) = returned_to(false);
-        departures.recv_timeout(Duration::from_millis(500)).unwrap();
-        assert!(actor.failure().is_none());
-        actor.request_stop();
-        wait_until(|| actor.is_finished());
-        assert!(actor.finish());
-        assert!(departures.try_recv().is_err());
-        assert!(!monhop_core::NativeSessionClaim::is_claimed());
-    }
-
-    #[test]
-    fn a_panicking_control_left_stops_the_session_as_panicked() {
-        let _test = lock_test();
-        let (mut actor, departures) = returned_to(true);
-        departures.recv_timeout(Duration::from_millis(500)).unwrap();
-        wait_until(|| actor.failure().is_some());
-        assert_eq!(actor.failure(), Some(ActorFailure::Panicked));
-        wait_until(|| actor.finish());
         assert!(!monhop_core::NativeSessionClaim::is_claimed());
     }
 }

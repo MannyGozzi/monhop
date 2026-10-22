@@ -232,14 +232,6 @@ impl<D: InputDestination> InputDestination for OwnerGuard<'_, D> {
         }
         self.destination.apply(action)
     }
-
-    /// Only the inbound owner's departure leaves this computer idle.
-    fn control_left(&mut self) {
-        let floor = self.floor.snapshot();
-        if floor.state.owner() == Some(FloorOwner::Inbound) && floor.peer == self.slot {
-            self.destination.control_left();
-        }
-    }
 }
 
 /// Slot 1 is index 0; [`FloorPeer::NONE`] has none.
@@ -261,7 +253,6 @@ mod tests {
     struct Destination {
         calls: Vec<DestinationAction>,
         fail_release: bool,
-        left: usize,
     }
 
     impl InputDestination for Destination {
@@ -271,10 +262,6 @@ mod tests {
                 return Err(DestinationFailure);
             }
             Ok(())
-        }
-
-        fn control_left(&mut self) {
-            self.left += 1;
         }
     }
 
@@ -658,56 +645,6 @@ mod tests {
         assert_eq!(sent(taken), (2, 1, Message::TakeBack));
         assert_eq!(target.calls[calls..], [EndGestures, ReleaseAll]);
         assert!(set.take_back(&mut target).is_none());
-    }
-
-    #[test]
-    fn the_owner_guard_reports_control_left_only_for_the_inbound_owner() {
-        let floor = SharedFloor::new();
-        let mut target = Destination::default();
-        let leave = |target: &mut Destination, slot: FloorPeer| {
-            OwnerGuard {
-                destination: target,
-                floor: &floor,
-                slot,
-            }
-            .control_left();
-        };
-        leave(&mut target, slot(1));
-        floor
-            .claim(floor.snapshot(), FloorState::Requesting, slot(1))
-            .unwrap();
-        leave(&mut target, slot(1));
-        assert_eq!(target.left, 0, "free, then outbound");
-        floor.reset();
-        floor
-            .claim(floor.snapshot(), FloorState::Receiving, slot(1))
-            .unwrap();
-        leave(&mut target, slot(2));
-        assert_eq!(target.left, 0, "another slot's claim");
-        leave(&mut target, slot(1));
-        assert_eq!(target.left, 1);
-    }
-
-    #[test]
-    fn a_handover_between_sources_leaves_this_computer_idle_once() {
-        let (mut set, gate) = set_with(&[1, 2]);
-        let mut target = Destination::default();
-        let at = Duration::ZERO;
-        set.receive(slot(1), &activation(2), at, &mut target)
-            .unwrap();
-        // A bystander's barrier while the first source holds the floor is not a departure.
-        set.receive(slot(2), &frame(1, 0, Message::ReleaseAll), at, &mut target)
-            .unwrap();
-        assert_eq!(target.left, 0);
-        set.receive(slot(1), &frame(2, 1, Message::ReleaseAll), at, &mut target)
-            .unwrap();
-        assert_eq!(target.left, 1);
-        assert_eq!(gate.floor().snapshot().state, FloorState::Free);
-        assert_eq!(
-            sent(set.receive(slot(2), &activation(2), at, &mut target)),
-            (2, 0, Message::ActivationAck(DisplayId(1)))
-        );
-        assert_eq!(target.left, 1, "the next source's entry is no departure");
     }
 
     #[test]

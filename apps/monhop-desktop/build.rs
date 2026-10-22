@@ -55,8 +55,6 @@ fn main() {
             "swipe_set_enabled",
             "control_as_command_status",
             "control_as_command_set_enabled",
-            "live_pointer_status",
-            "live_pointer_set_enabled",
             "window_hide",
             "computers_load",
             "computers_rename",

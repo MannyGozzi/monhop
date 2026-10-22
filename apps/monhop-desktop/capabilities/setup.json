@@ -47,8 +47,6 @@
     "allow-swipe-set-enabled",
     "allow-control-as-command-status",
     "allow-control-as-command-set-enabled",
-    "allow-live-pointer-status",
-    "allow-live-pointer-set-enabled",
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-minimize",

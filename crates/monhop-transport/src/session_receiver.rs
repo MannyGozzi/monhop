@@ -51,9 +51,6 @@ impl DestinationAction {
 /// Implementations own their injected pressed state and retry incomplete release operations.
 pub trait InputDestination {
     fn apply(&mut self, action: DestinationAction) -> Result<(), DestinationFailure>;
-    /// Control left this computer for its source or another computer; never on a take-back. Called
-    /// while the floor still names the receiver's claim.
-    fn control_left(&mut self) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -578,8 +575,6 @@ impl InputReceiver {
         }
         match &frame.message {
             Message::ReleaseAll => {
-                // A take-back already yielded, and a duplicate barrier finds the claim gone.
-                let left = !self.yielding && self.floor_generation.is_some() && self.owns_native();
                 // Closing admission precedes native cleanup and the floor becoming available.
                 // Without the floor it is still acknowledged, but never releases another owner's
                 // input.
@@ -592,9 +587,6 @@ impl InputReceiver {
                     self.gate.note_injected_released();
                 } else {
                     self.open_gestures = [false; 2];
-                }
-                if left {
-                    destination.control_left();
                 }
                 self.release_floor();
                 self.keys.fill(false);
@@ -910,9 +902,6 @@ mod tests {
         fail_move: bool,
         fail_release: bool,
         fail_end_gestures: bool,
-        /// Read in each `control_left`, so a test sees the floor as the call found it.
-        floor: Option<SharedFloor>,
-        left: Vec<Option<FloorSnapshot>>,
     }
     impl InputDestination for Destination {
         fn apply(&mut self, action: DestinationAction) -> Result<(), DestinationFailure> {
@@ -924,11 +913,6 @@ mod tests {
                 return Err(DestinationFailure);
             }
             Ok(())
-        }
-
-        fn control_left(&mut self) {
-            self.left
-                .push(self.floor.as_ref().map(SharedFloor::snapshot));
         }
     }
     fn receiver() -> InputReceiver {
@@ -1862,113 +1846,6 @@ mod tests {
             }))
         );
         assert_eq!(floor.snapshot(), free);
-    }
-
-    /// A pairwise receiver on its own floor, and a destination that reads that floor.
-    fn watched() -> (InputReceiver, Destination, SharedFloor, TakeBackGate) {
-        let floor = SharedFloor::new();
-        let gate = TakeBackGate::new(floor.clone());
-        let receiver = receiver().with_floor(gate.clone(), false, true);
-        let target = Destination {
-            floor: Some(floor.clone()),
-            ..Default::default()
-        };
-        (receiver, target, floor, gate)
-    }
-
-    #[test]
-    fn a_return_reports_control_left_once_while_the_claim_still_holds_the_floor() {
-        let (mut receiver, mut target, floor, _gate) = watched();
-        let at = Duration::ZERO;
-        receiver.receive(&activate(), at, &mut target).unwrap();
-        let claimed = floor.snapshot();
-        assert_eq!(
-            receiver.receive(&frame(2, 1, Message::ReleaseAll), at, &mut target),
-            Ok(Some(Message::ReleaseAck))
-        );
-        assert_eq!(target.left, [Some(claimed)]);
-        assert_eq!(claimed.state, FloorState::Receiving);
-        assert_eq!(floor.snapshot().state, FloorState::Free);
-        assert_eq!(
-            receiver.receive(&frame(2, 2, Message::ReleaseAll), at, &mut target),
-            Ok(Some(Message::ReleaseAck))
-        );
-        assert_eq!(target.left.len(), 1, "a duplicate barrier finds no claim");
-    }
-
-    #[test]
-    fn a_take_back_never_reports_control_left() {
-        let (mut receiver, mut target, floor, gate) = watched();
-        let at = Duration::ZERO;
-        receiver.receive(&activate(), at, &mut target).unwrap();
-        take_back_locally(&gate);
-        assert_eq!(receiver.take_back(&mut target), Ok(Some(Message::TakeBack)));
-        assert_eq!(
-            receiver.receive(&frame(2, 1, Message::ReleaseAll), at, &mut target),
-            Ok(Some(Message::ReleaseAck))
-        );
-        assert_eq!(floor.snapshot().state, FloorState::Free);
-        assert!(target.left.is_empty());
-    }
-
-    #[test]
-    fn a_stop_a_cleanup_or_a_held_link_never_reports_control_left() {
-        let (mut receiver, mut target, _floor, _gate) = watched();
-        receiver
-            .receive(&activate(), Duration::ZERO, &mut target)
-            .unwrap();
-        target.fail_release = true;
-        receiver.stop(ReceiverFailure::PeerStopped, &mut target);
-        target.fail_release = false;
-        receiver.retry_cleanup(&mut target);
-        assert!(!receiver.cleanup_pending());
-        assert!(target.left.is_empty());
-
-        // A stall releases this side's claim at once, so the barrier that ends it finds none.
-        let (mut receiver, mut target, floor, _gate) = watched();
-        receiver
-            .receive(&activate(), Duration::ZERO, &mut target)
-            .unwrap();
-        assert_eq!(receiver.tick(PEER_LIVENESS, &mut target), Ok(None));
-        assert_eq!(floor.snapshot().state, FloorState::Free);
-        assert_eq!(
-            receiver.receive(
-                &frame(2, 1, Message::ReleaseAll),
-                PEER_LIVENESS,
-                &mut target
-            ),
-            Ok(Some(Message::ReleaseAck))
-        );
-        assert!(target.left.is_empty());
-    }
-
-    #[test]
-    fn a_shared_receiver_reports_control_left_only_for_its_own_claim() {
-        let floor = SharedFloor::new();
-        let gate = TakeBackGate::new(floor.clone());
-        let at = Duration::ZERO;
-        let mut owner = shared(&gate, 1, false);
-        let mut owner_target = Destination {
-            floor: Some(floor.clone()),
-            ..Default::default()
-        };
-        owner.receive(&activate(), at, &mut owner_target).unwrap();
-        let claimed = floor.snapshot();
-
-        let mut other = shared(&gate, 2, false);
-        let mut other_target = Destination::default();
-        assert_eq!(
-            other.receive(&frame(1, 0, Message::ReleaseAll), at, &mut other_target),
-            Ok(Some(Message::ReleaseAck))
-        );
-        assert!(other_target.left.is_empty());
-
-        assert_eq!(
-            owner.receive(&frame(2, 1, Message::ReleaseAll), at, &mut owner_target),
-            Ok(Some(Message::ReleaseAck))
-        );
-        assert_eq!(owner_target.left, [Some(claimed)]);
-        assert_eq!(claimed.peer, FloorPeer::slot(1).unwrap());
     }
 
     use GesturePhase::{Began, Cancelled, Changed, Ended};
