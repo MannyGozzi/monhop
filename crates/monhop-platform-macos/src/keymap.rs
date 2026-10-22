@@ -14,7 +14,9 @@ pub enum KeyMapError {
 /// Maps a USB HID keyboard usage to the matching macOS physical key position.
 ///
 /// The mapping deliberately rejects usages with no physical Quartz key-code
-/// equivalent, including media and application-control usages.
+/// equivalent, including media and application-control usages. Print Screen,
+/// Scroll Lock and Pause, which Mac keyboards lack, become F13, F14 and F15 as
+/// on Apple's extended keyboard, in this direction only.
 pub const fn hid_to_mac_virtual_key(usage: HidUsage) -> Result<MacVirtualKey, KeyMapError> {
     let key = match usage.0 {
         0x04 => 0x00,
@@ -82,6 +84,9 @@ pub const fn hid_to_mac_virtual_key(usage: HidUsage) -> Result<MacVirtualKey, Ke
         0x43 => 0x6D,
         0x44 => 0x67,
         0x45 => 0x6F,
+        0x46 => 0x69,
+        0x47 => 0x6B,
+        0x48 => 0x71,
         0x49 => 0x72,
         0x4A => 0x73,
         0x4B => 0x74,

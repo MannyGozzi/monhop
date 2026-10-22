@@ -294,6 +294,8 @@ pub struct MacInjector {
     hotkeys: SymbolicHotkeys,
     /// Gestures with no macOS action: rotations, smart zooms, system gestures with nothing bound.
     unsupported_gestures: u64,
+    /// Key presses and releases of usages with no Mac key, dropped instead of ending sharing.
+    unsupported_keys: u64,
 }
 
 impl MacInjector {
@@ -326,6 +328,7 @@ impl MacInjector {
             stuck_chord_keys: StuckChordKeys::default(),
             hotkeys,
             unsupported_gestures: 0,
+            unsupported_keys: 0,
         })
     }
 
@@ -338,10 +341,14 @@ impl MacInjector {
     }
 
     pub fn key(&mut self, usage: HidUsage, is_down: bool) -> Result<(), MacError> {
-        if !should_post_held_state_event(is_down, self.held_keys.contains(&usage)) {
-            return Ok(());
-        }
-        let virtual_key = hid_to_mac_virtual_key(usage)?;
+        let virtual_key = match key_post(usage, is_down, self.held_keys.contains(&usage)) {
+            KeyPost::Key(key) => key,
+            KeyPost::Nothing => return Ok(()),
+            KeyPost::Unsupported => {
+                self.unsupported_keys = self.unsupported_keys.saturating_add(1);
+                return Ok(());
+            }
+        };
         let flags = self.modifier_flags_for_key(usage, is_down);
         backend::post_key(
             self.destination,
@@ -777,6 +784,12 @@ impl Drop for MacInjector {
                 self.unsupported_gestures
             );
         }
+        if self.unsupported_keys > 0 {
+            log::info!(
+                "dropped {} key events with no macOS key",
+                self.unsupported_keys
+            );
+        }
     }
 }
 
@@ -847,6 +860,25 @@ const fn should_post_held_state_event(is_down: bool, is_tracked: bool) -> bool {
     is_down || is_tracked
 }
 
+/// What one wire key transition posts on macOS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyPost {
+    Key(MacVirtualKey),
+    /// The release of a key this injector never pressed.
+    Nothing,
+    /// A usage with no Mac key, press and release alike: dropped and counted, never an error, so a
+    /// key the Mac cannot type never ends sharing.
+    Unsupported,
+}
+
+const fn key_post(usage: HidUsage, is_down: bool, is_tracked: bool) -> KeyPost {
+    match hid_to_mac_virtual_key(usage) {
+        Err(_) => KeyPost::Unsupported,
+        Ok(_) if !should_post_held_state_event(is_down, is_tracked) => KeyPost::Nothing,
+        Ok(key) => KeyPost::Key(key),
+    }
+}
+
 const fn mouse_button_index(button: MouseButton) -> usize {
     match button {
         MouseButton::Left => 0,
@@ -861,11 +893,11 @@ const fn mouse_button_index(button: MouseButton) -> usize {
 mod tests {
     use std::collections::BTreeMap;
 
-    use monhop_core::{LogicalRect, LogicalSize, MouseButton, Point};
+    use monhop_core::{HidUsage, LogicalRect, LogicalSize, MouseButton, Point};
 
     use super::{
-        CursorState, MacError, ScrollResidual, clear_cursor_after_button_recovery,
-        should_post_held_state_event,
+        CursorState, KeyPost, MacError, MacVirtualKey, ScrollResidual,
+        clear_cursor_after_button_recovery, key_post, should_post_held_state_event,
     };
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
@@ -945,6 +977,39 @@ mod tests {
         assert!(should_post_held_state_event(true, false));
         assert!(should_post_held_state_event(false, true));
         assert!(!should_post_held_state_event(false, false));
+    }
+
+    #[test]
+    fn print_screen_scroll_lock_and_pause_post_f13_to_f15_and_release_them() {
+        for (usage, key) in [(0x46, 0x69), (0x47, 0x6B), (0x48, 0x71)] {
+            assert_eq!(
+                key_post(HidUsage(usage), true, false),
+                KeyPost::Key(MacVirtualKey(key))
+            );
+            assert_eq!(
+                key_post(HidUsage(usage), false, true),
+                KeyPost::Key(MacVirtualKey(key))
+            );
+        }
+    }
+
+    /// Menu, Power, F21-F24 and the keypad extras a Windows keyboard can send.
+    #[test]
+    fn a_key_the_mac_cannot_type_is_dropped_on_press_and_release_instead_of_failing() {
+        for usage in [0x32, 0x65, 0x66, 0x70, 0x71, 0x72, 0x73, 0x85, 0xA4] {
+            for (is_down, is_tracked) in [(true, false), (false, false), (false, true)] {
+                assert_eq!(
+                    key_post(HidUsage(usage), is_down, is_tracked),
+                    KeyPost::Unsupported,
+                    "{usage:#x}"
+                );
+            }
+        }
+        assert_eq!(key_post(HidUsage(0x04), false, false), KeyPost::Nothing);
+        assert_eq!(
+            key_post(HidUsage(0x04), true, false),
+            KeyPost::Key(MacVirtualKey(0x00))
+        );
     }
 
     #[test]

@@ -20,6 +20,9 @@ fn cancelled_capture_returns_before_permissions_or_native_setup() {
     );
 }
 
+/// Print Screen, Scroll Lock and Pause, which a Mac types as F13, F14 and F15.
+const MAC_ALIASES: [(u16, u16); 3] = [(0x46, 0x68), (0x47, 0x69), (0x48, 0x6A)];
+
 #[test]
 fn every_supported_hid_mapping_round_trips_without_changing_physical_key() {
     for raw in 0x04_u16..=0xE7 {
@@ -27,6 +30,9 @@ fn every_supported_hid_mapping_round_trips_without_changing_physical_key() {
         let Ok(virtual_key) = hid_to_mac_virtual_key(usage) else {
             continue;
         };
+        if MAC_ALIASES.iter().any(|(alias, _)| *alias == raw) {
+            continue;
+        }
         assert_eq!(
             mac_virtual_key_to_hid(virtual_key),
             Ok(usage),
@@ -56,14 +62,34 @@ fn maps_separate_meta_and_option_sides_to_mac_physical_keys() {
 }
 
 #[test]
+fn keys_a_mac_lacks_type_as_f13_to_f15_and_a_mac_f_key_still_captures_as_itself() {
+    for (alias, f_key) in MAC_ALIASES {
+        let virtual_key = hid_to_mac_virtual_key(HidUsage(alias)).expect("aliased key");
+        assert_eq!(hid_to_mac_virtual_key(HidUsage(f_key)), Ok(virtual_key));
+        assert_eq!(mac_virtual_key_to_hid(virtual_key), Ok(HidUsage(f_key)));
+    }
+}
+
+#[test]
 fn unknown_or_nonphysical_keys_are_explicitly_unsupported() {
-    assert_eq!(
-        hid_to_mac_virtual_key(HidUsage(0x46)),
-        Err(KeyMapError::UnsupportedHidUsage)
-    );
+    for raw in [0x65, 0x66, 0x70, 0x73] {
+        assert_eq!(
+            hid_to_mac_virtual_key(HidUsage(raw)),
+            Err(KeyMapError::UnsupportedHidUsage),
+            "{raw:#x}"
+        );
+    }
     assert_eq!(
         mac_virtual_key_to_hid(MacVirtualKey(u16::MAX)),
         Err(KeyMapError::UnsupportedMacVirtualKey)
+    );
+}
+
+#[test]
+fn a_windows_print_screen_reaches_a_mac_as_f13() {
+    assert_eq!(
+        hid_to_mac_virtual_key(HidUsage(0x46)).map_err(MacError::from),
+        Ok(MacVirtualKey(0x69))
     );
 }
 

@@ -351,6 +351,19 @@ impl Injector {
     }
 }
 
+/// Whether a wire key transition posts. A usage with no set-1 scan code posts nothing, press and
+/// release alike, so a key Windows cannot type never ends sharing.
+#[cfg(any(windows, test))]
+fn key_posts(usage: HidUsage, pressed: bool, held: bool) -> Result<bool, InputError> {
+    if crate::keymap::set1_from_hid_usage(usage).is_err() {
+        return Ok(false);
+    }
+    if !pressed && !held {
+        return Err(InputError::KeyNotHeld);
+    }
+    Ok(true)
+}
+
 fn normalize_absolute_axis(value: i32, origin: i32, extent: u32) -> i32 {
     if extent == 1 {
         return 0;
@@ -453,7 +466,7 @@ mod windows {
 
     use super::{
         CaptureStats, InjectionOperation, InputError, MAX_CAPTURE_DURATION, MONHOP_INJECTED_MARKER,
-        absolute_send_input_coordinates,
+        absolute_send_input_coordinates, key_posts,
     };
 
     const DIAGNOSTIC_CLASS_NAME: &[u16] = &[
@@ -820,6 +833,9 @@ mod windows {
         /// Wheel units an open pinch has not posted yet; `None` while no pinch is open.
         pinch_residual: Option<f64>,
         unconfirmed: Vec<Unconfirmed>,
+        /// Key presses and releases of usages with no set-1 scan code, dropped instead of ending
+        /// sharing.
+        unsupported_keys: u64,
     }
 
     impl Injector {
@@ -830,14 +846,16 @@ mod windows {
                 synthetic: Synthetic::new(),
                 pinch_residual: None,
                 unconfirmed: Vec::new(),
+                unsupported_keys: 0,
             }
         }
 
         pub fn inject(&mut self, operation: InjectionOperation) -> Result<(), InputError> {
             match operation {
                 InjectionOperation::Key { usage, pressed } => {
-                    if !pressed && !self.held_keys.contains(&usage) {
-                        return Err(InputError::KeyNotHeld);
+                    if !key_posts(usage, pressed, self.held_keys.contains(&usage))? {
+                        self.unsupported_keys = self.unsupported_keys.saturating_add(1);
+                        return Ok(());
                     }
                     self.post(Operation::Wire(Stroke::Key { usage, pressed }))?;
                     if pressed {
@@ -1096,6 +1114,12 @@ mod windows {
     impl Drop for Injector {
         fn drop(&mut self) {
             let _ = self.release_all();
+            if self.unsupported_keys > 0 {
+                log::info!(
+                    "dropped {} key events with no Windows key",
+                    self.unsupported_keys
+                );
+            }
         }
     }
 
@@ -1341,6 +1365,24 @@ mod windows {
             assert!(injector.unconfirmed.is_empty());
         }
 
+        /// The drop happens before any batch is planned, so this posts nothing.
+        #[test]
+        fn a_key_windows_cannot_type_is_dropped_on_press_and_release_and_counted() {
+            let keypad_equals = HidUsage(0x67);
+            let mut injector = Injector::new();
+            for pressed in [true, false] {
+                assert_eq!(
+                    injector.inject(InjectionOperation::Key {
+                        usage: keypad_equals,
+                        pressed,
+                    }),
+                    Ok(())
+                );
+                assert!(!injector.is_key_held(keypad_equals));
+            }
+            assert_eq!(injector.unsupported_keys, 2);
+        }
+
         #[test]
         fn keys_and_buttons_map_to_the_virtual_keys_windows_reads_them_under() {
             assert_eq!(virtual_key_of(HeldInput::Key(LEFT_ARROW)), Some(0x25));
@@ -1350,5 +1392,28 @@ mod windows {
                 Some(4)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keypad "=" from a Mac keyboard, Pause, and keypad extras no set-1 code carries.
+    #[test]
+    fn a_key_windows_cannot_type_posts_nothing_on_press_or_release() {
+        for usage in [0x67, 0x48, 0x85, 0xA4] {
+            for (pressed, held) in [(true, false), (false, false), (false, true)] {
+                assert_eq!(key_posts(HidUsage(usage), pressed, held), Ok(false));
+            }
+        }
+    }
+
+    #[test]
+    fn a_typeable_key_posts_and_only_a_held_one_releases() {
+        let a = HidUsage(0x04);
+        assert_eq!(key_posts(a, true, false), Ok(true));
+        assert_eq!(key_posts(a, false, true), Ok(true));
+        assert_eq!(key_posts(a, false, false), Err(InputError::KeyNotHeld));
     }
 }
