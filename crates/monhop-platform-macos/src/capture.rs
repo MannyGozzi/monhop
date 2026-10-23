@@ -1399,15 +1399,18 @@ impl CallbackState {
         !self.shared.stop.is_stopped()
     }
 
-    /// Motion hold tap records: while remote, handled here and dropped before Quartz moves the
-    /// cursor off its pin. Otherwise, or once capture fails open, they pass on to the capture tap.
-    fn held_motion(
-        &mut self,
-        event_type: CGEventType,
-        event: CGEventRef,
-        source: EventSourceMetadata,
-    ) -> bool {
-        self.remote() && self.native_event(event_type, event, source)
+    /// Motion hold tap records: while remote, each is moved onto the pin, where Quartz then places
+    /// the cursor. The capture tap still handles every record, so one stream keeps their order.
+    fn pin_motion(&mut self, event: CGEventRef) -> bool {
+        if !self.remote() {
+            return false;
+        }
+        let Some(pin) = self.remote_pin else {
+            return false;
+        };
+        // SAFETY: this active tap owns the live event it returns for the callback.
+        unsafe { CGEventSetLocation(event, CGPoint { x: pin.x, y: pin.y }) };
+        true
     }
 
     fn native_event(
@@ -1614,7 +1617,7 @@ unsafe extern "C" fn event_callback(
     }
 }
 
-/// Withholding motion at the session tap leaves the cursor moving; this HID tap drops it first.
+/// Withholding motion at the session tap leaves the cursor moving; this HID tap pins it first.
 unsafe extern "C" fn motion_hold_callback(
     _: CGEventTapProxy,
     event_type: CGEventType,
@@ -1633,14 +1636,10 @@ unsafe extern "C" fn motion_hold_callback(
         }
     };
     // The capture tap counts ignored sources when the record reaches it.
-    if should_ignore_source(source, SYNTHETIC_EVENT_MARKER) {
-        return event;
+    if !should_ignore_source(source, SYNTHETIC_EVENT_MARKER) {
+        with_callback(|state| state.pin_motion(event));
     }
-    if with_callback(|state| state.held_motion(event_type, event, source)) {
-        ptr::null()
-    } else {
-        event
-    }
+    event
 }
 
 unsafe extern "C" fn display_reconfiguration_callback(
@@ -2446,11 +2445,18 @@ mod callback_tests {
         })
     }
 
-    /// Returns whether the motion hold tap dropped one physical mouse-moved record.
-    fn hold_motion(state: &mut CallbackState, delta_x: i64, delta_y: i64) -> bool {
-        with_motion(delta_x, delta_y, |event| {
-            state.held_motion(CG_EVENT_MOUSE_MOVED, event, physical_source())
-        })
+    /// Passes one physical mouse-moved record through the motion hold tap, then the capture tap,
+    /// and returns where the hold tap left it and whether the capture tap withheld it.
+    fn hold_then_capture(state: &mut CallbackState, delta_x: i64, delta_y: i64) -> (Point, bool) {
+        let mut held_at = Point::new(f64::NAN, f64::NAN);
+        let withheld = with_motion(delta_x, delta_y, |event| {
+            state.pin_motion(event);
+            // SAFETY: event is live for this closure; the read borrows nothing.
+            let location = unsafe { CGEventGetLocation(event) };
+            held_at = Point::new(location.x, location.y);
+            state.native_event(CG_EVENT_MOUSE_MOVED, event, physical_source())
+        });
+        (held_at, withheld)
     }
 
     /// Hands `handle` one physical mouse-moved record created at 10,10.
@@ -2961,15 +2967,14 @@ mod callback_tests {
     }
 
     #[test]
-    fn remote_motion_is_forwarded_and_dropped_at_the_hold_tap() {
+    fn remote_motion_is_pinned_at_the_hold_tap_and_forwarded_once_by_the_capture_tap() {
         let (mut state, mut consumer) = callback_fixture();
         let pinned = Point::new(50.0, 50.0);
         state.pointer_position = Some(pinned);
         route_remote(&mut state, &mut consumer);
-        assert!(
-            hold_motion(&mut state, 3, -2),
-            "dropped before Quartz moves the cursor"
-        );
+        let (held_at, withheld) = hold_then_capture(&mut state, 3, -2);
+        assert_eq!(held_at, pinned, "Quartz places the cursor at the pin");
+        assert!(withheld);
         assert_eq!(
             queued(&mut consumer),
             [(
@@ -2977,33 +2982,29 @@ mod callback_tests {
                 true
             )]
         );
-        assert_eq!(state.pointer_position, Some(pinned));
         let episode = state.episode.as_ref().expect("activation opens an episode");
-        assert_eq!(
-            (episode.motion_suppressed, episode.motion_passed),
-            (1, 0),
-            "counted once, by the hold tap"
-        );
+        assert_eq!((episode.motion_suppressed, episode.motion_passed), (1, 0));
     }
 
     #[test]
-    fn local_motion_passes_the_hold_tap_unhandled() {
-        let (mut state, mut consumer) = callback_fixture();
-        assert!(!hold_motion(&mut state, 3, 0));
-        assert_capture_untouched(&state, &mut consumer);
-        assert_eq!(
-            state.pointer_position, None,
-            "only the capture tap reads local motion"
-        );
+    fn local_motion_passes_the_hold_tap_where_it_is() {
+        let (mut state, _consumer) = callback_fixture();
+        state.remote_pin = Some(Point::new(50.0, 50.0));
+        let (held_at, withheld) = hold_then_capture(&mut state, 3, 0);
+        assert_eq!(held_at, Point::new(10.0, 10.0));
+        assert!(!withheld);
     }
 
     #[test]
-    fn a_stopped_capture_lets_motion_pass_the_hold_tap() {
+    fn a_stopped_capture_leaves_motion_where_it_is() {
         let (mut state, mut consumer) = callback_fixture();
+        state.pointer_position = Some(Point::new(50.0, 50.0));
         route_remote(&mut state, &mut consumer);
         state.shared.stop.stop(StopReason::NativeFailure);
-        assert!(
-            !hold_motion(&mut state, 3, 0),
+        let (held_at, _) = hold_then_capture(&mut state, 3, 0);
+        assert_eq!(
+            held_at,
+            Point::new(10.0, 10.0),
             "a stopped capture fails open"
         );
     }
