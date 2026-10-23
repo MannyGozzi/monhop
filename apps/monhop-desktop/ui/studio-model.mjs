@@ -234,24 +234,19 @@ export function resumeTarget({ lastActive = null, enabled = [] }) {
   return enabled[0] ?? null;
 }
 
-// The toolbar: Settings keeps only its title; the canvas offers Arrange over a placed arrangement
-// until arranging starts, where the Apply bar's own button is the way out (an unplaced computer's
-// card has its own). Its one sharing control starts sharing with a paired computer, then pauses
-// and resumes the group that is switched on.
-export function toolbarState({
-  selection,
-  arrange,
-  canArrange = false,
-  placed = true,
-  enabledCount = 0,
-  pairedCount = 0,
-  paused = false,
-}) {
+// A click on a placed arrangement starts arranging. Once it has, the Apply bar's own button is the way
+// out; an unplaced computer's card has its own way in, and Settings covers the canvas.
+export function isArrangeable({ selection, arrange, canArrange = false, placed = true }) {
+  return selection?.kind !== "settings" && !arrange.active && canArrange && placed;
+}
+
+// The toolbar: Settings keeps only its title. Its one sharing control starts sharing with a paired
+// computer, then pauses and resumes the group that is switched on.
+export function toolbarState({ selection, enabledCount = 0, pairedCount = 0, paused = false }) {
   const settings = selection?.kind === "settings";
   return {
     title: settings ? "Settings" : "Arrangement",
     canvasActions: !settings,
-    arrange: !arrange.active && canArrange && placed ? "begin" : null,
     pause: sharingControl({ enabledCount, pairedCount, paused }),
   };
 }

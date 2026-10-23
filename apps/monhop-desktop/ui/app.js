@@ -126,6 +126,7 @@ import {
   computerSelection,
   inspectorKind,
   inspectorPresentation,
+  isArrangeable,
   isPaused,
   listStep,
   localRowStatus,
@@ -230,6 +231,9 @@ const SHARING_ACTIONS = { start: startSharing, pause: pauseSharing, resume: resu
 let arrangeRequested = false;
 // The computer Arrange switched on to open the link; leaving without applying switches it off again.
 let arrangeSwitchedOn = null;
+// Arrange the hint started from the keyboard owes its focus to the Apply bar's way out, which a
+// command in flight disables; the focus lands there once it can.
+let leaveFocusOwed = false;
 // A Load pressed before its computer's link was up, as { fingerprint, layout }: Arrange opens with
 // that computer and the layout goes into the draft once the link connects.
 let loadOnConnect = null;
@@ -293,7 +297,6 @@ const nodes = {
   networkChipAddress: document.querySelector("#network-chip-address"),
   networkTooltip: document.querySelector("#network-tooltip"),
   networkMenu: document.querySelector("#network-menu"),
-  arrangeSlot: document.querySelector("#arrange-slot"),
   pauseSlot: document.querySelector("#pause-slot"),
   detailsSlot: document.querySelector("#details-slot"),
   workspace: document.querySelector(".workspace"),
@@ -333,9 +336,14 @@ for (const caption of nodes.windowControls.querySelectorAll("[data-window-action
 nodes.windowControls.hidden = platform !== "windows";
 accordionManager.mount();
 const toolbarControls = createToolbarControls();
+const arrangeHint = createArrangeHint();
 mountStaticGlyphs();
 
 nodes.sidebarSettings.addEventListener("click", () => select("settings"));
+// A primary click anywhere on a placed arrangement starts arranging; the side buttons still navigate.
+nodes.canvasStage.addEventListener("click", (event) => {
+  if (event.button === 0 && arrangeHint.arrangeable) arrangeWith();
+});
 document.addEventListener("mousedown", (event) => {
   if (MOUSE_STEPS[event.button]) event.preventDefault();
 });
@@ -711,11 +719,14 @@ function studioContext(status, active) {
     canvasComputer,
     canArrange,
     arrange,
-    toolbar: toolbarState({
+    arrangeable: isArrangeable({
       selection,
       arrange,
       canArrange,
       placed: canvasComputer?.setup?.saved === true,
+    }),
+    toolbar: toolbarState({
+      selection,
       enabledCount: enabled.length,
       pairedCount: fingerprints.length,
       paused,
@@ -908,6 +919,7 @@ function render() {
   renderToolbar(ctx);
   renderSidebar(nodes, ctx);
   renderCanvas(nodes, ctx);
+  renderArrangeHint(ctx);
   renderInspector(ctx);
   renderSettings(nodes, ctx);
   followDims(nodes.studio, dims);
@@ -916,6 +928,7 @@ function render() {
   // A control that moved the selection and left with it hands focus to the selected row.
   if (selectionChanged && interaction.focused && document.activeElement === document.body)
     nodes.sidebarIndicator.parentElement?.focus({ preventScroll: true });
+  settleLeaveFocus(studio);
   if (previousArrangementView && previousArrangementView !== arrangementView)
     previousArrangementView.destroy();
   syncArrangements();
@@ -1089,24 +1102,9 @@ function mountStaticGlyphs() {
   nodes.sidebarRefresh.replaceChildren(refresh);
 }
 
-// The toolbar's buttons, and Arrange floating over the canvas, outlive renders, so hover, focus and
-// a label mid-change carry on. The sharing button draws both of its glyphs and cross-fades between
-// them; short of room, a tooltip names each one.
+// The toolbar's buttons outlive renders, so hover, focus and a label mid-change carry on. The sharing
+// button draws both of its glyphs and cross-fades between them; short of room, a tooltip names each one.
 function createToolbarControls() {
-  const arrange = button("", {
-    variant: "secondary",
-    focusKey: "canvas-arrange-float",
-    onClick: () => arrangeWith(),
-  });
-  arrange.id = "canvas-arrange";
-  arrange.append(
-    el("span", {
-      className: "canvas-arrange-glyph",
-      attrs: { "aria-hidden": "true" },
-      children: [icon("monitor", 14)],
-    }),
-    el("span", { className: "canvas-arrange-label", text: "Arrange" }),
-  );
   const pause = button("", {
     variant: "secondary",
     size: "sm",
@@ -1124,7 +1122,6 @@ function createToolbarControls() {
     }),
     pauseLabel,
   );
-  const arrangeTip = toolbarTooltip("canvas-arrange-tooltip", arrange);
   const pauseTip = toolbarTooltip("toolbar-pause-tooltip", pause);
   // Below the overlay width a closed details sheet comes back from here.
   const details = iconButton({
@@ -1135,10 +1132,9 @@ function createToolbarControls() {
     size: "sm",
     onClick: showInspector,
   });
-  nodes.arrangeSlot.replaceChildren(arrange, arrangeTip);
   nodes.pauseSlot.replaceChildren(pause, pauseTip);
   nodes.detailsSlot.replaceChildren(details);
-  return { arrange, pause, pauseLabel, arrangeTip, pauseTip, pauseMode: null };
+  return { pause, pauseLabel, pauseTip, pauseMode: null };
 }
 
 function toolbarTooltip(id, control) {
@@ -1155,14 +1151,7 @@ function renderToolbar(ctx) {
   turnGlyph(refresh.querySelector(":scope > svg"), "computers-refresh", computersLoad.running);
   const canvas = toolbar.canvasActions;
   const busy = ctx.busy;
-  const { arrange, pause, pauseLabel, arrangeTip, pauseTip } = toolbarControls;
-  if (toolbar.arrange) {
-    // Arranging stops a session, so the tip says so then, and shows at any width.
-    const hint = isSessionActive(sharing);
-    arrangeTip.textContent = hint ? ARRANGE_PAUSES : "Arrange";
-    nodes.arrangeSlot.dataset.hint = String(hint);
-    arrange.disabled = busy;
-  }
+  const { pause, pauseLabel, pauseTip } = toolbarControls;
   toolbarControls.pauseMode = toolbar.pause;
   if (toolbar.pause) {
     const label = SHARING_LABELS[toolbar.pause];
@@ -1173,9 +1162,6 @@ function renderToolbar(ctx) {
     pause.dataset.variant = toolbar.pause === "pause" ? "secondary" : "primary";
     pause.disabled = busy;
   }
-  setSlotPresent(nodes.arrangeSlot, canvas && toolbar.arrange !== null, [], {
-    focusTarget: nodes.networkChip,
-  });
   const movers = [nodes.networkSlot];
   setSlotPresent(nodes.pauseSlot, canvas && toolbar.pause !== null, movers, {
     focusTarget: nodes.networkChip,
@@ -1282,6 +1268,82 @@ function onNetworkMenuKey(event) {
 }
 
 // ---------- arranging and pausing ----------
+
+// The hint over a placed arrangement says a click on it arranges. Mouse clicks pass through it to the
+// stage, so it is the keyboard's and assistive technology's way in; it outlives renders like the toolbar.
+function createArrangeHint() {
+  const detail = el("span", { className: "canvas-arrange-detail" });
+  const note = el("span", {
+    className: "visually-hidden",
+    attrs: { id: "canvas-arrange-hint-note" },
+  });
+  const node = el("button", {
+    className: "canvas-arrange-hint",
+    attrs: {
+      type: "button",
+      id: "canvas-arrange-hint",
+      "aria-label": "Arrange displays",
+      "aria-describedby": note.id,
+    },
+    children: [
+      el("span", {
+        className: "canvas-arrange-glyph",
+        attrs: { "aria-hidden": "true" },
+        children: [icon("monitor", 14)],
+      }),
+      el("span", { className: "canvas-arrange-label", text: "Click to arrange" }),
+      detail,
+      note,
+    ],
+  });
+  node.inert = true;
+  node.addEventListener("click", () => arrangeWith());
+  nodes.canvasStage.after(node);
+  return { node, detail, note, arrangeable: false };
+}
+
+// The pane's flag turns on the pointer, the tiles' hover look and the hint. Leaving it, the hint
+// hands its focus to the Apply bar's way out, drawn in the same pass, else to the selected row.
+function renderArrangeHint({ studio }) {
+  const { node, detail, note } = arrangeHint;
+  const { arrangeable } = studio;
+  arrangeHint.arrangeable = arrangeable;
+  nodes.canvasPane.dataset.arrangeable = String(arrangeable);
+  if (!arrangeable) {
+    const leave = studio.arrange.active ? leaveControl() : null;
+    if (leave && node.contains(document.activeElement)) leaveFocusOwed = true;
+    handOffFocus(node, leave ?? nodes.sidebarIndicator.parentElement);
+    // The Apply bar glides in hidden, so its button may not take the focus yet; the hint never keeps it.
+    if (node.contains(document.activeElement)) node.blur();
+  }
+  node.inert = !arrangeable;
+  // Arranging stops a session, so the hint says so then.
+  const session = isSessionActive(sharing);
+  note.textContent = session ? ARRANGE_PAUSES : "";
+  const pauses = session ? "Sharing pauses" : "";
+  if (detail.textContent === pauses) return;
+  const width = node.getBoundingClientRect().width;
+  setLabel(detail, pauses);
+  if (width) glideWidth(node, width);
+}
+
+function leaveControl() {
+  return nodes.canvasDock.querySelector('[data-focus-key="apply-bar-leave"]');
+}
+
+// The owed focus waits on the page until the way out can take it, and is dropped once the edit
+// opens, arranging ends or the user puts the focus elsewhere.
+function settleLeaveFocus({ arrange }) {
+  if (!leaveFocusOwed) return;
+  const leave = leaveControl();
+  const active = document.activeElement;
+  if (!arrange.active || (active !== document.body && active !== leave)) {
+    leaveFocusOwed = false;
+    return;
+  }
+  if (leave && !leave.disabled) leave.focus({ preventScroll: true });
+  leaveFocusOwed = document.activeElement !== leave || !isEditingLayout(sharing);
+}
 
 // Arrange opens the editor with the computer on the canvas; the canvas waits for the link.
 function arrangeWith(fingerprint) {

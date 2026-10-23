@@ -91,7 +91,8 @@ const RENDER_CHECK: &str = r#"(() => {
       && inspector.dataset.open === 'true' && !inspector.inert && inViewport(inspector)
       && inViewport(document.querySelector('.overview')) && inViewport(button)
       && button.disabled === false && document.querySelector('#settings-view').inert,
-    document.querySelector('#arrange-slot').hidden && document.querySelector('#pause-slot').hidden
+    document.querySelector('#canvas-pane').dataset.arrangeable === 'false'
+      && document.querySelector('#canvas-arrange-hint').inert && document.querySelector('#pause-slot').hidden
       && document.querySelectorAll('[data-select^="computer:"]').length === 0
       && document.querySelectorAll('[data-select="local"], [data-select="new"]').length === 2,
     (theme === undefined ? scheme === 'light dark' : scheme === theme)

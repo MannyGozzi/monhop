@@ -396,7 +396,7 @@ html[data-platform="macos"] .sidebar-top { justify-content: flex-end; padding-le
 /* Tooltips under toolbar controls: why the network is locked, and each button's name once it is only a glyph. */
 .toolbar-tooltip { position: absolute; z-index: 7; top: calc(100% + var(--gap-2)); right: 0; width: max-content; max-width: var(--tooltip-max-width); border-radius: var(--radius); padding: var(--gap-1) var(--gap-2); background: var(--surface-raised); box-shadow: var(--shadow-raised); color: var(--foreground); font-size: var(--text-sm); line-height: var(--leading-tight); opacity: 0; pointer-events: none; transform: scale(var(--scale-enter)); transform-origin: top right; transition: opacity var(--motion-fast) var(--ease-in-out), transform var(--motion-fast) var(--ease-out); }
 .toolbar-tooltip:empty { display: none; }
-#network-slot[data-locked="true"]:is(:hover, :focus-within) > .toolbar-tooltip, #network-slot[data-locked="true"]:has(.chip:focus-visible) > .toolbar-tooltip, #arrange-slot[data-hint="true"]:is(:hover, :focus-within) > .toolbar-tooltip { opacity: 1; transform: none; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
+#network-slot[data-locked="true"]:is(:hover, :focus-within) > .toolbar-tooltip, #network-slot[data-locked="true"]:has(.chip:focus-visible) > .toolbar-tooltip { opacity: 1; transform: none; transition: opacity var(--motion-fast) var(--ease-out), transform var(--motion-fast) var(--ease-out); }
 #network-slot:has(.menu[data-open="true"]) > .toolbar-tooltip { opacity: 0; transition: opacity var(--motion-fast) var(--ease-in-out); }
 
 /* Short of room, the toolbar's buttons keep their glyphs; the label stays for assistive technology. */
@@ -802,17 +802,17 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .arrangement-canvas { display: block; width: 100%; height: 100%; }
 /* Never scale this selector: CSS scale ignores the group's SVG translate attribute (arrangement-view.mjs
    setPosition), so the group would jump. Enter and leave scale its .arrangement-display tiles instead. */
-.arrangement-group.is-local { color: var(--display-local); }
-.arrangement-group.is-peer { color: var(--display-peer); }
+.arrangement-group.is-local { --tile-hue: var(--display-local); }
+.arrangement-group.is-peer { --tile-hue: var(--display-peer); }
 /* data-tone (arrangement-render.mjs) is the general hook members beyond local/peer rely on; the
    class rules above keep working for the two-computer case, which still sets both. */
-.arrangement-group[data-tone="local"] { color: var(--display-local); }
-.arrangement-group[data-tone="peer"] { color: var(--display-peer); }
-.arrangement-group[data-tone="peer-2"] { color: var(--display-peer-2); }
-.arrangement-group[data-tone="peer-3"] { color: var(--display-peer-3); }
-.arrangement-group[data-tone="peer-4"] { color: var(--display-peer-4); }
-.arrangement-group[data-tone="peer-5"] { color: var(--display-peer-5); }
-.arrangement-group[data-tone="peer-6"] { color: var(--display-peer-6); }
+.arrangement-group[data-tone="local"] { --tile-hue: var(--display-local); }
+.arrangement-group[data-tone="peer"] { --tile-hue: var(--display-peer); }
+.arrangement-group[data-tone="peer-2"] { --tile-hue: var(--display-peer-2); }
+.arrangement-group[data-tone="peer-3"] { --tile-hue: var(--display-peer-3); }
+.arrangement-group[data-tone="peer-4"] { --tile-hue: var(--display-peer-4); }
+.arrangement-group[data-tone="peer-5"] { --tile-hue: var(--display-peer-5); }
+.arrangement-group[data-tone="peer-6"] { --tile-hue: var(--display-peer-6); }
 .arrangement-group[tabindex] { cursor: grab; outline: none; }
 .arrangement-group[tabindex]:hover { filter: var(--filter-raised); }
 /* The dragged group follows the pointer one to one; only its lift animates. */

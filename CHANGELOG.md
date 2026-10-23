@@ -11,6 +11,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 ### Changed
 
 - Settings is split into pages you pick from a list beside them: Sharing, Clipboard, Screen dimming, Mouse and trackpad on a Mac or Keyboard on Windows, General, Updates and About. Each page groups its controls under short headings, the keys that take your keyboard and mouse back are drawn as keys on the Sharing page, and About leads with the version. In a narrow window the list runs across the top. The Clipboard settings link beside a computer opens the Clipboard page.
+- Click anywhere on the arrangement to start arranging. Pointing at it lights the displays up and shows a short Click to arrange hint, and the Arrange button in its top right corner is gone.
 - The notch island now only shows what is happening with your connections: a computer connecting, connected, reconnecting, waiting for an answer, or dropped. Pointing at the notch no longer opens sharing, dimming and clipboard controls, and the island no longer takes clicks near the notch. Dimming, update-ready and which computer has the pointer no longer show there.
 
 ### Fixed

@@ -14,6 +14,7 @@ import {
   defaultSelection,
   inspectorKind,
   inspectorPresentation,
+  isArrangeable,
   isPaused,
   localRowStatus,
   networkChip,
@@ -212,7 +213,7 @@ test("the add row becomes the selected New computer and says where the pairing i
   assert.equal(pairingRowLabel("paired"), "Paired");
 });
 
-test("arranging stays on while the link waits for Apply, and the toolbar's Arrange leaves once it starts", () => {
+test("arranging stays on while the link waits for Apply, and a click on the picture starts it only until then", () => {
   assert.deepEqual(arrangeState({}), { active: false, leavable: false });
   assert.deepEqual(arrangeState({ connected: true }), { active: true, leavable: false });
   assert.deepEqual(arrangeState({ connected: true, editing: true }), {
@@ -221,48 +222,42 @@ test("arranging stays on while the link waits for Apply, and the toolbar's Arran
   });
   assert.deepEqual(arrangeState({ requested: true }), { active: true, leavable: true });
 
-  const canvas = { selection: LOCAL, enabledCount: 0 };
-  assert.equal(toolbarState({ ...canvas, arrange: arrangeState({}) }).arrange, null);
+  const canvas = { selection: LOCAL };
+  assert.equal(isArrangeable({ ...canvas, arrange: arrangeState({}) }), false);
+  assert.equal(isArrangeable({ ...canvas, arrange: arrangeState({}), canArrange: true }), true);
   assert.equal(
-    toolbarState({ ...canvas, arrange: arrangeState({}), canArrange: true }).arrange,
-    "begin",
-  );
-  assert.equal(
-    toolbarState({ ...canvas, arrange: arrangeState({ connected: true }), canArrange: true })
-      .arrange,
-    null,
+    isArrangeable({ ...canvas, arrange: arrangeState({ connected: true }), canArrange: true }),
+    false,
   );
   // A computer not placed yet offers Arrange on its own card instead.
   assert.equal(
-    toolbarState({ ...canvas, arrange: arrangeState({}), canArrange: true, placed: false }).arrange,
-    null,
+    isArrangeable({ ...canvas, arrange: arrangeState({}), canArrange: true, placed: false }),
+    false,
   );
-  // The Apply bar's own button is the one way out, so the toolbar offers nothing while arranging.
+  // Settings covers the canvas, so its picture takes no click.
+  assert.equal(
+    isArrangeable({ selection: SETTINGS, arrange: arrangeState({}), canArrange: true }),
+    false,
+  );
+  // The Apply bar's own button is the one way out, so a click on the editor never starts it again.
   for (const arrange of [arrangeState({ editing: true }), arrangeState({ requested: true })])
-    assert.equal(toolbarState({ ...canvas, arrange, canArrange: true }).arrange, null);
+    assert.equal(isArrangeable({ ...canvas, arrange, canArrange: true }), false);
 });
 
 test("the toolbar titles the view and offers Start, Pause, Resume or nothing", () => {
-  const arrange = arrangeState({});
-  const settings = toolbarState({ selection: SETTINGS, arrange, enabledCount: 1 });
+  const settings = toolbarState({ selection: SETTINGS, enabledCount: 1 });
   assert.equal(settings.title, "Settings");
   assert.equal(settings.canvasActions, false);
-  const sharing = toolbarState({ selection: LOCAL, arrange, enabledCount: 2 });
+  const sharing = toolbarState({ selection: LOCAL, enabledCount: 2 });
   assert.equal(sharing.title, "Arrangement");
   assert.equal(sharing.pause, "pause");
   // A pause keeps the group switched on, so Resume shows exactly while that group is paused.
-  assert.equal(
-    toolbarState({ selection: LOCAL, arrange, enabledCount: 1, paused: true }).pause,
-    "resume",
-  );
+  assert.equal(toolbarState({ selection: LOCAL, enabledCount: 1, paused: true }).pause, "resume");
   // Nothing switched on: Start shares with a paired computer; with none paired there is nothing to start.
-  assert.equal(toolbarState({ selection: LOCAL, arrange, pairedCount: 1 }).pause, "start");
-  assert.equal(
-    toolbarState({ selection: LOCAL, arrange, pairedCount: 2, paused: true }).pause,
-    "start",
-  );
-  assert.equal(toolbarState({ selection: LOCAL, arrange }).pause, null);
-  assert.equal(toolbarState({ selection: LOCAL, arrange, paused: true }).pause, null);
+  assert.equal(toolbarState({ selection: LOCAL, pairedCount: 1 }).pause, "start");
+  assert.equal(toolbarState({ selection: LOCAL, pairedCount: 2, paused: true }).pause, "start");
+  assert.equal(toolbarState({ selection: LOCAL }).pause, null);
+  assert.equal(toolbarState({ selection: LOCAL, paused: true }).pause, null);
 });
 
 test("the live view says whether sharing is paused, and the computer list until it answers", () => {

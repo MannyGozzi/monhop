@@ -50,12 +50,10 @@
   --canvas-chevron-open: 90deg;
   --canvas-swatch: 8px;
   --canvas-card-y: 0px;
-  /* Arrange floats over the canvas on frosted glass, its glyph in an accent well that fills on hover. */
+  /* The hint to click the arrangement floats on frosted glass, its glyph in an accent well. */
   --canvas-arrange-height: 36px;
   --canvas-arrange-well: 24px;
   --canvas-glass-rim: light-dark(oklch(1 0 0 / 70%), oklch(1 0 0 / 7%));
-  --canvas-arrange-lift: -1px;
-  --canvas-arrange-halo: 2px;
   /* A card on its way: accent rings leave the other computer's glyph, and a light runs along its edge. */
   --canvas-ripple-scale: 1.6;
   --canvas-ripple-ring: 1.5px;
@@ -70,7 +68,6 @@
   --canvas-thumb-width: 44px;
   --canvas-thumb-aspect: 44 / 30;
   --canvas-display-glyph: 26px;
-  --canvas-arrange-shadow-hover: 0 0 0 .5px var(--hairline-strong), 0 2px 4px light-dark(oklch(.2 .01 275 / 10%), oklch(0 0 0 / 45%)), 0 12px 28px -10px light-dark(oklch(.2 .01 275 / 22%), oklch(0 0 0 / 65%));
 }
 :root[data-theme="dark"] { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); --canvas-seam-highlight: oklch(1 0 0 / 85%); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --canvas-tile-tone: 70%; --canvas-tile-tone-hover: 80%; --canvas-tile-sheen: oklch(1 0 0 / 9%); --canvas-seam-highlight: oklch(1 0 0 / 85%); } }
@@ -93,12 +90,14 @@
 .dashboard-arrangement-canvas .arrangement-display { transform-box: fill-box; transform-origin: 0 0; }
 
 /* Display tiles */
-.arrangement-group { color: var(--display-local); filter: var(--canvas-tile-shadow); transition: transform var(--motion-spring) var(--ease-spring), opacity var(--motion-slow) var(--ease-out), filter var(--motion-slow) var(--ease-out); }
+.arrangement-group { --tile-hue: var(--display-local); color: var(--tile-hue); filter: var(--canvas-tile-shadow); transition: transform var(--motion-spring) var(--ease-spring), opacity var(--motion-slow) var(--ease-out), filter var(--motion-slow) var(--ease-out); }
 .arrangement-group[data-quiet="true"] { opacity: var(--canvas-quiet-opacity); filter: saturate(var(--canvas-quiet-saturate)) var(--canvas-tile-shadow); }
 .arrangement-display-bezel { fill: var(--tile-bezel); stroke: var(--canvas-tile-rim); stroke-width: var(--hairline-width); transition: stroke var(--motion-fast) var(--ease-out), stroke-width var(--motion-fast) var(--ease-out); }
 /* The display a menu was opened from keeps an accent ring while the menu stays. */
 .arrangement-display[data-selected="true"] .arrangement-display-bezel { stroke: var(--primary); stroke-width: var(--stroke-bold); }
-.arrangement-display-screen { fill: color-mix(in oklab, currentColor var(--canvas-tile-tone), var(--tile-shade)); transition: fill var(--motion-slow) var(--ease-out); }
+/* Mixed from --tile-hue, not currentColor: Chromium cannot interpolate a fill mixed with currentColor
+   and shows it transparent for the whole transition. */
+.arrangement-display-screen { fill: color-mix(in oklab, var(--tile-hue) var(--canvas-tile-tone), var(--tile-shade)); transition: fill var(--motion-slow) var(--ease-out); }
 .arrangement-display-depth, .arrangement-display-sheen { pointer-events: none; }
 .arrangement-display-hatch { opacity: 0; pointer-events: none; transition: opacity var(--motion-slow) var(--ease-out); }
 .arrangement-paint-clear { stop-color: var(--canvas-tile-clear); }
@@ -194,14 +193,26 @@
 @container canvas-stage (max-width: 520px) { .arrangement-legend-item:is([data-kind="primary"], [data-kind="shared"], [data-kind="seam"]) { display: none; } }
 .canvas-stage { container: canvas-stage / size; }
 
-/* Arrange floats in the stage's top right corner; on hover it lifts and its well fills with the accent. */
-.canvas-stage, .canvas-arrange { grid-row: 2; grid-column: 1; }
-.canvas-arrange { position: relative; z-index: 2; display: flex; align-self: start; justify-self: end; margin: var(--gap-3) var(--gap-3) 0 0; }
-#canvas-arrange { height: var(--canvas-arrange-height); gap: var(--gap-2); border-radius: var(--radius-pill); padding: 0 var(--gap-4) 0 calc((var(--canvas-arrange-height) - var(--canvas-arrange-well)) / 2); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: inset 0 1px 0 var(--canvas-glass-rim), var(--shadow-raised); color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-medium); }
-#canvas-arrange:hover:not(:disabled) { background: var(--solid); box-shadow: inset 0 1px 0 var(--canvas-glass-rim), var(--canvas-arrange-shadow-hover); transform: translateY(var(--canvas-arrange-lift)); }
-#canvas-arrange:active:not(:disabled) { transform: scale(var(--scale-press)); }
-.canvas-arrange-glyph { display: grid; width: var(--canvas-arrange-well); height: var(--canvas-arrange-well); place-items: center; border-radius: 50%; background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); box-shadow: 0 0 0 0 color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); transition: background-color var(--motion-fast) var(--ease-out), color var(--motion-fast) var(--ease-out), box-shadow var(--motion-base) var(--ease-out); }
-#canvas-arrange:hover:not(:disabled) .canvas-arrange-glyph { background: var(--primary-fill); box-shadow: 0 0 0 var(--canvas-arrange-halo) color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary-foreground); }
+/* While a click would start arranging (app.js sets the pane's flag), the whole picture answers the
+   pointer: its tiles take the editor's hover look and, after a moment's rest, a hint drops in at the
+   top of the stage. Clicks pass through the hint to the stage; keyboard focus shows it at once. */
+.canvas-stage, .canvas-arrange-hint { grid-row: 2; grid-column: 1; }
+.canvas-pane[data-arrangeable="true"] > .canvas-stage, .canvas-pane[data-arrangeable="true"] > .canvas-stage .arrangement-group { cursor: pointer; }
+.canvas-pane[data-arrangeable="true"] > .canvas-stage:hover .arrangement-group[data-quiet="true"] { filter: saturate(var(--canvas-quiet-saturate)) var(--canvas-tile-shadow-hover); }
+/* Leaving, the hint fades where it stands and drops back to its starting offset once unseen. */
+.canvas-arrange-hint { position: relative; z-index: 2; display: inline-flex; align-items: center; align-self: start; justify-self: center; gap: var(--gap-2); max-width: calc(100% - var(--gap-8)); height: var(--canvas-arrange-height); margin: var(--gap-3) 0 0; overflow: hidden; border: 0; border-radius: var(--radius-pill); padding: 0 var(--gap-4) 0 calc((var(--canvas-arrange-height) - var(--canvas-arrange-well)) / 2); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: inset 0 var(--hairline-width) 0 var(--canvas-glass-rim), var(--shadow-raised); color: var(--foreground); font-size: var(--text-base); font-weight: var(--weight-medium); white-space: nowrap; pointer-events: none; opacity: 0; transform: translateY(calc(var(--motion-rise) * -1)) scale(var(--scale-enter)); visibility: hidden; transition: opacity var(--motion-fast) var(--ease-in-out), transform 0s linear var(--motion-fast), box-shadow var(--motion-fast) var(--ease-out), visibility 0s linear var(--motion-fast); }
+/* Kept visible, though clear, while arrangeable, so Tab can reach it. */
+.canvas-pane[data-arrangeable="true"] > .canvas-arrange-hint { visibility: visible; transition: opacity var(--motion-fast) var(--ease-in-out), transform 0s linear var(--motion-fast), box-shadow var(--motion-fast) var(--ease-out), visibility 0s; }
+.canvas-pane[data-arrangeable="true"] > .canvas-arrange-hint:focus-visible { opacity: 1; transform: none; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-base) var(--ease-out), box-shadow var(--motion-fast) var(--ease-out), visibility 0s; }
+/* The delay is hover intent: a pointer only crossing the canvas never flashes the hint. */
+.canvas-pane[data-arrangeable="true"] > .canvas-stage:hover ~ .canvas-arrange-hint { opacity: 1; transform: none; transition: opacity var(--motion-base) var(--ease-out) var(--motion-fast), transform var(--motion-base) var(--ease-out) var(--motion-fast), box-shadow var(--motion-fast) var(--ease-out), visibility 0s; }
+.canvas-pane[data-arrangeable="true"] > .canvas-stage:active ~ .canvas-arrange-hint, .canvas-pane[data-arrangeable="true"] > .canvas-arrange-hint:active { transform: scale(var(--scale-press)); transition: opacity var(--motion-base) var(--ease-out) var(--motion-fast), var(--transition-press), box-shadow var(--motion-fast) var(--ease-out), visibility 0s; }
+/* The note that an arrangement just applied holds the same spot, so the hint waits for it to go. */
+.canvas-pane[data-arrangeable="true"] > .canvas-stage:has(.canvas-toast[data-shown="true"]) ~ .canvas-arrange-hint:not(:focus-visible) { opacity: 0; transform: translateY(calc(var(--motion-rise) * -1)) scale(var(--scale-enter)); transition: opacity var(--motion-fast) var(--ease-in-out), transform 0s linear var(--motion-fast), box-shadow var(--motion-fast) var(--ease-out), visibility 0s; }
+.canvas-arrange-glyph { display: grid; flex: none; width: var(--canvas-arrange-well); height: var(--canvas-arrange-well); place-items: center; border-radius: var(--radius-circle); background: color-mix(in oklab, var(--primary) var(--mix-tint), transparent); color: var(--primary); }
+.canvas-arrange-label { flex: none; }
+.canvas-arrange-detail { min-width: 0; overflow: hidden; color: var(--muted-foreground); font-weight: var(--weight-regular); text-overflow: ellipsis; }
+.canvas-arrange-detail:empty { display: none; }
 
 /* A note that the arrangement just applied, floating at the top of the stage. */
 .canvas-toast { position: absolute; top: var(--gap-3); left: 50%; display: inline-flex; align-items: center; gap: var(--gap-2); max-width: calc(100% - var(--gap-8)); margin: 0; border-radius: var(--radius-pill); padding: var(--gap-1) var(--gap-3) var(--gap-1) var(--gap-1); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-chip); color: var(--muted-foreground); font-size: var(--text-sm); white-space: nowrap; translate: -50% 0; transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-spring) var(--ease-spring), visibility 0s linear 0s; }
@@ -380,8 +391,8 @@
 .arrangement-stage { position: relative; }
 .arrangement-stage > .arrangement-legend { bottom: var(--gap-2); }
 .arrangement-stage .arrangement-display { transform-box: fill-box; transform-origin: center; transition: transform var(--motion-spring) var(--ease-spring); }
-.arrangement-group[tabindex]:hover { filter: var(--canvas-tile-shadow-hover); }
-.arrangement-group[tabindex]:hover .arrangement-display-screen { fill: color-mix(in oklab, currentColor var(--canvas-tile-tone-hover), var(--tile-shade)); }
+.arrangement-group[tabindex]:hover, .canvas-pane[data-arrangeable="true"] > .canvas-stage:hover .arrangement-group { filter: var(--canvas-tile-shadow-hover); }
+.arrangement-group[tabindex]:hover .arrangement-display-screen, .canvas-pane[data-arrangeable="true"] > .canvas-stage:hover .arrangement-group:not([data-state="offline"]) .arrangement-display-screen { fill: color-mix(in oklab, var(--tile-hue) var(--canvas-tile-tone-hover), var(--tile-shade)); }
 .arrangement-group:focus-visible .arrangement-display-bezel { stroke: var(--primary); stroke-width: var(--stroke-bold); }
 /* Dragging, the group lifts off the desk: a deeper shadow, the tiles raised and a touch larger. */
 .arrangement-group.is-dragging { opacity: 1; filter: var(--canvas-tile-lift); }
