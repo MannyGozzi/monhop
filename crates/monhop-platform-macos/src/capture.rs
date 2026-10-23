@@ -53,10 +53,10 @@ use crate::{
     enumerate_active_displays,
     event_tap::{
         CFRelease, CG_EVENT_SOURCE_USER_DATA, CG_EVENT_TAP_OPTION_DEFAULT,
-        CG_EVENT_TAP_OPTION_LISTEN_ONLY, CG_HEAD_INSERT_EVENT_TAP, CG_HID_EVENT_TAP, CGEventField,
-        CGEventGetIntegerValueField, CGEventPost, CGEventRef, CGEventSetIntegerValueField,
-        CGEventTapProxy, CGEventType, EventTap, EventTapInstallError, RunLoopWake,
-        capture_event_mask, finish_and_post_event, tap_disabled,
+        CG_EVENT_TAP_OPTION_LISTEN_ONLY, CG_HEAD_INSERT_EVENT_TAP, CG_HID_EVENT_TAP,
+        CG_SESSION_EVENT_TAP, CGEventField, CGEventGetIntegerValueField, CGEventPost, CGEventRef,
+        CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, EventTap, EventTapInstallError,
+        RunLoopWake, capture_event_mask, finish_and_post_event, motion_event_mask, tap_disabled,
     },
     hid_to_mac_virtual_key, mac_virtual_key_to_hid,
     native::PERMISSION_CACHE_TTL,
@@ -1399,6 +1399,17 @@ impl CallbackState {
         !self.shared.stop.is_stopped()
     }
 
+    /// Motion hold tap records: while remote, handled here and dropped before Quartz moves the
+    /// cursor off its pin. Otherwise, or once capture fails open, they pass on to the capture tap.
+    fn held_motion(
+        &mut self,
+        event_type: CGEventType,
+        event: CGEventRef,
+        source: EventSourceMetadata,
+    ) -> bool {
+        self.remote() && self.native_event(event_type, event, source)
+    }
+
     fn native_event(
         &mut self,
         event_type: CGEventType,
@@ -1603,6 +1614,35 @@ unsafe extern "C" fn event_callback(
     }
 }
 
+/// Withholding motion at the session tap leaves the cursor moving; this HID tap drops it first.
+unsafe extern "C" fn motion_hold_callback(
+    _: CGEventTapProxy,
+    event_type: CGEventType,
+    event: CGEventRef,
+    _: *mut c_void,
+) -> CGEventRef {
+    if tap_disabled(event_type) || event.is_null() {
+        latch_callback_failure(StopReason::NativeFailure);
+        return event;
+    }
+    // SAFETY: Core Graphics supplies a live event for the callback duration.
+    let source = unsafe {
+        EventSourceMetadata {
+            user_data: CGEventGetIntegerValueField(event, CG_EVENT_SOURCE_USER_DATA),
+            state_id: CGEventGetIntegerValueField(event, CG_EVENT_SOURCE_STATE_ID),
+        }
+    };
+    // The capture tap counts ignored sources when the record reaches it.
+    if should_ignore_source(source, SYNTHETIC_EVENT_MARKER) {
+        return event;
+    }
+    if with_callback(|state| state.held_motion(event_type, event, source)) {
+        ptr::null()
+    } else {
+        event
+    }
+}
+
 unsafe extern "C" fn display_reconfiguration_callback(
     _: CGDirectDisplayID,
     flags: CGDisplayChangeSummaryFlags,
@@ -1753,6 +1793,9 @@ fn run(
                 shared.interception_failed.load(Ordering::Acquire),
             );
         if !finished {
+            resources.hold_motion(
+                shared.remote_active.load(Ordering::Acquire) && !shared.stop.is_stopped(),
+            );
             resources.run_once();
             pass.lap(LoopStep::RunLoop, shared.origin.elapsed());
         }
@@ -2083,6 +2126,10 @@ fn seconds_setting(value: &CFType) -> Option<Duration> {
 
 struct Resources {
     tap: EventTap,
+    /// Enabled only while remote, so local cursor motion never waits on this thread. None when
+    /// passive, or when Quartz refused it and remote motion still moves the cursor.
+    motion_hold: Option<EventTap>,
+    motion_hold_enabled: bool,
     wake: RunLoopWake,
     _permissions: PermissionWatch,
 }
@@ -2104,8 +2151,8 @@ impl Resources {
                 MacError::AccessibilityPermissionRequired,
             ));
         }
-        // Both undo themselves on drop, so a later failure here never leaves them behind; the tap,
-        // which does not, comes last.
+        // Each of these and both taps undo themselves on drop, so a later failure never leaves
+        // one behind.
         let wake = RunLoopWake::install().ok_or(NativeCaptureError::StartFailed)?;
         let permission_watch =
             PermissionWatch::start(shared.permissions.clone(), PERMISSION_CACHE_TTL, || {
@@ -2123,6 +2170,7 @@ impl Resources {
         // The mask holds documented input types plus the private gesture types, and the callback
         // uses thread-local state established before this explicit tap is created.
         let tap = EventTap::install(
+            CG_SESSION_EVENT_TAP,
             CG_HEAD_INSERT_EVENT_TAP,
             options,
             capture_event_mask(),
@@ -2135,11 +2183,41 @@ impl Resources {
                 EventTapInstallError::SourceUnavailable => MacError::EventTapSourceUnavailable,
             })
         })?;
+        let motion_hold = if passive {
+            None
+        } else {
+            // Same thread-local callback state and run loop as the capture tap.
+            EventTap::install(
+                CG_HID_EVENT_TAP,
+                CG_HEAD_INSERT_EVENT_TAP,
+                CG_EVENT_TAP_OPTION_DEFAULT,
+                motion_event_mask(),
+                Some(motion_hold_callback),
+                ptr::null_mut(),
+            )
+            .inspect(EventTap::disable)
+            .inspect_err(|_| {
+                log::warn!("motion hold tap unavailable; remote motion moves this cursor")
+            })
+            .ok()
+        };
         Ok(Self {
             tap,
+            motion_hold,
+            motion_hold_enabled: false,
             wake,
             _permissions: permission_watch,
         })
+    }
+
+    /// Owner loop, before each pass: the hold tap follows the route within one pass.
+    fn hold_motion(&mut self, remote: bool) {
+        if let Some(hold) = &self.motion_hold
+            && remote != self.motion_hold_enabled
+        {
+            hold.set_enabled(remote);
+            self.motion_hold_enabled = remote;
+        }
     }
 
     fn run_once(&self) {
@@ -2151,6 +2229,10 @@ impl Resources {
     fn close(&mut self) -> Result<(), NativeCaptureError> {
         // Disabling before removal prevents new suppression; close then ends delivery before TLS
         // state is cleared.
+        if let Some(mut hold) = self.motion_hold.take() {
+            hold.disable();
+            hold.close();
+        }
         self.tap.disable();
         self.tap.close();
         self.wake.close();
@@ -2359,6 +2441,20 @@ mod callback_tests {
 
     /// Returns whether the callback withheld one physical mouse-moved record from local apps.
     fn deliver_motion(state: &mut CallbackState, delta_x: i64, delta_y: i64) -> bool {
+        with_motion(delta_x, delta_y, |event| {
+            state.native_event(CG_EVENT_MOUSE_MOVED, event, physical_source())
+        })
+    }
+
+    /// Returns whether the motion hold tap dropped one physical mouse-moved record.
+    fn hold_motion(state: &mut CallbackState, delta_x: i64, delta_y: i64) -> bool {
+        with_motion(delta_x, delta_y, |event| {
+            state.held_motion(CG_EVENT_MOUSE_MOVED, event, physical_source())
+        })
+    }
+
+    /// Hands `handle` one physical mouse-moved record created at 10,10.
+    fn with_motion(delta_x: i64, delta_y: i64, handle: impl FnOnce(CGEventRef) -> bool) -> bool {
         // SAFETY: the event type is mouse-moved and the point is finite; the owned event is never
         // posted.
         let event = unsafe {
@@ -2375,7 +2471,7 @@ mod callback_tests {
             CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X, delta_x);
             CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y, delta_y);
         }
-        let suppressed = state.native_event(CG_EVENT_MOUSE_MOVED, event, physical_source());
+        let suppressed = handle(event);
         // SAFETY: event was created above and never transferred.
         unsafe { CFRelease(event) };
         suppressed
@@ -2862,6 +2958,54 @@ mod callback_tests {
         assert_capture_untouched(&state, &mut consumer);
         assert!(deliver_motion(&mut state, 3, 0));
         assert_eq!(state.pointer_position, Some(pinned));
+    }
+
+    #[test]
+    fn remote_motion_is_forwarded_and_dropped_at_the_hold_tap() {
+        let (mut state, mut consumer) = callback_fixture();
+        let pinned = Point::new(50.0, 50.0);
+        state.pointer_position = Some(pinned);
+        route_remote(&mut state, &mut consumer);
+        assert!(
+            hold_motion(&mut state, 3, -2),
+            "dropped before Quartz moves the cursor"
+        );
+        assert_eq!(
+            queued(&mut consumer),
+            [(
+                CaptureEvent::LogicalRelativeMotion { dx: 3.0, dy: -2.0 },
+                true
+            )]
+        );
+        assert_eq!(state.pointer_position, Some(pinned));
+        let episode = state.episode.as_ref().expect("activation opens an episode");
+        assert_eq!(
+            (episode.motion_suppressed, episode.motion_passed),
+            (1, 0),
+            "counted once, by the hold tap"
+        );
+    }
+
+    #[test]
+    fn local_motion_passes_the_hold_tap_unhandled() {
+        let (mut state, mut consumer) = callback_fixture();
+        assert!(!hold_motion(&mut state, 3, 0));
+        assert_capture_untouched(&state, &mut consumer);
+        assert_eq!(
+            state.pointer_position, None,
+            "only the capture tap reads local motion"
+        );
+    }
+
+    #[test]
+    fn a_stopped_capture_lets_motion_pass_the_hold_tap() {
+        let (mut state, mut consumer) = callback_fixture();
+        route_remote(&mut state, &mut consumer);
+        state.shared.stop.stop(StopReason::NativeFailure);
+        assert!(
+            !hold_motion(&mut state, 3, 0),
+            "a stopped capture fails open"
+        );
     }
 
     #[test]

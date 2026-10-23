@@ -15,6 +15,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ### Fixed
 
+- Moving a Mac's trackpad or mouse while it controls another computer no longer moves the Mac's own cursor too. The Mac cursor stays where you left it, as the Windows cursor already does when a Windows mouse controls a Mac.
 - A middle click from a Windows mouse on a Mac is now just a middle click: it opens links in new tabs and closes tabs without starting autoscroll or swallowing your next click. Hold the middle button and move to autoscroll.
 - Pressing Print Screen, Scroll Lock, the Menu key or another key a Mac lacks on a Windows keyboard controlling a Mac no longer stops sharing. Print Screen, Scroll Lock and Pause type F13, F14 and F15 there, and keys the Mac cannot type are ignored. A Mac key Windows cannot type, such as the keypad's equals key, is ignored the same way.
 

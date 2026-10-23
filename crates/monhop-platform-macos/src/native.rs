@@ -26,9 +26,9 @@ use crate::capture_decode::{
 use crate::event_tap::{
     CFAllocatorRef, CFRelease, CFRunLoopGetCurrent, CFRunLoopRef, CFStringRef,
     CG_EVENT_SOURCE_USER_DATA, CG_EVENT_TAP_OPTION_LISTEN_ONLY, CG_HEAD_INSERT_EVENT_TAP,
-    CG_HID_EVENT_TAP, CGEventField, CGEventGetIntegerValueField, CGEventPost, CGEventRef,
-    CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, EventTap, EventTapInstallError,
-    finish_and_post_event, full_input_event_mask, tap_disabled,
+    CG_HID_EVENT_TAP, CG_SESSION_EVENT_TAP, CGEventField, CGEventGetIntegerValueField, CGEventPost,
+    CGEventRef, CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, EventTap,
+    EventTapInstallError, finish_and_post_event, full_input_event_mask, tap_disabled,
 };
 
 use crate::gesture_inject::{
@@ -312,6 +312,7 @@ pub fn run_passive_diagnostic(
     };
     // SAFETY: state outlives the tap, which is closed before this function returns.
     let mut tap = EventTap::install(
+        CG_SESSION_EVENT_TAP,
         CG_HEAD_INSERT_EVENT_TAP,
         CG_EVENT_TAP_OPTION_LISTEN_ONLY,
         full_input_event_mask(),

@@ -1,7 +1,7 @@
-//! Shared Quartz event-tap plumbing for the active capture tap and the passive diagnostic tap.
+//! Shared Quartz event-tap plumbing for the capture taps and the passive diagnostic tap.
 //!
-//! Tap location is fixed to the session event tap; placement, options, event mask, callback and
-//! callback state are the only knobs either site varies.
+//! Location, placement, options, event mask, callback and callback state are the knobs each site
+//! varies.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -32,7 +32,7 @@ pub(crate) type CGEventTapPlacement = u32;
 pub(crate) type CGEventTapOptions = u32;
 
 pub(crate) const CG_HID_EVENT_TAP: CGEventTapLocation = 0;
-const CG_SESSION_EVENT_TAP: CGEventTapLocation = 1;
+pub(crate) const CG_SESSION_EVENT_TAP: CGEventTapLocation = 1;
 pub(crate) const CG_HEAD_INSERT_EVENT_TAP: CGEventTapPlacement = 0;
 pub(crate) const CG_EVENT_TAP_OPTION_DEFAULT: CGEventTapOptions = 0;
 pub(crate) const CG_EVENT_TAP_OPTION_LISTEN_ONLY: CGEventTapOptions = 1;
@@ -115,22 +115,27 @@ const fn event_mask_bit(event_type: CGEventType) -> CGEventMask {
     1_u64 << event_type
 }
 
+/// Every record type that moves the cursor: the motion hold tap's set.
+pub(crate) const fn motion_event_mask() -> CGEventMask {
+    event_mask_bit(CG_EVENT_MOUSE_MOVED)
+        | event_mask_bit(CG_EVENT_LEFT_MOUSE_DRAGGED)
+        | event_mask_bit(CG_EVENT_RIGHT_MOUSE_DRAGGED)
+        | event_mask_bit(CG_EVENT_OTHER_MOUSE_DRAGGED)
+}
+
 /// The fixed keyboard, pointer and scroll event set the passive diagnostic tap listens for.
 pub(crate) const fn full_input_event_mask() -> CGEventMask {
-    event_mask_bit(CG_EVENT_LEFT_MOUSE_DOWN)
+    motion_event_mask()
+        | event_mask_bit(CG_EVENT_LEFT_MOUSE_DOWN)
         | event_mask_bit(CG_EVENT_LEFT_MOUSE_UP)
         | event_mask_bit(CG_EVENT_RIGHT_MOUSE_DOWN)
         | event_mask_bit(CG_EVENT_RIGHT_MOUSE_UP)
-        | event_mask_bit(CG_EVENT_MOUSE_MOVED)
-        | event_mask_bit(CG_EVENT_LEFT_MOUSE_DRAGGED)
-        | event_mask_bit(CG_EVENT_RIGHT_MOUSE_DRAGGED)
         | event_mask_bit(CG_EVENT_KEY_DOWN)
         | event_mask_bit(CG_EVENT_KEY_UP)
         | event_mask_bit(CG_EVENT_FLAGS_CHANGED)
         | event_mask_bit(CG_EVENT_SCROLL_WHEEL)
         | event_mask_bit(CG_EVENT_OTHER_MOUSE_DOWN)
         | event_mask_bit(CG_EVENT_OTHER_MOUSE_UP)
-        | event_mask_bit(CG_EVENT_OTHER_MOUSE_DRAGGED)
 }
 
 /// The active capture tap's set: the full input set plus the private trackpad gesture types, so a
@@ -179,28 +184,22 @@ pub(crate) struct EventTap {
     tap: CFMachPortRef,
     source: CFRunLoopSourceRef,
     run_loop: CFRunLoopRef,
+    closed: bool,
 }
 
 impl EventTap {
     pub(crate) fn install(
+        location: CGEventTapLocation,
         placement: CGEventTapPlacement,
         options: CGEventTapOptions,
         mask: CGEventMask,
         callback: EventTapCallback,
         user_info: *mut c_void,
     ) -> Result<Self, EventTapInstallError> {
-        // SAFETY: mask, options and placement are caller-selected fixed values, callback is a
-        // valid extern "C" function pointer, and user_info remains live for the tap's lifetime.
-        let tap = unsafe {
-            CGEventTapCreate(
-                CG_SESSION_EVENT_TAP,
-                placement,
-                options,
-                mask,
-                callback,
-                user_info,
-            )
-        };
+        // SAFETY: location, mask, options and placement are caller-selected fixed values, callback
+        // is a valid extern "C" function pointer, and user_info remains live for the tap's lifetime.
+        let tap =
+            unsafe { CGEventTapCreate(location, placement, options, mask, callback, user_info) };
         if tap.is_null() {
             return Err(EventTapInstallError::TapUnavailable);
         }
@@ -226,6 +225,7 @@ impl EventTap {
             tap,
             source,
             run_loop,
+            closed: false,
         })
     }
 
@@ -234,13 +234,24 @@ impl EventTap {
         run_current_once(slice);
     }
 
+    /// A disabled tap receives nothing, so every record passes it untouched.
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        if self.closed {
+            return;
+        }
+        // SAFETY: self.tap is a live mach port owned by this instance until close releases it.
+        unsafe { CGEventTapEnable(self.tap, enabled) };
+    }
+
     /// Stops new suppression from this tap. Callers that need this call it before `close`.
     pub(crate) fn disable(&self) {
-        // SAFETY: self.tap is a live mach port owned by this instance until close releases it.
-        unsafe { CGEventTapEnable(self.tap, false) };
+        self.set_enabled(false);
     }
 
     pub(crate) fn close(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
         // SAFETY: close runs once on the run-loop owner. Removal ends delivery before the mach
         // port and run-loop source are released.
         unsafe {
@@ -249,6 +260,14 @@ impl EventTap {
             CFRelease(self.source);
             CFRelease(self.tap);
         }
+    }
+}
+
+/// A tap left open, as by a panic, would keep Quartz waiting on records nobody serves.
+impl Drop for EventTap {
+    fn drop(&mut self) {
+        self.disable();
+        self.close();
     }
 }
 
@@ -390,6 +409,21 @@ mod tests {
         assert!(waited < Duration::from_secs(1), "waited {waited:?}");
         wake();
         drop(wake);
+    }
+
+    #[test]
+    fn the_motion_hold_tap_takes_exactly_the_records_that_move_the_cursor() {
+        for event_type in 0..64 {
+            assert_eq!(
+                motion_event_mask() & event_mask_bit(event_type) != 0,
+                crate::capture_decode::is_pointer_motion(event_type),
+                "event type {event_type}"
+            );
+        }
+        assert_eq!(
+            capture_event_mask() & motion_event_mask(),
+            motion_event_mask()
+        );
     }
 
     #[test]
