@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-10-22
+
 ### Added
 
 - A Show clipboard copies switch under Notch island in Settings puts a short note beside the notch when something you copied moves to or from another computer. It is off until you turn it on.
@@ -326,7 +328,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.13...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.14...HEAD
+[0.2.14]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.14
 [0.2.13]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.13
 [0.2.12]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.12
 [0.2.11]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.11

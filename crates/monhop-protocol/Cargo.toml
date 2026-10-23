@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-monhop-core = { path = "../monhop-core", version = "=0.2.13" }
+monhop-core = { path = "../monhop-core", version = "=0.2.14" }
 
 [lints]
 workspace = true
