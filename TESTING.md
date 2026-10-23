@@ -30,6 +30,12 @@ An opt-in native integration test observed the process's tap while capture was r
 cargo test -p monhop-platform-macos --test native_capture --locked -- passive_capture_removes_tap_before_returning_in_the_same_process --ignored --exact
 ```
 
+A second opt-in test starts the real session capture, checks that its capture and motion hold taps are both live and that capture has not stopped itself, takes control remote and back, and checks that no tap survives the stop. It needs Accessibility and listen-event permission and briefly withholds real input while remote. It failed on 251ddaa, whose hold tap treated its own switch-off notice as a failure, and passes since (2026-10-22):
+
+```sh
+cargo test -p monhop-platform-macos --test native_capture --locked -- session_capture_survives_a_remote_round_trip_and_removes_both_taps --ignored --exact
+```
+
 The separate ignored `denied_permission_rejects_capture_without_installing_a_tap` test must run from a context that genuinely lacks listen-event permission. Do not revoke another application's permission or bypass TCC to obtain that result.
 
 The corrected self-process fixture checks both sides of Shift/Control/Option/Command, complete chord releases, left drag, both scroll axes and Ctrl/right-button cleanup. A native continuation run passed with 24 keyboard, 6 pointer and 2 scroll events in 3.23 seconds. Raising ChatGPT during a second run produced the expected focus failure. The fixture only posted to its own PID and never targeted ChatGPT. Caps Lock, keyboard layout, real application/system shortcuts and the global posting route remain unverified.

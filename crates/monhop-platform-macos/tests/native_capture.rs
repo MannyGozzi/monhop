@@ -66,6 +66,57 @@ fn passive_capture_removes_tap_before_returning_in_the_same_process() {
 }
 
 #[test]
+#[ignore = "explicit native diagnostic: requires existing macOS Accessibility and input permission"]
+fn session_capture_survives_a_remote_round_trip_and_removes_both_taps() {
+    use monhop_core::{
+        NativeSessionClaim, RevocationSignal, SharedFloor, TakeBackGate,
+        capture::MAX_SUPPRESSION_TTL,
+    };
+    use monhop_platform_macos::native_capture::{NativeCapture, NativeCaptureError};
+
+    let permissions = preflight_permissions().unwrap();
+    assert!(permissions.listen_events && permissions.accessibility);
+    assert_eq!(own_tap_count(), 0);
+    let wait_until = |done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    };
+    let (permit, _injection) = NativeSessionClaim::claim().unwrap().split();
+    let mut capture = NativeCapture::start_for_session(
+        1,
+        RevocationSignal::default(),
+        permit,
+        TakeBackGate::new(SharedFloor::new()),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(capture.stop_reason(), None, "after start");
+    assert_eq!(own_tap_count(), 2, "capture and motion hold taps");
+
+    assert!(wait_until(&|| capture.is_ready_for_suppression()));
+    let revision = capture.activate_remote(1, MAX_SUPPRESSION_TTL).unwrap();
+    assert!(wait_until(
+        &|| capture.completed_control_revision() == Ok(revision)
+    ));
+    let revision = capture.restore_local(1).unwrap();
+    assert!(wait_until(
+        &|| capture.completed_control_revision() == Ok(revision)
+    ));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(capture.stop_reason(), None, "after the round trip");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while capture.finish() == Err(NativeCaptureError::CleanupPending) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(capture.is_finished());
+    assert_eq!(own_tap_count(), 0, "a tap survived capture");
+}
+
+#[test]
 #[ignore = "run only from a launch context without macOS input permission"]
 fn denied_permission_rejects_capture_without_installing_a_tap() {
     assert!(!preflight_permissions().unwrap().listen_events);

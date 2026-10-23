@@ -1409,7 +1409,10 @@ impl CallbackState {
             return false;
         };
         // SAFETY: this active tap owns the live event it returns for the callback.
-        unsafe { CGEventSetLocation(event, CGPoint { x: pin.x, y: pin.y }) };
+        unsafe {
+            CGEventSetLocation(event, CGPoint { x: pin.x, y: pin.y });
+            CGEventSetIntegerValueField(event, CG_EVENT_SOURCE_USER_DATA, PINNED_MOTION_MARKER);
+        }
         true
     }
 
@@ -1533,7 +1536,23 @@ impl CallbackState {
                     )
                 };
                 let remote = self.remote();
-                let location = Point::new(point.x, point.y);
+                let mut location = Point::new(point.x, point.y);
+                if source.user_data == PINNED_MOTION_MARKER {
+                    // Pinned before control came back, it holds the old pin, not the cursor.
+                    if !remote && let Some(cursor) = self.pointer_position {
+                        location = cursor;
+                        // SAFETY: this active tap owns the live event it returns for the callback.
+                        unsafe {
+                            CGEventSetLocation(
+                                event,
+                                CGPoint {
+                                    x: cursor.x,
+                                    y: cursor.y,
+                                },
+                            )
+                        };
+                    }
+                }
                 let DecodedPointer {
                     local_absolute,
                     input,
@@ -1617,6 +1636,10 @@ unsafe extern "C" fn event_callback(
     }
 }
 
+/// Tags a record the hold tap pinned. Unlike MonHop's injection marker, the capture tap handles it.
+/// Quartz keeps the first user data written, so local apps see the tag; it means nothing to them.
+const PINNED_MOTION_MARKER: i64 = 0x4C4B_4D02;
+
 /// Withholding motion at the session tap leaves the cursor moving; this HID tap pins it first.
 unsafe extern "C" fn motion_hold_callback(
     _: CGEventTapProxy,
@@ -1624,8 +1647,9 @@ unsafe extern "C" fn motion_hold_callback(
     event: CGEventRef,
     _: *mut c_void,
 ) -> CGEventRef {
+    // Switching a tap off, as the owner loop does on every return, delivers a disabled record. A
+    // disabled hold tap only stops pinning: the capture tap still withholds remote motion.
     if tap_disabled(event_type) || event.is_null() {
-        latch_callback_failure(StopReason::NativeFailure);
         return event;
     }
     // SAFETY: Core Graphics supplies a live event for the callback duration.
@@ -3007,6 +3031,61 @@ mod callback_tests {
             Point::new(10.0, 10.0),
             "a stopped capture fails open"
         );
+    }
+
+    fn user_data(event: CGEventRef) -> i64 {
+        // SAFETY: callers pass a live event they own.
+        unsafe { CGEventGetIntegerValueField(event, CG_EVENT_SOURCE_USER_DATA) }
+    }
+
+    #[test]
+    fn the_hold_tap_tags_what_it_pins() {
+        let (mut state, mut consumer) = callback_fixture();
+        state.pointer_position = Some(Point::new(50.0, 50.0));
+        route_remote(&mut state, &mut consumer);
+        with_motion(3, 0, |event| {
+            assert!(state.pin_motion(event));
+            assert_eq!(user_data(event), PINNED_MOTION_MARKER);
+            let source = EventSourceMetadata {
+                user_data: user_data(event),
+                ..physical_source()
+            };
+            assert!(state.native_event(CG_EVENT_MOUSE_MOVED, event, source));
+            true
+        });
+    }
+
+    #[test]
+    fn a_record_pinned_before_control_returned_lands_where_the_cursor_is() {
+        let (mut state, mut consumer) = callback_fixture();
+        let restored = Point::new(70.0, 70.0);
+        state.pointer_position = Some(restored);
+        let withheld = with_motion(3, 0, |event| {
+            // SAFETY: the event is live and owned by with_motion; the old pin is finite.
+            unsafe {
+                CGEventSetLocation(event, CGPoint { x: 50.0, y: 50.0 });
+                CGEventSetIntegerValueField(event, CG_EVENT_SOURCE_USER_DATA, PINNED_MOTION_MARKER);
+            }
+            let source = EventSourceMetadata {
+                user_data: PINNED_MOTION_MARKER,
+                ..physical_source()
+            };
+            let withheld = state.native_event(CG_EVENT_MOUSE_MOVED, event, source);
+            // SAFETY: as above.
+            let location = unsafe { CGEventGetLocation(event) };
+            assert_eq!(Point::new(location.x, location.y), restored, "local apps");
+            withheld
+        });
+        assert!(!withheld);
+        assert_eq!(state.pointer_position, Some(restored));
+        let anchors: Vec<_> = queued(&mut consumer)
+            .into_iter()
+            .filter_map(|(event, _)| match event {
+                CaptureEvent::LogicalAbsoluteMotion { x, y } => Some(Point::new(x, y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(anchors, [restored], "local routing never sees the old pin");
     }
 
     #[test]
