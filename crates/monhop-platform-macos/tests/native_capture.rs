@@ -101,6 +101,7 @@ fn session_capture_survives_a_remote_round_trip_and_removes_both_taps() {
     assert!(wait_until(
         &|| capture.completed_control_revision() == Ok(revision)
     ));
+    // The 120 ms lease is never renewed: LeaseExpired here means a loaded machine, not the taps.
     let revision = capture.restore_local(1).unwrap();
     assert!(wait_until(
         &|| capture.completed_control_revision() == Ok(revision)

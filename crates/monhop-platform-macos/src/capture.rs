@@ -57,6 +57,7 @@ use crate::{
         CG_SESSION_EVENT_TAP, CGEventField, CGEventGetIntegerValueField, CGEventPost, CGEventRef,
         CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, EventTap, EventTapInstallError,
         RunLoopWake, capture_event_mask, finish_and_post_event, motion_event_mask, tap_disabled,
+        tap_timed_out,
     },
     hid_to_mac_virtual_key, mac_virtual_key_to_hid,
     native::PERMISSION_CACHE_TTL,
@@ -931,6 +932,8 @@ impl Drop for CallbackState {
 thread_local! {
     static CALLBACK: RefCell<Option<CallbackState>> = const { RefCell::new(None) };
     static CALLBACK_SHARED: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
+    // Set by the hold tap's callback, taken by the owner loop on the same thread.
+    static HOLD_TAP_TIMED_OUT: Cell<bool> = const { Cell::new(false) };
     // A Cell apart from CALLBACK, so the source filter still never borrows callback state.
     static IGNORED_SOURCES: Cell<IgnoredSources> = const {
         Cell::new(IgnoredSources {
@@ -1650,6 +1653,9 @@ unsafe extern "C" fn motion_hold_callback(
     // Switching a tap off, as the owner loop does on every return, delivers a disabled record. A
     // disabled hold tap only stops pinning: the capture tap still withholds remote motion.
     if tap_disabled(event_type) || event.is_null() {
+        if tap_timed_out(event_type) {
+            let _ = HOLD_TAP_TIMED_OUT.try_with(|timed_out| timed_out.set(true));
+        }
         return event;
     }
     // SAFETY: Core Graphics supplies a live event for the callback duration.
@@ -2235,6 +2241,11 @@ impl Resources {
 
     /// Owner loop, before each pass: the hold tap follows the route within one pass.
     fn hold_motion(&mut self, remote: bool) {
+        // Quartz leaves a timed-out tap off, so the next remote pass switches it back on.
+        if HOLD_TAP_TIMED_OUT.with(Cell::take) {
+            log::warn!("motion hold tap timed out");
+            self.motion_hold_enabled = false;
+        }
         if let Some(hold) = &self.motion_hold
             && remote != self.motion_hold_enabled
         {
@@ -3036,6 +3047,29 @@ mod callback_tests {
     fn user_data(event: CGEventRef) -> i64 {
         // SAFETY: callers pass a live event they own.
         unsafe { CGEventGetIntegerValueField(event, CG_EVENT_SOURCE_USER_DATA) }
+    }
+
+    #[test]
+    fn only_a_timed_out_hold_tap_asks_the_owner_to_switch_it_back_on() {
+        use crate::event_tap::{
+            CG_EVENT_TAP_DISABLED_BY_TIMEOUT, CG_EVENT_TAP_DISABLED_BY_USER_INPUT,
+        };
+        with_motion(0, 0, |event| {
+            for (event_type, timed_out) in [
+                (CG_EVENT_TAP_DISABLED_BY_USER_INPUT, false),
+                (CG_EVENT_TAP_DISABLED_BY_TIMEOUT, true),
+            ] {
+                HOLD_TAP_TIMED_OUT.with(|flag| flag.set(false));
+                // SAFETY: the event is live; the callback ignores the proxy and user info.
+                let passed = unsafe {
+                    motion_hold_callback(ptr::null_mut(), event_type, event, ptr::null_mut())
+                };
+                assert_eq!(passed, event);
+                assert_eq!(HOLD_TAP_TIMED_OUT.with(Cell::get), timed_out);
+            }
+            HOLD_TAP_TIMED_OUT.with(|flag| flag.set(false));
+            true
+        });
     }
 
     #[test]

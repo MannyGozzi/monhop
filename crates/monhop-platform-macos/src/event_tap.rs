@@ -36,8 +36,8 @@ pub(crate) const CG_SESSION_EVENT_TAP: CGEventTapLocation = 1;
 pub(crate) const CG_HEAD_INSERT_EVENT_TAP: CGEventTapPlacement = 0;
 pub(crate) const CG_EVENT_TAP_OPTION_DEFAULT: CGEventTapOptions = 0;
 pub(crate) const CG_EVENT_TAP_OPTION_LISTEN_ONLY: CGEventTapOptions = 1;
-const CG_EVENT_TAP_DISABLED_BY_TIMEOUT: CGEventType = u32::MAX - 1;
-const CG_EVENT_TAP_DISABLED_BY_USER_INPUT: CGEventType = u32::MAX;
+pub(crate) const CG_EVENT_TAP_DISABLED_BY_TIMEOUT: CGEventType = u32::MAX - 1;
+pub(crate) const CG_EVENT_TAP_DISABLED_BY_USER_INPUT: CGEventType = u32::MAX;
 // kCGEventSourceUserData in the installed CoreGraphics SDK.
 pub(crate) const CG_EVENT_SOURCE_USER_DATA: CGEventField = 42;
 
@@ -153,6 +153,11 @@ pub(crate) const fn tap_disabled(event_type: CGEventType) -> bool {
         event_type,
         CG_EVENT_TAP_DISABLED_BY_TIMEOUT | CG_EVENT_TAP_DISABLED_BY_USER_INPUT
     )
+}
+
+/// True when Quartz itself switched the tap off because its callback answered too slowly.
+pub(crate) const fn tap_timed_out(event_type: CGEventType) -> bool {
+    event_type == CG_EVENT_TAP_DISABLED_BY_TIMEOUT
 }
 
 /// Tags and hands an owned, non-null event to `post` for delivery, then releases it. Callers
