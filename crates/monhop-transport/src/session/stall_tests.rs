@@ -29,7 +29,7 @@ const LONG_STALL: Duration = Duration::from_millis(1_500);
 const SHORT_STALL: Duration = Duration::from_millis(180);
 /// 44-byte scroll frames that more than fill the 16 KiB stream window at once, so the writer waits
 /// on credit for the whole stall.
-const SCROLL_BURST: usize = 400;
+pub(super) const SCROLL_BURST: usize = 400;
 /// Tick lateness on a loaded machine; a retreat that waited for `PEER_LIVENESS` still fails.
 const RETREAT_SLACK: Duration = Duration::from_millis(80);
 

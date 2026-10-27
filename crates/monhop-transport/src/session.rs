@@ -1344,6 +1344,11 @@ mod link_tests {
             assert_eq!(sender.send(Message::SessionReady), Ok(()));
             read_until_marker(&mut server.control_streams).await;
             let stalled = tokio::time::Instant::now();
+            // Motion coalesces to one frame per wake, about 64 a second on Windows' timer, so only
+            // frames that never merge use up the credit at once.
+            for _ in 0..super::stall_tests::SCROLL_BURST {
+                assert_eq!(sender.send(scroll()), Ok(()));
+            }
             let mut sent = 0;
             let ended = 'moving: loop {
                 let due = millis_u64(stalled.elapsed());
