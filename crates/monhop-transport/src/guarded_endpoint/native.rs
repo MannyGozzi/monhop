@@ -4,7 +4,7 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -23,12 +23,12 @@ use super::{ListenSelection, PinnedNetwork, RouteCheckFailure, socket::Reachabil
 
 #[cfg(target_os = "macos")]
 use monhop_platform_macos::{
-    network::{self, Adapter},
+    network::{self, Adapter, AdapterReading},
     network_watch, udp_receive,
 };
 #[cfg(windows)]
 use monhop_platform_windows::{
-    network::{self, Adapter},
+    network::{self, Adapter, AdapterReading},
     network_watch, udp_receive,
 };
 
@@ -178,25 +178,23 @@ pub(super) fn prepare_listener(selection: &ListenSelection) -> io::Result<Prepar
     validate_initial_adapter(&initial)?;
 
     let pinned: Arc<Mutex<Option<InterfaceSnapshot>>> = Arc::default();
+    let ended: Arc<OnceLock<RevocationSignal>> = Arc::default();
     let check: SharedCheck = {
-        let (initial, selection, pinned) = (initial.clone(), selection.clone(), pinned.clone());
+        let (initial, pinned, ended) = (initial.clone(), pinned.clone(), ended.clone());
         Arc::new(move || {
-            let current = observe_selected_adapter(&initial, AdapterKey::of_listener(&selection))
-                .and_then(|observed| interface_snapshot(&observed));
-            let Ok(pinned) = pinned.lock() else {
-                return false;
-            };
-            let holds = matches!((pinned.as_ref(), &current), (Some(pinned), Ok(current)) if pinned == current);
-            if !holds {
-                log::warn!("pairing network recheck: the selected adapter changed");
-            }
-            holds
+            let settled = settle(
+                REREADS,
+                || session_ended(&ended),
+                |_| listener_verdict(&pinned, read_selected(&initial)),
+            );
+            concluded(settled, &ended)
         })
     };
     let watch = start_watch(&initial, &check)?;
     let signal = watch.revocation_signal();
+    let _ = ended.set(signal.clone());
     require_active(&signal, None)?;
-    let interface = interface_snapshot(&observe_selected_adapter(&initial, key)?)?;
+    let interface = read_selected(&initial)?;
     *pinned
         .lock()
         .map_err(|_| io::Error::from(io::ErrorKind::Other))? = Some(interface.clone());
@@ -204,7 +202,7 @@ pub(super) fn prepare_listener(selection: &ListenSelection) -> io::Result<Prepar
 
     let socket = bind_on_interface(selection.local, selection.interface_index)?;
     let socket = NativeSocket::from(receiver(socket, selection.local)?);
-    if interface_snapshot(&observe_selected_adapter(&initial, key)?)? != interface {
+    if read_selected(&initial)? != interface {
         return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
     }
     require_active(&signal, None)?;
@@ -268,10 +266,12 @@ fn prepare_selection(
     let watched: PinnedLock = Arc::new(Watched {
         lock: Mutex::new(None),
         reachability: reachability.clone(),
+        ended: OnceLock::new(),
     });
     let check = pinned_check(&initial, pinned, &watched);
     let watch = start_watch(&initial, &check)?;
     let signal = watch.revocation_signal();
+    let _ = watched.ended.set(signal.clone());
     require_active(&signal, cancel)?;
 
     let (selected, routes) = current_selection(&initial, pinned, &signal, cancel)?;
@@ -315,26 +315,95 @@ fn current_selection(
     signal: &RevocationSignal,
     cancel: Option<&RevocationSignal>,
 ) -> io::Result<(InterfaceSnapshot, PeerRoutes)> {
-    let observed = observe_selected_adapter(initial, AdapterKey::of(pinned))?;
+    let selected = read_selected(initial)?;
     require_active(signal, cancel)?;
-    let selected = interface_snapshot(&observed)?;
     let sole = pinned.peers.len() == 1;
     let mut routes = Vec::with_capacity(pinned.peers.len());
     for peer in &pinned.peers {
-        routes.push(peer_route(&selected, *peer.ip(), sole)?);
+        routes.push((
+            *peer.ip(),
+            read_route(&selected, *peer.ip(), sole, route_snapshot)?,
+        ));
         require_active(signal, cancel)?;
     }
     Ok((selected, routes))
 }
 
-/// Every peer must be on the selected subnet before its route is even read.
-fn peer_route(
+/// Why a read of the pinned network gave no whole answer.
+#[derive(Debug)]
+enum Unread {
+    /// The read shows the selected adapter gone or different.
+    Changed(io::Error),
+    /// The read failed or caught the adapter between states, so it decides nothing yet.
+    Unreadable(io::Error),
+}
+
+impl From<Unread> for io::Error {
+    fn from(unread: Unread) -> Self {
+        match unread {
+            Unread::Changed(error) | Unread::Unreadable(error) => error,
+        }
+    }
+}
+
+/// Reads the selected adapter on its own, so another adapter coming or going cannot fail it.
+fn read_selected(initial: &Adapter) -> Result<InterfaceSnapshot, Unread> {
+    judge_adapter(initial, network::read_selected_adapter(initial))
+}
+
+/// An adapter that is gone or reads back as another is a change. A failed read, an adapter
+/// between states, or one whose network is not identified yet is unreadable.
+fn judge_adapter(
+    initial: &Adapter,
+    read: io::Result<AdapterReading>,
+) -> Result<InterfaceSnapshot, Unread> {
+    let observed = match read {
+        Ok(AdapterReading::Present(observed)) => observed,
+        Ok(AdapterReading::Lost) => {
+            return Err(Unread::Changed(io::Error::from(io::ErrorKind::NotFound)));
+        }
+        #[cfg(windows)]
+        Ok(AdapterReading::Settling) => {
+            return Err(Unread::Unreadable(policy_category(
+                PolicyError::InterfaceDown,
+            )));
+        }
+        Err(error) => return Err(Unread::Unreadable(native_category(error))),
+    };
+    if !same_adapter_identity(initial, &observed) {
+        return Err(Unread::Changed(io::Error::from(
+            io::ErrorKind::ConnectionAborted,
+        )));
+    }
+    if observed.attachment.is_none() {
+        return Err(Unread::Unreadable(policy_category(
+            PolicyError::UnknownAttachment,
+        )));
+    }
+    interface_snapshot(&observed).map_err(Unread::Changed)
+}
+
+/// One pinned peer's route through `selected`, which it must be on the subnet of before the
+/// route is even read. A route the platform answers with but the policy refuses is a change; any
+/// other failed lookup is unreadable, except that a group member the platform cannot reach is
+/// only set aside.
+fn read_route(
     selected: &InterfaceSnapshot,
     peer: Ipv4Addr,
     sole: bool,
-) -> io::Result<(Ipv4Addr, PeerRoute)> {
-    validate_peer(selected, peer).map_err(policy_category)?;
-    Ok((peer, member_route(route_snapshot(selected, peer), sole)?))
+    lookup: impl FnOnce(&InterfaceSnapshot, Ipv4Addr) -> io::Result<RouteSnapshot>,
+) -> Result<PeerRoute, Unread> {
+    validate_peer(selected, peer).map_err(|error| Unread::Changed(policy_category(error)))?;
+    match lookup(selected, peer) {
+        Err(error) if route_refused(&error) => Err(Unread::Changed(route_check_error(error))),
+        route => member_route(route, sole).map_err(Unread::Unreadable),
+    }
+}
+
+fn route_refused(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<network::RouteRefused>())
 }
 
 /// A route the platform reports unreachable sets aside only that member. A lone member's route
@@ -389,21 +458,13 @@ fn enumerate_initial() -> io::Result<Vec<Adapter>> {
     network::enumerate_adapters()
 }
 
-#[cfg(target_os = "macos")]
-fn enumerate_current() -> io::Result<Vec<Adapter>> {
-    network::enumerate_adapters_with_attachment()
-}
-
-#[cfg(windows)]
-fn enumerate_current() -> io::Result<Vec<Adapter>> {
-    network::enumerate_adapters()
-}
-
-/// The watcher's private copy of the session lock, empty until the first snapshot is taken, and
-/// the member reachability each check that keeps the lock hands to the socket and dialer.
+/// The watcher's private copy of the session lock, empty until the first snapshot is taken, the
+/// member reachability each check that keeps the lock hands to the socket and dialer, and the
+/// watch's revocation, known once the watch has started, which cuts short a check's rereads.
 struct Watched {
     lock: Mutex<Option<NetworkLock>>,
     reachability: Arc<Reachability>,
+    ended: OnceLock<RevocationSignal>,
 }
 
 type PinnedLock = Arc<Watched>;
@@ -427,49 +488,181 @@ fn notice_check(check: &SharedCheck) -> network_watch::PinnedCheck {
     Box::new(move || check())
 }
 
-/// What one check reads: the selected adapter, and each pinned peer's route through it.
-type Observation = (Option<InterfaceSnapshot>, Option<io::Result<PeerRoutes>>);
+/// What one whole read finds: the selected adapter, and each pinned peer's route through it.
+type Observed = (InterfaceSnapshot, PeerRoutes);
+
+/// How long a check may keep reading a network it could not read whole, counted from its first
+/// read, and how long it waits between reads. No read starts once the window has ended, but a
+/// read already under way is not cut short, so a check takes at most the window plus one read.
+#[derive(Clone, Copy)]
+struct Rereads {
+    window: Duration,
+    interval: Duration,
+}
+
+/// A network caught between states gets 1 s plus one read to read back whole, with reads 300 ms
+/// apart. Only a macOS route lookup gives up when that second ends; adapter, Wi-Fi and Windows
+/// route reads run to completion.
+const REREADS: Rereads = Rereads {
+    window: Duration::from_secs(1),
+    interval: Duration::from_millis(300),
+};
+
+/// How often a wait between reads looks for the session ending.
+const REREAD_POLL: Duration = Duration::from_millis(20);
+
+/// What one read decided; a read that revokes says why, for the log once the session is revoked.
+#[derive(Debug)]
+enum Verdict {
+    Holds,
+    Revokes(String),
+    Undecided(io::Error),
+}
+
+/// How a check ended.
+enum Settled {
+    Holds,
+    /// What to log once the session is revoked.
+    Revokes(String),
+    /// The session ended first; there is nothing to report.
+    Ended,
+}
 
 /// The same adapter, attachment, peer, and on-link route revalidation the session performs, for
-/// every pinned peer. Anything unreadable, or a check before the first snapshot, reads as a
-/// change. A check that keeps the lock sets each member's reachability, so a member set aside
-/// earlier is admitted again once its route is back.
+/// every pinned peer. A read that shows a change revokes at once; one that cannot read the network
+/// whole is read again, and revokes once the `REREADS` window ends. A check before the first
+/// snapshot revokes. A check that keeps the lock sets each member's reachability, so a member set
+/// aside earlier is admitted again once its route is back.
 fn pinned_check(initial: &Adapter, pinned: &PinnedNetwork, watched: &PinnedLock) -> SharedCheck {
     let initial = initial.clone();
     let pinned = pinned.clone();
-    checking(watched, move || observe_pinned(&initial, &pinned))
+    checking(watched, REREADS, move |deadline| {
+        observe_pinned(&initial, &pinned, deadline)
+    })
 }
 
-fn observe_pinned(initial: &Adapter, pinned: &PinnedNetwork) -> Observation {
-    let current = observe_selected_adapter(initial, AdapterKey::of(pinned))
-        .and_then(|observed| interface_snapshot(&observed))
-        .inspect_err(|error| {
-            log::warn!(
-                "network recheck: the selected adapter did not read back ({:?})",
-                error.kind()
-            );
-        });
+/// Its route lookups give up at `deadline`.
+fn observe_pinned(
+    initial: &Adapter,
+    pinned: &PinnedNetwork,
+    deadline: Instant,
+) -> Result<Observed, Unread> {
+    let current = read_selected(initial)?;
     let sole = pinned.peers.len() == 1;
-    let routes = current.as_ref().ok().map(|current| {
-        pinned
-            .peers
-            .iter()
-            .map(|peer| peer_route(current, *peer.ip(), sole))
-            .collect::<io::Result<PeerRoutes>>()
-    });
-    (current.ok(), routes)
+    let lookup = |selected: &InterfaceSnapshot, peer| route_snapshot_by(selected, peer, deadline);
+    let routes = pinned
+        .peers
+        .iter()
+        .map(|peer| Ok((*peer.ip(), read_route(&current, *peer.ip(), sole, lookup)?)))
+        .collect::<Result<PeerRoutes, Unread>>()?;
+    Ok((current, routes))
 }
 
-/// A check that applies what `observe` reads to the watched lock.
+/// A check that applies each read `observe` makes to the watched lock, reading again while it
+/// cannot decide; `observe` is handed the window's deadline.
 fn checking(
     watched: &PinnedLock,
-    observe: impl Fn() -> Observation + Send + Sync + 'static,
+    rereads: Rereads,
+    observe: impl Fn(Instant) -> Result<Observed, Unread> + Send + Sync + 'static,
 ) -> SharedCheck {
     let watched = Arc::clone(watched);
     Arc::new(move || {
-        let (current, routes) = observe();
-        recheck(&watched, current.as_ref(), routes)
+        let settled = settle(
+            rereads,
+            || session_ended(&watched.ended),
+            |deadline| recheck(&watched, observe(deadline)),
+        );
+        concluded(settled, &watched.ended)
     })
+}
+
+/// True while the network holds. Once the watch has started, a check that revokes revokes the
+/// session itself before it writes the log line, so the revoke never waits on the log.
+fn concluded(settled: Settled, ended: &OnceLock<RevocationSignal>) -> bool {
+    match settled {
+        Settled::Holds => true,
+        Settled::Ended => false,
+        Settled::Revokes(reason) => {
+            if let Some(signal) = ended.get() {
+                signal.revoke();
+            }
+            log::warn!("{reason}");
+            false
+        }
+    }
+}
+
+/// Reads until one read decides, handing each read the deadline one window after the first. An
+/// undecided read is read again `rereads.interval` later; once no further read starts before the
+/// deadline, or the session has ended, it revokes. Nothing about the socket changes in between:
+/// its interface, address, peers and pins stay as bound.
+fn settle(
+    rereads: Rereads,
+    ended: impl Fn() -> bool,
+    mut read: impl FnMut(Instant) -> Verdict,
+) -> Settled {
+    let deadline = Instant::now() + rereads.window;
+    let mut reads = 0_u32;
+    loop {
+        reads += 1;
+        let error = match read(deadline) {
+            Verdict::Holds => return Settled::Holds,
+            Verdict::Revokes(reason) => return Settled::Revokes(reason),
+            Verdict::Undecided(error) => error,
+        };
+        if Instant::now() + rereads.interval < deadline {
+            log::info!(
+                "network recheck: the selected adapter did not read back ({:?}: {error}); reading again",
+                error.kind()
+            );
+            if !wait_unless_ended(rereads.interval, &ended) {
+                return Settled::Ended;
+            }
+            if Instant::now() < deadline {
+                continue;
+            }
+        }
+        return Settled::Revokes(format!(
+            "network recheck: the selected adapter still did not read back after {reads} reads ({:?}: {error}); revoked",
+            error.kind()
+        ));
+    }
+}
+
+/// False as soon as `ended`, otherwise true once `interval` has passed.
+fn wait_unless_ended(interval: Duration, ended: &impl Fn() -> bool) -> bool {
+    let until = Instant::now() + interval;
+    loop {
+        if ended() {
+            return false;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(REREAD_POLL));
+    }
+}
+
+fn session_ended(signal: &OnceLock<RevocationSignal>) -> bool {
+    signal.get().is_some_and(RevocationSignal::is_revoked)
+}
+
+/// A pairing listener holds only while its adapter reads back exactly as it was bound.
+fn listener_verdict(
+    pinned: &Mutex<Option<InterfaceSnapshot>>,
+    current: Result<InterfaceSnapshot, Unread>,
+) -> Verdict {
+    let Ok(pinned) = pinned.lock() else {
+        return Verdict::Revokes(
+            "pairing network recheck: the pinned adapter could not be read".to_owned(),
+        );
+    };
+    match (pinned.as_ref(), current) {
+        (Some(pinned), Ok(current)) if *pinned == current => Verdict::Holds,
+        (Some(_), Err(Unread::Unreadable(error))) => Verdict::Undecided(error),
+        _ => Verdict::Revokes("pairing network recheck: the selected adapter changed".to_owned()),
+    }
 }
 
 /// How often the timer reruns the check while a member is set aside, and how long each member set
@@ -614,8 +807,8 @@ async fn readmit(
             Ok(true) => {}
             Ok(false) => return,
             Err(_) => {
-                log::warn!("network watch: a timed recheck could not run; revoked");
                 signal.revoke();
+                log::warn!("network watch: a timed recheck could not run; revoked");
                 return;
             }
         }
@@ -623,7 +816,7 @@ async fn readmit(
 }
 
 /// Runs `check` as the change watch runs it on a notice: never once revoked, and a check that
-/// fails or panics revokes.
+/// fails or panics revokes. A session that ended while the check ran is not reported as changed.
 fn timed_recheck(check: &SharedCheck, signal: &RevocationSignal) -> bool {
     if signal.is_revoked() {
         return false;
@@ -632,46 +825,47 @@ fn timed_recheck(check: &SharedCheck, signal: &RevocationSignal) -> bool {
         std::mem::forget(payload);
         false
     });
-    if !holds {
-        log::warn!("network watch: a timed recheck found the pinned network changed; revoked");
+    if !holds && !signal.is_revoked() {
         signal.revoke();
+        log::warn!("network watch: a timed recheck found the pinned network changed; revoked");
     }
     holds
 }
 
-fn recheck(
-    watched: &Watched,
-    current: Option<&InterfaceSnapshot>,
-    routes: Option<io::Result<PeerRoutes>>,
-) -> bool {
+fn recheck(watched: &Watched, observed: Result<Observed, Unread>) -> Verdict {
     let Ok(mut lock) = watched.lock.lock() else {
-        return false;
+        return Verdict::Revokes(
+            "network recheck failed: the pinned lock could not be read".to_owned(),
+        );
     };
-    let holds = pinned_facts_hold(lock.as_mut(), current, routes);
-    if holds && let Some(lock) = lock.as_ref() {
+    let verdict = judge(lock.as_mut(), observed);
+    if matches!(verdict, Verdict::Holds)
+        && let Some(lock) = lock.as_ref()
+    {
         watched.reachability.set(lock.reachable());
     }
-    holds
+    verdict
 }
 
-fn pinned_facts_hold(
-    lock: Option<&mut NetworkLock>,
-    current: Option<&InterfaceSnapshot>,
-    routes: Option<io::Result<PeerRoutes>>,
-) -> bool {
-    let failure = match (lock, current, routes) {
-        (Some(lock), Some(current), Some(Ok(routes))) => {
-            match lock.revalidate(Some(current), &routes) {
-                Ok(()) => return true,
-                Err(error) => format!("{error:?}"),
-            }
+/// A whole read goes to the lock, which revokes for good on any difference, as a change the read
+/// shows does. An unreadable read leaves the lock and every member's reachability as they were.
+fn judge(lock: Option<&mut NetworkLock>, observed: Result<Observed, Unread>) -> Verdict {
+    let failure = match (lock, observed) {
+        (None, _) => "no pinned snapshot yet".to_owned(),
+        (Some(lock), Ok((current, routes))) => match lock.revalidate(Some(&current), &routes) {
+            Ok(()) => return Verdict::Holds,
+            Err(error) => format!("{error:?}"),
+        },
+        (Some(lock), Err(Unread::Changed(error))) => {
+            let _ = lock.revalidate::<PeerRoute>(None, &[]);
+            format!("the selected adapter changed ({:?}: {error})", error.kind())
         }
-        (None, ..) => "no pinned snapshot yet".to_owned(),
-        (_, _, Some(Err(error))) => error.to_string(),
-        _ => return false,
+        (Some(lock), Err(Unread::Unreadable(_))) if lock.is_revoked() => {
+            format!("{:?}", PolicyError::SessionClosed)
+        }
+        (Some(_), Err(Unread::Unreadable(error))) => return Verdict::Undecided(error),
     };
-    log::warn!("network recheck failed: {failure}");
-    false
+    Verdict::Revokes(format!("network recheck failed: {failure}"))
 }
 
 /// What names the selected adapter: its stable id, its index and the address bound on it.
@@ -698,16 +892,6 @@ impl<'a> AdapterKey<'a> {
             address: *selection.local.ip(),
         }
     }
-}
-
-fn observe_selected_adapter(initial: &Adapter, key: AdapterKey<'_>) -> io::Result<Adapter> {
-    let adapters = enumerate_current().map_err(native_category)?;
-    let observed = find_exact_adapter(&adapters, key)?;
-    if !same_adapter_identity(initial, &observed) {
-        return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
-    }
-    validate_initial_adapter(&observed)?;
-    Ok(observed)
 }
 
 fn find_exact_adapter(adapters: &[Adapter], key: AdapterKey<'_>) -> io::Result<Adapter> {
@@ -777,12 +961,35 @@ fn adapter_kind(adapter: &Adapter) -> Option<InterfaceKind> {
 }
 
 fn route_snapshot(selected: &InterfaceSnapshot, peer: Ipv4Addr) -> io::Result<RouteSnapshot> {
-    let route = network::best_route(selected.address, peer)?;
-    Ok(RouteSnapshot {
+    network::best_route(selected.address, peer).map(snapshot_of)
+}
+
+/// As `route_snapshot`, its wait for the kernel's reply ending at `deadline`.
+#[cfg(target_os = "macos")]
+fn route_snapshot_by(
+    selected: &InterfaceSnapshot,
+    peer: Ipv4Addr,
+    deadline: Instant,
+) -> io::Result<RouteSnapshot> {
+    network::best_route_by(selected.address, peer, deadline).map(snapshot_of)
+}
+
+/// Windows reads its route table in one synchronous call, with no reply to wait for.
+#[cfg(windows)]
+fn route_snapshot_by(
+    selected: &InterfaceSnapshot,
+    peer: Ipv4Addr,
+    _deadline: Instant,
+) -> io::Result<RouteSnapshot> {
+    route_snapshot(selected, peer)
+}
+
+fn snapshot_of(route: network::Route) -> RouteSnapshot {
+    RouteSnapshot {
         interface_index: route.interface_index,
         source: route.source,
         next_hop: route.next_hop,
-    })
+    }
 }
 
 fn route_check_error(error: io::Error) -> io::Error {
@@ -926,6 +1133,7 @@ mod tests {
         Watched {
             lock: Mutex::new(Some(lock)),
             reachability,
+            ended: OnceLock::new(),
         }
     }
 
@@ -942,6 +1150,27 @@ mod tests {
             .unwrap()
             .as_ref()
             .is_none_or(NetworkLock::is_revoked)
+    }
+
+    fn unreadable() -> Unread {
+        Unread::Unreadable(io::Error::from(io::ErrorKind::Other))
+    }
+
+    fn changed() -> Unread {
+        Unread::Changed(io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    fn whole(current: &InterfaceSnapshot, routes: PeerRoutes) -> Result<Observed, Unread> {
+        Ok((current.clone(), routes))
+    }
+
+    /// `Some(holds)` once a read decides, `None` while it cannot.
+    fn decided(verdict: Verdict) -> Option<bool> {
+        match verdict {
+            Verdict::Holds => Some(true),
+            Verdict::Revokes(_) => Some(false),
+            Verdict::Undecided(_) => None,
+        }
     }
 
     #[test]
@@ -965,105 +1194,195 @@ mod tests {
     }
 
     #[test]
-    fn a_change_notice_keeps_the_session_only_while_adapter_attachment_and_route_hold() {
+    fn an_adapter_gone_or_read_back_as_another_is_a_change_and_one_between_states_is_unreadable() {
+        let initial = adapter();
+        let present = |adapter: Adapter| Ok(AdapterReading::Present(adapter));
+        assert_eq!(
+            judge_adapter(&initial, present(initial.clone())).unwrap(),
+            interface_snapshot(&initial).unwrap()
+        );
+        #[cfg(windows)]
+        assert!(matches!(
+            judge_adapter(&initial, Ok(AdapterReading::Settling)),
+            Err(Unread::Unreadable(_))
+        ));
+        for between_states in [
+            Err(io::Error::from(io::ErrorKind::Other)),
+            present(Adapter {
+                attachment: None,
+                ..initial.clone()
+            }),
+        ] {
+            assert!(matches!(
+                judge_adapter(&initial, between_states),
+                Err(Unread::Unreadable(_))
+            ));
+        }
+        for gone_or_another in [
+            Ok(AdapterReading::Lost),
+            present(Adapter {
+                name: "reused-index".to_owned(),
+                ..initial.clone()
+            }),
+            present(Adapter {
+                stable_id: "another-adapter".to_owned(),
+                ..initial.clone()
+            }),
+            present(Adapter {
+                prefix_len: 16,
+                ..initial.clone()
+            }),
+        ] {
+            assert!(matches!(
+                judge_adapter(&initial, gone_or_another),
+                Err(Unread::Changed(_))
+            ));
+        }
+        // Another network name reads back whole; the lock then judges it a change.
+        let other_network = judge_adapter(
+            &initial,
+            present(Adapter {
+                attachment: Some(vec![2; 32]),
+                ..initial.clone()
+            }),
+        )
+        .unwrap();
+        assert_ne!(other_network, interface_snapshot(&initial).unwrap());
+    }
+
+    #[test]
+    fn a_failed_route_lookup_is_unreadable_and_a_refused_route_or_off_subnet_peer_a_change() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let found = |_: &InterfaceSnapshot, _: Ipv4Addr| Ok(route());
+        assert_eq!(
+            read_route(&selected, PEER, true, found).unwrap(),
+            PeerRoute::Found(route())
+        );
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::NotFound,
+        ] {
+            for sole in [true, false] {
+                let failed = read_route(&selected, PEER, sole, |_, _| Err(io::Error::from(kind)));
+                assert!(matches!(failed, Err(Unread::Unreadable(_))), "{kind:?}");
+            }
+        }
+        // A peer the platform cannot reach sets aside a group member; a lone one is unreadable.
+        for kind in [
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+        ] {
+            let unreachable = |_: &InterfaceSnapshot, _: Ipv4Addr| Err(io::Error::from(kind));
+            assert_eq!(
+                read_route(&selected, PEER, false, unreachable).unwrap(),
+                PeerRoute::Unreachable
+            );
+            assert!(matches!(
+                read_route(&selected, PEER, true, unreachable),
+                Err(Unread::Unreadable(_))
+            ));
+        }
+        // A route the policy refuses is a change for a group member and a lone peer alike.
+        for sole in [true, false] {
+            let refused = read_route(&selected, PEER, sole, |_, _| {
+                Err(io::Error::other(network::RouteRefused("ineligible route")))
+            });
+            let Err(Unread::Changed(error)) = refused else {
+                panic!("a refused route must be a change");
+            };
+            assert!(
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<RouteCheckFailure>())
+            );
+        }
+        let off_subnet = Ipv4Addr::new(192, 168, 51, 11);
+        assert!(matches!(
+            read_route(&selected, off_subnet, true, found),
+            Err(Unread::Changed(_))
+        ));
+    }
+
+    #[test]
+    fn a_whole_read_keeps_the_session_only_while_adapter_attachment_and_route_hold() {
         let selected = interface_snapshot(&adapter()).unwrap();
         let peer = Ipv4Addr::new(192, 168, 50, 11);
         let lock = NetworkLock::new(selected.clone(), peer, route(), false).unwrap();
 
         let mut unchanged = lock.clone();
-        assert!(pinned_facts_hold(
-            Some(&mut unchanged),
-            Some(&selected),
-            Some(Ok(peer_routes(route())))
-        ));
-        assert!(pinned_facts_hold(
-            Some(&mut unchanged),
-            Some(&selected),
-            Some(Ok(peer_routes(route())))
-        ));
+        for _ in 0..2 {
+            let read = whole(&selected, peer_routes(route()));
+            assert_eq!(decided(judge(Some(&mut unchanged), read)), Some(true));
+        }
         assert!(!unchanged.is_revoked());
 
-        let mut other_network = lock.clone();
         let mut moved = selected.clone();
         moved.network_signature = vec![2; 32];
-        assert!(!pinned_facts_hold(
-            Some(&mut other_network),
-            Some(&moved),
-            Some(Ok(peer_routes(route())))
-        ));
-        assert!(other_network.is_revoked());
+        let gateway = RouteSnapshot {
+            next_hop: Ipv4Addr::new(192, 168, 50, 1),
+            ..route()
+        };
+        let elsewhere = RouteSnapshot {
+            interface_index: 9,
+            ..route()
+        };
+        for (current, route) in [
+            (&moved, route()),
+            (&selected, gateway),
+            (&selected, elsewhere),
+        ] {
+            let mut lock = lock.clone();
+            let read = whole(current, peer_routes(route));
+            assert_eq!(decided(judge(Some(&mut lock), read)), Some(false));
+            assert!(lock.is_revoked());
+        }
 
-        let mut gateway = lock.clone();
-        assert!(!pinned_facts_hold(
-            Some(&mut gateway),
-            Some(&selected),
-            Some(Ok(peer_routes(RouteSnapshot {
-                next_hop: Ipv4Addr::new(192, 168, 50, 1),
-                ..route()
-            })))
-        ));
-        assert!(gateway.is_revoked());
+        // A read that shows the adapter gone or different revokes the lock for good.
+        let mut gone = lock.clone();
+        assert_eq!(decided(judge(Some(&mut gone), Err(changed()))), Some(false));
+        assert!(gone.is_revoked());
+        let read = whole(&selected, peer_routes(route()));
+        assert_eq!(decided(judge(Some(&mut gone), read)), Some(false));
 
-        let mut other_interface = lock.clone();
-        assert!(!pinned_facts_hold(
-            Some(&mut other_interface),
-            Some(&selected),
-            Some(Ok(peer_routes(RouteSnapshot {
-                interface_index: 9,
-                ..route()
-            })))
-        ));
+        // An unreadable one decides nothing and leaves the lock as it was.
+        let mut unread = lock.clone();
+        assert_eq!(decided(judge(Some(&mut unread), Err(unreadable()))), None);
+        assert!(!unread.is_revoked());
+        let read = whole(&selected, peer_routes(route()));
+        assert_eq!(decided(judge(Some(&mut unread), read)), Some(true));
 
-        let mut unreadable = lock.clone();
-        assert!(!pinned_facts_hold(
-            Some(&mut unreadable),
-            Some(&selected),
-            Some(Err(io::Error::from(io::ErrorKind::Other)))
-        ));
-        assert!(!pinned_facts_hold(Some(&mut lock.clone()), None, None));
-        assert!(!pinned_facts_hold(
-            None,
-            Some(&selected),
-            Some(Ok(peer_routes(route())))
-        ));
-
-        let mut revoked = lock;
-        revoked.revalidate(None, &peer_routes(route())).unwrap_err();
-        assert!(!pinned_facts_hold(
-            Some(&mut revoked),
-            Some(&selected),
-            Some(Ok(peer_routes(route())))
-        ));
+        // Before the first snapshot, or once revoked, there is nothing to read again.
+        let read = whole(&selected, peer_routes(route()));
+        assert_eq!(decided(judge(None, read)), Some(false));
+        assert_eq!(decided(judge(None, Err(unreadable()))), Some(false));
+        assert_eq!(
+            decided(judge(Some(&mut gone), Err(unreadable()))),
+            Some(false)
+        );
     }
 
     #[test]
-    fn a_change_notice_revokes_the_whole_set_when_any_member_route_fails() {
+    fn a_whole_read_revokes_the_whole_set_when_any_member_route_moves() {
         let selected = interface_snapshot(&adapter()).unwrap();
         let members = member_routes();
         let lock = NetworkLock::new_group(selected.clone(), &members, false).unwrap();
         let mut unchanged = lock.clone();
-        assert!(pinned_facts_hold(
-            Some(&mut unchanged),
-            Some(&selected),
-            Some(Ok(members.clone()))
-        ));
+        let read = whole(&selected, members.clone());
+        assert_eq!(decided(judge(Some(&mut unchanged), read)), Some(true));
         for member in 0..members.len() {
             let mut routed = members.clone();
             routed[member].1 = gateway();
             let mut lock = lock.clone();
-            assert!(!pinned_facts_hold(
-                Some(&mut lock),
-                Some(&selected),
-                Some(Ok(routed))
-            ));
+            assert_eq!(
+                decided(judge(Some(&mut lock), whole(&selected, routed))),
+                Some(false)
+            );
             assert!(lock.is_revoked());
         }
         let mut missing = lock.clone();
-        assert!(!pinned_facts_hold(
-            Some(&mut missing),
-            Some(&selected),
-            Some(Ok(members[1..].to_vec()))
-        ));
+        let read = whole(&selected, members[1..].to_vec());
+        assert_eq!(decided(judge(Some(&mut missing), read)), Some(false));
         assert!(missing.is_revoked());
     }
 
@@ -1091,32 +1410,36 @@ mod tests {
         let selected = interface_snapshot(&adapter()).unwrap();
         let members = member_routes();
         let watched = watching(&selected, &members);
-        let mut second_down = members.clone();
-        second_down[1].1 = PeerRoute::Unreachable;
-        assert!(recheck(&watched, Some(&selected), Some(Ok(second_down))));
+        let second_down = with_down(&members, &[1]);
+        assert_eq!(
+            decided(recheck(&watched, whole(&selected, second_down))),
+            Some(true)
+        );
         assert_eq!(reaches(&watched), [true, false, true]);
         assert!(!revoked(&watched));
 
-        let mut outer_down = members.clone();
-        outer_down[0].1 = PeerRoute::Unreachable;
-        outer_down[2].1 = PeerRoute::Unreachable;
-        assert!(recheck(&watched, Some(&selected), Some(Ok(outer_down))));
+        let outer_down = with_down(&members, &[0, 2]);
+        assert_eq!(
+            decided(recheck(&watched, whole(&selected, outer_down))),
+            Some(true)
+        );
+        assert_eq!(reaches(&watched), [false, true, false]);
+
+        // An unreadable read sets no member aside and admits none.
+        assert_eq!(decided(recheck(&watched, Err(unreadable()))), None);
         assert_eq!(reaches(&watched), [false, true, false]);
 
         // The next check that finds their routes admits them again.
-        assert!(recheck(
-            &watched,
-            Some(&selected),
-            Some(Ok(members.clone()))
-        ));
+        assert_eq!(
+            decided(recheck(&watched, whole(&selected, members.clone()))),
+            Some(true)
+        );
         assert_eq!(reaches(&watched), [true, true, true]);
         assert!(!revoked(&watched));
 
         // A bind may start with a member already set aside.
-        let mut bound_down = members;
-        bound_down[2].1 = PeerRoute::Unreachable;
         assert_eq!(
-            reaches(&watching(&selected, &bound_down)),
+            reaches(&watching(&selected, &with_down(&members, &[2]))),
             [true, true, false]
         );
     }
@@ -1124,8 +1447,7 @@ mod tests {
     #[test]
     fn an_interface_change_still_revokes_every_member() {
         let selected = interface_snapshot(&adapter()).unwrap();
-        let mut set_aside = member_routes();
-        set_aside[1].1 = PeerRoute::Unreachable;
+        let set_aside = with_down(&member_routes(), &[1]);
         let mut other_network = selected.clone();
         other_network.network_signature = vec![2; 32];
         let mut renumbered = selected.clone();
@@ -1136,11 +1458,8 @@ mod tests {
         resubnetted.prefix_len = 16;
         for current in [other_network, renumbered, readdressed, resubnetted] {
             let watched = watching(&selected, &set_aside);
-            assert!(!recheck(
-                &watched,
-                Some(&current),
-                Some(Ok(set_aside.clone()))
-            ));
+            let read = whole(&current, set_aside.clone());
+            assert_eq!(decided(recheck(&watched, read)), Some(false));
             assert!(revoked(&watched));
         }
 
@@ -1157,23 +1476,207 @@ mod tests {
             let watched = watching(&selected, &set_aside);
             let mut routes = set_aside.clone();
             routes[2].1 = found;
-            assert!(!recheck(&watched, Some(&selected), Some(Ok(routes))));
+            assert_eq!(
+                decided(recheck(&watched, whole(&selected, routes))),
+                Some(false)
+            );
             assert!(revoked(&watched));
         }
 
         let watched = watching(&selected, &set_aside);
-        assert!(!recheck(&watched, None, None));
-        let watched = watching(&selected, &set_aside);
-        assert!(!recheck(
-            &watched,
-            Some(&selected),
-            Some(Err(io::Error::from(io::ErrorKind::Other)))
-        ));
+        assert_eq!(decided(recheck(&watched, Err(changed()))), Some(false));
+        assert!(revoked(&watched));
+        assert_eq!(reaches(&watched), [true, false, true]);
+    }
+
+    /// Stands in for the one-second window and the 300 ms between rereads.
+    const REREAD: Rereads = Rereads {
+        window: Duration::from_millis(300),
+        interval: Duration::from_millis(50),
+    };
+
+    /// How late a loaded machine may run a sleep or a step past its due time.
+    const SLACK: Duration = Duration::from_millis(150);
+
+    /// A window no test outlasts, for tests about what a read decides rather than when.
+    const PATIENT: Rereads = Rereads {
+        window: SETTLE,
+        interval: Duration::from_millis(30),
+    };
+
+    /// A check on a lock bound to `selected` and one peer, whose `n`th read returns
+    /// `read(n, deadline)`, and when it made each read with the deadline it was handed.
+    struct Scripted {
+        watched: PinnedLock,
+        check: SharedCheck,
+        reads: Arc<Mutex<Vec<(Instant, Instant)>>>,
+    }
+
+    impl Scripted {
+        fn new(
+            selected: &InterfaceSnapshot,
+            rereads: Rereads,
+            read: impl Fn(usize, Instant) -> Result<Observed, Unread> + Send + Sync + 'static,
+        ) -> Self {
+            let watched = Arc::new(watching(selected, &peer_routes(route())));
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let check = {
+                let reads = Arc::clone(&reads);
+                checking(&watched, rereads, move |deadline| {
+                    let read_number = {
+                        let mut reads = reads.lock().unwrap();
+                        reads.push((Instant::now(), deadline));
+                        reads.len() - 1
+                    };
+                    read(read_number, deadline)
+                })
+            };
+            Self {
+                watched,
+                check,
+                reads,
+            }
+        }
+
+        fn reads(&self) -> Vec<Instant> {
+            self.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|read| read.0)
+                .collect()
+        }
+
+        fn deadlines(&self) -> Vec<Instant> {
+            self.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|read| read.1)
+                .collect()
+        }
     }
 
     #[test]
-    fn a_group_of_one_still_revokes_on_its_route_failure() {
-        // Its lone member's route failing fails the check, whatever the platform calls it.
+    fn a_read_caught_between_states_is_read_again_and_an_unchanged_one_keeps_the_session() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let current = selected.clone();
+        let script = Scripted::new(&selected, PATIENT, move |read, _| {
+            if read < 2 {
+                Err(unreadable())
+            } else {
+                whole(&current, peer_routes(route()))
+            }
+        });
+        assert!((script.check)());
+        let reads = script.reads();
+        assert_eq!(reads.len(), 3);
+        assert!(
+            reads
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] >= PATIENT.interval)
+        );
+        assert!(!revoked(&script.watched));
+    }
+
+    #[test]
+    fn a_network_unreadable_for_the_whole_window_revokes_when_it_ends() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let script = Scripted::new(&selected, REREAD, |_, _| Err(unreadable()));
+        let started = Instant::now();
+        assert!(!(script.check)());
+        let took = started.elapsed();
+        // Every 50 ms up to 250 ms on an idle machine; a loaded one fits fewer, never one.
+        assert!((2..=6).contains(&script.reads().len()));
+        assert!(took >= REREAD.window - REREAD.interval);
+        assert!(took < SETTLE);
+    }
+
+    #[test]
+    fn every_read_shares_one_deadline_so_slow_reads_cannot_stretch_the_window() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let rereads = Rereads {
+            window: Duration::from_millis(300),
+            interval: Duration::from_millis(30),
+        };
+        let slow = Duration::from_millis(120);
+        // Four reads of 120 ms would take 570 ms; the window stops the third from starting.
+        let script = Scripted::new(&selected, rereads, move |_, _| {
+            std::thread::sleep(slow);
+            Err(unreadable())
+        });
+        let started = Instant::now();
+        assert!(!(script.check)());
+        let finished = Instant::now();
+        let (reads, deadlines) = (script.reads(), script.deadlines());
+        assert!(reads.len() <= 2);
+        assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
+        assert!(deadlines[0] >= started + rereads.window);
+        assert!(deadlines[0] <= reads[0] + rereads.window);
+        // No read starts after the deadline, and the check ends with its last read.
+        assert!(reads.iter().all(|read| *read < deadlines[0]));
+        assert!(finished < reads[reads.len() - 1] + slow + SLACK);
+
+        // A lookup that gives up only at its deadline leaves no time for another read.
+        let script = Scripted::new(&selected, rereads, |_, deadline| {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Err(unreadable())
+        });
+        assert!(!(script.check)());
+        let finished = Instant::now();
+        assert_eq!(script.reads().len(), 1);
+        assert!(finished < script.deadlines()[0] + SLACK);
+    }
+
+    #[test]
+    fn a_read_that_shows_a_change_revokes_without_reading_again() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let mut moved = selected.clone();
+        moved.network_signature = vec![2; 32];
+        let script = Scripted::new(&selected, PATIENT, move |_, _| {
+            whole(&moved, peer_routes(route()))
+        });
+        assert!(!(script.check)());
+        assert_eq!(script.reads().len(), 1);
+        assert!(revoked(&script.watched));
+
+        let script = Scripted::new(&selected, PATIENT, |_, _| Err(changed()));
+        assert!(!(script.check)());
+        assert_eq!(script.reads().len(), 1);
+        assert!(revoked(&script.watched));
+
+        // A change found on a reread revokes on that read.
+        let script = Scripted::new(&selected, PATIENT, |read, _| {
+            Err(if read == 0 { unreadable() } else { changed() })
+        });
+        assert!(!(script.check)());
+        assert_eq!(script.reads().len(), 2);
+        assert!(revoked(&script.watched));
+    }
+
+    #[test]
+    fn a_session_that_ends_between_reads_stops_reading_at_once() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let signal = RevocationSignal::default();
+        let ending = signal.clone();
+        let long = Rereads {
+            window: SETTLE * 4,
+            interval: SETTLE * 2,
+        };
+        let script = Scripted::new(&selected, long, move |_, _| {
+            ending.revoke();
+            Err(unreadable())
+        });
+        assert!(script.watched.ended.set(signal).is_ok());
+        let started = Instant::now();
+        assert!(!(script.check)());
+        assert!(started.elapsed() < SETTLE);
+        assert_eq!(script.reads().len(), 1);
+    }
+
+    #[test]
+    fn a_lone_member_whose_route_stays_unreadable_revokes_once_the_window_ends() {
+        // Its lone member's route failing fails the read, whatever the platform calls it.
         for kind in [
             io::ErrorKind::HostUnreachable,
             io::ErrorKind::NetworkUnreachable,
@@ -1186,20 +1689,29 @@ mod tests {
                     .get_ref()
                     .is_some_and(|cause| cause.is::<RouteCheckFailure>())
             );
-            let selected = interface_snapshot(&adapter()).unwrap();
-            let watched = watching(&selected, &peer_routes(route()));
-            assert!(!recheck(&watched, Some(&selected), Some(Err(error))));
         }
-
-        // The lock refuses a lone unreachable member too, at bind and on a check.
         let selected = interface_snapshot(&adapter()).unwrap();
+        let current = selected.clone();
+        let script = Scripted::new(&selected, REREAD, move |_, _| {
+            let route = read_route(&current, PEER, true, |_, _| {
+                Err(io::Error::from(io::ErrorKind::HostUnreachable))
+            })?;
+            whole(&current, vec![(PEER, route)])
+        });
+        assert!(!(script.check)());
+        assert!((2..=6).contains(&script.reads().len()));
+
+        // The lock refuses a lone unreachable member too, at bind and on a whole read.
         let alone = vec![(PEER, PeerRoute::Unreachable)];
         assert_eq!(
             NetworkLock::new_group(selected.clone(), &alone, false).unwrap_err(),
             PolicyError::PeerUnreachable
         );
         let watched = watching(&selected, &peer_routes(route()));
-        assert!(!recheck(&watched, Some(&selected), Some(Ok(alone))));
+        assert_eq!(
+            decided(recheck(&watched, whole(&selected, alone))),
+            Some(false)
+        );
         assert!(revoked(&watched));
     }
 
@@ -1217,11 +1729,12 @@ mod tests {
     }
 
     impl Network {
-        fn observe(&self) -> Observation {
+        fn observe(&self) -> Result<Observed, Unread> {
             self.reads.lock().unwrap().push(Instant::now());
             let (current, routes) = self.current.lock().unwrap().clone();
-            let routes = current.is_some().then_some(Ok(routes));
-            (current, routes)
+            current
+                .map(|current| (current, routes))
+                .ok_or_else(unreadable)
         }
 
         fn set(&self, current: Option<&InterfaceSnapshot>, routes: &PeerRoutes) {
@@ -1252,7 +1765,7 @@ mod tests {
                 reads: Mutex::default(),
             });
             let reading = Arc::clone(&network);
-            let check = checking(&watched, move || reading.observe());
+            let check = checking(&watched, REREAD, move |_| reading.observe());
             let signal = RevocationSignal::default();
             let probes = Arc::new(Mutex::new(Vec::new()));
             let probe: Probe = {

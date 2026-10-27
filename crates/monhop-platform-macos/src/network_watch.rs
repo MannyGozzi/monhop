@@ -2,22 +2,26 @@
 //!
 //! This module only subscribes to the dynamic store and the kernel routing socket after a local
 //! enable action. Every notice re-reads the selected interface through the caller's check; a
-//! changed, missing, or unreadable interface permanently revokes the watcher. Drop it before an
+//! changed or missing interface, or one that stays unreadable, permanently revokes the watcher. A
+//! notice that the selected interface's link changed revokes without the check. Drop it before an
 //! explicitly reconnected session.
 
 use std::{
     error::Error,
     ffi::{c_char, c_void},
-    fmt,
+    fmt, io,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
-    sync::Arc,
+    sync::{
+        Arc,
+        mpsc::{SyncSender, TrySendError, sync_channel},
+    },
     thread::JoinHandle,
 };
 
 use monhop_core::RevocationSignal;
 
-use crate::network::RouteObserver;
+use crate::network::{RouteChange, RouteObserver};
 
 use core_foundation::{
     array::{CFArray, CFArrayRef},
@@ -30,7 +34,8 @@ const STORE_NAME: &str = "MonHop network watcher";
 const DISPATCH_QUEUE_LABEL: &[u8] = b"com.manuelgozzi.monhop.network-watch\0";
 const MAX_LOGGED_KEYS: usize = 6;
 
-/// Re-reads the selected interface after a change notice; `false` revokes. It runs on the watch queue.
+/// Re-reads the selected interface after a change notice; `false` revokes. It runs on the watch
+/// queue or the route check thread, and may block while it reads a network mid-transition again.
 pub type PinnedCheck = Box<dyn Fn() -> bool + Send + Sync>;
 
 type SCDynamicStoreRef = CFTypeRef;
@@ -128,7 +133,7 @@ impl NetworkChangeWatcher {
         still_pinned: PinnedCheck,
     ) -> Result<Self, NetworkWatchError> {
         let patterns = notification_patterns(interface_name)?;
-        let state = Arc::new(WatcherState::new(still_pinned));
+        let state = Arc::new(WatcherState::new(interface_name, still_pinned));
         let power =
             crate::power_watch::PowerWatch::start_after_local_enable(state.signal.clone(), None)
                 .map_err(|_| NetworkWatchError::PowerRegistrationFailed)?;
@@ -184,13 +189,16 @@ impl Drop for NetworkChangeWatcher {
 struct WatcherState {
     signal: RevocationSignal,
     still_pinned: PinnedCheck,
+    /// The dynamic-store key holding the selected interface's link state.
+    link_key: String,
 }
 
 impl WatcherState {
-    fn new(still_pinned: PinnedCheck) -> Self {
+    fn new(interface_name: &str, still_pinned: PinnedCheck) -> Self {
         Self {
             signal: RevocationSignal::default(),
             still_pinned,
+            link_key: format!("State:/Network/Interface/{interface_name}/Link"),
         }
     }
 
@@ -202,20 +210,36 @@ impl WatcherState {
         self.signal.is_revoked()
     }
 
-    /// A notice revokes only when the pinned interface no longer reads back as it was selected.
+    /// A change to the selected link's key revokes without a check: the link was active at bind,
+    /// so it went down at least once, and coalesced notices may find it active again by now.
+    fn notice(&self, changed_keys: &[String]) {
+        if !changed_keys.contains(&self.link_key) {
+            self.observe(&key_summary(changed_keys));
+        } else if !self.is_revoked() {
+            self.revoke();
+            log::warn!("network watch: the selected interface's link changed; revoked");
+        }
+    }
+
+    /// A notice revokes only when the pinned interface no longer reads back as it was selected. A
+    /// watcher revoked while its check ran is not reported as a network change.
     fn observe(&self, changed_keys: &str) {
         if self.is_revoked() {
             return;
         }
-        if pinned_facts_hold(&self.still_pinned) {
+        let holds = pinned_facts_hold(&self.still_pinned);
+        if self.is_revoked() {
+            return;
+        }
+        if holds {
             log::debug!(
                 "network watch: {changed_keys} changed; the selected interface is unchanged, session continues"
             );
         } else {
+            self.revoke();
             log::warn!(
                 "network watch: {changed_keys} changed and the selected interface differs; revoked"
             );
-            self.revoke();
         }
     }
 }
@@ -301,43 +325,78 @@ impl Drop for OwnedDispatchQueue {
 }
 
 /// Kernel route changes never reach the dynamic store, so a routing socket feeds the same check.
+/// The check runs on its own thread, so a slow one never leaves the socket unread long enough to
+/// overflow and drop a notice.
 struct RouteListener {
     observer: Arc<RouteObserver>,
-    thread: Option<JoinHandle<()>>,
+    reader: Option<JoinHandle<()>>,
+    checker: Option<JoinHandle<()>>,
 }
 
 impl RouteListener {
     fn start(state: Arc<WatcherState>, interface_index: u32) -> Result<Self, NetworkWatchError> {
         let observer =
             Arc::new(RouteObserver::open().map_err(|_| NetworkWatchError::RouteListenerFailed)?);
-        let reader = Arc::clone(&observer);
-        let thread = std::thread::Builder::new()
-            .name("monhop-route-watch".to_owned())
-            .spawn(move || {
-                loop {
-                    match reader.next(interface_index) {
-                        Ok(Some(change)) => state.observe(&format!("kernel route {change:?}")),
-                        Ok(None) => break,
-                        Err(_) => {
-                            log::warn!("network watch: the kernel route listener failed; revoked");
-                            state.revoke();
-                            break;
-                        }
+        // One slot: a queued check already covers every change that arrives before it starts.
+        let (changes, pending) = sync_channel::<RouteChange>(1);
+        let checker = {
+            let state = Arc::clone(&state);
+            std::thread::Builder::new()
+                .name("monhop-route-check".to_owned())
+                .spawn(move || {
+                    while let Ok(change) = pending.recv() {
+                        state.observe(&format!("kernel route {change:?}"));
                     }
-                }
-            })
+                })
+                .map_err(|_| NetworkWatchError::RouteListenerFailed)?
+        };
+        let reader = Arc::clone(&observer);
+        // The reader owns the only sender, so the checker ends once the reader does.
+        let reader = std::thread::Builder::new()
+            .name("monhop-route-watch".to_owned())
+            .spawn(move || forward_route_changes(|| reader.next(interface_index), &changes, &state))
             .map_err(|_| NetworkWatchError::RouteListenerFailed)?;
         Ok(Self {
             observer,
-            thread: Some(thread),
+            reader: Some(reader),
+            checker: Some(checker),
         })
+    }
+}
+
+/// Hands each route change to the checker without waiting, until the listener stops. A failed
+/// read, or a checker that is gone, revokes.
+fn forward_route_changes(
+    mut next: impl FnMut() -> io::Result<Option<RouteChange>>,
+    changes: &SyncSender<RouteChange>,
+    state: &WatcherState,
+) {
+    loop {
+        match next() {
+            Ok(Some(change)) => {
+                if let Err(TrySendError::Disconnected(_)) = changes.try_send(change) {
+                    state.revoke();
+                    log::warn!("network watch: a route check could not run; revoked");
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(_) => {
+                state.revoke();
+                log::warn!("network watch: the kernel route listener failed; revoked");
+                return;
+            }
+        }
     }
 }
 
 impl Drop for RouteListener {
     fn drop(&mut self) {
         self.observer.stop();
-        if let Some(thread) = self.thread.take() {
+        for thread in [self.reader.take(), self.checker.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = thread.join();
         }
     }
@@ -421,23 +480,26 @@ extern "C" fn dynamic_store_callback(
     changed_keys: CFArrayRef,
     info: *mut c_void,
 ) {
-    let changed_keys = changed_key_summary(changed_keys);
+    let changed_keys = changed_key_list(changed_keys);
     // SAFETY: the dynamic-store context retains this state through queued and in-flight callbacks.
-    unsafe { (&*info.cast::<WatcherState>()).observe(&changed_keys) };
+    unsafe { (&*info.cast::<WatcherState>()).notice(&changed_keys) };
 }
 
-/// Dynamic-store keys name interfaces and services only, never addresses or network names.
-fn changed_key_summary(changed_keys: CFArrayRef) -> String {
+fn changed_key_list(changed_keys: CFArrayRef) -> Vec<String> {
     if changed_keys.is_null() {
-        return "unknown keys".to_owned();
+        return Vec::new();
     }
     // SAFETY: SystemConfiguration passes an array of CFString keys that outlives this callback.
     let keys: CFArray<CFString> = unsafe { CFArray::wrap_under_get_rule(changed_keys) };
-    keys.iter()
-        .take(MAX_LOGGED_KEYS)
-        .map(|key| key.to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
+    keys.iter().map(|key| key.to_string()).collect()
+}
+
+/// Dynamic-store keys name interfaces and services only, never addresses or network names.
+fn key_summary(changed_keys: &[String]) -> String {
+    if changed_keys.is_empty() {
+        return "unknown keys".to_owned();
+    }
+    changed_keys[..changed_keys.len().min(MAX_LOGGED_KEYS)].join(" ")
 }
 
 /// Only the selected interface's own keys and the primary IPv4 service can affect the pinned socket.
@@ -483,22 +545,143 @@ mod tests {
 
     #[test]
     fn a_notice_with_unchanged_facts_keeps_the_session() {
-        let state = WatcherState::new(Box::new(|| true));
+        let state = WatcherState::new("en0", Box::new(|| true));
         state.observe("State:/Network/Interface/en0/IPv6");
         assert!(!state.is_revoked());
     }
 
+    fn counted(holds: bool) -> (WatcherState, Arc<std::sync::atomic::AtomicUsize>) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        let state = WatcherState::new(
+            "en0",
+            Box::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                holds
+            }),
+        );
+        (state, runs)
+    }
+
+    fn keys(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|key| (*key).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_change_to_the_selected_link_revokes_without_a_check() {
+        // Even with the network reading back unchanged, as a link already back up would.
+        let (state, runs) = counted(true);
+        state.notice(&keys(&[
+            "State:/Network/Interface/en0/AirPort",
+            "State:/Network/Interface/en0/IPv4",
+            "State:/Network/Interface/en0/AirPort/SSID_STR",
+            "State:/Network/Interface/en0/AirPort/BusyUI",
+            "State:/Network/Interface/en0/AirPort/ProfileID",
+            "State:/Network/Interface/en0/AirPort/WEP40",
+            "State:/Network/Interface/en0/Link",
+        ]));
+        assert!(state.is_revoked());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn other_keys_and_other_links_only_recheck() {
+        let (state, runs) = counted(true);
+        for notice in [
+            keys(&["State:/Network/Interface/en0/LinkQuality"]),
+            keys(&["State:/Network/Interface/en1/Link"]),
+            keys(&["State:/Network/Interface/en0/AirPort"]),
+            keys(&["State:/Network/Global/IPv4"]),
+            Vec::new(),
+        ] {
+            state.notice(&notice);
+        }
+        assert!(!state.is_revoked());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 5);
+
+        let (state, runs) = counted(false);
+        state.notice(&keys(&["State:/Network/Interface/en0/LinkQuality"]));
+        assert!(state.is_revoked());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_notice_logs_at_most_six_keys() {
+        let many: Vec<String> = (0..9)
+            .map(|n| format!("State:/Network/Interface/en0/K{n}"))
+            .collect();
+        assert_eq!(key_summary(&many).split(' ').count(), MAX_LOGGED_KEYS);
+        assert_eq!(key_summary(&[]), "unknown keys");
+    }
+
     #[test]
     fn a_notice_with_changed_facts_revokes() {
-        let state = WatcherState::new(Box::new(|| false));
+        let state = WatcherState::new("en0", Box::new(|| false));
         state.observe("State:/Network/Interface/en0/IPv4");
         assert!(state.is_revoked());
     }
 
     #[test]
     fn a_panicking_check_revokes_instead_of_unwinding() {
-        let state = WatcherState::new(Box::new(|| -> bool { panic!("check failed") }));
+        let state = WatcherState::new("en0", Box::new(|| -> bool { panic!("check failed") }));
         state.observe("State:/Network/Global/IPv4");
+        assert!(state.is_revoked());
+    }
+
+    /// The reads a route listener makes, in order, then the end of the stream.
+    fn route_reads(
+        reads: Vec<io::Result<Option<RouteChange>>>,
+    ) -> impl FnMut() -> io::Result<Option<RouteChange>> {
+        let mut reads = reads.into_iter();
+        move || reads.next().unwrap_or(Ok(None))
+    }
+
+    #[test]
+    fn route_changes_queue_one_check_without_waiting_and_a_stopped_listener_keeps_the_session() {
+        let state = WatcherState::new("en0", Box::new(|| true));
+        let (changes, pending) = sync_channel(1);
+        let reads = [
+            RouteChange::Added,
+            RouteChange::Changed,
+            RouteChange::Deleted,
+        ]
+        .map(|change| Ok(Some(change)))
+        .into();
+        forward_route_changes(route_reads(reads), &changes, &state);
+        assert!(!state.is_revoked());
+        assert_eq!(pending.try_recv(), Ok(RouteChange::Added));
+        assert!(pending.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_route_change_with_no_checker_left_revokes() {
+        let state = WatcherState::new("en0", Box::new(|| true));
+        let (changes, pending) = sync_channel(1);
+        drop(pending);
+        let reads = vec![Ok(Some(RouteChange::Changed)), Ok(Some(RouteChange::Added))];
+        let mut left = route_reads(reads);
+        let mut made = 0;
+        forward_route_changes(
+            || {
+                made += 1;
+                left()
+            },
+            &changes,
+            &state,
+        );
+        assert!(state.is_revoked());
+        assert_eq!(
+            made, 1,
+            "the listener stops at the first change it cannot hand over"
+        );
+    }
+
+    #[test]
+    fn a_failed_route_read_revokes() {
+        let state = WatcherState::new("en0", Box::new(|| true));
+        let (changes, _pending) = sync_channel(1);
+        let reads = vec![Err(io::Error::other("routing socket closed"))];
+        forward_route_changes(route_reads(reads), &changes, &state);
         assert!(state.is_revoked());
     }
 
@@ -514,7 +697,7 @@ mod tests {
 
     #[test]
     fn revocation_latch_is_irreversible() {
-        let state = WatcherState::new(Box::new(|| true));
+        let state = WatcherState::new("en0", Box::new(|| true));
         assert!(!state.is_revoked());
         state.revoke();
         assert!(state.is_revoked());
@@ -523,7 +706,7 @@ mod tests {
     #[test]
     fn dropping_owner_revokes_escaped_socket_signal() {
         let watcher = NetworkChangeWatcher {
-            state: Arc::new(WatcherState::new(Box::new(|| true))),
+            state: Arc::new(WatcherState::new("en0", Box::new(|| true))),
             registration: None,
         };
         let signal = watcher.revocation_signal();
@@ -534,7 +717,7 @@ mod tests {
 
     #[test]
     fn registration_failure_revokes_and_propagates() {
-        let state = WatcherState::new(Box::new(|| true));
+        let state = WatcherState::new("en0", Box::new(|| true));
         assert_eq!(
             require_native_success(&state, 0, NetworkWatchError::DispatchRegistrationFailed,),
             Err(NetworkWatchError::DispatchRegistrationFailed)
@@ -544,14 +727,14 @@ mod tests {
 
     #[test]
     fn failed_unregistration_revokes_without_rearming() {
-        let state = WatcherState::new(Box::new(|| true));
+        let state = WatcherState::new("en0", Box::new(|| true));
         record_unregistration_result(&state, 0);
         assert!(state.is_revoked());
     }
 
     #[test]
     fn context_retain_release_keeps_state_alive_for_native_callbacks() {
-        let state = Arc::new(WatcherState::new(Box::new(|| true)));
+        let state = Arc::new(WatcherState::new("en0", Box::new(|| true)));
         let weak = Arc::downgrade(&state);
         let info = Arc::as_ptr(&state).cast::<c_void>();
 

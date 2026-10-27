@@ -6,11 +6,11 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::{CStr, c_char, c_int, c_void},
+    ffi::{CStr, c_char, c_int, c_ulong, c_void},
     io,
     mem::{offset_of, size_of},
     net::{Ipv4Addr, UdpSocket},
-    os::fd::{AsRawFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     ptr,
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
@@ -25,6 +25,10 @@ const AF_INET: u8 = 2;
 const AF_LINK: u8 = 18;
 const PF_ROUTE: c_int = 17;
 const SOCK_RAW: c_int = 3;
+const SOCK_DGRAM: c_int = 2;
+const IFNAMSIZ: usize = 16;
+const IFM_AVALID: c_int = 0x1;
+const IFM_ACTIVE: c_int = 0x2;
 const IFF_UP: u32 = 0x1;
 const IFF_RUNNING: u32 = 0x40;
 const IFF_LOOPBACK: u32 = 0x8;
@@ -95,12 +99,37 @@ impl Adapter {
     }
 }
 
+/// One read of the selected adapter, for a recheck that must tell a change from a transition.
+pub enum AdapterReading {
+    /// Read back with its link active, as `enumerate_adapters_with_attachment` lists it; the
+    /// attachment is `None` while the Wi-Fi network name does not read back.
+    Present(Adapter),
+    /// The interface, its link, or the selected address on it is gone.
+    Lost,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
     pub interface_index: u32,
     pub source: Ipv4Addr,
     /// An unspecified next hop denotes a directly connected route.
     pub next_hop: Ipv4Addr,
+}
+
+/// A route lookup that answered, with a route the selected-network policy refuses for good.
+#[derive(Debug)]
+pub struct RouteRefused(pub &'static str);
+
+impl std::fmt::Display for RouteRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RouteRefused {}
+
+fn refused(reason: &'static str) -> io::Error {
+    io::Error::other(RouteRefused(reason))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +199,7 @@ unsafe extern "C" {
     fn getpid() -> c_int;
     fn socket(domain: c_int, socket_type: c_int, protocol: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn write(fd: c_int, buffer: *const c_void, length: usize) -> isize;
     fn read(fd: c_int, buffer: *mut c_void, length: usize) -> isize;
     fn poll(fds: *mut PollFd, count: u32, timeout_ms: c_int) -> c_int;
@@ -234,6 +264,142 @@ unsafe extern "C" {
 /// IOKit hardware metadata. Unknown or virtual interfaces remain nonphysical.
 pub fn enumerate_adapters() -> io::Result<Vec<Adapter>> {
     let metadata = system_configuration_metadata()?;
+    let mut adapters = Vec::new();
+    let mut hardware_backing = BTreeMap::new();
+    walk_ipv4_nodes(|node| {
+        // An interface removed since the list was read is no longer listed.
+        let Some(record) = address_record(node)? else {
+            return Ok(());
+        };
+        let backed = match hardware_backing.get(record.name) {
+            Some(backed) => *backed,
+            None => {
+                let backed = has_hardware_controller(record.name)?;
+                hardware_backing.insert(record.name.to_owned(), backed);
+                backed
+            }
+        };
+        adapters.push(adapter_from_record(
+            record,
+            metadata.get(record.name),
+            backed,
+        ));
+        Ok(())
+    })?;
+    adapters.sort_by_key(|adapter: &Adapter| (adapter.index, adapter.address));
+    Ok(adapters)
+}
+
+/// Reads only the selected adapter, so another interface coming or going mid-read cannot fail it.
+pub fn read_selected_adapter(selected: &Adapter) -> io::Result<AdapterReading> {
+    let mut found = adapters_with(selected.address, |name| {
+        name.to_bytes() == selected.name.as_bytes()
+    })?;
+    let Some(mut adapter) = found.pop() else {
+        return Ok(AdapterReading::Lost);
+    };
+    if !found.is_empty() {
+        return Err(io::Error::other("macOS listed the selected address twice"));
+    }
+    // macOS keeps IFF_RUNNING set when a cable is pulled or Wi-Fi drops, so only the media status
+    // shows the link down that any move to a same-named network passes through.
+    if !adapter.up || adapter.physical && !read_link_active(&adapter.name)? {
+        return Ok(AdapterReading::Lost);
+    }
+    if adapter.physical && adapter.wifi {
+        adapter.attachment = crate::wifi_attachment::read_attachment(&adapter.name)?;
+    }
+    Ok(AdapterReading::Present(adapter))
+}
+
+/// `struct ifmediareq` from net/if.h, asking for the status words only. The SDK packs it to 4
+/// bytes, so it is 44 long and the ioctl code that encodes its size matches only that layout.
+#[repr(C, packed(4))]
+struct IfMediaReq {
+    name: [c_char; IFNAMSIZ],
+    current: c_int,
+    mask: c_int,
+    status: c_int,
+    active: c_int,
+    count: c_int,
+    list: *mut c_int,
+}
+
+/// `_IOWR('i', 56, struct ifmediareq)` from sys/sockio.h.
+const SIOCGIFMEDIA: c_ulong = ioctl_read_write(b'i', 56, size_of::<IfMediaReq>());
+
+const fn ioctl_read_write(group: u8, number: u8, length: usize) -> c_ulong {
+    const IOC_INOUT: c_ulong = 0xC000_0000;
+    const IOCPARM_MASK: c_ulong = 0x1fff;
+    IOC_INOUT
+        | ((length as c_ulong & IOCPARM_MASK) << 16)
+        | ((group as c_ulong) << 8)
+        | number as c_ulong
+}
+
+/// Whether the interface's link is up, as the driver's media status reports it now.
+fn read_link_active(name: &str) -> io::Result<bool> {
+    if name.len() >= IFNAMSIZ || name.bytes().any(|byte| byte == 0) {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let mut request = IfMediaReq {
+        name: [0; IFNAMSIZ],
+        current: 0,
+        mask: 0,
+        status: 0,
+        active: 0,
+        count: 0,
+        list: ptr::null_mut(),
+    };
+    for (slot, byte) in request.name.iter_mut().zip(name.bytes()) {
+        *slot = byte as c_char;
+    }
+    // SAFETY: a plain datagram socket, opened only to carry this read-only ioctl.
+    let fd = unsafe { socket(c_int::from(AF_INET), SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: socket returned this descriptor and nothing else owns it.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: the request is a live ifmediareq with a NUL-terminated name and no list to fill.
+    if unsafe { ioctl(socket.as_raw_fd(), SIOCGIFMEDIA, &raw mut request) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    link_state(request.status)
+        .ok_or_else(|| io::Error::other("macOS reported no link state for the selected interface"))
+}
+
+/// The link state a media status word carries; `None` when the driver reports none.
+fn link_state(status: c_int) -> Option<bool> {
+    (status & IFM_AVALID != 0).then_some(status & IFM_ACTIVE != 0)
+}
+
+/// The adapters carrying `address` on an interface `wanted` accepts, without attachments. No
+/// other interface's node is decoded, so one coming or going mid-read cannot fail it.
+fn adapters_with(address: Ipv4Addr, wanted: impl Fn(&CStr) -> bool) -> io::Result<Vec<Adapter>> {
+    let mut adapters = Vec::new();
+    walk_ipv4_nodes(|node| {
+        // SAFETY: getifaddrs supplies a NUL-terminated interface name for this node.
+        if !wanted(unsafe { CStr::from_ptr(node.name) }) {
+            return Ok(());
+        }
+        let carried = sockaddr_bytes(node.address).and_then(|bytes| parse_ipv4_sockaddr(&bytes));
+        if carried.ok() != Some(address) {
+            return Ok(());
+        }
+        let Some(record) = address_record(node)? else {
+            return Ok(());
+        };
+        let metadata = interface_metadata(record.name)?;
+        let backed = has_hardware_controller(record.name)?;
+        adapters.push(adapter_from_record(record, metadata.as_ref(), backed));
+        Ok(())
+    })?;
+    Ok(adapters)
+}
+
+/// Visits each IPv4 node of one getifaddrs snapshot, at most `MAX_INTERFACES` nodes in all.
+fn walk_ipv4_nodes(mut visit: impl FnMut(&IfAddrs) -> io::Result<()>) -> io::Result<()> {
     let mut list = ptr::null_mut();
     // SAFETY: getifaddrs initializes the output pointer on success.
     if unsafe { getifaddrs(&mut list) } != 0 {
@@ -243,65 +409,53 @@ pub fn enumerate_adapters() -> io::Result<Vec<Adapter>> {
         return Err(io::Error::other("macOS returned an empty interface list"));
     }
     let _list = IfAddrsList(list);
-    let mut adapters = Vec::new();
-    let mut hardware_backing = BTreeMap::new();
     let mut current = list;
-
     for _ in 0..MAX_INTERFACES {
         if current.is_null() {
-            adapters.sort_by_key(|adapter: &Adapter| (adapter.index, adapter.address));
-            return Ok(adapters);
+            return Ok(());
         }
         // SAFETY: current is a node owned by the getifaddrs list guard.
-        let record = unsafe { &*current };
-        current = record.next;
-        if record.address.is_null() || record.netmask.is_null() || record.name.is_null() {
+        let node = unsafe { &*current };
+        current = node.next;
+        if node.address.is_null() || node.netmask.is_null() || node.name.is_null() {
             continue;
         }
         // SAFETY: getifaddrs owns this sockaddr; its fixed family byte is readable here.
-        if unsafe { (*record.address).family } != AF_INET {
+        if unsafe { (*node.address).family } != AF_INET {
             continue;
         }
-        let address_bytes = sockaddr_bytes(record.address)?;
-        // SAFETY: getifaddrs supplies a NUL-terminated interface name for this node.
-        let name = unsafe { CStr::from_ptr(record.name) }
-            .to_str()
-            .map_err(|_| io::Error::other("macOS returned a non-UTF-8 interface name"))?;
-        if name.is_empty() || name.len() >= 16 {
-            return Err(io::Error::other("macOS returned an invalid interface name"));
-        }
-        // SAFETY: record.name is a live getifaddrs-owned C string during this iteration.
-        let index = unsafe { if_nametoindex(record.name) };
-        if index == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let address = parse_ipv4_sockaddr(&address_bytes)?;
-        let netmask_bytes = sockaddr_bytes(record.netmask)?;
-        let prefix_len = prefix_from_netmask(&netmask_bytes)?;
-        let backed = match hardware_backing.get(name) {
-            Some(backed) => *backed,
-            None => {
-                let backed = has_hardware_controller(name)?;
-                hardware_backing.insert(name.to_owned(), backed);
-                backed
-            }
-        };
-        let adapter = adapter_from_record(
-            AddressRecord {
-                name,
-                index,
-                address,
-                prefix_len,
-                flags: record.flags,
-            },
-            metadata.get(name),
-            backed,
-        );
-        adapters.push(adapter);
+        visit(node)?;
     }
     Err(io::Error::other(
         "macOS interface list exceeds the supported bound",
     ))
+}
+
+/// One IPv4 node's name, index, address and prefix; `None` once its interface is gone.
+fn address_record(node: &IfAddrs) -> io::Result<Option<AddressRecord<'_>>> {
+    let address_bytes = sockaddr_bytes(node.address)?;
+    // SAFETY: getifaddrs supplies a NUL-terminated interface name for this node.
+    let name = unsafe { CStr::from_ptr(node.name) }
+        .to_str()
+        .map_err(|_| io::Error::other("macOS returned a non-UTF-8 interface name"))?;
+    if name.is_empty() || name.len() >= 16 {
+        return Err(io::Error::other("macOS returned an invalid interface name"));
+    }
+    // SAFETY: node.name is a live getifaddrs-owned C string during this iteration.
+    let index = unsafe { if_nametoindex(node.name) };
+    if index == 0 {
+        return Ok(None);
+    }
+    let address = parse_ipv4_sockaddr(&address_bytes)?;
+    let netmask_bytes = sockaddr_bytes(node.netmask)?;
+    let prefix_len = prefix_from_netmask(&netmask_bytes)?;
+    Ok(Some(AddressRecord {
+        name,
+        index,
+        address,
+        prefix_len,
+        flags: node.flags,
+    }))
 }
 
 /// Explicit attachment diagnostic. Ordinary enumeration and route lookup do not read Wi-Fi identifiers.
@@ -328,15 +482,21 @@ fn populate_wifi_attachments(
 
 /// Reads the route an `IP_BOUND_IF` socket on `source`'s interface uses, without binding,
 /// connecting, or sending to a peer. Scoping matches the pinned sockets, so a VPN that claims the
-/// LAN in the global table does not move this route.
+/// LAN in the global table does not move this route. A route the policy refuses carries
+/// `RouteRefused`.
 pub fn best_route(source: Ipv4Addr, peer: Ipv4Addr) -> io::Result<Route> {
+    best_route_by(source, peer, Instant::now() + ROUTE_REPLY_TIMEOUT)
+}
+
+/// As `best_route`, giving up on the kernel's reply with `TimedOut` at `deadline`.
+pub fn best_route_by(source: Ipv4Addr, peer: Ipv4Addr, deadline: Instant) -> io::Result<Route> {
     if source.is_unspecified() || peer.is_unspecified() || peer.is_multicast() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "an exact unicast IPv4 source and peer are required",
         ));
     }
-    let scope = enumerate_adapters()?
+    let scope = adapters_with(source, |_| true)?
         .into_iter()
         .find(|adapter| adapter.address == source && adapter.physical && adapter.up)
         .map(|adapter| adapter.index)
@@ -345,9 +505,9 @@ pub fn best_route(source: Ipv4Addr, peer: Ipv4Addr) -> io::Result<Route> {
                 "the requested source is not a live physical Ethernet or Wi-Fi interface",
             )
         })?;
-    let RouteReply { route, rejected } = kernel_route_lookup(peer, scope)?;
+    let RouteReply { route, rejected } = kernel_route_lookup(peer, scope, deadline)?;
     if route.interface_index != scope || route.source != source {
-        return Err(io::Error::other(
+        return Err(refused(
             "the kernel-selected route does not use the requested interface and source address",
         ));
     }
@@ -397,6 +557,50 @@ pub fn mark_interactive_traffic(socket: &UdpSocket) -> io::Result<()> {
 }
 
 fn system_configuration_metadata() -> io::Result<BTreeMap<String, InterfaceMetadata>> {
+    let mut metadata = BTreeMap::new();
+    for_each_sc_interface(|interface, name| {
+        let Some(candidate) = sc_metadata(interface)? else {
+            return Ok(());
+        };
+        let name = cf_string(name, 15)?;
+        if !name.is_empty() {
+            let merged = merge_metadata(metadata.remove(&name), candidate);
+            metadata.insert(name, merged);
+        }
+        Ok(())
+    })?;
+    Ok(metadata)
+}
+
+/// The metadata of the interface named `name` alone; other names are compared, never decoded.
+fn interface_metadata(name: &str) -> io::Result<Option<InterfaceMetadata>> {
+    let wanted = c_string(name)?;
+    // SAFETY: the C string is NUL-terminated and the returned string is owned on success.
+    let wanted =
+        CfOwned(unsafe { CFStringCreateWithCString(ptr::null(), wanted.as_ptr(), 0x0800_0100) });
+    if wanted.0.is_null() {
+        return Err(io::Error::other(
+            "CoreFoundation could not allocate an interface name",
+        ));
+    }
+    let mut metadata = None;
+    for_each_sc_interface(|interface, name| {
+        // SAFETY: both values are valid Core Foundation strings for this comparison.
+        if unsafe { CFEqual(name, wanted.0) } == 0 {
+            return Ok(());
+        }
+        if let Some(candidate) = sc_metadata(interface)? {
+            metadata = Some(merge_metadata(metadata.take(), candidate));
+        }
+        Ok(())
+    })?;
+    Ok(metadata)
+}
+
+/// Visits each SystemConfiguration interface that has a BSD name, with that name.
+fn for_each_sc_interface(
+    mut visit: impl FnMut(SCNetworkInterfaceRef, CFStringRef) -> io::Result<()>,
+) -> io::Result<()> {
     // SAFETY: SCNetworkInterfaceCopyAll returns a retained array or null on failure.
     let interfaces = CfOwned(unsafe { SCNetworkInterfaceCopyAll() });
     if interfaces.0.is_null() {
@@ -405,7 +609,6 @@ fn system_configuration_metadata() -> io::Result<BTreeMap<String, InterfaceMetad
         ));
     }
     let count = cf_array_count(interfaces.0, MAX_IOKIT_INTERFACES)?;
-    let mut metadata = BTreeMap::new();
     for index in 0..count {
         // SAFETY: index is within the checked Core Foundation array bounds.
         let interface = unsafe { CFArrayGetValueAtIndex(interfaces.0, index as isize) };
@@ -414,41 +617,43 @@ fn system_configuration_metadata() -> io::Result<BTreeMap<String, InterfaceMetad
         }
         // SAFETY: the array owns a valid SCNetworkInterfaceRef at this index.
         let name = unsafe { SCNetworkInterfaceGetBSDName(interface) };
-        // SAFETY: the array owns a valid SCNetworkInterfaceRef at this index.
-        let interface_type = unsafe { SCNetworkInterfaceGetInterfaceType(interface) };
-        let kind = interface_kind(interface_type);
-        if name.is_null() || kind == InterfaceType::Other {
-            continue;
-        }
-        let name = cf_string(name, 15)?;
-        if name.is_empty() {
-            continue;
-        }
-        // SAFETY: the array owns a valid SCNetworkInterfaceRef at this index.
-        let hardware = unsafe { SCNetworkInterfaceGetHardwareAddressString(interface) };
-        let stable_id = if hardware.is_null() {
-            None
-        } else {
-            normalize_hardware_address(&cf_string(hardware, 17)?)
-        };
-        let candidate = InterfaceMetadata { kind, stable_id };
-        match metadata.get(&name) {
-            Some(existing) if existing != &candidate => {
-                metadata.insert(
-                    name,
-                    InterfaceMetadata {
-                        kind: InterfaceType::Other,
-                        stable_id: None,
-                    },
-                );
-            }
-            Some(_) => {}
-            None => {
-                metadata.insert(name, candidate);
-            }
+        if !name.is_null() {
+            visit(interface, name)?;
         }
     }
-    Ok(metadata)
+    Ok(())
+}
+
+/// An Ethernet or Wi-Fi interface's kind and hardware identity; `None` for any other kind.
+fn sc_metadata(interface: SCNetworkInterfaceRef) -> io::Result<Option<InterfaceMetadata>> {
+    // SAFETY: the caller's array owns this valid SCNetworkInterfaceRef.
+    let kind = interface_kind(unsafe { SCNetworkInterfaceGetInterfaceType(interface) });
+    if kind == InterfaceType::Other {
+        return Ok(None);
+    }
+    // SAFETY: the caller's array owns this valid SCNetworkInterfaceRef.
+    let hardware = unsafe { SCNetworkInterfaceGetHardwareAddressString(interface) };
+    let stable_id = if hardware.is_null() {
+        None
+    } else {
+        normalize_hardware_address(&cf_string(hardware, 17)?)
+    };
+    Ok(Some(InterfaceMetadata { kind, stable_id }))
+}
+
+/// A name listed twice with different metadata is ambiguous, so it can never be hardware.
+fn merge_metadata(
+    existing: Option<InterfaceMetadata>,
+    candidate: InterfaceMetadata,
+) -> InterfaceMetadata {
+    match existing {
+        Some(existing) if existing != candidate => InterfaceMetadata {
+            kind: InterfaceType::Other,
+            stable_id: None,
+        },
+        Some(existing) => existing,
+        None => candidate,
+    }
 }
 
 fn interface_kind(interface_type: CFStringRef) -> InterfaceType {
@@ -620,7 +825,7 @@ fn adapter_from_record(
     }
 }
 
-fn kernel_route_lookup(peer: Ipv4Addr, scope: u32) -> io::Result<RouteReply> {
+fn kernel_route_lookup(peer: Ipv4Addr, scope: u32, deadline: Instant) -> io::Result<RouteReply> {
     // SAFETY: this opens the local routing-control plane, never a peer data endpoint.
     let fd = unsafe { socket(PF_ROUTE, SOCK_RAW, 0) };
     if fd < 0 {
@@ -674,8 +879,36 @@ fn kernel_route_lookup(peer: Ipv4Addr, scope: u32) -> io::Result<RouteReply> {
         ));
     }
 
-    let deadline = Instant::now() + ROUTE_REPLY_TIMEOUT;
-    let mut reply = [0_u8; MAX_ROUTE_REPLY];
+    route_reply_from(
+        |buffer| next_route_message(&socket, deadline, buffer),
+        pid,
+        sequence,
+        peer,
+    )
+}
+
+/// Reads routing messages until this lookup's own reply; every other message is skipped.
+fn route_reply_from(
+    mut next: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    pid: i32,
+    sequence: i32,
+    peer: Ipv4Addr,
+) -> io::Result<RouteReply> {
+    let mut message = [0_u8; MAX_ROUTE_REPLY];
+    loop {
+        let length = next(&mut message)?;
+        if let Some(reply) = parse_route_reply(&message[..length], pid, sequence, peer)? {
+            return Ok(reply);
+        }
+    }
+}
+
+/// The next message on a lookup's routing socket, or `TimedOut` once `deadline` passes.
+fn next_route_message(
+    socket: &RouteSocket,
+    deadline: Instant,
+    message: &mut [u8],
+) -> io::Result<usize> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -712,8 +945,8 @@ fn kernel_route_lookup(peer: Ipv4Addr, scope: u32) -> io::Result<RouteReply> {
                 "macOS routing-control socket returned an unsupported poll event",
             ));
         }
-        // SAFETY: reply is writable and the routing socket is readable after poll.
-        let length = unsafe { read(socket.0, reply.as_mut_ptr().cast(), reply.len()) };
+        // SAFETY: message is writable and the routing socket is readable after poll.
+        let length = unsafe { read(socket.0, message.as_mut_ptr().cast(), message.len()) };
         if length < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -721,12 +954,8 @@ fn kernel_route_lookup(peer: Ipv4Addr, scope: u32) -> io::Result<RouteReply> {
             }
             return Err(error);
         }
-        let length = usize::try_from(length)
-            .map_err(|_| io::Error::other("macOS returned a negative route reply length"))?;
-        let Some(route) = parse_route_reply(&reply[..length], pid, sequence, peer)? else {
-            continue;
-        };
-        return Ok(route);
+        return usize::try_from(length)
+            .map_err(|_| io::Error::other("macOS returned a negative route reply length"));
     }
 }
 
@@ -950,6 +1179,15 @@ fn parse_route_reply(
     expected_sequence: i32,
     peer: Ipv4Addr,
 ) -> io::Result<Option<RouteReply>> {
+    // The lookup socket also receives every other routing message, many shorter than a route
+    // header (address and interface notices), so only this lookup's own reply is validated.
+    let ours = read_i32(message, offset_of!(RtMsgHdr, pid)).is_ok_and(|pid| pid == expected_pid)
+        && read_i32(message, offset_of!(RtMsgHdr, sequence))
+            .is_ok_and(|sequence| sequence == expected_sequence)
+        && message.get(offset_of!(RtMsgHdr, message_type)) == Some(&RTM_GET);
+    if !ours {
+        return Ok(None);
+    }
     if message.len() < size_of::<RtMsgHdr>() {
         return Err(io::Error::other("route reply is shorter than its header"));
     }
@@ -959,16 +1197,9 @@ fn parse_route_reply(
             "route reply has an invalid message length",
         ));
     }
-    let pid = read_i32(message, offset_of!(RtMsgHdr, pid))?;
-    let sequence = read_i32(message, offset_of!(RtMsgHdr, sequence))?;
-    if pid != expected_pid || sequence != expected_sequence {
-        return Ok(None);
-    }
-    if message[offset_of!(RtMsgHdr, version)] != RTM_VERSION
-        || message[offset_of!(RtMsgHdr, message_type)] != RTM_GET
-    {
+    if message[offset_of!(RtMsgHdr, version)] != RTM_VERSION {
         return Err(io::Error::other(
-            "macOS returned an unexpected route reply type",
+            "macOS returned an unexpected route reply version",
         ));
     }
     let error = read_i32(message, offset_of!(RtMsgHdr, error))?;
@@ -987,7 +1218,7 @@ fn parse_route_reply(
         || rejected && flags & (RTF_GATEWAY | RTF_STATIC) != 0
         || rejected && flags & (RTF_HOST | RTF_LLINFO) != RTF_HOST | RTF_LLINFO
     {
-        return Err(io::Error::other("macOS returned an ineligible route"));
+        return Err(refused("macOS returned an ineligible route"));
     }
     let addrs = parse_route_addresses(message, addresses)?;
     let destination = addrs
@@ -997,7 +1228,7 @@ fn parse_route_reply(
         Some(prefix_len) => ipv4_prefix_contains(destination, prefix_len, peer),
         None => destination == peer,
     } {
-        return Err(io::Error::other(
+        return Err(refused(
             "macOS route reply destination does not cover the requested IPv4 peer",
         ));
     }
@@ -1426,6 +1657,115 @@ mod tests {
         assert!(adapters.iter().all(|adapter| adapter.attachment.is_none()));
     }
 
+    fn listed_loopback() -> Adapter {
+        enumerate_adapters()
+            .unwrap()
+            .into_iter()
+            .find(|adapter| adapter.name == "lo0" && adapter.address == Ipv4Addr::LOCALHOST)
+            .expect("lo0 carries 127.0.0.1")
+    }
+
+    #[test]
+    fn the_targeted_read_reads_the_adapter_back_as_listed() {
+        let listed = listed_loopback();
+        match read_selected_adapter(&listed).unwrap() {
+            AdapterReading::Present(read) => assert!(read == listed),
+            AdapterReading::Lost => panic!("the listed loopback read back lost"),
+        }
+    }
+
+    #[test]
+    fn a_media_status_reports_the_link_only_when_it_marks_itself_valid() {
+        assert_eq!(link_state(IFM_AVALID | IFM_ACTIVE), Some(true));
+        assert_eq!(link_state(IFM_AVALID), Some(false));
+        assert_eq!(link_state(0), None);
+        assert_eq!(link_state(IFM_ACTIVE), None);
+        // Bits above the two flags never change the answer.
+        assert_eq!(link_state(IFM_AVALID | 0x7f00), Some(false));
+    }
+
+    #[test]
+    fn the_media_request_matches_the_sdk_layout() {
+        // As the SDK's own sizeof and SIOCGIFMEDIA give them.
+        assert_eq!(size_of::<IfMediaReq>(), 44);
+        assert_eq!(offset_of!(IfMediaReq, status), 24);
+        assert_eq!(SIOCGIFMEDIA, 0xC02C_6938);
+    }
+
+    #[test]
+    fn a_link_read_refuses_a_name_that_cannot_fit() {
+        for name in ["abcdefghijklmnop", "en\u{0}1"] {
+            assert_eq!(
+                read_link_active(name).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    /// Run with an interface whose link is up and one whose link is down, as
+    /// `ifconfig` shows them (`status: active` and `status: inactive`).
+    #[test]
+    #[ignore = "set MONHOP_TEST_ACTIVE_LINK and MONHOP_TEST_INACTIVE_LINK to interface names"]
+    fn native_link_read_matches_ifconfig_status() {
+        let active = std::env::var("MONHOP_TEST_ACTIVE_LINK").expect("an active link's name");
+        let inactive = std::env::var("MONHOP_TEST_INACTIVE_LINK").expect("an inactive link's name");
+        assert!(read_link_active(&active).unwrap());
+        assert!(!read_link_active(&inactive).unwrap());
+        // The targeted read keeps a listed physical adapter whose link is up.
+        let listed = enumerate_adapters()
+            .unwrap()
+            .into_iter()
+            .find(|adapter| adapter.name == active && adapter.physical && adapter.up)
+            .expect("the active link is a listed physical adapter");
+        assert!(matches!(
+            read_selected_adapter(&listed).unwrap(),
+            AdapterReading::Present(_)
+        ));
+    }
+
+    #[test]
+    fn a_selected_address_or_interface_that_is_gone_reads_as_lost() {
+        let listed = listed_loopback();
+        let readdressed = Adapter {
+            address: Ipv4Addr::new(192, 0, 2, 1),
+            ..listed.clone()
+        };
+        let renamed = Adapter {
+            name: "zz9".to_owned(),
+            ..listed
+        };
+        for gone in [readdressed, renamed] {
+            assert!(matches!(
+                read_selected_adapter(&gone).unwrap(),
+                AdapterReading::Lost
+            ));
+        }
+    }
+
+    #[test]
+    fn a_route_from_an_address_no_interface_carries_is_refused_before_any_lookup() {
+        let error =
+            best_route(Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn a_name_listed_twice_with_different_metadata_is_never_hardware() {
+        let ethernet = metadata(InterfaceType::Ethernet);
+        assert_eq!(merge_metadata(None, ethernet.clone()), ethernet);
+        assert_eq!(
+            merge_metadata(Some(ethernet.clone()), ethernet.clone()),
+            ethernet
+        );
+        let ambiguous = merge_metadata(Some(ethernet), metadata(InterfaceType::WiFi));
+        assert_eq!(ambiguous.kind, InterfaceType::Other);
+        assert_eq!(ambiguous.stable_id, None);
+        assert_eq!(
+            merge_metadata(Some(ambiguous), metadata(InterfaceType::WiFi)).kind,
+            InterfaceType::Other
+        );
+    }
+
     #[test]
     fn wifi_network_name_requires_live_physical_wifi_with_an_attachment() {
         let mut adapter = adapter_from_record(record(), Some(&metadata(InterfaceType::WiFi)), true);
@@ -1533,6 +1873,7 @@ mod tests {
             error.to_string(),
             "macOS route reply destination does not cover the requested IPv4 peer"
         );
+        assert!(is_refused(&error));
 
         let default_route = route_reply(
             18,
@@ -1588,6 +1929,7 @@ mod tests {
         ] {
             let error = parse_route_reply(&host(blocked), 17, 9, peer).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Other, "{blocked:#x}");
+            assert!(is_refused(&error), "{blocked:#x}");
         }
         let subnet_block = route_reply(
             17,
@@ -1600,6 +1942,94 @@ mod tests {
         );
         let error = parse_route_reply(&subnet_block, 17, 9, peer).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(is_refused(&error));
+    }
+
+    fn is_refused(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<RouteRefused>())
+    }
+
+    #[test]
+    fn a_lookup_past_its_deadline_times_out_without_waiting() {
+        // SAFETY: this opens the local routing-control plane, never a peer data endpoint.
+        let socket = RouteSocket(unsafe { socket(PF_ROUTE, SOCK_RAW, 0) });
+        assert!(socket.0 >= 0);
+        let mut message = [0_u8; MAX_ROUTE_REPLY];
+        let started = Instant::now();
+        let error = next_route_message(&socket, started, &mut message).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!is_refused(&error));
+        assert!(started.elapsed() < ROUTE_REPLY_TIMEOUT);
+    }
+
+    #[test]
+    fn route_lookup_skips_foreign_messages_and_still_finds_its_reply() {
+        let peer = Ipv4Addr::new(192, 168, 1, 20);
+        let reply = route_reply(
+            17,
+            9,
+            Ipv4Addr::new(192, 168, 1, 0),
+            Some(24),
+            Ipv4Addr::new(192, 168, 1, 10),
+            None,
+            RTF_UP,
+        );
+        // An address notice (ifa_msghdr) is 20 bytes, shorter than any route header.
+        let mut address_notice = vec![0_u8; 20];
+        write_u16(&mut address_notice, offset_of!(RtMsgHdr, message_len), 20);
+        address_notice[offset_of!(RtMsgHdr, version)] = RTM_VERSION;
+        address_notice[offset_of!(RtMsgHdr, message_type)] = 0xc;
+        // Another kind of message that happens to carry this lookup's pid and sequence.
+        let mut other_kind = reply.clone();
+        other_kind[offset_of!(RtMsgHdr, message_type)] = RTM_ADD;
+        let other_lookup = route_reply(
+            17,
+            8,
+            Ipv4Addr::new(192, 168, 1, 0),
+            Some(24),
+            Ipv4Addr::new(192, 168, 1, 10),
+            None,
+            RTF_UP,
+        );
+        for foreign in [
+            &address_notice[..],
+            &[RTM_VERSION; 3],
+            &other_kind,
+            &other_lookup,
+        ] {
+            assert_eq!(parse_route_reply(foreign, 17, 9, peer).unwrap(), None);
+        }
+
+        let mut queue = vec![address_notice, other_kind, reply];
+        queue.reverse();
+        let found = route_reply_from(
+            |buffer| {
+                let message = queue.pop().expect("the reply arrives");
+                buffer[..message.len()].copy_from_slice(&message);
+                Ok(message.len())
+            },
+            17,
+            9,
+            peer,
+        )
+        .unwrap();
+        assert_eq!(found.route.source, Ipv4Addr::new(192, 168, 1, 10));
+        assert!(queue.is_empty());
+
+        // Its own reply cut short is still a failed lookup.
+        let mut truncated = route_reply(
+            17,
+            9,
+            Ipv4Addr::new(192, 168, 1, 0),
+            Some(24),
+            Ipv4Addr::new(192, 168, 1, 10),
+            None,
+            RTF_UP,
+        );
+        truncated.truncate(size_of::<RtMsgHdr>() - 4);
+        assert!(parse_route_reply(&truncated, 17, 9, peer).is_err());
     }
 
     #[test]
@@ -1654,12 +2084,13 @@ mod tests {
             offset_of!(RtMsgHdr, message_len),
             missing_source_len,
         );
+        let malformed = parse_route_reply(&missing_source, 17, 9, peer).unwrap_err();
         assert_eq!(
-            parse_route_reply(&missing_source, 17, 9, peer)
-                .unwrap_err()
-                .to_string(),
+            malformed.to_string(),
             "macOS route reply omitted its IPv4 source"
         );
+        // A reply cut short is a failed read, not a route the policy refuses.
+        assert!(!is_refused(&malformed));
         assert_eq!(route_roundup(0), size_of::<u32>());
         assert_eq!(route_roundup(9), 12);
     }
@@ -1684,7 +2115,8 @@ mod tests {
     fn native_kernel_lookup_receives_and_rejects_loopback() {
         // SAFETY: the name is a static NUL-terminated C string.
         let lo0 = unsafe { if_nametoindex(c"lo0".as_ptr()) };
-        let error = kernel_route_lookup(Ipv4Addr::LOCALHOST, lo0).unwrap_err();
+        let deadline = Instant::now() + ROUTE_REPLY_TIMEOUT;
+        let error = kernel_route_lookup(Ipv4Addr::LOCALHOST, lo0, deadline).unwrap_err();
         assert_eq!(error.to_string(), "macOS returned an ineligible route");
     }
 

@@ -8,7 +8,10 @@ use std::{
 };
 use windows_sys::{
     Win32::{
-        Foundation::{ERROR_HOST_UNREACHABLE, ERROR_NETWORK_UNREACHABLE, HANDLE},
+        Foundation::{
+            ERROR_FILE_NOT_FOUND, ERROR_HOST_UNREACHABLE, ERROR_NETWORK_UNREACHABLE,
+            ERROR_NOT_FOUND, HANDLE, NO_ERROR,
+        },
         NetworkManagement::{
             IpHelper::*,
             Ndis::IfOperStatusUp,
@@ -25,6 +28,17 @@ use windows_sys::{
 
 const WIFI_NETWORK_GUID_LEN: usize = 16;
 const MAX_WIFI_SSID_LEN: usize = 32;
+// MIB_IF_ROW2 InterfaceAndOperStatusFlags bits.
+const IF_HARDWARE: u8 = 1;
+const IF_FILTER: u8 = 2;
+const IF_NOT_AUTHENTICATED: u8 = 8;
+const IF_NOT_MEDIA_CONNECTED: u8 = 16;
+const IF_PAUSED: u8 = 32;
+const IF_LOW_POWER: u8 = 64;
+/// The link itself is down: a move to a same-named network passes through this.
+const IF_LINK_DOWN: u8 = IF_NOT_AUTHENTICATED | IF_NOT_MEDIA_CONNECTED;
+/// The adapter is held without losing its link, and passes traffic again once resumed.
+const IF_SUSPENDED: u8 = IF_PAUSED | IF_LOW_POWER;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Adapter {
@@ -51,12 +65,35 @@ impl Adapter {
     }
 }
 
+/// One read of the selected adapter, for a recheck that must tell a change from a transition.
+pub enum AdapterReading {
+    /// Read back as `enumerate_adapters` lists it; the attachment is `None` while unidentified.
+    Present(Adapter),
+    /// The interface, its link, or the selected address on it is gone, or the address is refused.
+    Lost,
+    /// Present with its link up, but held: the address is not yet or no longer preferred, or the
+    /// adapter is paused or in low power.
+    Settling,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
     pub interface_index: u32,
     pub source: Ipv4Addr,
     pub next_hop: Ipv4Addr,
 }
+
+/// A route lookup that answered, with a route the selected-network policy refuses for good.
+#[derive(Debug)]
+pub struct RouteRefused(pub &'static str);
+
+impl std::fmt::Display for RouteRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RouteRefused {}
 
 struct AddressTable(*mut MIB_UNICASTIPADDRESS_TABLE);
 impl Drop for AddressTable {
@@ -87,62 +124,152 @@ pub fn enumerate_adapters() -> io::Result<Vec<Adapter>> {
     };
     let mut adapters = Vec::new();
     for address in rows {
-        if address.SkipAsSource || address.DadState != IpDadStatePreferred {
+        if address_readiness(address.DadState, address.SkipAsSource) != Readiness::Ready {
             continue;
         }
-        let mut interface = MIB_IF_ROW2 {
-            InterfaceIndex: address.InterfaceIndex,
-            ..Default::default()
+        // An interface removed since the table was read is no longer listed.
+        let Some(interface) = interface_row(address.InterfaceIndex)? else {
+            continue;
         };
-        // SAFETY: InterfaceIndex selects the row; the remaining fields are initialized by Windows.
-        win_result(unsafe { GetIfEntry2(&mut interface) })?;
-        let ethernet = interface.Type == IF_TYPE_ETHERNET_CSMACD;
-        let wifi = interface.Type == IF_TYPE_IEEE80211;
-        let flags = interface.InterfaceAndOperStatusFlags._bitfield;
-        let physical = flags & 1 != 0 && flags & 2 == 0 && interface.TunnelType == 0;
-        let up = interface.OperStatus == IfOperStatusUp && flags & (8 | 16 | 32 | 64) == 0;
-        let guid = guid_bytes(&interface.NetworkGuid);
-        let attachment = if wifi && up {
-            wifi_attachment(&interface.InterfaceGuid)
-                .ok()
-                .map(|mut connection| {
-                    connection.extend_from_slice(&guid);
-                    connection
-                })
-        } else if ethernet && up && guid != [0; 16] {
-            Some(guid.to_vec())
-        } else {
-            None
-        };
-        adapters.push(Adapter {
-            stable_id: guid_bytes(&interface.InterfaceGuid)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            name: String::from_utf16_lossy(
-                &interface.Alias[..interface
-                    .Alias
-                    .iter()
-                    .position(|v| *v == 0)
-                    .unwrap_or(interface.Alias.len())],
-            ),
-            index: address.InterfaceIndex,
-            address: ipv4_from_sockaddr(&address.Address)?,
-            prefix_len: address.OnLinkPrefixLength,
-            physical,
-            up,
-            ethernet,
-            wifi,
-            attachment,
-        });
+        adapters.push(adapter_from_rows(address, &interface)?);
     }
     adapters.sort_by_key(|adapter| (adapter.index, adapter.address));
     Ok(adapters)
 }
 
+/// Reads only the selected interface and its selected address, so another adapter coming or
+/// going mid-read cannot fail it.
+pub fn read_selected_adapter(selected: &Adapter) -> io::Result<AdapterReading> {
+    let mut address = MIB_UNICASTIPADDRESS_ROW {
+        Address: sockaddr(selected.address),
+        InterfaceIndex: selected.index,
+        ..Default::default()
+    };
+    // SAFETY: the row names one address on one interface; Windows fills the rest synchronously.
+    match unsafe { GetUnicastIpAddressEntry(&mut address) } {
+        NO_ERROR => {}
+        ERROR_NOT_FOUND | ERROR_FILE_NOT_FOUND => return Ok(AdapterReading::Lost),
+        code => return Err(io::Error::from_raw_os_error(code as i32)),
+    }
+    let Some(interface) = interface_row(selected.index)? else {
+        return Ok(AdapterReading::Lost);
+    };
+    let address_ready = address_readiness(address.DadState, address.SkipAsSource);
+    match address_ready.and(link_readiness(&interface)) {
+        Readiness::Ready => Ok(AdapterReading::Present(adapter_from_rows(
+            &address, &interface,
+        )?)),
+        Readiness::Settling => Ok(AdapterReading::Settling),
+        Readiness::Lost => Ok(AdapterReading::Lost),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Readiness {
+    Ready,
+    Settling,
+    Lost,
+}
+
+impl Readiness {
+    /// Lost outranks settling, which outranks ready.
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Lost, _) | (_, Self::Lost) => Self::Lost,
+            (Self::Settling, _) | (_, Self::Settling) => Self::Settling,
+            _ => Self::Ready,
+        }
+    }
+}
+
+/// A duplicate or invalid address is refused for good; one still being confirmed, past its
+/// preferred lifetime, or kept from use as a source is between states.
+fn address_readiness(dad: NL_DAD_STATE, skip_as_source: bool) -> Readiness {
+    if dad == IpDadStateDuplicate || dad == IpDadStateInvalid {
+        Readiness::Lost
+    } else if dad == IpDadStatePreferred && !skip_as_source {
+        Readiness::Ready
+    } else {
+        Readiness::Settling
+    }
+}
+
+/// A link that is down, unplugged or unauthenticated is lost at once, since a move to a
+/// same-named network goes through one; a paused or low-power adapter keeps its link.
+fn link_readiness(interface: &MIB_IF_ROW2) -> Readiness {
+    let flags = interface.InterfaceAndOperStatusFlags._bitfield;
+    if interface.OperStatus != IfOperStatusUp || flags & IF_LINK_DOWN != 0 {
+        Readiness::Lost
+    } else if flags & IF_SUSPENDED != 0 {
+        Readiness::Settling
+    } else {
+        Readiness::Ready
+    }
+}
+
+/// `None` once the interface is gone.
+fn interface_row(index: u32) -> io::Result<Option<MIB_IF_ROW2>> {
+    let mut interface = MIB_IF_ROW2 {
+        InterfaceIndex: index,
+        ..Default::default()
+    };
+    // SAFETY: InterfaceIndex selects the row; the remaining fields are initialized by Windows.
+    match unsafe { GetIfEntry2(&mut interface) } {
+        NO_ERROR => Ok(Some(interface)),
+        ERROR_FILE_NOT_FOUND => Ok(None),
+        code => Err(io::Error::from_raw_os_error(code as i32)),
+    }
+}
+
+/// The adapter one address row and its interface row describe.
+fn adapter_from_rows(
+    address: &MIB_UNICASTIPADDRESS_ROW,
+    interface: &MIB_IF_ROW2,
+) -> io::Result<Adapter> {
+    let ethernet = interface.Type == IF_TYPE_ETHERNET_CSMACD;
+    let wifi = interface.Type == IF_TYPE_IEEE80211;
+    let flags = interface.InterfaceAndOperStatusFlags._bitfield;
+    let physical = flags & IF_HARDWARE != 0 && flags & IF_FILTER == 0 && interface.TunnelType == 0;
+    let up = link_readiness(interface) == Readiness::Ready;
+    let guid = guid_bytes(&interface.NetworkGuid);
+    let attachment = if wifi && up {
+        wifi_attachment(&interface.InterfaceGuid)
+            .ok()
+            .map(|mut connection| {
+                connection.extend_from_slice(&guid);
+                connection
+            })
+    } else if ethernet && up && guid != [0; 16] {
+        Some(guid.to_vec())
+    } else {
+        None
+    };
+    Ok(Adapter {
+        stable_id: guid_bytes(&interface.InterfaceGuid)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        name: String::from_utf16_lossy(
+            &interface.Alias[..interface
+                .Alias
+                .iter()
+                .position(|v| *v == 0)
+                .unwrap_or(interface.Alias.len())],
+        ),
+        index: address.InterfaceIndex,
+        address: ipv4_from_sockaddr(&address.Address)?,
+        prefix_len: address.OnLinkPrefixLength,
+        physical,
+        up,
+        ethernet,
+        wifi,
+        attachment,
+    })
+}
+
 /// Reads the actual best route, without forcing Windows to pretend the selected NIC is best.
-/// No route to the peer is `HostUnreachable` or `NetworkUnreachable`; every other failure keeps
-/// its own kind.
+/// No route to the peer is `HostUnreachable` or `NetworkUnreachable`, and a route the policy
+/// refuses carries `RouteRefused`; every other failure keeps its own kind.
 pub fn best_route(source: Ipv4Addr, peer: Ipv4Addr) -> io::Result<Route> {
     let source = sockaddr(source);
     let destination = sockaddr(peer);
@@ -161,9 +288,9 @@ pub fn best_route(source: Ipv4Addr, peer: Ipv4Addr) -> io::Result<Route> {
         )
     })?;
     if route.Loopback {
-        return Err(io::Error::other(
+        return Err(io::Error::other(RouteRefused(
             "Loopback route is not a physical peer route",
-        ));
+        )));
     }
     Ok(Route {
         interface_index: route.InterfaceIndex,
@@ -420,6 +547,125 @@ mod tests {
             wifi: true,
             attachment,
         }
+    }
+
+    #[test]
+    fn an_address_being_confirmed_is_settling_and_a_refused_one_is_lost() {
+        assert_eq!(
+            address_readiness(IpDadStatePreferred, false),
+            Readiness::Ready
+        );
+        for (dad, skip_as_source) in [
+            (IpDadStateTentative, false),
+            (IpDadStateDeprecated, false),
+            (IpDadStatePreferred, true),
+        ] {
+            assert_eq!(
+                address_readiness(dad, skip_as_source),
+                Readiness::Settling,
+                "{dad} {skip_as_source}"
+            );
+        }
+        for dad in [IpDadStateDuplicate, IpDadStateInvalid] {
+            assert_eq!(address_readiness(dad, false), Readiness::Lost, "{dad}");
+        }
+    }
+
+    #[test]
+    fn a_link_that_goes_down_is_lost_and_a_held_adapter_is_settling() {
+        use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusDown;
+        let (_, interface) = ethernet_rows();
+        assert_eq!(link_readiness(&interface), Readiness::Ready);
+        for flag in [IF_NOT_AUTHENTICATED, IF_NOT_MEDIA_CONNECTED] {
+            let mut down = interface;
+            down.InterfaceAndOperStatusFlags._bitfield |= flag;
+            assert_eq!(link_readiness(&down), Readiness::Lost, "{flag}");
+        }
+        let mut not_operational = interface;
+        not_operational.OperStatus = IfOperStatusDown;
+        assert_eq!(link_readiness(&not_operational), Readiness::Lost);
+        for flag in [IF_PAUSED, IF_LOW_POWER] {
+            let mut held = interface;
+            held.InterfaceAndOperStatusFlags._bitfield |= flag;
+            assert_eq!(link_readiness(&held), Readiness::Settling, "{flag}");
+            // A link that also went down is lost, whatever else holds the adapter.
+            held.InterfaceAndOperStatusFlags._bitfield |= IF_NOT_MEDIA_CONNECTED;
+            assert_eq!(link_readiness(&held), Readiness::Lost, "{flag}");
+        }
+        assert_eq!(Readiness::Settling.and(Readiness::Lost), Readiness::Lost);
+        assert_eq!(
+            Readiness::Ready.and(Readiness::Settling),
+            Readiness::Settling
+        );
+    }
+
+    fn ethernet_rows() -> (MIB_UNICASTIPADDRESS_ROW, MIB_IF_ROW2) {
+        let address = MIB_UNICASTIPADDRESS_ROW {
+            Address: sockaddr(Ipv4Addr::new(192, 168, 1, 10)),
+            InterfaceIndex: 7,
+            OnLinkPrefixLength: 24,
+            DadState: IpDadStatePreferred,
+            ..Default::default()
+        };
+        let mut interface = MIB_IF_ROW2 {
+            InterfaceIndex: 7,
+            Type: IF_TYPE_ETHERNET_CSMACD,
+            OperStatus: IfOperStatusUp,
+            NetworkGuid: GUID::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
+            ..Default::default()
+        };
+        interface.InterfaceAndOperStatusFlags._bitfield = IF_HARDWARE;
+        (address, interface)
+    }
+
+    #[test]
+    fn adapter_listing_shows_only_a_ready_link_as_up() {
+        let (address, interface) = ethernet_rows();
+        let adapter = adapter_from_rows(&address, &interface).unwrap();
+        assert!(adapter.up && adapter.physical && adapter.ethernet);
+        assert_eq!(adapter.address, Ipv4Addr::new(192, 168, 1, 10));
+        assert!(adapter.attachment.is_some());
+
+        for flag in [
+            IF_NOT_AUTHENTICATED,
+            IF_NOT_MEDIA_CONNECTED,
+            IF_PAUSED,
+            IF_LOW_POWER,
+        ] {
+            let mut flagged = interface;
+            flagged.InterfaceAndOperStatusFlags._bitfield |= flag;
+            let adapter = adapter_from_rows(&address, &flagged).unwrap();
+            assert!(!adapter.up, "{flag}");
+            assert!(adapter.attachment.is_none(), "{flag}");
+        }
+        let mut filter = interface;
+        filter.InterfaceAndOperStatusFlags._bitfield |= IF_FILTER;
+        assert!(!adapter_from_rows(&address, &filter).unwrap().physical);
+    }
+
+    #[test]
+    #[ignore = "set MONHOP_TEST_INTERFACE_INDEX to an up physical adapter's index"]
+    fn native_targeted_read_matches_the_listed_adapter() {
+        let index = std::env::var("MONHOP_TEST_INTERFACE_INDEX")
+            .expect("explicit selected interface index required")
+            .parse::<u32>()
+            .expect("numeric interface index required");
+        let listed = enumerate_adapters()
+            .unwrap()
+            .into_iter()
+            .find(|adapter| adapter.index == index && adapter.physical && adapter.up)
+            .expect("selected physical interface must be present and up");
+        match read_selected_adapter(&listed).unwrap() {
+            AdapterReading::Present(read) => assert!(read == listed),
+            AdapterReading::Lost => panic!("the listed adapter read back lost"),
+            AdapterReading::Settling => panic!("the listed adapter read back settling"),
+        }
+        let mut elsewhere = listed;
+        elsewhere.address = Ipv4Addr::new(192, 0, 2, 1);
+        assert!(matches!(
+            read_selected_adapter(&elsewhere).unwrap(),
+            AdapterReading::Lost
+        ));
     }
 
     #[test]
