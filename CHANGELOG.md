@@ -7,11 +7,11 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 ### Fixed
 
 - On a Mac, the notch island no longer appears as a black bar in the middle of the screen. macOS sometimes moves it when displays come and go, such as when you open the lid with an external display attached, and it now goes straight back to the notch.
-- Opening and closing Arrange is smoother. The arrangement no longer redraws on every frame while the Apply bar slides in, scrollbars no longer flicker at its edges, and displays you drop now spring into place on a Mac as they do on Windows. Arrange also starts drawing sooner after you click it.
 - Pausing or resuming sharing now morphs the toolbar button between Pause sharing and Resume, gliding to its new width and color instead of snapping, and it no longer flickers while the change is applied.
+- Opening and closing Arrange is smoother. The arrangement no longer redraws on every frame while the Apply bar slides in, scrollbars no longer flicker at its edges, and displays you drop now spring into place on a Mac as they do on Windows. Arrange also starts drawing sooner after you click it.
 - Right Shift on a Windows keyboard controlling a Mac now shifts. It was ignored there and pressed Shift on Windows instead, so only Left Shift worked.
 - Sharing no longer drops on a healthy network when a network check briefly can't read the adapter, or when Windows reports routine Wi-Fi activity. Such a check now reads again for up to a second, and a real change, such as a lost link or a new address, still stops sharing at once.
-- Sharing no longer drops when Wi-Fi stalls for a moment while you move the mouse quickly. A stall shorter than about 0.4 s now only delays input, a longer one brings the pointer home until the link recovers, and only a stall past about 5 s ends the connection. Both computers need this version.
+- Sharing no longer drops when Wi-Fi stalls for a moment while you move the mouse quickly. A stall shorter than about 0.4 s now only delays input, a longer one brings the pointer home until the link recovers, and only an outage of several seconds ends the connection. Both computers need this version.
 
 ### Security
 
