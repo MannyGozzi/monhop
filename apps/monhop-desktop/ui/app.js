@@ -1170,7 +1170,10 @@ function renderToolbar(ctx) {
     pause.dataset.variant = toolbar.pause === "pause" ? "secondary" : "primary";
     pause.disabled = busy;
     // A switch in flight stays at full strength, so pausing or resuming reads as one morph.
-    pause.toggleAttribute("aria-busy", busy && ["active", "enabled"].includes(sharing.pending?.kind));
+    pause.toggleAttribute(
+      "aria-busy",
+      busy && ["active", "enabled"].includes(sharing.pending?.kind),
+    );
     if (width) glideWidth(pause, width);
   }
   const movers = [nodes.networkSlot];
