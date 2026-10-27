@@ -1161,12 +1161,17 @@ function renderToolbar(ctx) {
   toolbarControls.pauseMode = toolbar.pause;
   if (toolbar.pause) {
     const label = SHARING_LABELS[toolbar.pause];
+    // Measured only when its words change, so the button glides on from the width it is drawn at.
+    const width = pauseLabel.textContent === label ? 0 : pause.getBoundingClientRect().width;
     setLabel(pauseLabel, label);
     pauseTip.textContent = label;
     pause.dataset.mode = toolbar.pause;
     // While sharing the button steps back; at rest it is the way in, in the accent.
     pause.dataset.variant = toolbar.pause === "pause" ? "secondary" : "primary";
     pause.disabled = busy;
+    // A switch in flight stays at full strength, so pausing or resuming reads as one morph.
+    pause.toggleAttribute("aria-busy", busy && ["active", "enabled"].includes(sharing.pending?.kind));
+    if (width) glideWidth(pause, width);
   }
   const movers = [nodes.networkSlot];
   setSlotPresent(nodes.pauseSlot, canvas && toolbar.pause !== null, movers, {
