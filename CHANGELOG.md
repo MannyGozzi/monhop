@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-10-27
+
 ### Fixed
 
 - On a Mac, the notch island no longer appears as a black bar in the middle of the screen. macOS sometimes moves it when displays come and go, such as when you open the lid with an external display attached, and it now goes straight back to the notch.
@@ -341,7 +343,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.14...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.15...HEAD
+[0.2.15]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.15
 [0.2.14]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.14
 [0.2.13]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.13
 [0.2.12]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.12
