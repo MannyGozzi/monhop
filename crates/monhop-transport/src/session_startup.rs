@@ -53,7 +53,8 @@ pub(crate) struct ReadyControl {
     pub epoch: SessionEpoch,
     pub next_incoming: u64,
     pub next_outgoing: u64,
-    /// Heartbeats use their own sequence space because they travel as datagrams.
+    /// Heartbeats keep their own gap-tolerant sequence space: an earlier build sends them as
+    /// datagrams, possibly out of order, and a replaced one leaves a gap.
     pub next_heartbeat_out: u64,
     pub last_heartbeat_in: Option<u64>,
     pub health: PeerHealth,
@@ -121,7 +122,8 @@ impl StartupControl {
             .allow_at(millis_u64(now))
             .map_err(|_| self.fail(StartupError::RateLimited))?;
         if is_heartbeat(&frame.message) {
-            // Datagrams may arrive out of order: a stale heartbeat is dropped, never answered or trusted.
+            // An earlier build's datagrams may arrive out of order and a replaced heartbeat leaves a
+            // gap: a stale one is dropped, never answered or trusted.
             if self.heartbeats.accept_heartbeat(frame).is_err() {
                 return Ok(None);
             }

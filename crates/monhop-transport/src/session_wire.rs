@@ -10,7 +10,8 @@ use monhop_protocol::{
     DecodeError, EncodeError, Frame, HEADER_LEN, MAX_FRAME_LEN, Message, decode,
 };
 
-/// A write is abandoned when it cannot complete within this bounded interval.
+/// A handshake write is abandoned when it cannot complete within this bounded interval. The
+/// session's input stream has no such deadline: its liveness belongs to `session_health`.
 pub const WRITE_DEADLINE: Duration = Duration::from_millis(60);
 
 const ABORT_ERROR_CODE: u32 = 1;
@@ -233,8 +234,8 @@ pub async fn write_frame(
     FrameWriter::default().write(connection, send, frame).await
 }
 
-/// Ping and Pong ride QUIC datagrams inside an input session: a lost one costs an interval, and
-/// a retransmitting input stream cannot hold liveness hostage.
+/// Ping and Pong. This build sends them on the ordered stream, behind the input they vouch for;
+/// an earlier build sends them as datagrams, which are still accepted.
 pub const fn is_heartbeat(message: &Message) -> bool {
     matches!(message, Message::Ping(_) | Message::Pong(_))
 }
@@ -264,11 +265,34 @@ impl Default for FrameWriter {
     }
 }
 impl FrameWriter {
+    /// Bounded by [`WRITE_DEADLINE`], for handshake frames.
     pub async fn write(
         &mut self,
         connection: &quinn::Connection,
         send: &mut quinn::SendStream,
         frame: &Frame,
+    ) -> Result<(), SessionWireError> {
+        self.write_within(connection, send, frame, Some(WRITE_DEADLINE))
+            .await
+    }
+
+    /// Waits for the peer's stream credit as long as the connection lives: a stalled peer is the
+    /// session's hold to judge, not a write's. A failed or cancelled write still closes the link.
+    pub async fn write_awaiting_credit(
+        &mut self,
+        connection: &quinn::Connection,
+        send: &mut quinn::SendStream,
+        frame: &Frame,
+    ) -> Result<(), SessionWireError> {
+        self.write_within(connection, send, frame, None).await
+    }
+
+    async fn write_within(
+        &mut self,
+        connection: &quinn::Connection,
+        send: &mut quinn::SendStream,
+        frame: &Frame,
+        deadline: Option<Duration>,
     ) -> Result<(), SessionWireError> {
         let mut close_guard = CloseConnectionOnDrop::new(connection);
         self.encoded.clear();
@@ -279,37 +303,15 @@ impl FrameWriter {
                 _ => SessionWireError::InvalidFrame,
             })?;
 
-        match tokio::time::timeout(WRITE_DEADLINE, send.write_all(&self.encoded)).await {
-            Ok(Ok(())) => {
-                close_guard.disarm();
-                Ok(())
-            }
-            Ok(Err(_)) => Err(SessionWireError::Io),
-            Err(_) => Err(SessionWireError::TimedOut),
-        }
-    }
-
-    /// Sends a heartbeat as a datagram; a full send buffer drops the oldest queued heartbeat.
-    pub fn send_datagram(
-        &mut self,
-        connection: &quinn::Connection,
-        frame: &Frame,
-    ) -> Result<(), SessionWireError> {
-        if !is_heartbeat(&frame.message) {
-            return Err(SessionWireError::InvalidFrame);
-        }
-        self.encoded.clear();
-        frame
-            .encode_into(&mut self.encoded)
-            .map_err(|_| SessionWireError::InvalidFrame)?;
-        connection
-            .send_datagram(bytes::Bytes::copy_from_slice(&self.encoded))
-            .map_err(|error| match error {
-                quinn::SendDatagramError::TooLarge => SessionWireError::TooLarge,
-                quinn::SendDatagramError::ConnectionLost(_) => SessionWireError::Io,
-                quinn::SendDatagramError::UnsupportedByPeer
-                | quinn::SendDatagramError::Disabled => SessionWireError::Terminal,
-            })
+        let written = match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, send.write_all(&self.encoded))
+                .await
+                .map_err(|_| SessionWireError::TimedOut)?,
+            None => send.write_all(&self.encoded).await,
+        };
+        written.map_err(|_| SessionWireError::Io)?;
+        close_guard.disarm();
+        Ok(())
     }
 }
 

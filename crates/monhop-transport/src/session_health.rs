@@ -14,6 +14,9 @@ pub const RETREAT_AFTER: Duration = PEER_LIVENESS.saturating_sub(SUPPRESSION_LEA
 /// How long a held session waits for the link to come back before it ends as a health failure.
 /// Sized under the QUIC idle timeout so the transport never closes first.
 pub const HOLD_LIMIT: Duration = Duration::from_secs(5);
+/// A frame the local input stream has not accepted for this long ends the link. A backstop only:
+/// heartbeats queue behind that frame, so the hold sees the stall first and bounds it.
+pub const STREAM_STALL_LIMIT: Duration = PEER_LIVENESS.saturating_add(HOLD_LIMIT);
 /// A held source whose barrier was acknowledged but that hears no fresh reply sends another
 /// barrier after this long: the receiver consumed the last one just before holding itself.
 pub const BARRIER_RESEND_AFTER: Duration = PEER_LIVENESS;
@@ -334,6 +337,7 @@ mod tests {
     fn the_retreat_leaves_the_full_lease_cap_before_the_deadline() {
         assert_eq!(RETREAT_AFTER + SUPPRESSION_LEASE_CAP, PEER_LIVENESS);
         assert!(HOLD_LIMIT < Duration::from_secs(10));
+        assert!(STREAM_STALL_LIMIT < Duration::from_secs(10));
     }
 
     #[test]

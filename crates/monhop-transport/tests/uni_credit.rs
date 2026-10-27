@@ -13,7 +13,7 @@ use monhop_protocol::{
 use monhop_transport::{
     crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig, VerifiedPeer},
     session_handshake::{HandshakeConfig, NegotiatedSession, negotiate},
-    session_wire::{FrameWriter, decode_datagram, write_frame},
+    session_wire::{decode_datagram, write_frame},
 };
 use tokio::time::timeout;
 
@@ -63,8 +63,8 @@ async fn without_credit_a_unidirectional_stream_is_never_opened_or_accepted() {
     .expect("loopback test exceeded five seconds");
 }
 
-/// Ordered control frames and heartbeat datagrams keep flowing both ways while the peer's
-/// unidirectional open waits for credit that never comes.
+/// Ordered control frames and an earlier build's heartbeat datagrams keep flowing both ways while
+/// the peer's unidirectional open waits for credit that never comes.
 #[tokio::test]
 async fn control_frames_keep_flowing_without_unidirectional_streams() {
     timeout(NETWORK_TIMEOUT, async {
@@ -110,8 +110,12 @@ async fn exchange(from: &mut NegotiatedSession, to: &mut NegotiatedSession) {
     }
 
     let heartbeat = Frame::new(epoch, first + FRAMES, Message::Ping(first)).with_scope(scope);
-    FrameWriter::default()
-        .send_datagram(&from.connection, &heartbeat)
+    let mut encoded = Vec::new();
+    heartbeat
+        .encode_into(&mut encoded)
+        .expect("encode a heartbeat");
+    from.connection
+        .send_datagram(encoded.into())
         .expect("send a heartbeat");
     let datagram = to
         .connection

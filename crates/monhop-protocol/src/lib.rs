@@ -722,7 +722,7 @@ pub struct SequenceGate {
     active_epoch: Option<SessionEpoch>,
     reliable_sequence: Option<u64>,
     motion_sequence: Option<u64>,
-    /// Heartbeats travel as datagrams in their own sequence space; loss leaves gaps, never replays.
+    /// Heartbeats keep their own sequence space, datagrams or not; gaps are allowed, never replays.
     heartbeat_sequence: Option<u64>,
 }
 
@@ -764,7 +764,7 @@ impl SequenceGate {
         Self::advance(last_sequence, frame.sequence)
     }
 
-    /// Admits a Ping or Pong that arrived as a datagram: newer than the last one, gaps allowed.
+    /// Admits a Ping or Pong, on either channel: newer than the last one, gaps allowed.
     pub fn accept_heartbeat(&mut self, frame: &Frame) -> Result<(), SequenceGateError> {
         if !matches!(frame.message, Message::Ping(_) | Message::Pong(_)) {
             return Err(SequenceGateError::NotHeartbeat);

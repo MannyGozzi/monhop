@@ -421,7 +421,8 @@ pub struct SourceController {
     outbound_control_sequence: u64,
     inbound_input_epoch: Option<SessionEpoch>,
     inbound_input_sequence: Option<u64>,
-    /// Peer heartbeats arrive as datagrams: newer than the last one counts, gaps are loss.
+    /// Newer than the last heartbeat counts and gaps are fine: an earlier build sends them as
+    /// datagrams, possibly out of order, and a replaced one leaves a gap.
     inbound_heartbeats: SequenceGate,
     capture_route: CaptureRoute,
     next_route_request: u64,
@@ -1226,7 +1227,8 @@ impl SourceController {
             return self.outcome(effects);
         }
         match frame.message {
-            // Datagrams may arrive out of order: a stale heartbeat is dropped, never answered or trusted.
+            // An earlier build's datagrams may arrive out of order and a replaced heartbeat leaves a
+            // gap: a stale one is dropped, never answered or trusted.
             Message::Ping(token) => {
                 if self.inbound_heartbeats.accept_heartbeat(frame).is_ok() {
                     self.push_control(Message::Pong(token), &mut effects);

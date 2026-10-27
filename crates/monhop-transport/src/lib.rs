@@ -28,6 +28,7 @@ pub mod session_hub_actor;
 pub mod session_link;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod session_native;
+pub(crate) mod session_outbox;
 pub mod session_receiver;
 pub mod session_receiver_set;
 #[cfg(any(windows, target_os = "macos"))]

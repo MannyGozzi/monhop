@@ -6,7 +6,9 @@ pub use crate::session_runtime::run_session;
 use crate::{
     session_clock::{micros_u64, millis_u64},
     session_handshake::NegotiatedSession,
-    session_wire::{FrameReader, FrameWriter, decode_datagram, is_heartbeat},
+    session_health::STREAM_STALL_LIMIT,
+    session_outbox::{Outbox, Refusal},
+    session_wire::{FrameReader, FrameWriter, decode_datagram},
 };
 use monhop_core::{
     DeviceId, DisplayId, RevocationSignal, capture::StopReason, capture_physical::HeldInput,
@@ -388,7 +390,8 @@ impl SessionIo {
     }
 }
 
-/// The receiving half of one peer link: its ordered control stream and heartbeat datagrams.
+/// The receiving half of one peer link: its ordered control stream, plus the heartbeat datagrams
+/// an earlier build still sends.
 pub(crate) struct LinkReader {
     scopes: SessionScopes,
     connection: quinn::Connection,
@@ -397,9 +400,9 @@ pub(crate) struct LinkReader {
 }
 
 impl LinkReader {
-    /// The next frame from the ordered stream or a heartbeat datagram. A peer that opens a
-    /// bidirectional stream ends the link; unidirectional streams belong to their own acceptor.
-    /// A closed or lost connection surfaces as Wire on every arm.
+    /// The next frame from the ordered stream or an earlier build's heartbeat datagram. A peer
+    /// that opens a bidirectional stream ends the link; unidirectional streams belong to their own
+    /// acceptor. A closed or lost connection surfaces as Wire on every arm.
     pub(crate) async fn next_frame(&mut self) -> Result<Frame, SessionFailure> {
         let frame = tokio::select! {
             biased;
@@ -416,13 +419,15 @@ impl LinkReader {
 }
 
 /// The sending half of one peer link, which owns the connection: dropping it closes the link.
-/// The writer may await socket capacity while the reader keeps reading and polling recovery.
+/// Every frame, heartbeats included, goes out in order on the control stream, so a heartbeat is
+/// heard only once the input queued before it was. The writer waits for the peer's stream credit
+/// with no deadline: the session's hold judges a stalled link.
 pub(crate) struct LinkIo {
     scopes: SessionScopes,
     connection: quinn::Connection,
     /// The peer address this link is bound to; any other path ends the link.
     remote: SocketAddr,
-    outbound: tokio::sync::mpsc::Sender<Frame>,
+    outbox: Arc<Outbox>,
     writer: tokio::task::JoinHandle<Result<(), SessionFailure>>,
     progress: SessionProgress,
     queued: AtomicU64,
@@ -444,29 +449,29 @@ impl LinkIo {
         let remote = connection.remote_address();
         let writer_connection = connection.clone();
         let mut send = session.control_streams.send;
-        let (outbound, mut pending) = tokio::sync::mpsc::channel::<Frame>(SESSION_QUEUE_CAPACITY);
+        let outbox = Arc::new(Outbox::new(SESSION_QUEUE_CAPACITY));
+        let writer_outbox = Arc::clone(&outbox);
         let writer_progress = progress.clone();
         let written = Arc::new(AtomicU64::new(0));
         let writer_written = written.clone();
         let writer = tokio::spawn(async move {
             let mut encoder = FrameWriter::default();
-            while let Some(frame) = pending.recv().await {
-                if is_heartbeat(&frame.message) {
-                    encoder
-                        .send_datagram(&writer_connection, &frame)
-                        .map_err(|_| SessionFailure::Wire)?;
-                } else {
-                    encoder
-                        .write(&writer_connection, &mut send, &frame)
-                        .await
-                        .map_err(|_| SessionFailure::Wire)?;
+            loop {
+                let frame = writer_outbox.next().await;
+                if encoder
+                    .write_awaiting_credit(&writer_connection, &mut send, &frame)
+                    .await
+                    .is_err()
+                {
+                    writer_outbox.close();
+                    return Err(SessionFailure::Wire);
                 }
+                writer_outbox.written();
                 writer_written.fetch_add(1, Ordering::Relaxed);
                 if is_input(&frame) {
                     writer_progress.0.sent.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Ok(())
         });
         let reader = LinkReader {
             scopes,
@@ -478,7 +483,7 @@ impl LinkIo {
             scopes,
             connection,
             remote,
-            outbound,
+            outbox,
             writer,
             progress,
             queued: AtomicU64::new(0),
@@ -487,10 +492,10 @@ impl LinkIo {
         (reader, link)
     }
     fn send(&self, frame: Frame) -> Result<(), SessionFailure> {
-        self.outbound.try_send(frame).map_err(|error| match error {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => SessionFailure::QueueFull,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => SessionFailure::Wire,
-        })?;
+        if let Err(refusal) = self.outbox.push(frame) {
+            log::warn!("session wire refused a frame: {refusal:?}");
+            return Err(refusal_failure(refusal));
+        }
         self.queued.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -540,7 +545,22 @@ impl LinkIo {
             .0
             .rtt_us
             .store(micros_u64(self.connection.rtt()), Ordering::Relaxed);
-        if self.writer.is_finished() || self.connection.close_reason().is_some() {
+        if let Some(refusal @ Refusal::Full) = self.outbox.refused() {
+            log::warn!("session wire ended: the peer left {SESSION_QUEUE_CAPACITY} frames queued");
+            return Err(refusal_failure(refusal));
+        }
+        let waited = self
+            .outbox
+            .waiting_since()
+            .map(|since| since.elapsed())
+            .filter(|waited| *waited >= STREAM_STALL_LIMIT);
+        if let Some(waited) = waited {
+            log::warn!(
+                "session wire ended: the stream accepted no queued frame for {} ms",
+                waited.as_millis()
+            );
+            Err(SessionFailure::Wire)
+        } else if self.writer.is_finished() || self.connection.close_reason().is_some() {
             log::warn!(
                 "session wire ended: writer finished={}, close reason {:?}",
                 self.writer.is_finished(),
@@ -555,6 +575,14 @@ impl LinkIo {
         }
     }
 }
+
+fn refusal_failure(refusal: Refusal) -> SessionFailure {
+    match refusal {
+        Refusal::Full => SessionFailure::QueueFull,
+        Refusal::Closed => SessionFailure::Wire,
+    }
+}
+
 pub(crate) const SESSION_ENDED_REASON: &[u8] = b"input session ended";
 pub(crate) const SESSION_FAILED_REASON: &[u8] = b"input session failed";
 pub(crate) const NETWORK_REVOKED_REASON: &[u8] = b"network revoked";
@@ -876,7 +904,8 @@ mod link_tests {
     };
     use monhop_core::{Platform, Point};
     use monhop_protocol::{
-        Capabilities, ControlPermissions, DisplayDescription, DisplayTopology, SessionPurpose,
+        Capabilities, ControlPermissions, DisplayDescription, DisplayTopology, Motion,
+        SessionPurpose,
     };
     use std::net::Ipv4Addr;
     use tokio::time::timeout;
@@ -892,10 +921,10 @@ mod link_tests {
         movable::<LinkIo>();
     };
 
-    struct Pair {
-        client: NegotiatedSession,
-        server: NegotiatedSession,
-        _endpoints: [quinn::Endpoint; 2],
+    pub(super) struct Pair {
+        pub(super) client: NegotiatedSession,
+        pub(super) server: NegotiatedSession,
+        pub(super) _endpoints: [quinn::Endpoint; 2],
     }
 
     fn pin(identity: &DeviceIdentity) -> VerifiedPeer {
@@ -944,7 +973,7 @@ mod link_tests {
         .expect("share handshake configuration")
     }
 
-    async fn negotiated_pair() -> Pair {
+    pub(super) async fn negotiated_pair() -> Pair {
         let client_identity = DeviceIdentity::generate().expect("client identity");
         let server_identity = DeviceIdentity::generate().expect("server identity");
         let (client_pin, server_pin) = (pin(&client_identity), pin(&server_identity));
@@ -1119,4 +1148,279 @@ mod link_tests {
         .await
         .expect("loopback test exceeded five seconds");
     }
+
+    /// Long enough for 1000 Hz motion to use up the peer's stream credit and then outlast a 60 ms
+    /// write deadline, and still under `PEER_LIVENESS`.
+    const STALL: Duration = Duration::from_millis(450);
+    /// Inside `STALL` and after the stream credit runs out, whatever credit the stall began with.
+    const BLOCKED: [u64; 6] = [350, 365, 380, 395, 410, 425];
+
+    /// The source half of a link: one input sequence, as a source controller numbers frames, and
+    /// what its peer must receive.
+    struct Sender {
+        link: LinkIo,
+        _reader: LinkReader,
+        epoch: monhop_protocol::SessionEpoch,
+        sequence: u64,
+        motions: u64,
+        last_motion: Option<Point>,
+        /// Each discrete frame in order, with the last position sent before it.
+        discrete: Vec<(Message, Option<Point>)>,
+    }
+
+    impl Sender {
+        fn new(session: NegotiatedSession) -> Self {
+            let epoch = session.initial_epoch;
+            let (reader, link) = LinkIo::split(session, SessionProgress::default());
+            Self {
+                link,
+                _reader: reader,
+                epoch,
+                sequence: 0,
+                motions: 0,
+                last_motion: None,
+                discrete: Vec::new(),
+            }
+        }
+
+        fn send(&mut self, message: Message) -> Result<(), SessionFailure> {
+            self.sequence += 1;
+            match &message {
+                Message::Motion(Motion::Absolute(point)) => {
+                    self.motions += 1;
+                    self.last_motion = Some(*point);
+                }
+                Message::SessionReady => {}
+                other => self.discrete.push((other.clone(), self.last_motion)),
+            }
+            self.link
+                .send_outbound(Frame::new(self.epoch, self.sequence, message))
+        }
+
+        /// One absolute position per millisecond for `length`, caught up after a late wake, each
+        /// scheduled frame right after its millisecond's motion; the link stays up throughout.
+        async fn move_for(&mut self, length: Duration, schedule: &[(u64, Message)]) {
+            let started = tokio::time::Instant::now();
+            let total = millis_u64(length);
+            let mut sent = 0;
+            while sent < total {
+                let due = millis_u64(started.elapsed()).min(total);
+                while sent < due {
+                    let next = Point::new(self.motions as f64 + 1.0, 7.0);
+                    let accepted = self.send(Message::Motion(Motion::Absolute(next)));
+                    assert_eq!(accepted, Ok(()), "motion refused at {sent} ms");
+                    for (_, message) in schedule.iter().filter(|(at, _)| *at == sent) {
+                        let accepted = self.send(message.clone());
+                        assert_eq!(accepted, Ok(()), "a frame refused at {sent} ms");
+                    }
+                    sent += 1;
+                }
+                assert_eq!(self.link.check(), Ok(()), "the link ended at {sent} ms");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    async fn read_until_marker(
+        streams: &mut crate::session_handshake::ControlStreams,
+    ) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = streams
+                .reader
+                .read_frame(&mut streams.recv)
+                .await
+                .expect("read a stream frame");
+            if frame.message == Message::SessionReady {
+                return frames;
+            }
+            frames.push(frame);
+        }
+    }
+
+    fn key(is_down: bool) -> Message {
+        Message::Key(monhop_protocol::Key {
+            usage: monhop_core::HidUsage(0x04),
+            is_down,
+            repeat: false,
+            modifiers: monhop_core::ModifierState::default(),
+        })
+    }
+
+    fn button(is_down: bool) -> Message {
+        Message::Button(monhop_protocol::Button {
+            button: monhop_core::MouseButton::Left,
+            is_down,
+            click_count: 1,
+        })
+    }
+
+    fn scroll() -> Message {
+        Message::Scroll(monhop_protocol::Scroll {
+            horizontal: 0.0,
+            vertical: 1.0,
+        })
+    }
+
+    /// A peer that stops taking the input stream while 1000 Hz motion is aimed at it: the link
+    /// survives, and once the stream moves again every discrete frame and heartbeat arrives in
+    /// order behind the latest position sent before it.
+    #[tokio::test]
+    async fn a_stall_under_the_limit_coalesces_motion_and_keeps_every_discrete_frame() {
+        timeout(Duration::from_secs(10), async {
+            let pair = negotiated_pair().await;
+            let mut sender = Sender::new(pair.client);
+            let mut server = pair.server;
+            let schedule = [
+                (BLOCKED[0], button(true)),
+                (BLOCKED[1], key(true)),
+                (BLOCKED[2], Message::Ping(9)),
+                (BLOCKED[3], key(false)),
+                (BLOCKED[4], button(false)),
+                (BLOCKED[5], scroll()),
+            ];
+            let source = async {
+                sender.move_for(Duration::from_millis(100), &[]).await;
+                assert_eq!(sender.send(Message::SessionReady), Ok(()));
+                sender
+                    .move_for(STALL + Duration::from_millis(150), &schedule)
+                    .await;
+                assert_eq!(sender.send(Message::SessionReady), Ok(()));
+            };
+            let peer = async {
+                let streams = &mut server.control_streams;
+                let mut received = read_until_marker(streams).await;
+                tokio::time::sleep(STALL).await;
+                received.extend(read_until_marker(streams).await);
+                received
+            };
+            let ((), received) = tokio::join!(source, peer);
+
+            assert!(
+                received
+                    .windows(2)
+                    .all(|two| two[0].sequence < two[1].sequence),
+                "frames arrived out of order"
+            );
+            let mut last_motion = None;
+            let mut discrete = Vec::new();
+            for frame in &received {
+                match &frame.message {
+                    Message::Motion(Motion::Absolute(point)) => last_motion = Some(*point),
+                    other => discrete.push((other.clone(), last_motion)),
+                }
+            }
+            assert_eq!(
+                discrete, sender.discrete,
+                "discrete frames or their positions changed"
+            );
+            assert_eq!(
+                last_motion, sender.last_motion,
+                "motion did not resume at the latest"
+            );
+            let motions = received.len() - discrete.len();
+            assert!(
+                (motions as u64) < sender.motions,
+                "motion never coalesced, so the stream never backed up: {motions} of {}",
+                sender.motions
+            );
+            assert_eq!(sender.link.check(), Ok(()));
+            assert!(server.connection.close_reason().is_none());
+        })
+        .await
+        .expect("loopback test exceeded ten seconds");
+    }
+
+    /// A peer that never takes the stream again ends the link once the queued frame has waited
+    /// `STREAM_STALL_LIMIT`, never sooner; motion meanwhile neither fails nor piles up.
+    #[tokio::test]
+    async fn a_stream_stalled_past_the_limit_ends_the_link() {
+        use crate::session_health::STREAM_STALL_LIMIT;
+        timeout(STREAM_STALL_LIMIT + Duration::from_secs(5), async {
+            let pair = negotiated_pair().await;
+            let mut sender = Sender::new(pair.client);
+            let mut server = pair.server;
+            sender.move_for(Duration::from_millis(100), &[]).await;
+            assert_eq!(sender.send(Message::SessionReady), Ok(()));
+            read_until_marker(&mut server.control_streams).await;
+            let stalled = tokio::time::Instant::now();
+            let mut sent = 0;
+            let ended = 'moving: loop {
+                let due = millis_u64(stalled.elapsed());
+                while sent < due {
+                    let next = Point::new(sender.motions as f64 + 1.0, 7.0);
+                    if let Err(failure) = sender.send(Message::Motion(Motion::Absolute(next))) {
+                        break 'moving (failure, stalled.elapsed());
+                    }
+                    sent += 1;
+                }
+                if let Err(failure) = sender.link.check() {
+                    break (failure, stalled.elapsed());
+                }
+                assert!(
+                    stalled.elapsed() < STREAM_STALL_LIMIT + Duration::from_millis(1_500),
+                    "the stalled stream never ended the link"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+            assert_eq!(ended.0, SessionFailure::Wire);
+            assert!(
+                ended.1 >= STREAM_STALL_LIMIT,
+                "the link ended {:?} into a stall the limit allows",
+                ended.1
+            );
+
+            sender.link.close_after(&Err(ended.0), false, false);
+            drop(sender);
+            let closed = timeout(QUIET, server.connection.closed()).await;
+            assert_eq!(classify_close(closed.ok()), LinkClose::PeerFailed);
+        })
+        .await
+        .expect("the stalled-link test overran");
+    }
+
+    /// Discrete frames are never coalesced, so a peer that stops taking them fills the queue: the
+    /// link refuses the next one instead of growing, and keeps refusing until it is closed.
+    #[tokio::test]
+    async fn an_overflowing_stream_queue_ends_the_link_cleanly() {
+        timeout(NETWORK_TIMEOUT, async {
+            let pair = negotiated_pair().await;
+            let mut sender = Sender::new(pair.client);
+            let mut server = pair.server;
+            assert_eq!(sender.send(Message::SessionReady), Ok(()));
+            read_until_marker(&mut server.control_streams).await;
+            let mut accepted = 0;
+            let refused = 'filling: loop {
+                for _ in 0..4 {
+                    match sender.send(scroll()) {
+                        Ok(()) => accepted += 1,
+                        Err(failure) => break 'filling failure,
+                    }
+                }
+                assert_eq!(
+                    sender.link.check(),
+                    Ok(()),
+                    "the link ended after {accepted}"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+            assert_eq!(refused, SessionFailure::QueueFull);
+            assert!(
+                accepted >= SESSION_QUEUE_CAPACITY,
+                "refused after {accepted}"
+            );
+            assert_eq!(sender.send(key(true)), Err(SessionFailure::QueueFull));
+            assert_eq!(sender.link.check(), Err(SessionFailure::QueueFull));
+
+            sender.link.close_after(&Err(refused), false, false);
+            drop(sender);
+            let closed = timeout(QUIET, server.connection.closed()).await;
+            assert_eq!(classify_close(closed.ok()), LinkClose::PeerFailed);
+        })
+        .await
+        .expect("loopback test exceeded five seconds");
+    }
 }
+
+#[cfg(test)]
+mod stall_tests;

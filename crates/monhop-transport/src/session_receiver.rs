@@ -500,7 +500,8 @@ impl InputReceiver {
             .allow_at(millis_u64(now))
             .map_err(|_| ReceiverFailure::RateLimited)?;
         if matches!(frame.message, Message::Ping(_) | Message::Pong(_)) {
-            // Datagrams may arrive out of order: a stale heartbeat is dropped, never answered or trusted.
+            // An earlier build's datagrams may arrive out of order and a replaced heartbeat leaves a
+            // gap: a stale one is dropped, never answered or trusted.
             if self.control_sequences.accept_heartbeat(frame).is_err() {
                 return Ok(None);
             }
@@ -1262,6 +1263,59 @@ mod tests {
             ),
             Ok(Some(Message::Ping(3)))
         );
+    }
+
+    /// The backlog a stalled input stream delivers late: once the receiver has held, the motion,
+    /// clicks and keys typed during the stall are tracked but never injected, and the barrier
+    /// behind them leaves nothing pressed.
+    #[test]
+    fn input_queued_behind_a_stall_is_never_injected_once_the_receiver_held() {
+        let mut receiver = receiver();
+        let mut target = Destination::default();
+        receiver
+            .receive(&activate(), Duration::ZERO, &mut target)
+            .unwrap();
+        receiver
+            .receive(&frame(2, 1, key(true)), Duration::ZERO, &mut target)
+            .unwrap();
+        assert_eq!(receiver.tick(PEER_LIVENESS, &mut target), Ok(None));
+        assert!(matches!(
+            target.calls.last(),
+            Some(DestinationAction::ReleaseAll)
+        ));
+        let released = target.calls.len();
+
+        let late = PEER_LIVENESS + Duration::from_secs(2);
+        let click = |is_down| {
+            Message::Button(monhop_protocol::Button {
+                button: MouseButton::Left,
+                is_down,
+                click_count: 1,
+            })
+        };
+        let backlog = [
+            Message::Motion(Motion::Absolute(Point::new(20.0, 20.0))),
+            click(true),
+            key(false),
+            Message::Scroll(monhop_protocol::Scroll {
+                horizontal: 0.0,
+                vertical: 1.0,
+            }),
+            Message::Motion(Motion::Absolute(Point::new(30.0, 30.0))),
+        ];
+        for (sequence, message) in (2..).zip(backlog) {
+            assert_eq!(
+                receiver.receive(&frame(2, sequence, message), late, &mut target),
+                Ok(None)
+            );
+        }
+        assert_eq!(
+            receiver.receive(&frame(2, 7, Message::ReleaseAll), late, &mut target),
+            Ok(Some(Message::ReleaseAck))
+        );
+        assert!(receiver.held_since().is_none());
+        assert!(target.calls[released..].iter().all(|a| a.is_release()));
+        assert!(!receiver.keys.contains(&true) && !receiver.buttons.contains(&true));
     }
 
     /// Builds the same activated receiver twice, so the hold is the only difference between them.
