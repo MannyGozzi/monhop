@@ -72,11 +72,31 @@ let escapePlatform = null;
 let dockBar = null;
 let dockHeight = 0;
 let dockSlide = null;
+// A bar rewritten this render, not measured yet: whether it was up already, and where it was drawn.
+let dockPending = null;
+let canvasStage = null;
+// What the last frame drew, read before the render writes anything, so reading it forces no layout.
+let drawn = null;
+
+// Call first in a render: where the view and the Apply bar were drawn, and how opaque the view was.
+export function captureCanvas() {
+  const element = shown?.element?.isConnected ? shown.element : null;
+  const motion = motionEnabled();
+  drawn = {
+    element,
+    box: element && motion ? { width: element.offsetWidth, height: element.offsetHeight } : null,
+    opacity: element && motion ? Number(getComputedStyle(element).opacity) : 0,
+    dockTop:
+      motion && dockBar?.dataset.shown === "true" ? dockBar.getBoundingClientRect().top : null,
+  };
+}
 
 // The canvas: its banners, the arrangement (read only, or the live editor while arranging), the
-// Apply bar and the status bar. The dock is settled before a new view is built, so the view is drawn
-// once at the stage size it keeps while the one leaving fades in the box it had.
+// Apply bar and the status bar. A new view is written with the dock before anything is measured,
+// so one layout gives the stage size it keeps and its card's height, and it is drawn once at both
+// while the one leaving fades in the box it had.
 export function renderCanvas(nodes, ctx) {
+  canvasStage = nodes.canvasStage;
   watchStage(nodes.canvasStage);
   renderBanners(nodes.canvasBanners, ctx);
   const mode = canvasMode(ctx);
@@ -87,26 +107,35 @@ export function renderCanvas(nodes, ctx) {
   const signature = viewSignature(mode, ctx);
   const stays = shown?.signature === signature && shown.element.isConnected;
   if (!stays) holdLeaving(shown?.element);
-  const restaged = renderDock(nodes.canvasDock, ctx, mode);
-  if (stays) {
-    shown.update(ctx);
-    // A picture refits from where it is drawn; the editor, which watches its own stage, restages.
-    if (restaged) (shown.restage ?? shown.refit)?.(stageSize(nodes.canvasStage));
-  } else {
-    const view = buildView(mode, ctx, stageSize(nodes.canvasStage));
+  renderDock(nodes.canvasDock, ctx, mode);
+  if (stays) shown.update(ctx);
+  else {
+    const view = buildView(mode, ctx);
     showView(nodes.canvasStage, { ...view, signature });
-    view.mounted?.();
+    const stage = stageSize(nodes.canvasStage);
+    settleDock({ restage: false });
+    view.mounted?.(stage);
   }
   renderMenus(nodes, ctx, mode);
   // Hidden while arranging, the status bar takes its words without a cross-fade nobody sees.
   renderStatusBar(nodes, ctx, { quiet: wasArranging || ctx.arrange.active });
 }
 
+// Call once the whole render is written: what changed size is measured in the layout the frame
+// needs anyway. A bar that changed height slides from where it was drawn and the view refits.
+export function settleCanvas() {
+  settleDock({ restage: true });
+  shown?.settle?.();
+}
+
 // A view on its way out keeps the box it was drawn in, so the stage taking its new size under it
 // never reflows the picture while it fades.
 function holdLeaving(element) {
   if (!element?.isConnected || !motionEnabled()) return;
-  const { offsetWidth: width, offsetHeight: height } = element;
+  const { width, height } =
+    drawn?.element === element && drawn.box
+      ? drawn.box
+      : { width: element.offsetWidth, height: element.offsetHeight };
   Object.assign(element.style, {
     inset: "0 auto auto 0",
     width: `${width}px`,
@@ -116,8 +145,7 @@ function holdLeaving(element) {
 }
 
 // The Apply bar comes and goes by CSS transform and opacity, out of flow once leaving, so the stage
-// takes its final size in one layout; a new height slides it from where it was drawn. Returns
-// whether its height changed.
+// takes its final size in one layout; settleDock measures what it became.
 function renderDock(dock, ctx, mode) {
   if (!dockBar) {
     dockBar = el("div", {
@@ -133,25 +161,34 @@ function renderDock(dock, ctx, mode) {
   const was = bar.dataset.shown === "true";
   if (!show) {
     if (was) leaveDock(bar);
-    return false;
+    dockPending = null;
+    return;
   }
-  const slide = was && motionEnabled();
-  const drawnTop = slide ? bar.getBoundingClientRect().top : null;
+  dockPending = { was, drawnTop: was ? (drawn?.dockTop ?? null) : null };
   bar.replaceChildren(...applyBarParts(ctx, mode));
   bar.dataset.shown = "true";
   bar.inert = false;
   bar.removeAttribute("aria-hidden");
+}
+
+// A new height slides the bar from where it was drawn; with `restage`, the view on the stage
+// refits: a picture from where it is drawn, the editor, which watches its own stage, at once.
+function settleDock({ restage }) {
+  const pending = dockPending;
+  if (!pending || !dockBar) return;
+  dockPending = null;
   dockSlide?.cancel();
   dockSlide = null;
-  const box = bar.getBoundingClientRect();
-  const resized = was && moved(box.height, dockHeight);
+  const box = dockBar.getBoundingClientRect();
+  const resized = pending.was && moved(box.height, dockHeight);
   dockHeight = box.height;
-  if (drawnTop !== null && moved(drawnTop, box.top))
-    dockSlide = bar.animate(
-      { translate: [`0 ${drawnTop - box.top}px`, "0 0"] },
+  if (pending.drawnTop !== null && moved(pending.drawnTop, box.top))
+    dockSlide = dockBar.animate(
+      { translate: [`0 ${pending.drawnTop - box.top}px`, "0 0"] },
       { duration: motionMs("--motion-slow"), easing: motionEase("--ease-glide") },
     );
-  return resized;
+  if (restage && resized && shown?.element.isConnected)
+    (shown.restage ?? shown.refit)?.(stageSize(canvasStage));
 }
 
 // The bar keeps what it last showed while it sinks away, as a copy would, out of reach of focus.
@@ -185,12 +222,13 @@ function viewSignature(mode, ctx) {
   return mode === "saved" || mode === "unarranged" ? `${mode}:${fingerprint}` : mode;
 }
 
-function buildView(mode, ctx, stage) {
+// Built off screen; `mounted(stage)` draws what needs the stage size once it is in the document.
+function buildView(mode, ctx) {
   if (mode === "edit") return editView(ctx);
-  if (mode === "saved") return savedView(ctx, stage);
-  if (mode === "waiting") return waitingView(ctx, stage);
-  if (mode === "unarranged") return unarrangedView(ctx, stage);
-  return emptyView(ctx, stage);
+  if (mode === "saved") return savedView(ctx);
+  if (mode === "waiting") return waitingView(ctx);
+  if (mode === "unarranged") return unarrangedView(ctx);
+  return emptyView(ctx);
 }
 
 function stageSize(node) {
@@ -211,8 +249,9 @@ function watchStage(stage) {
 function showView(stage, view) {
   const leaving = shown?.element?.isConnected ? shown.element : null;
   if (leaving) {
-    const opacity = Number(getComputedStyle(leaving).opacity);
-    for (const animation of leaving.getAnimations()) animation.cancel();
+    const opacity =
+      drawn?.element === leaving ? drawn.opacity : Number(getComputedStyle(leaving).opacity);
+    rises.get(leaving)?.cancel();
     leaving.dataset.exit = "true";
     leaving.inert = true;
     leaving.setAttribute("aria-hidden", "true");
@@ -239,9 +278,12 @@ function showView(stage, view) {
   if (leaving) riseIn(view.element);
 }
 
+// Each view's rise, the one animation a view itself runs: asking the view would force a layout.
+const rises = new WeakMap();
+
 function riseIn(element) {
   if (!motionEnabled()) return;
-  element.animate(
+  const rise = element.animate(
     [
       {
         opacity: 0,
@@ -251,6 +293,7 @@ function riseIn(element) {
     ],
     { duration: motionMs("--motion-base"), easing: motionEase() },
   );
+  rises.set(element, rise);
 }
 
 // --- banners ------------------------------------------------------------------
@@ -428,7 +471,7 @@ function pairingLive(ctx) {
   return ctx.studio.selection.kind === "new" || ctx.pairing?.view?.phase === "showing";
 }
 
-function savedView(ctx, stage) {
+function savedView(ctx) {
   const computer = ctx.studio.canvasComputer;
   const element = el("div", { className: "canvas-view", dataset: { view: "saved" } });
   const toast = el("p", {
@@ -438,6 +481,7 @@ function savedView(ctx, stage) {
   });
   let setupKey = null;
   let picture = null;
+  let latest = ctx;
   const pictureNames = (context) => {
     const peer = peerStatus(context, computer);
     return {
@@ -451,7 +495,7 @@ function savedView(ctx, stage) {
       slot: pairingLive(context) ? SLOT_COPY : null,
     };
   };
-  function update(context) {
+  function draw(context, stage = null) {
     const current = findComputer(context.computers, computer.fingerprint) ?? computer;
     const key = JSON.stringify(current.setup ?? null);
     const names = pictureNames(context);
@@ -460,31 +504,30 @@ function savedView(ctx, stage) {
       const next = createDashboardArrangement(current.setup, {
         ...names,
         motionKey: `canvas-${computer.fingerprint}-layout`,
-        stage: stageSize(element.parentElement ?? element),
+        stage: stage ?? stageSize(element.parentElement ?? element),
         motion: MOTION,
       });
       if (picture) picture.element.replaceWith(next.element);
       else element.prepend(next.element);
       picture = next;
     } else picture.update(names);
+  }
+  function update(context) {
+    latest = context;
+    // Until it is mounted the picture waits for the stage size the render measures.
+    if (picture) draw(context);
     const applied = hasAppliedLayout(context.sharing) && !isSessionStatus(context.status);
     toast.lastElementChild.textContent = applied
       ? `Sharing with ${context.peerName} starts in a moment.`
       : "";
     toast.dataset.shown = String(applied);
   }
-  setupKey = JSON.stringify(computer.setup ?? null);
-  picture = createDashboardArrangement(computer.setup, {
-    ...pictureNames(ctx),
-    motionKey: `canvas-${computer.fingerprint}-layout`,
-    stage,
-    motion: MOTION,
-  });
-  element.append(picture.element, toast);
+  element.append(toast);
   update(ctx);
   return {
     element,
     update,
+    mounted: (stage) => draw(latest, stage),
     hold: (size) => picture?.hold(size),
     refit: (size) => picture?.refit(size),
   };
@@ -492,10 +535,13 @@ function savedView(ctx, stage) {
 
 // A canvas without an arrangement draws this computer's own displays above a card that says what
 // comes next. `card(context)` builds that card; `slot(context)` names the place still empty.
-function pictureView(ctx, stage, { view, card, slot }) {
+function pictureView(ctx, { view, card, slot }) {
   const host = el("div", { className: "canvas-picture" });
   const element = el("div", { className: "canvas-view", dataset: { view }, children: [host] });
   let cardHeight = CARD_ESTIMATE;
+  let latest = ctx;
+  // A card replaced on screen, measured once the render is written.
+  let cardMoved = false;
   const pictureNames = (context) => ({
     local: localName(context),
     localPlatform: localPlatformOf(context),
@@ -512,15 +558,15 @@ function pictureView(ctx, stage, { view, card, slot }) {
     const top = picture?.cardTop();
     if (top !== null && top !== undefined) element.style.setProperty("--canvas-card-y", `${top}px`);
   }
-  function measureCard({ still = false } = {}) {
+  function measureCard() {
     const height = cardNode?.isConnected ? cardNode.offsetHeight : 0;
     if (height > 0 && Math.abs(height - cardHeight) >= 1) {
       cardHeight = height;
-      picture?.setCard(height, { still });
+      picture?.setCard(height);
     }
     placeCard();
   }
-  function update(context, size = null) {
+  function draw(context, size = null) {
     const reported = context.state.snapshot?.displays ?? [];
     const key = JSON.stringify(reported);
     const names = pictureNames(context);
@@ -535,22 +581,46 @@ function pictureView(ctx, stage, { view, card, slot }) {
       host.replaceChildren(...(picture ? [picture.element] : []));
       element.dataset.picture = String(Boolean(picture));
     } else picture?.update(names);
+  }
+  function update(context) {
+    latest = context;
+    // Until it is mounted the picture waits for the stage size and card height one layout gives.
+    if (displaysKey !== null) draw(context);
     const built = card(context);
     if (built.key !== cardKey) {
       cardKey = built.key;
       const next = el("div", { className: "canvas-card", children: [built.node] });
       if (cardNode) cardNode.replaceWith(next);
-      else element.append(next);
+      else {
+        // Its first place comes with the picture; gliding there from the top would read as a slip.
+        next.dataset.placing = "";
+        element.append(next);
+      }
       cardNode = next;
-      measureCard();
+      cardMoved = displaysKey !== null;
     } else built.refresh?.(cardNode.firstElementChild);
     placeCard();
   }
-  update(ctx, stage);
+  update(ctx);
   return {
     element,
     update,
-    mounted: () => measureCard({ still: true }),
+    mounted: (stage) => {
+      const height = cardNode?.offsetHeight ?? 0;
+      if (height > 0) cardHeight = height;
+      draw(latest, stage);
+      placeCard();
+      // Drawn in place this frame; from the next one on it glides with the picture.
+      const placed = cardNode;
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => placed?.removeAttribute("data-placing")),
+      );
+    },
+    settle: () => {
+      if (!cardMoved) return;
+      cardMoved = false;
+      measureCard();
+    },
     hold: (size) => {
       picture?.hold(size);
       placeCard();
@@ -574,8 +644,8 @@ function placeholder({ title, body, actions = [] }) {
 }
 
 // With nothing paired the canvas shows this computer's own displays, as the last check reported them.
-function emptyView(ctx, stage) {
-  return pictureView(ctx, stage, {
+function emptyView(ctx) {
+  return pictureView(ctx, {
     view: "empty",
     slot: (context) => (pairingLive(context) ? SLOT_COPY : null),
     card: (context) => {
@@ -613,9 +683,9 @@ function emptyView(ctx, stage) {
   });
 }
 
-function unarrangedView(ctx, stage) {
+function unarrangedView(ctx) {
   const computer = ctx.studio.canvasComputer;
-  return pictureView(ctx, stage, {
+  return pictureView(ctx, {
     view: "unarranged",
     slot: () => ({ title: displayName(computer), detail: "Not placed yet" }),
     card: (context) => {
@@ -642,7 +712,7 @@ function unarrangedView(ctx, stage) {
 }
 
 // Arranging needs the link with the other computer; until it is up the canvas says what it waits for.
-function waitingView(ctx, stage) {
+function waitingView(ctx) {
   if (isConnected(ctx.sharing)) {
     const element = el("div", {
       className: "canvas-view",
@@ -664,7 +734,7 @@ function waitingView(ctx, stage) {
     return { element, update() {} };
   }
   const computer = ctx.studio.canvasComputer;
-  return pictureView(ctx, stage, {
+  return pictureView(ctx, {
     view: "waiting",
     slot: (context) => ({ title: context.peerName, detail: "Its displays appear once connected" }),
     card: (context) => {

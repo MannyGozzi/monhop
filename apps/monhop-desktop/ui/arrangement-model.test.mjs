@@ -514,6 +514,18 @@ test("a stored layout lists what it left out, and an older one shows the copy it
     positions: [],
     hidden: [],
   });
+  // The order localeCompare gives, mixed case and digit runs included.
+  const ids = ["b", "A", "a", "10", "9", "\\\\.\\DISPLAY2", "4387096063190498813"];
+  const byLocaleCompare = ids.toSorted((a, b) => a.localeCompare(b));
+  const placed = layoutArrangement(
+    { positions: Object.fromEntries(ids.map((id) => [id, [0, 0]])) },
+    ids,
+  );
+  assert.deepEqual(
+    placed.positions.map((entry) => entry.display),
+    byLocaleCompare,
+  );
+  assert.deepEqual(placed.hidden, byLocaleCompare);
 });
 
 test("own seams mirror the native edge inheritance", () => {

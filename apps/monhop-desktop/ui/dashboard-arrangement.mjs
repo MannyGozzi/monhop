@@ -457,7 +457,7 @@ function createPicture(content, names) {
     return looks.offTiles.has(place.from) || looks.offTiles.has(place.to);
   }
 
-  function draw(stage, { force = false, still = false } = {}) {
+  function draw(stage, { force = false } = {}) {
     const size = canvasSize(stage);
     const same = drawn?.size.width === size.width && drawn?.size.height === size.height;
     if (!force && same && !drawn.hold) return;
@@ -518,7 +518,7 @@ function createPicture(content, names) {
       seams,
       animations: [],
     };
-    playMotion(previous, visual, state, still ? null : motion);
+    playMotion(previous, visual, state, motion);
     drawn = state;
     if (key) lastDrawn.set(key, state);
     // Real text metrics need a laid-out canvas, so the estimated truncation is corrected on the next frame.
@@ -571,11 +571,11 @@ function createPicture(content, names) {
     seams.restyle(seamOff);
   }
 
-  // The card's height is known only once it is laid out; a picture not yet on screen takes it still.
-  function setCard(height, { still = false } = {}) {
+  // The card's height is known only once it is laid out; a new height moves the picture to make room.
+  function setCard(height) {
     if (!drawn || Math.abs(height - card) < 1) return;
     card = height;
-    draw(drawn.hold?.size ?? drawn.size, { force: true, still });
+    draw(drawn.hold?.size ?? drawn.size, { force: true });
   }
 
   draw(names.stage);

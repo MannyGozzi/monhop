@@ -167,7 +167,7 @@ import { normalizeAutostartView } from "./autostart-model.mjs";
 import { islandContext, normalizeIslandView } from "./island-model.mjs";
 import { localInspector } from "./screen-ready.mjs";
 import { computerInspector } from "./computer-card.mjs";
-import { banner, renderCanvas } from "./screen-displays.mjs";
+import { banner, captureCanvas, renderCanvas, settleCanvas } from "./screen-displays.mjs";
 import { renderSettings, showSettingsPage } from "./screen-settings.mjs";
 import { renderSidebar } from "./sidebar.mjs";
 import { MOUSE_STEPS, emptyTrail, step as stepTrail, trackSwipe, visit } from "./history-model.mjs";
@@ -246,6 +246,8 @@ let inspectorDismissed = false;
 // displays from the Apply bar, or { kind: "use", display } from a display on the canvas; or none.
 let canvasMenu = null;
 let networkMenuOpen = false;
+// What the network menu was last built from; an unchanged menu keeps its nodes.
+let networkMenuKey = null;
 // This Mac's network list, opened under its checklist row with Change once a network is chosen.
 let localNetworkOpen = false;
 // The selection the inspector last drew, when that changed, and what it showed before, fading out.
@@ -633,8 +635,9 @@ function captureInteraction() {
 }
 
 function restoreInteraction(interaction, { resetInspector }) {
+  // A pane at the top stays there whatever the render rebuilt; writing it back would force a layout.
   scrollers.forEach((node, index) => {
-    node.scrollTop = interaction.scroll[index];
+    if (interaction.scroll[index]) node.scrollTop = interaction.scroll[index];
   });
   if (resetInspector) nodes.inspectorScroll.scrollTop = 0;
   if (!interaction.focused) return;
@@ -891,8 +894,10 @@ function render() {
     renderAfterDrag = true;
     return;
   }
+  // Everything a render measures of the last frame is read here, before anything is written.
   const interaction = captureInteraction();
   const dims = captureDims(nodes.studio);
+  captureCanvas();
   // The canvas hands back the same editor across polls; only a view it dropped is torn down.
   const previousArrangementView = arrangementView;
   arrangementView = null;
@@ -923,6 +928,7 @@ function render() {
   renderInspector(ctx);
   renderSettings(nodes, ctx);
   followDims(nodes.studio, dims);
+  settleCanvas();
   phaseLoops();
   restoreInteraction(interaction, { resetInspector: selectionChanged });
   // A control that moved the selection and left with it hands focus to the selected row.
@@ -1191,17 +1197,28 @@ function renderNetworkChip(ctx) {
     eligibleCount: eligibleNetworks().length,
     sessionActive: isSessionActive(sharing),
   });
-  const width = nodes.networkChip.getBoundingClientRect().width;
-  setLabel(nodes.networkChipName, chip.name);
-  setLabel(nodes.networkChipAddress, chip.address);
-  nodes.networkChipAddress.hidden = !chip.address;
-  if (width) glideWidth(nodes.networkChip, width);
+  const { networkChipName: name, networkChipAddress: address } = nodes;
+  // Measured only when its words change: a read here forces a layout of all the render wrote so far.
+  if (
+    name.textContent !== chip.name ||
+    address.textContent !== chip.address ||
+    address.hidden !== !chip.address
+  ) {
+    const width = nodes.networkChip.getBoundingClientRect().width;
+    setLabel(name, chip.name);
+    setLabel(address, chip.address);
+    address.hidden = !chip.address;
+    if (width) glideWidth(nodes.networkChip, width);
+  }
   nodes.networkChip.disabled = chip.disabled || ctx.busy;
   nodes.networkSlot.dataset.locked = String(nodes.networkChip.disabled);
-  nodes.networkTooltip.textContent = chip.hint;
+  if (nodes.networkTooltip.textContent !== chip.hint) nodes.networkTooltip.textContent = chip.hint;
   nodes.networkChipDot.dataset.tone = selected ? "connected" : "neutral";
   if (nodes.networkChip.disabled && networkMenuOpen) setNetworkMenuOpen(false, { render: false });
   const items = networkMenuItems(state.snapshot?.interfaces ?? [], state.selectedInterfaceId);
+  const menuKey = JSON.stringify([items, chip.hint]);
+  if (menuKey === networkMenuKey) return;
+  networkMenuKey = menuKey;
   clear(nodes.networkMenu);
   nodes.networkMenu.append(
     el("p", { className: "menu-heading", text: "Network connection" }),
@@ -1360,8 +1377,8 @@ function arrangeWith(fingerprint) {
   arrangeSwitchedOn = isComputerEnabled(target, enabled) ? null : target;
   arrangeRequested = true;
   canvasMenu = null;
-  render();
-  void beginLayoutEdit(target);
+  settleLoadOnConnect();
+  renderUnlessPending(() => beginLayoutEdit(target));
 }
 
 // Done and Cancel both end the edit; what was applied stays applied.
@@ -1371,8 +1388,15 @@ function leaveArrange() {
   arrangeRequested = false;
   loadOnConnect = null;
   canvasMenu = null;
-  render();
-  void endLayoutEdit(switchedOn);
+  renderUnlessPending(() => endLayoutEdit(switchedOn));
+}
+
+// Starting a sharing command renders its pending state in the same task, so a render just before it
+// would never be drawn and would only double the work of the frame the change starts in.
+function renderUnlessPending(command) {
+  const pending = sharing.pending;
+  void command();
+  if (sharing.pending === pending) render();
 }
 
 // The Apply bar's button closes its own menu and takes over one a display opened.

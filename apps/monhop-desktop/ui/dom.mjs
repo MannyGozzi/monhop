@@ -443,13 +443,28 @@ function dimTarget(node) {
   return node.closest(".slider-row") ?? node;
 }
 
+// What sets a control's dimmed look: its classes and its disabled and busy states.
+function dimLook(node) {
+  const { className, disabled } = node;
+  return [
+    className,
+    disabled,
+    node.getAttribute("aria-disabled"),
+    node.getAttribute("aria-busy"),
+  ].join("|");
+}
+
 export function captureDims(root) {
   const drawn = new Map();
   if (!motionEnabled()) return drawn;
   for (const node of root.querySelectorAll(DIMMABLE)) {
     const key = dimKey(node);
     if (key && node.getClientRects().length)
-      drawn.set(key, { node, opacity: Number(getComputedStyle(dimTarget(node)).opacity) });
+      drawn.set(key, {
+        node,
+        look: dimLook(node),
+        opacity: Number(getComputedStyle(dimTarget(node)).opacity),
+      });
   }
   return drawn;
 }
@@ -457,18 +472,27 @@ export function captureDims(root) {
 export function followDims(root, drawn) {
   if (!drawn.size || !motionEnabled()) return;
   for (const node of root.querySelectorAll(DIMMABLE)) {
-    const last = drawn.get(dimKey(node));
-    const target = dimTarget(node);
-    // A kept node transitions on its own; one already fading in some other way keeps that motion.
-    if (!last || last.node === node || target.getAnimations().some(fadesOpacity)) continue;
     const key = dimKey(node);
+    const last = drawn.get(key);
+    // A kept node transitions on its own.
+    if (!last || last.node === node) continue;
     const running = dimFades.get(key) ?? null;
+    // Built as the one it replaces and not mid-fade, it rests as that one did. Asked before any
+    // style read, since the first one in a render costs a style and layout pass.
+    if (last.look === dimLook(node) && tweenNow(running) === null) {
+      dimFades.delete(key);
+      continue;
+    }
+    const target = dimTarget(node);
     const resting = Number(getComputedStyle(target).opacity);
     const follow = dimFollow({
       drawn: last.opacity,
       resting,
       running: tweenNow(running) === null ? null : running.to,
     });
+    if (follow === null && !running) continue;
+    // One already fading in some other way keeps that motion.
+    if (target.getAnimations().some(fadesOpacity)) continue;
     if (follow === "carry") {
       dimFades.set(key, { ...running, animation: copyAnimation(running.animation, target) });
       continue;
@@ -545,8 +569,7 @@ export function swap(key, node, signature, { block = false, scale = true } = {})
   const elapsed = now - entry.changedAt;
   if (elapsed >= enterMs() || !motionEnabled()) return wrapper;
   // Kept only while it fades in, the one stretch a change could catch it mid-way.
-  entry.live = node;
-  play(node, enterFrames(scale), enterMs(), elapsed);
+  entry.live = { node, enter: play(node, enterFrames(scale), enterMs(), elapsed) };
   for (const leaver of leavers) {
     const ghost = ghostOf(leaver.node);
     wrapper.append(ghost);
@@ -556,10 +579,10 @@ export function swap(key, node, signature, { block = false, scale = true } = {})
   return wrapper;
 }
 
-function drawnMidEnter(node) {
-  if (!node?.isConnected || !node.getAnimations().some((run) => run.playState === "running"))
-    return null;
-  const { opacity, transform } = getComputedStyle(node);
+// Read only while its own enter runs: asking the node for its animations would force a layout.
+function drawnMidEnter(live) {
+  if (!live?.node.isConnected || live.enter.playState !== "running") return null;
+  const { opacity, transform } = getComputedStyle(live.node);
   return { opacity, transform };
 }
 

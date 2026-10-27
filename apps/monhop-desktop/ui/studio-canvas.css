@@ -226,6 +226,7 @@
 
 /* The card under a picture that says what comes next; alone, it sits in the middle of the stage. */
 .canvas-card { position: absolute; top: 0; left: 50%; width: min(calc(100% - var(--gap-8)), var(--canvas-card-width)); translate: -50% var(--canvas-card-y); transition: translate var(--motion-slow) var(--ease-out); }
+.canvas-card[data-placing] { transition: none; }
 .canvas-view:is([data-picture="false"], [data-view="blocked"]) .canvas-card { top: 50%; translate: -50% -50%; }
 .canvas-card > .canvas-placeholder { max-width: none; border-radius: var(--radius-card); padding: var(--gap-5) var(--gap-6); background: var(--panel); -webkit-backdrop-filter: blur(var(--panel-blur)); backdrop-filter: blur(var(--panel-blur)); box-shadow: var(--shadow-panel); }
 .canvas-card > .canvas-placeholder p { text-wrap: pretty; }

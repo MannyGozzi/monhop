@@ -115,6 +115,9 @@ let frame = null;
 let lastRender = null;
 // Pages fading out from a scrolled position, each drawn where it was until its exit ends.
 let leavingOffsets = [];
+// When Settings last closed. A closed pane is still laid out, so once its exit has played the page
+// is not rebuilt until it opens again, settled.
+let closedAt = -Infinity;
 
 // Settings opens on this page next; a link elsewhere names the page its control lives on.
 export function showSettingsPage(key) {
@@ -123,6 +126,14 @@ export function showSettingsPage(key) {
 
 export function renderSettings(nodes, ctx) {
   lastRender = { nodes, ctx };
+  if (ctx.studio.view === "settings") closedAt = null;
+  else {
+    closedAt ??= performance.now();
+    if (performance.now() - closedAt >= motionMs("--motion-base")) {
+      builtPage = null;
+      return;
+    }
+  }
   if (!frame) frame = mountFrame(nodes.settingsContent);
   const pages = PAGES.filter((page) => page.available?.(ctx) ?? true);
   if (!pages.some((page) => page.key === shownPage)) shownPage = pages[0].key;

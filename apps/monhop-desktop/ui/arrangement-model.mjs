@@ -13,6 +13,9 @@ const OPPOSITE = { left: "right", right: "left", top: "bottom", bottom: "top" };
 const SIDES = ["local", "peer"];
 // vendor-product-serial of the physical monitor, as the native side formats it.
 const MONITOR_KEY = /^[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{8}$/;
+// localeCompare's order. Built at load: the first locale comparison loads collation data, which
+// costs milliseconds wherever it lands, such as the frame the editor opens in.
+const byLocale = new Intl.Collator().compare;
 
 // Top and bottom insets reserve the band a group label needs, so a label never lands off the canvas.
 export const VIEW_INSETS = Object.freeze({ top: 24, right: 16, bottom: 24, left: 16 });
@@ -898,10 +901,10 @@ export function placementFromLayout(groups, arrangement, crossings) {
 export function layoutArrangement(placement, hidden = []) {
   if (!placement) return null;
   const positions = Object.entries(placement.positions)
-    .toSorted(([a], [b]) => a.localeCompare(b))
+    .toSorted(([a], [b]) => byLocale(a, b))
     .map(([display, [x, y]]) => ({ display, x, y }));
   // Always listed, even empty: a layout that shows every display must restore that way.
-  return { positions, hidden: hidden.toSorted((a, b) => a.localeCompare(b)) };
+  return { positions, hidden: hidden.toSorted(byLocale) };
 }
 
 // --- plain-language description -----------------------------------------
