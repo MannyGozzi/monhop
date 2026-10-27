@@ -39,6 +39,7 @@ const LLKHF_EXTENDED: u32 = 0x01;
 const LLKHF_LOWER_IL_INJECTED: u32 = 0x02;
 const LLKHF_INJECTED: u32 = 0x10;
 const LLKHF_UP: u32 = 0x80;
+const RIGHT_SHIFT_MAKE_CODE: u32 = 0x36;
 const LLMHF_INJECTED: u32 = 0x01;
 const LLMHF_LOWER_IL_INJECTED: u32 = 0x02;
 const XBUTTON1: u16 = 0x0001;
@@ -68,7 +69,8 @@ pub fn decode_keyboard(
         return DecodedInput::Unsupported;
     }
 
-    let prefix = if flags & LLKHF_EXTENDED != 0 {
+    // LLKHF_EXTENDED is the layout's KBDEXT bit, which Right Shift carries without an E0 prefix.
+    let prefix = if flags & LLKHF_EXTENDED != 0 && scan_code != RIGHT_SHIFT_MAKE_CODE {
         Set1Prefix::E0
     } else {
         Set1Prefix::None
@@ -216,6 +218,55 @@ mod tests {
             0x4a,
             true,
         );
+    }
+
+    const VK_LSHIFT: u32 = 0xa0;
+    const VK_RSHIFT: u32 = 0xa1;
+
+    #[test]
+    fn right_shift_decodes_with_or_without_the_extended_flag() {
+        for flags in [0, LLKHF_EXTENDED] {
+            assert_key(
+                decode_keyboard(WM_KEYDOWN, VK_RSHIFT, 0x36, flags, 0),
+                0xe5,
+                true,
+            );
+            assert_key(
+                decode_keyboard(WM_KEYUP, VK_RSHIFT, 0x36, flags | LLKHF_UP, 0),
+                0xe5,
+                false,
+            );
+        }
+        assert_key(
+            decode_keyboard(WM_KEYDOWN, VK_LSHIFT, 0x2a, 0, 0),
+            0xe1,
+            true,
+        );
+        assert_key(
+            decode_keyboard(WM_KEYUP, VK_LSHIFT, 0x2a, LLKHF_UP, 0),
+            0xe1,
+            false,
+        );
+    }
+
+    #[test]
+    fn fake_shifts_stay_unsupported() {
+        // Windows' own Shift toggles around Shift+numpad keys carry SCANCODE_SIMULATED (0x200),
+        // and a keyboard's E0 2A never names a key.
+        for (virtual_key, scan_code, flags) in [
+            (VK_LSHIFT, 0x22a, 0),
+            (VK_LSHIFT, 0x22a, LLKHF_EXTENDED),
+            (VK_RSHIFT, 0x236, 0),
+            (VK_RSHIFT, 0x236, LLKHF_EXTENDED),
+            (VK_LSHIFT, 0x2a, LLKHF_EXTENDED),
+        ] {
+            for (message, up) in [(WM_KEYDOWN, 0), (WM_KEYUP, LLKHF_UP)] {
+                assert!(matches!(
+                    decode_keyboard(message, virtual_key, scan_code, flags | up, 0),
+                    DecodedInput::Unsupported
+                ));
+            }
+        }
     }
 
     #[test]
