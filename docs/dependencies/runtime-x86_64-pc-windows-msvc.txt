@@ -170,7 +170,7 @@ time-core v0.1.9 MIT OR Apache-2.0
 tinystr v0.8.4 Unicode-3.0
 tinyvec v1.13.2 Zlib OR Apache-2.0 OR MIT
 tinyvec_macros v0.1.1 MIT OR Apache-2.0 OR Zlib
-tokio v1.53.1 MIT
+tokio v1.53.3 MIT
 tokio-rustls v0.26.5 MIT OR Apache-2.0
 tokio-util v0.7.19 MIT
 toml v1.1.5+spec-1.1.0 MIT OR Apache-2.0

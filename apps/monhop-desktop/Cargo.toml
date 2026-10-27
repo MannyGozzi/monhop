@@ -11,7 +11,7 @@ monhop-core = { path = "../../crates/monhop-core", version = "=0.2.14" }
 monhop-transport = { path = "../../crates/monhop-transport", version = "=0.2.14" }
 monhop-protocol = { path = "../../crates/monhop-protocol", version = "=0.2.14" }
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio = { version = "=1.53.1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio = { version = "=1.53.3", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 monhop-platform-macos = { path = "../../crates/monhop-platform-macos", version = "=0.2.14" }
 monhop-platform-windows = { path = "../../crates/monhop-platform-windows", version = "=0.2.14" }
 log = "=0.4.34"

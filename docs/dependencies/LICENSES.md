@@ -396,7 +396,7 @@ Generated from Cargo.lock. Includes all resolved target and build dependencies. 
 | tinystr | 0.8.4 | Unicode-3.0 |
 | tinyvec | 1.13.2 | Zlib OR Apache-2.0 OR MIT |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib |
-| tokio | 1.53.1 | MIT |
+| tokio | 1.53.3 | MIT |
 | tokio-macros | 2.7.2 | MIT |
 | tokio-rustls | 0.26.5 | MIT OR Apache-2.0 |
 | tokio-util | 0.7.19 | MIT |

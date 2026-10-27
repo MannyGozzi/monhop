@@ -18,7 +18,7 @@ sha2 = "=0.11.0"
 spake2 = "=0.4.0"
 ring = { version = "=0.17.14", default-features = false }
 zeroize = "=1.9.0"
-tokio = { version = "=1.53.1", default-features = false, features = ["rt", "macros", "net", "time", "io-util", "sync"] }
+tokio = { version = "=1.53.3", default-features = false, features = ["rt", "macros", "net", "time", "io-util", "sync"] }
 
 [dev-dependencies]
 quinn-proto = { version = "=0.11.18", default-features = false }

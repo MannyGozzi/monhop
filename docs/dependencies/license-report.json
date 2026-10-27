@@ -2745,7 +2745,7 @@
   },
   {
     "name": "tokio",
-    "version": "1.53.1",
+    "version": "1.53.3",
     "license": "MIT",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://github.com/tokio-rs/tokio"
