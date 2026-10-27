@@ -23,11 +23,11 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplicationDidChangeScreenParametersNotification, NSColor, NSScreen, NSStatusWindowLevel,
-    NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWorkspace,
-    NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification, NSWorkspaceDidWakeNotification,
-    NSWorkspaceScreensDidSleepNotification, NSWorkspaceScreensDidWakeNotification,
-    NSWorkspaceSessionDidBecomeActiveNotification, NSWorkspaceSessionDidResignActiveNotification,
-    NSWorkspaceWillSleepNotification,
+    NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowDidMoveNotification,
+    NSWorkspace, NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
+    NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidSleepNotification,
+    NSWorkspaceScreensDidWakeNotification, NSWorkspaceSessionDidBecomeActiveNotification,
+    NSWorkspaceSessionDidResignActiveNotification, NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
     NSDistributedNotificationCenter, NSNotification, NSNotificationCenter, NSNotificationName,
@@ -51,6 +51,8 @@ use super::{
 const SETTLE_TOLERANCE: f64 = 0.5;
 /// Screen changes arrive in bursts; the island re-places once they stop.
 const SCREENS_QUIET: f64 = 0.1;
+/// How far the island check drops the window, about where macOS was seen to leave it.
+const DISPLACED: f64 = 832.0;
 
 /// Whether Reduce Motion is honored; the island check always animates so it can measure motion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +79,8 @@ pub struct Probe {
     pub at_rest: bool,
     /// The drawn outline lies inside the window.
     pub fits: bool,
+    /// The window hangs from the notch.
+    pub placed: bool,
     /// The fastest any point of the current motion travels, in points per second.
     pub peak_speed: f64,
     /// The content tree on show; a rebuild or a new entrance changes it.
@@ -124,6 +128,17 @@ pub fn render(mtm: MainThreadMarker, generation: u64, activity: Option<Activity>
 pub fn probe(mtm: MainThreadMarker) -> Option<Probe> {
     let _ = mtm;
     with_island(|island| island.probe())
+}
+
+/// Moves the window off the notch, as macOS does when displays come and go; for the island check.
+pub fn displace(mtm: MainThreadMarker) {
+    let _ = mtm;
+    with_island(|island| {
+        let origin = island.panel.frame().origin;
+        island
+            .panel
+            .setFrameOrigin(NSPoint::new(origin.x, origin.y - DISPLACED));
+    });
 }
 
 /// The content at rest holds exactly the layers a fresh build of what it shows would, and no
@@ -490,6 +505,17 @@ impl Island {
         name: &NSNotificationName,
         work: fn(&mut Island),
     ) {
+        self.watch_from(center, name, None, work);
+    }
+
+    /// Like `watch`, for notifications `sender` posts alone when given.
+    fn watch_from(
+        &mut self,
+        center: &NSNotificationCenter,
+        name: &NSNotificationName,
+        sender: Option<&AnyObject>,
+        work: fn(&mut Island),
+    ) {
         let generation = self.generation;
         let block = RcBlock::new(move |_: NonNull<NSNotification>| {
             with_island_soon(move |island| {
@@ -503,7 +529,7 @@ impl Island {
         let observer = unsafe {
             center.addObserverForName_object_queue_usingBlock(
                 Some(name),
-                None,
+                sender,
                 Some(&NSOperationQueue::mainQueue()),
                 &block,
             )
@@ -525,6 +551,7 @@ impl Island {
                 NSWorkspaceSessionDidResignActiveNotification,
                 NSWorkspaceSessionDidBecomeActiveNotification,
                 NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
+                NSWindowDidMoveNotification,
             ]
         };
         let [
@@ -536,8 +563,16 @@ impl Island {
             resign,
             resumed,
             motion,
+            moved,
         ] = names;
         self.watch(&app, screens, Island::screens_changed);
+        let panel = self.panel.clone();
+        let sender: &AnyObject = &panel;
+        self.watch_from(&app, moved, Some(sender), |island| {
+            if !island.at_home() {
+                island.screens_changed();
+            }
+        });
         self.watch(&workspace, will_sleep, |island| {
             island.hidden.asleep = true;
             island.update_visibility();
@@ -610,10 +645,10 @@ impl Island {
     fn replace(&mut self) {
         let found = notch_placement(self.mtm);
         self.hidden.no_display = found.is_none();
-        if let Some(place) = found
-            && place != self.look.place
-        {
-            self.relayout(place);
+        match found {
+            Some(place) if place != self.look.place => self.relayout(place),
+            Some(_) => self.go_home(),
+            None => {}
         }
         self.update_visibility();
     }
@@ -895,9 +930,31 @@ impl Island {
             return;
         }
         self.envelope = envelope;
-        let frame = self.look.place.frame(envelope);
-        self.panel.setFrame_display(draw::rect(frame), true);
+        self.panel.setFrame_display(draw::rect(self.home()), true);
         self.lay_out_stage();
+    }
+
+    /// Where the window belongs: hanging from the notch, as big as the envelope.
+    fn home(&self) -> Rect {
+        self.look.place.frame(self.envelope)
+    }
+
+    fn at_home(&self) -> bool {
+        to_rect(self.panel.frame()).placed_for(self.home())
+    }
+
+    /// macOS moves windows itself when displays come and go; the island puts its own back.
+    fn go_home(&self) {
+        if self.at_home() {
+            return;
+        }
+        let origin = self.panel.frame().origin;
+        log::info!(
+            "island: window found at ({:.0}, {:.0}), put back at the notch",
+            origin.x,
+            origin.y
+        );
+        self.panel.setFrame_display(draw::rect(self.home()), true);
     }
 
     /// Island coordinates (origin at the top center, y up) for every layer under the stage.
@@ -955,6 +1012,7 @@ impl Island {
                 && self.envelope == place.envelope(size, size, 0.0)
                 && content_rest,
             fits,
+            placed: self.at_home(),
             peak_speed: self.swing.as_ref().map_or(0.0, |swing| swing.peak),
             content: self.shown.as_ref().map(|piece| piece.id),
             band_scaling: self

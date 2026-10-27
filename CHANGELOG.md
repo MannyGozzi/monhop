@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- On a Mac, the notch island no longer appears as a black bar in the middle of the screen. macOS sometimes moves it when displays come and go, such as when you open the lid with an external display attached, and it now goes straight back to the notch.
+
 ## [0.2.14] - 2026-10-22
 
 ### Added

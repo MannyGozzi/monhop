@@ -97,6 +97,8 @@ enum Order {
     Show(Option<Activity>),
     /// Shows this while the island must still be moving.
     Interrupt(Option<Activity>),
+    /// Moves the window off the notch, as macOS does when displays come and go.
+    Displace,
 }
 
 struct Step {
@@ -169,7 +171,8 @@ fn shows(activity: &Option<Activity>, expected: Option<ActivityId>) -> Result<()
 
 /// Idle and every activity the model shows: connecting, connected, a copy with notices off and
 /// on (then the other way in place), a drop, reconnecting, waiting, a second computer connecting,
-/// two drops in a row in place, and a growth interrupted mid-flight by a return to rest.
+/// two drops in a row in place, a growth interrupted mid-flight by a return to rest, and the window
+/// moved off the notch.
 fn script() -> Result<Vec<Step>, String> {
     let mut feed = Feed {
         model: Model::default(),
@@ -259,6 +262,11 @@ fn script() -> Result<Vec<Step>, String> {
             (0.0, Order::Show(connecting)),
             (INTERRUPT_AFTER, Order::Interrupt(None)),
         ]),
+        in_place: false,
+    });
+    steps.push(Step {
+        name: "moved off the notch by macOS",
+        orders: VecDeque::from([(0.0, Order::Displace)]),
         in_place: false,
     });
     Ok(steps)
@@ -393,6 +401,7 @@ impl Check {
                     }
                     macos::render(mtm, GENERATION, activity);
                 }
+                Order::Displace => macos::displace(mtm),
             }
             return None;
         }
@@ -415,6 +424,9 @@ impl Check {
             return Some(Err(format!(
                 "{name}: settled {off:.2} pt away from its target"
             )));
+        }
+        if !probe.placed {
+            return Some(Err(format!("{name}: the window rests away from the notch")));
         }
         let (height, notch) = (probe.target.bounds().height, probe.idle.bounds().height);
         if (height - notch).abs() > REST_TOLERANCE {

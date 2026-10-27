@@ -60,6 +60,18 @@ impl Rect {
     pub fn mid_x(self) -> f64 {
         self.x + self.width / 2.0
     }
+
+    /// A window frame AppKit placed for `asked`: it rounds each edge to a whole point, either way.
+    pub fn placed_for(self, asked: Rect) -> bool {
+        [
+            (self.x, asked.x),
+            (self.y, asked.y),
+            (self.max_x(), asked.max_x()),
+            (self.max_y(), asked.max_y()),
+        ]
+        .iter()
+        .all(|(edge, wanted)| (edge - wanted).abs() < 1.0)
+    }
 }
 
 /// What one display reports, in global points.
@@ -439,5 +451,16 @@ mod tests {
         let rest = place.envelope(place.idle, place.idle, 0.0);
         assert!(rest.height >= place.idle.height);
         assert!(on_pixels(place.frame(rest).x, 2.0));
+    }
+
+    #[test]
+    fn a_window_counts_as_placed_through_appkit_rounding_but_not_when_moved() {
+        // Seen on a 185 pt camera gap: asked at 770.5, AppKit made it 770 and 188 wide when the
+        // window was made, and 770 and 187 wide on a resize.
+        let asked = Rect::new(770.5, 1084.0, 187.0, 33.0);
+        assert!(Rect::new(770.0, 1084.0, 188.0, 33.0).placed_for(asked));
+        assert!(Rect::new(770.0, 1084.0, 187.0, 33.0).placed_for(asked));
+        assert!(!Rect::new(770.0, 252.0, 187.0, 33.0).placed_for(asked));
+        assert!(!Rect::new(768.0, 1084.0, 187.0, 33.0).placed_for(asked));
     }
 }
