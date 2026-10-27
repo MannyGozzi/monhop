@@ -103,10 +103,10 @@ export function revealPanel(content) {
 
 // Shows or hides a reveal panel. On its way out it turns inert at once, so focus inside first moves
 // to `focusTarget`, as a closing disclosure hands it to its trigger.
-export function setRevealOpen(panel, open, { focusTarget = null } = {}) {
+export function setRevealOpen(panel, open, { focusTarget = null, instant = false } = {}) {
   if (!open) handOffFocus(panel, focusTarget);
   panel.inert = !open;
-  setPanelOpen(panel, open);
+  setPanelOpen(panel, open, { instant });
 }
 
 // A keyed block that comes and goes across renders: its height glides between 0 and its content's

@@ -81,7 +81,11 @@
 /* Every view fills the stage; the picture fits itself inside it. */
 .canvas-view:is([data-view="saved"], [data-view="empty"], [data-view="unarranged"], [data-view="waiting"], [data-view="blocked"]) { position: absolute; inset: 0; display: block; min-height: 0; padding: 0; }
 .canvas-stage > [data-exit="true"] { pointer-events: none; }
-.canvas-picture, .dashboard-arrangement-preview[data-size="canvas"] { position: absolute; inset: 0; display: block; margin: 0; }
+/* A view fading out keeps the box it was drawn in (screen-displays.mjs holdLeaving), which may stand
+   past a stage that just shrank: the stage clips it rather than flashing a scrollbar. */
+.canvas-stage:has(> [data-exit="true"]) { overflow: hidden; }
+/* A picture's crossings overlay slides with a held drawing; clipped here, it never scrolls the stage. */
+.canvas-picture, .dashboard-arrangement-preview[data-size="canvas"] { position: absolute; inset: 0; display: block; overflow: clip; margin: 0; }
 .dashboard-arrangement-preview[data-size="canvas"]::before { content: ""; position: absolute; inset: 0; background: radial-gradient(closest-side, var(--canvas-live-halo), transparent); opacity: 0; pointer-events: none; transition: opacity var(--motion-slow) var(--ease-in-out); }
 .dashboard-arrangement-preview[data-live="true"]::before { opacity: 1; transition: opacity var(--canvas-seam-fill) var(--ease-out); }
 .dashboard-arrangement-preview[data-size="canvas"] .dashboard-arrangement-canvas { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
@@ -256,6 +260,10 @@
 
 /* The Apply bar: a glass bar docked at the bottom. Its state and the way out on top, the tools under. */
 .apply-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "status actions" "tools tools"; align-items: center; gap: var(--gap-2) var(--gap-3); padding: var(--gap-2) var(--gap-2) var(--gap-2) var(--gap-4); }
+/* One bar for the life of the window (screen-displays.mjs renderDock): it rises in where the status bar
+   sinks, and sinks away out of flow, so the stage takes its final size in one layout. */
+.apply-bar { transition: opacity var(--motion-base) var(--ease-out), transform var(--motion-slow) var(--ease-out), visibility 0s linear 0s; }
+.apply-bar[data-shown="false"] { position: absolute; right: 0; bottom: 0; left: 0; opacity: 0; transform: translateY(var(--motion-slide)); visibility: hidden; pointer-events: none; transition: opacity var(--motion-fast) var(--ease-in-out), transform var(--motion-base) var(--ease-in-out), visibility 0s linear var(--motion-base); }
 .apply-bar-status { grid-area: status; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--gap-half); min-width: 0; }
 .apply-bar-status > * { min-width: 0; }
 .apply-bar-actions { grid-area: actions; flex-wrap: nowrap; justify-content: flex-end; margin-left: 0; }

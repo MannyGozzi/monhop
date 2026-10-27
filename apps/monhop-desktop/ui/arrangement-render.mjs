@@ -1,5 +1,11 @@
 // One read-only drawing path for the arrangement editor and the canvas picture.
-import { formatSize, labelPlacement, spokenSize, truncateToWidth } from "./arrangement-model.mjs";
+import {
+  formatSize,
+  labelPlacement,
+  spokenSize,
+  truncateToWidth,
+  truncationSteps,
+} from "./arrangement-model.mjs";
 import { icon } from "./icons.mjs";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -808,27 +814,46 @@ export function refineText(root) {
   const estimates = nodes.map((node) => node.textContent);
   for (const node of nodes) node.textContent = node.dataset.text ?? "";
   const widths = nodes.map((node) => node.getComputedTextLength());
-  nodes.forEach((node, index) => {
+  const shown = nodes.map((node, index) => {
     const full = node.dataset.text ?? "";
     const maxWidth = Number(node.dataset.width);
     const width = widths[index];
-    if (!(width > 0) || !Number.isFinite(maxWidth)) {
-      node.textContent = estimates[index];
-      return;
-    }
-    const shown =
-      width <= maxWidth
-        ? full
-        : node.dataset.fit === "exact"
-          ? ""
-          : truncateToWidth(full, maxWidth, (value) => {
-              node.textContent = value;
-              return node.getComputedTextLength();
-            });
-    if (node.textContent !== shown) node.textContent = shown;
-    const visibility = shown ? "visible" : "hidden";
+    if (!(width > 0) || !Number.isFinite(maxWidth)) return estimates[index];
+    if (width <= maxWidth) return full;
+    if (node.dataset.fit === "exact") return "";
+    // The full text's width is known already, so its shortening starts at the first candidate.
+    const steps = truncationSteps(full, maxWidth);
+    steps.next();
+    return { steps, step: steps.next(width) };
+  });
+  shortenTogether(nodes, shown);
+  nodes.forEach((node, index) => {
+    const text = shown[index];
+    if (node.textContent !== text) node.textContent = text;
+    if (!Number.isFinite(Number(node.dataset.width)) || !(widths[index] > 0)) return;
+    const visibility = text ? "visible" : "hidden";
     if (node.getAttribute("visibility") !== visibility) node.setAttribute("visibility", visibility);
   });
+}
+
+// Runs every overlong text's shortening in step: each round writes all candidates before measuring
+// any, so the page lays out once per round instead of once per candidate. A slot of `shown` still
+// shortening ends as the text it settled on.
+function shortenTogether(nodes, shown) {
+  for (;;) {
+    const open = [];
+    shown.forEach((search, index) => {
+      if (typeof search === "string") return;
+      if (search.step.done) shown[index] = search.step.value;
+      else open.push(index);
+    });
+    if (!open.length) return;
+    for (const index of open) nodes[index].textContent = shown[index].step.value;
+    const measured = open.map((index) => nodes[index].getComputedTextLength());
+    open.forEach((index, at) => {
+      shown[index].step = shown[index].steps.next(measured[at]);
+    });
+  }
 }
 
 // A display drawn as a small screen: its computer's tone glowing under a sheen, inside a thin

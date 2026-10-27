@@ -26,6 +26,7 @@ import { displayOwner, displaySections } from "./canvas-menus-model.mjs";
 import { watchSize } from "./arrangement-render.mjs";
 import { newestFirst, resolveEnabledList } from "./computer-card-model.mjs";
 import { presence } from "./accordion.mjs";
+import { moved } from "./glide-model.mjs";
 import { createDashboardArrangement, createLocalPicture } from "./dashboard-arrangement.mjs";
 import { UPDATE_READY_NOTE, canInstall, installHint } from "./updates-model.mjs";
 import { ESCAPE_SENTENCE, escapeKeys } from "./escape-model.mjs";
@@ -67,27 +68,101 @@ const SLOT_COPY = { title: "New computer", detail: "Its displays appear here" };
 let shown = null;
 let stageWatch = null;
 let escapePlatform = null;
+// The Apply bar, one node for the life of the window, and the height it was last laid out at.
+let dockBar = null;
+let dockHeight = 0;
+let dockSlide = null;
 
 // The canvas: its banners, the arrangement (read only, or the live editor while arranging), the
-// Apply bar and the status bar.
+// Apply bar and the status bar. The dock is settled before a new view is built, so the view is drawn
+// once at the stage size it keeps while the one leaving fades in the box it had.
 export function renderCanvas(nodes, ctx) {
   watchStage(nodes.canvasStage);
   renderBanners(nodes.canvasBanners, ctx);
   const mode = canvasMode(ctx);
+  const wasArranging = dockBar?.dataset.shown === "true";
   nodes.canvasPane.dataset.mode = mode;
   if (mode !== "edit") releaseEditor();
+  else editorFor(ctx);
   const signature = viewSignature(mode, ctx);
-  if (shown?.signature === signature && shown.element.isConnected) shown.update(ctx);
-  else {
+  const stays = shown?.signature === signature && shown.element.isConnected;
+  if (!stays) holdLeaving(shown?.element);
+  const restaged = renderDock(nodes.canvasDock, ctx, mode);
+  if (stays) {
+    shown.update(ctx);
+    // A picture refits from where it is drawn; the editor, which watches its own stage, restages.
+    if (restaged) (shown.restage ?? shown.refit)?.(stageSize(nodes.canvasStage));
+  } else {
     const view = buildView(mode, ctx, stageSize(nodes.canvasStage));
     showView(nodes.canvasStage, { ...view, signature });
     view.mounted?.();
   }
-  clear(nodes.canvasDock);
-  const bar = presence("apply-bar", ctx.arrange.active ? applyBar(ctx, mode) : null);
-  if (bar) nodes.canvasDock.append(bar);
   renderMenus(nodes, ctx, mode);
-  renderStatusBar(nodes, ctx);
+  // Hidden while arranging, the status bar takes its words without a cross-fade nobody sees.
+  renderStatusBar(nodes, ctx, { quiet: wasArranging || ctx.arrange.active });
+}
+
+// A view on its way out keeps the box it was drawn in, so the stage taking its new size under it
+// never reflows the picture while it fades.
+function holdLeaving(element) {
+  if (!element?.isConnected || !motionEnabled()) return;
+  const { offsetWidth: width, offsetHeight: height } = element;
+  Object.assign(element.style, {
+    inset: "0 auto auto 0",
+    width: `${width}px`,
+    height: `${height}px`,
+    minHeight: "0",
+  });
+}
+
+// The Apply bar comes and goes by CSS transform and opacity, out of flow once leaving, so the stage
+// takes its final size in one layout; a new height slides it from where it was drawn. Returns
+// whether its height changed.
+function renderDock(dock, ctx, mode) {
+  if (!dockBar) {
+    dockBar = el("div", {
+      className: "apply-bar",
+      dataset: { shown: "false" },
+      attrs: { role: "region", "aria-label": "Arranging", "aria-hidden": "true" },
+    });
+    dockBar.inert = true;
+    dock.append(dockBar);
+  }
+  const bar = dockBar;
+  const show = ctx.arrange.active;
+  const was = bar.dataset.shown === "true";
+  if (!show) {
+    if (was) leaveDock(bar);
+    return false;
+  }
+  const slide = was && motionEnabled();
+  const drawnTop = slide ? bar.getBoundingClientRect().top : null;
+  bar.replaceChildren(...applyBarParts(ctx, mode));
+  bar.dataset.shown = "true";
+  bar.inert = false;
+  bar.removeAttribute("aria-hidden");
+  dockSlide?.cancel();
+  dockSlide = null;
+  const box = bar.getBoundingClientRect();
+  const resized = was && moved(box.height, dockHeight);
+  dockHeight = box.height;
+  if (drawnTop !== null && moved(drawnTop, box.top))
+    dockSlide = bar.animate(
+      { translate: [`0 ${drawnTop - box.top}px`, "0 0"] },
+      { duration: motionMs("--motion-slow"), easing: motionEase("--ease-glide") },
+    );
+  return resized;
+}
+
+// The bar keeps what it last showed while it sinks away, as a copy would, out of reach of focus.
+function leaveDock(bar) {
+  bar.dataset.shown = "false";
+  bar.inert = true;
+  bar.setAttribute("aria-hidden", "true");
+  for (const node of bar.querySelectorAll("[id], [data-focus-key]")) {
+    node.removeAttribute("id");
+    delete node.dataset.focusKey;
+  }
 }
 
 function canvasMode(ctx) {
@@ -636,6 +711,7 @@ function editView(ctx) {
       first?.mounted();
       first = null;
     },
+    restage: () => live?.editor.restage?.(),
   };
 }
 
@@ -657,7 +733,7 @@ function resetControl({ sharing, actions, busy }) {
 
 // Apply and the way out, the editor's own Reset and Fit, and the saved arrangements and the
 // displays in use a press away in menus over the canvas.
-function applyBar(ctx, mode) {
+function applyBarParts(ctx, mode) {
   const { sharing, actions, busy, arrange, canvasMenu } = ctx;
   const applying = sharing.pending?.kind === "apply" || isSyncing(sharing);
   const editing = mode === "edit";
@@ -672,45 +748,41 @@ function applyBar(ctx, mode) {
           : null,
       ]
     : [];
-  return el("div", {
-    className: "apply-bar",
-    attrs: { role: "region", "aria-label": "Arranging" },
-    children: [
-      el("div", {
-        className: "apply-bar-status",
-        children: [
-          editing
-            ? syncStatus(ctx, draftChanged)
-            : el("p", {
-                className: "progress-line",
-                text: "Sharing is paused while you arrange. Apply turns on once both computers connect.",
-              }),
-          sharing.message && editing ? note(sharing.message, "danger") : null,
-        ],
-      }),
-      // The tools wrap as one group and the way out as another, so Apply never strays from Done.
-      el("div", {
-        className: "apply-bar-tools",
-        children: [
-          el("div", { className: "apply-bar-drawers", children: toggles }),
-          editing ? live?.controls : null,
-        ],
-      }),
-      el("div", {
-        className: "apply-bar-actions",
-        children: [
-          arrange.leavable ? leaveButton(ctx, applying) : null,
-          button(applying ? "Applying…" : "Apply on both computers", {
-            busy: applying,
-            size: "sm",
-            disabled: !editing || applying || busy || !canApplySetup(sharing),
-            focusKey: "displays-apply",
-            onClick: actions.applySetup,
-          }),
-        ],
-      }),
-    ],
-  });
+  return [
+    el("div", {
+      className: "apply-bar-status",
+      children: [
+        editing
+          ? syncStatus(ctx, draftChanged)
+          : el("p", {
+              className: "progress-line",
+              text: "Sharing is paused while you arrange. Apply turns on once both computers connect.",
+            }),
+        sharing.message && editing ? note(sharing.message, "danger") : null,
+      ],
+    }),
+    // The tools wrap as one group and the way out as another, so Apply never strays from Done.
+    el("div", {
+      className: "apply-bar-tools",
+      children: [
+        el("div", { className: "apply-bar-drawers", children: toggles }),
+        editing ? live?.controls : null,
+      ],
+    }),
+    el("div", {
+      className: "apply-bar-actions",
+      children: [
+        arrange.leavable ? leaveButton(ctx, applying) : null,
+        button(applying ? "Applying…" : "Apply on both computers", {
+          busy: applying,
+          size: "sm",
+          disabled: !editing || applying || busy || !canApplySetup(sharing),
+          focusKey: "displays-apply",
+          onClick: actions.applySetup,
+        }),
+      ],
+    }),
+  ];
   function menuToggle(context, kind, label) {
     const open = canvasMenu?.kind === kind && !canvasMenu.display;
     const toggle = button(label, {
@@ -758,8 +830,9 @@ function savedLabel(sharing) {
 }
 
 // The overall state on the left, and the way to take input back, drawn as the keys to hold.
-function renderStatusBar(nodes, ctx) {
+function renderStatusBar(nodes, ctx, { quiet = false } = {}) {
   const { status } = ctx;
+  const write = quiet ? writeLabel : setLabel;
   nodes.statusBarDot.dataset.tone = status.tone;
   const text = nodes.statusBarText;
   if (!text.querySelector(".status-bar-label")) {
@@ -769,10 +842,14 @@ function renderStatusBar(nodes, ctx) {
     );
   }
   const detail = status.detail && status.detail !== status.label ? status.detail : "";
-  setLabel(text.querySelector(".status-bar-label"), status.label);
-  setLabel(text.querySelector(".status-bar-detail"), detail);
+  write(text.querySelector(".status-bar-label"), status.label);
+  write(text.querySelector(".status-bar-detail"), detail);
   text.title = detail ? `${status.label} · ${detail}` : status.label;
   renderEscape(nodes.statusBarText.closest(".status-bar"), ctx.platform);
+}
+
+function writeLabel(node, label) {
+  if (node.textContent !== label) node.textContent = label;
 }
 
 function renderEscape(bar, platform) {
@@ -855,42 +932,61 @@ function labelTones(ctx, options) {
   return Object.fromEntries(keys.map((key) => [key, { tone }]));
 }
 
-function liveEditor(ctx) {
+// What the editor is fed on each render.
+function editorState(ctx) {
   const { sharing, actions, busy } = ctx;
   const reset = resetControl(ctx);
-  const arrangement = arrangementForSharing(sharing);
   const setup = liveOptions(ctx);
-  const key = JSON.stringify(setup);
-  const handlers = {
-    onCommit: (placement, moving) => actions.commitArrangement(placement, moving),
-    onReset: reset.apply,
-    onShowMonitor: (monitor, side) => actions.showMonitorOn(monitor, side),
-    onPickDisplay: (id) => actions.pickDisplay(id),
-    onLift: () => actions.closeCanvasMenu(),
-    onScene: () => menus?.shell.reposition(),
+  return {
+    setup,
+    key: JSON.stringify(setup),
+    reset,
+    arrangement: arrangementForSharing(sharing),
+    handlers: {
+      onCommit: (placement, moving) => actions.commitArrangement(placement, moving),
+      onReset: reset.apply,
+      onShowMonitor: (monitor, side) => actions.showMonitorOn(monitor, side),
+      onPickDisplay: (id) => actions.pickDisplay(id),
+      onLift: () => actions.closeCanvasMenu(),
+      onScene: () => menus?.shell.reposition(),
+    },
+    shared: sharedMonitorChoices(sharing),
+    selectedDisplay: ctx.canvasMenu?.kind === "use" ? (ctx.canvasMenu.display ?? null) : null,
+    labelDetails: labelTones(ctx, setup),
+    busy,
   };
-  const shared = sharedMonitorChoices(sharing);
-  const selectedDisplay = ctx.canvasMenu?.kind === "use" ? (ctx.canvasMenu.display ?? null) : null;
-  const labelDetails = labelTones(ctx, setup);
-  if (live?.key !== key) {
-    releaseEditor();
-    const view = createArrangementView({
-      ...setup,
-      ...handlers,
-      arrangement,
-      shared,
-      selectedDisplay,
-      labelDetails,
-      disabled: busy,
-      canReset: reset.enabled,
-      resetHint: reset.hint,
-    });
-    // Reset and Fit ride in the Apply bar; the editor still drives them there.
-    const controls = view.element.querySelector(".arrangement-controls");
-    controls?.remove();
-    live = { key, editor: view, handle: null, controls };
-  }
-  const editor = live.editor;
+}
+
+// The editor for these computers, made again only when they change, so its Reset and Fit are in
+// hand before the Apply bar that carries them is laid out.
+function editorFor(ctx, state = editorState(ctx)) {
+  if (live?.key === state.key) return live;
+  releaseEditor();
+  const { setup, handlers, arrangement, shared, selectedDisplay, labelDetails, reset } = state;
+  const view = createArrangementView({
+    ...setup,
+    ...handlers,
+    arrangement,
+    shared,
+    selectedDisplay,
+    labelDetails,
+    disabled: state.busy,
+    canReset: reset.enabled,
+    resetHint: reset.hint,
+  });
+  // Reset and Fit ride in the Apply bar; the editor still drives them there.
+  const controls = view.element.querySelector(".arrangement-controls");
+  controls?.remove();
+  live = { key: state.key, editor: view, handle: null, controls };
+  return live;
+}
+
+function liveEditor(ctx) {
+  const { actions } = ctx;
+  const state = editorState(ctx);
+  const { setup, handlers, arrangement, shared, selectedDisplay, labelDetails, reset, busy } =
+    state;
+  const editor = editorFor(ctx, state).editor;
   // app.js destroys whatever view it holds on the next render; only the handle it still holds may tear the editor down.
   const handle = {
     element: editor.element,

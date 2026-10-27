@@ -1065,14 +1065,23 @@ export function labelPlacement(self, other, stage, size, insets = VIEW_INSETS, a
 }
 
 export function truncateToWidth(value, maxWidth, measure) {
+  const steps = truncationSteps(value, maxWidth);
+  let step = steps.next();
+  while (!step.done) step = steps.next(measure(step.value));
+  return step.value;
+}
+
+// truncateToWidth one measurement at a time: yields each text to measure, takes its width back and
+// returns the shortened text, so many texts' candidates can share one layout per round.
+export function* truncationSteps(value, maxWidth) {
   const characters = Array.from(String(value ?? ""));
   if (!characters.length || !Number.isFinite(maxWidth) || maxWidth <= 0) return "";
-  if (measure(characters.join("")) <= maxWidth) return characters.join("");
+  if ((yield characters.join("")) <= maxWidth) return characters.join("");
   let low = 0;
   let high = characters.length - 1;
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
-    if (measure(`${characters.slice(0, middle).join("")}…`) <= maxWidth) low = middle;
+    if ((yield `${characters.slice(0, middle).join("")}…`) <= maxWidth) low = middle;
     else high = middle - 1;
   }
   return low > 0 ? `${characters.slice(0, low).join("")}…` : "";

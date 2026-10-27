@@ -253,6 +253,8 @@ export function createArrangementView(options) {
   let landing = false;
   let dropped = null;
   let groupLayer = null;
+  // Each group's running spring to its place, cancelled when a new one starts or the group lifts.
+  const groupGlides = new WeakMap();
   // The crossings drawn last, where the overlay lays them.
   let places = [];
   let previewLayer = null;
@@ -320,7 +322,7 @@ export function createArrangementView(options) {
     ]);
   }
 
-  function renderShared() {
+  function renderShared({ instant = false } = {}) {
     const withShared = arrangement.tiles.some((tile) => tile.shared);
     if (Boolean(legend.dataset.shared) !== withShared) {
       const next = legendFor(withShared);
@@ -339,7 +341,7 @@ export function createArrangementView(options) {
       sharedRow.replaceChildren(...shared.map(sharedItem));
     }
     for (const choice of shared) refreshShared(choice);
-    setRevealOpen(sharedPanel, shared.length > 0, { focusTarget: fit });
+    setRevealOpen(sharedPanel, shared.length > 0, { focusTarget: fit, instant });
   }
 
   function sharedItem(choice) {
@@ -417,8 +419,11 @@ export function createArrangementView(options) {
       groups = arrangement.groups;
       pending = null;
     }
-    // The stage size and every drawn position are read before the first write.
-    const bounds = observed ?? stage.getBoundingClientRect();
+    // A new editor rises in whole, its cabled monitors' row with it, so its stage is measured once at
+    // the size it keeps, laid out rather than drawn (rising in scales it). Otherwise the stage size
+    // and every drawn position are read before the first write.
+    if (!drawnFor) renderShared({ instant: true });
+    const bounds = observed ?? { width: stage.offsetWidth, height: stage.offsetHeight };
     const size = stageBox(bounds);
     const content = contentSignature();
     // While the stage glides the held drawing stands; the render once it settles refits it.
@@ -557,7 +562,9 @@ export function createArrangementView(options) {
 
   // Each group starts where it shows and springs to its place, its size included, so a drop or a
   // refit never jumps. A rebuilt group carries on entering, or its displays settling from the lift
-  // they had. Each crossing rides with a group that moves, from where that group shows it.
+  // they had. Each crossing rides with a group that moves, from where that group shows it. The spring
+  // animates the CSS transform over the group's translate attribute, already at its place: WebKit
+  // never transitions that attribute itself.
   function flipGroups(drawn, { rebuilt }) {
     const starts = [];
     const lifted = [];
@@ -577,9 +584,10 @@ export function createArrangementView(options) {
       const from = drawn[groupKey];
       const to = rects.groups[groupKey];
       if (!from || !to?.width || !to.height) continue;
+      groupGlides.get(node)?.cancel();
       node.style.transition = "none";
-      setPosition(node, from.x, from.y, [from.width / to.width, from.height / to.height]);
-      starts.push([node, to]);
+      setPosition(node, to.x, to.y);
+      starts.push([node, from, to]);
       if (!rebuilt) continue;
       if (from.entering !== null) {
         node.dataset.motion = "enter";
@@ -599,9 +607,17 @@ export function createArrangementView(options) {
     for (const [node, elapsed] of entering)
       for (const animation of node.getAnimations({ subtree: true }))
         if ("animationName" in animation) animation.currentTime = elapsed;
-    for (const [node, to] of starts) {
+    for (const [node, from, to] of starts) {
       node.style.removeProperty("transition");
-      setPosition(node, to.x, to.y);
+      if (resting(from, to)) continue;
+      const start = `translate(${from.x}px, ${from.y}px) scale(${from.width / to.width}, ${from.height / to.height})`;
+      groupGlides.set(
+        node,
+        node.animate(
+          { transform: [start, `translate(${to.x}px, ${to.y}px)`] },
+          { duration: motionMs("--motion-spring"), easing: motionEase("--ease-spring") },
+        ),
+      );
     }
     for (const tile of lifted) tile.style.removeProperty("transition");
     for (const tile of lifted) tile.style.removeProperty("transform");
@@ -780,6 +796,7 @@ export function createArrangementView(options) {
   }
 
   function liftGroup() {
+    groupGlides.get(drag.node)?.cancel();
     if (!drag.keyboard) raise(drag.node);
     drag.lifted = true;
     stage.dataset.dragging = "true";
@@ -993,6 +1010,14 @@ export function createArrangementView(options) {
         arrangement = incoming;
         groups = arrangement.groups;
       }
+      renderScene();
+    },
+    // The stage changed size in one step: the drawing glides to its new fit from where it shows,
+    // instead of holding until the resize watch settles.
+    restage() {
+      if (destroyed || drag || !drawnFor) return;
+      observed = null;
+      landing = true;
       renderScene();
     },
     // Where a display rests on screen, its group's glide aside, for a menu to point at; null once

@@ -38,6 +38,7 @@ import {
   tiles,
   transformFits,
   truncateToWidth,
+  truncationSteps,
 } from "./arrangement-model.mjs";
 
 const monitor = (id, x, y, width, height, primary = false) => ({
@@ -343,6 +344,32 @@ test("names are shortened by measured width, never mid-character, and vanish bef
   assert.equal(truncateToWidth("🖥🖥🖥 Studio", 25, measure), "🖥…");
   assert.equal(truncateToWidth("", 100, measure), "");
   assert.equal(truncateToWidth("Name", 0, measure), "");
+});
+
+test("shortening one measurement at a time asks for the full text first and lands where a measure would", () => {
+  const settle = (value, maxWidth) => {
+    const steps = truncationSteps(value, maxWidth);
+    const asked = [];
+    let step = steps.next();
+    while (!step.done) {
+      asked.push(step.value);
+      step = steps.next(measure(step.value));
+    }
+    return { text: step.value, asked };
+  };
+  const long = settle("Built-in Retina Display", 55);
+  assert.equal(long.text, "Buil…");
+  assert.equal(long.asked[0], "Built-in Retina Display");
+  assert.ok(long.asked.slice(1).every((candidate) => candidate.endsWith("…")));
+  assert.deepEqual(settle("Short", 300), { text: "Short", asked: ["Short"] });
+  assert.deepEqual(settle("Name", 0), { text: "", asked: [] });
+  for (const [value, maxWidth] of [
+    ["Built-in Retina Display", 300],
+    ["Built-in Retina Display", 5],
+    ["🖥🖥🖥 Studio", 25],
+    ["", 100],
+  ])
+    assert.equal(settle(value, maxWidth).text, truncateToWidth(value, maxWidth, measure));
 });
 
 test("the crossing is described in words, and an unconnected arrangement says why", () => {
