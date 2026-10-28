@@ -55,6 +55,8 @@ fn main() {
             "swipe_set_enabled",
             "control_as_command_status",
             "control_as_command_set_enabled",
+            "pointer_speed_status",
+            "pointer_speed_set",
             "window_hide",
             "computers_load",
             "computers_rename",

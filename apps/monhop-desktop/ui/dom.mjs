@@ -746,7 +746,9 @@ export function switchRow(
   return el("label", { className: "switch-row", children: [copy, control] });
 }
 
-// A range input reports every drag step through onInput and the settled value through onChange.
+// A range input reports every drag step through onInput and the settled value through onChange. The
+// fill grows from `origin`, ticked when inside the range, and `ends` names the two ends under the track.
+// With `glide`, a value that arrives without a drag eases there from what the last render drew.
 export function sliderRow(
   label,
   {
@@ -754,9 +756,14 @@ export function sliderRow(
     min,
     max,
     step = 1,
+    origin = min,
+    ends = null,
     format = String,
+    valueText = null,
+    ariaLabel = null,
     description,
     disabled = false,
+    glide = false,
     focusKey,
     id,
     onInput,
@@ -767,30 +774,63 @@ export function sliderRow(
 ) {
   const input = el("input", {
     className: "slider",
-    attrs: { type: "range", min: String(min), max: String(max), step: String(step) },
+    attrs: {
+      type: "range",
+      min: String(min),
+      max: String(max),
+      step: String(step),
+      "aria-label": ariaLabel,
+    },
   });
-  input.value = String(value);
   input.disabled = disabled;
   if (focusKey) input.dataset.focusKey = focusKey;
   if (id) input.id = id;
-  const readout = el("output", { className: "slider-value", text: format(value) });
-  // The track paints its filled part up to --slider-fill.
-  const fill = () =>
-    input.style.setProperty(
-      "--slider-fill",
-      `${((Number(input.value) - min) / (max - min)) * 100}%`,
-    );
-  fill();
+  const readout = el("output", { className: "slider-value" });
+  const at = (number) => `${((number - min) / (max - min)) * 100}%`;
+  // The track fills between the origin and `shown`; the words name the step nearest it.
+  const paint = (shown) => {
+    input.style.setProperty("--slider-from", at(Math.min(shown, origin)));
+    input.style.setProperty("--slider-fill", at(Math.max(shown, origin)));
+    const nearest = min + Math.round((shown - min) / step) * step;
+    readout.textContent = format(nearest);
+    if (valueText) input.setAttribute("aria-valuetext", valueText(nearest));
+  };
+  // Only a glide draws between steps.
+  const draw = (shown, between = false) => {
+    input.step = between ? "any" : String(step);
+    input.value = String(shown);
+    paint(shown);
+  };
+  const key = glide ? (focusKey ?? id ?? null) : null;
+  if (key) glideSlider(key, value, draw);
+  else draw(value);
   input.addEventListener("input", () => {
-    fill();
-    readout.textContent = format(Number(input.value));
-    onInput?.(Number(input.value));
+    const shown = Number(input.value);
+    if (key) holdSlider(key, shown, draw);
+    paint(shown);
+    onInput?.(shown);
   });
   input.addEventListener("change", () => onChange?.(Number(input.value)));
+  if (key)
+    for (const event of ["pointerdown", "keydown"])
+      input.addEventListener(event, () => landSlider(key));
   if (onDragStart) input.addEventListener("pointerdown", () => onDragStart());
+  // A release fires change after pointerup, so a render the drag held waits for it.
   if (onDragEnd)
     for (const event of ["pointerup", "pointercancel"])
-      input.addEventListener(event, () => onDragEnd());
+      input.addEventListener(event, () => setTimeout(onDragEnd));
+  const tick =
+    origin > min && origin < max
+      ? el("span", { className: "slider-tick", attrs: { "aria-hidden": "true" } })
+      : null;
+  tick?.style.setProperty("--slider-origin", String((origin - min) / (max - min)));
+  const scale = ends
+    ? el("span", {
+        className: "slider-ends",
+        attrs: { "aria-hidden": "true" },
+        children: ends.map((end) => el("small", { text: end })),
+      })
+    : null;
   const copy = el("span", {
     className: "switch-copy",
     children: [
@@ -800,8 +840,63 @@ export function sliderRow(
   });
   return el("label", {
     className: "slider-row",
-    children: [copy, el("span", { className: "slider-control", children: [input, readout] })],
+    children: [
+      copy,
+      el("span", { className: "slider-control", children: [tick, input, readout, scale] }),
+    ],
   });
+}
+
+// Each keyed slider's glide toward a value it was given without a drag, carried across the renders that
+// rebuild its input: { animation, from, to, draw }, with no animation once it rests.
+const sliderGlides = new Map();
+
+// A new value glides from what is drawn now; one the glide already heads for carries it on.
+function glideSlider(key, value, draw) {
+  const last = sliderGlides.get(key) ?? null;
+  const midway = tweenNow(last);
+  if (motionEnabled() && midway !== null && last.to === value) {
+    last.draw = draw;
+    draw(midway, true);
+    return;
+  }
+  last?.animation?.cancel();
+  const drawn = midway ?? last?.to ?? value;
+  if (!motionEnabled() || drawn === value) {
+    sliderGlides.set(key, { animation: null, from: value, to: value, draw });
+    draw(value);
+    return;
+  }
+  const timing = { duration: motionMs("--motion-slow"), easing: motionEase("--ease-glide") };
+  const animation = new Animation(new KeyframeEffect(null, null, timing), document.timeline);
+  const tween = { animation, from: drawn, to: value, draw };
+  sliderGlides.set(key, tween);
+  animation.play();
+  draw(drawn, true);
+  const frame = () => {
+    if (sliderGlides.get(key) !== tween) return;
+    const shown = tweenNow(tween);
+    if (shown === null) tween.draw(tween.to);
+    else {
+      tween.draw(shown, true);
+      requestAnimationFrame(frame);
+    }
+  };
+  requestAnimationFrame(frame);
+}
+
+// A drag or key press starts from the value the slider stands for, so a glide still running lands first.
+function landSlider(key) {
+  const tween = sliderGlides.get(key);
+  if (tweenNow(tween) === null) return;
+  tween.animation.cancel();
+  tween.draw(tween.to);
+}
+
+// What the user drew is where the slider rests.
+function holdSlider(key, shown, draw) {
+  sliderGlides.get(key)?.animation?.cancel();
+  sliderGlides.set(key, { animation: null, from: shown, to: shown, draw });
 }
 
 // The Copy/Copied button (state-driven label and icon) plus its aria-live feedback line, shared

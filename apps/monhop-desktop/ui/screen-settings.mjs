@@ -32,6 +32,21 @@ import { AUTOSCROLL_LABEL, AUTOSCROLL_NOTE } from "./autoscroll-model.mjs";
 import { SWIPE_LABEL, SWIPE_NOTE } from "./swipe-model.mjs";
 import { CONTROL_AS_COMMAND_LABEL, CONTROL_AS_COMMAND_NOTE } from "./keyboard-model.mjs";
 import {
+  MAX_STEP,
+  MIN_STEP,
+  POINTER_SPEED_DESCRIPTION,
+  POINTER_SPEED_ENDS,
+  POINTER_SPEED_LABEL,
+  POINTER_SPEED_TITLE,
+  SAME,
+  pointerPageDescription,
+  pointerPageTitle,
+  pointerPeerRows,
+  pointerSliderTitle,
+  pointerSpeedText,
+  pointerSpeedValueText,
+} from "./pointer-speed-model.mjs";
+import {
   CLIPBOARD_PRIVACY,
   clipboardAccessNotice,
   clipboardNoticeText,
@@ -77,7 +92,8 @@ const THEMES = [
 ];
 
 // The pages of Settings in rail order: what MonHop does across computers and on this one, then the
-// app itself. A page this computer has nothing for stays out of the rail.
+// app itself. A page this computer has nothing for stays out of the rail; a title that is a function
+// names the page for this computer's platform.
 const PAGES = [
   { key: "sharing", title: "Sharing", icon: "link", build: sharingPage },
   {
@@ -90,9 +106,9 @@ const PAGES = [
   { key: "dimming", title: "Screen dimming", icon: "moon", build: dimmingPage },
   {
     key: "pointer",
-    title: "Mouse and trackpad",
+    title: pointerPageTitle,
     icon: "mouse",
-    available: (ctx) => Boolean(ctx.autoscroll || ctx.swipe),
+    available: (ctx) => Boolean(ctx.pointerSpeed),
     build: pointerPage,
   },
   {
@@ -137,7 +153,7 @@ export function renderSettings(nodes, ctx) {
   if (!frame) frame = mountFrame(nodes.settingsContent);
   const pages = PAGES.filter((page) => page.available?.(ctx) ?? true);
   if (!pages.some((page) => page.key === shownPage)) shownPage = pages[0].key;
-  placeRail(pages);
+  placeRail(pages, ctx.platform);
   const page = pages.find((item) => item.key === shownPage);
   const alert = presence("settings-alert", ctx.studio.view === "settings" ? ctx.pageAlert : null);
   // A page coming back builds settled, so what changed while it was hidden does not replay.
@@ -171,7 +187,7 @@ function mountFrame(content) {
 
 // Only a change to which pages exist redraws the rail: one that joins grows in, one that leaves
 // closes where it was.
-function placeRail(pages) {
+function placeRail(pages, platform) {
   const keys = pages.map((page) => page.key);
   if (keys.join() === frame.order.join()) return;
   const first = frame.order.length === 0;
@@ -190,7 +206,7 @@ function placeRail(pages) {
       );
     const kept = keys.includes(page.key);
     if (kept && !frame.items.has(page.key)) {
-      frame.items.set(page.key, railItem(page));
+      frame.items.set(page.key, railItem(page, platform));
       if (!first) presence(`settings-nav-${page.key}`, null);
     }
     const panel = presence(`settings-nav-${page.key}`, kept ? frame.items.get(page.key) : null);
@@ -208,15 +224,22 @@ function placeRail(pages) {
     });
 }
 
-function railItem(page) {
+function railItem(page, platform) {
   const item = el("button", {
     className: "settings-nav-item",
     attrs: { type: "button" },
     dataset: { focusKey: `settings-nav-${page.key}` },
-    children: [pageTile(page), el("span", { className: "settings-nav-label", text: page.title })],
+    children: [
+      pageTile(page),
+      el("span", { className: "settings-nav-label", text: pageTitle(page, platform) }),
+    ],
   });
   item.addEventListener("click", () => choosePage(page.key));
   return item;
+}
+
+function pageTitle(page, platform) {
+  return typeof page.title === "function" ? page.title(platform) : page.title;
 }
 
 // The tile a page is known by, in the rail and large beside its title.
@@ -305,7 +328,7 @@ function pageNode(page, ctx) {
             children: [
               el("h2", {
                 attrs: { id: "settings-page-title" },
-                children: heading ?? [text(page.title)],
+                children: heading ?? [text(pageTitle(page, ctx.platform))],
               }),
               description ? el("p", { text: description }) : null,
             ],
@@ -494,8 +517,8 @@ function dimmingPage({ core, dimming, actions }) {
               focusKey: "settings-dimming-level",
               onInput: actions.previewDimLevel,
               onChange: actions.setDimLevel,
-              onDragStart: actions.beginDimDrag,
-              onDragEnd: actions.endDimDrag,
+              onDragStart: actions.beginSliderDrag,
+              onDragEnd: actions.endSliderDrag,
             }),
             fadeCopy(
               row({ title: dimRowTitle(view), actions: [toggle] }),
@@ -510,9 +533,10 @@ function dimmingPage({ core, dimming, actions }) {
   };
 }
 
-// Only on a Mac, once app.js has Rust's views: autoscroll matters when a Windows mouse controls this
-// Mac, swiping between pages when this Mac's trackpad controls another computer.
-function pointerPage({ core, autoscroll, swipe, actions }) {
+// This computer's pointer speed on the others, then on a Mac, once app.js has Rust's views, autoscroll
+// (when a Windows mouse controls this Mac) and swiping between pages (when its trackpad controls another).
+function pointerPage(ctx) {
+  const { core, platform, autoscroll, swipe, actions } = ctx;
   const switches = [
     autoscroll &&
       switchRow(AUTOSCROLL_LABEL, {
@@ -532,19 +556,83 @@ function pointerPage({ core, autoscroll, swipe, actions }) {
       }),
   ].filter(Boolean);
   return {
-    description:
-      "When another computer's mouse controls this Mac, or this Mac's trackpad controls another computer.",
+    description: pointerPageDescription(platform),
     groups: [
-      group({
-        id: "settings-pointer",
-        children: [
-          rows(switches),
-          fadingText("settings-autoscroll-message", "note", autoscroll?.view.error, "danger"),
-          fadingText("settings-swipe-message", "note", swipe?.view.error, "danger"),
-        ],
-      }),
+      pointerSpeedGroup(ctx),
+      presence(
+        "settings-pointer",
+        switches.length
+          ? group({
+              id: "settings-pointer",
+              title: "Scroll and swipe",
+              children: [
+                rows(switches),
+                fadingText("settings-autoscroll-message", "note", autoscroll?.view.error, "danger"),
+                fadingText("settings-swipe-message", "note", swipe?.view.error, "danger"),
+              ],
+            })
+          : null,
+      ),
     ],
   };
+}
+
+// The slider is never disabled while a step saves: the newest one wins.
+function pointerSpeedGroup(ctx) {
+  const { core, platform, pointerSpeed, actions } = ctx;
+  return group({
+    id: "settings-pointer-speed",
+    title: POINTER_SPEED_TITLE,
+    description: POINTER_SPEED_DESCRIPTION,
+    children: [
+      rows([
+        sliderRow(pointerSliderTitle(platform), {
+          value: pointerSpeed.step,
+          min: MIN_STEP,
+          max: MAX_STEP,
+          origin: SAME,
+          ends: POINTER_SPEED_ENDS,
+          format: pointerSpeedText,
+          valueText: pointerSpeedValueText,
+          ariaLabel: POINTER_SPEED_LABEL,
+          glide: true,
+          disabled: !core,
+          focusKey: "settings-pointer-speed",
+          onChange: actions.setPointerSpeed,
+          onDragStart: actions.beginSliderDrag,
+          onDragEnd: actions.endSliderDrag,
+        }),
+        ...pointerPeerPanels(ctx),
+      ]),
+      fadingText("settings-pointer-speed-message", "note", pointerSpeed.message, "danger"),
+    ],
+  });
+}
+
+// The computers whose rows were drawn last, so one that leaves closes where it was.
+let drawnPointerPeers = [];
+
+// A row for each computer whose pointer moves here; the rest glide past one that comes or goes.
+function pointerPeerPanels({ computers, sharing, active }) {
+  const live = pointerPeerRows({ computers, sharingView: sharing.view, active });
+  const kept = new Set(live.map((peer) => peer.key));
+  const order = [...live];
+  drawnPointerPeers.forEach((peer, index) => {
+    if (!kept.has(peer.key)) order.splice(Math.min(index, order.length), 0, peer);
+  });
+  const panels = [];
+  const next = [];
+  for (const peer of order) {
+    const panel = presence(
+      `settings-pointer-peer-${peer.key}`,
+      kept.has(peer.key) ? row({ title: peer.name, detail: peer.note }) : null,
+    );
+    if (!panel) continue;
+    panels.push(panel);
+    next.push(peer);
+  }
+  drawnPointerPeers = next;
+  return panels;
 }
 
 // Only on Windows, once app.js has Rust's view: the switch matters when this keyboard controls a Mac.

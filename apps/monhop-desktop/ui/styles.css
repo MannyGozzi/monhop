@@ -187,6 +187,8 @@
   --switch-travel-press: calc(var(--switch-travel) - var(--switch-thumb-press) + var(--switch-thumb));
   --slider-track: 4px;
   --slider-thumb: 18px;
+  /* The mark across the track where a slider's fill starts from inside its range. */
+  --slider-tick: 12px;
   --slider-value-width: 40px;
   /* Notch island: its fill (the camera housing's black) and how narrow or wide a wing may be. */
   --island-fill: rgb(0 0 0);
@@ -671,15 +673,18 @@ html[data-platform="windows"] .window-controls:not([hidden]) { display: flex; }
 .switch:active:not(:disabled) .switch-thumb { width: var(--switch-thumb-press); transition: transform var(--motion-fast) var(--ease-out), width var(--motion-fast) var(--ease-out); }
 .switch[aria-checked="true"]:active:not(:disabled) .switch-thumb { transform: translateX(var(--switch-travel-press)); }
 
-/* Slider. dom.mjs sliderRow keeps --slider-fill in step with the value. */
+/* Slider. dom.mjs sliderRow keeps the filled stretch, --slider-from to --slider-fill, in step with the value.
+   A tick behind the track marks where the fill starts from inside the range; the ends are named below it. */
 .slider-row { display: grid; gap: var(--gap-2); }
 .slider-row:has(.slider:disabled) { opacity: var(--opacity-disabled); }
-.slider-control { display: grid; grid-template-columns: minmax(0, 1fr) var(--slider-value-width); align-items: center; gap: var(--gap-3); }
-.slider-value { color: var(--muted-foreground); font-size: var(--text-sm); font-variant-numeric: tabular-nums; text-align: right; transition: color var(--motion-fast) var(--ease-out); }
+.slider-control { display: grid; grid-template-columns: minmax(0, 1fr) var(--slider-value-width); align-items: center; gap: 0 var(--gap-3); }
+.slider-tick { grid-area: 1 / 1; justify-self: start; width: var(--stroke-bold); height: var(--slider-tick); margin-left: calc(var(--slider-thumb) / 2 + (100% - var(--slider-thumb)) * var(--slider-origin) - var(--stroke-bold) / 2); border-radius: var(--radius-pill); background: var(--hairline-strong); pointer-events: none; }
+.slider-ends { grid-area: 2 / 1; display: flex; justify-content: space-between; gap: var(--gap-2); color: var(--subtle-foreground); font-size: var(--text-xs); line-height: var(--leading-tight); }
+.slider-value { grid-area: 1 / 2; color: var(--muted-foreground); font-size: var(--text-sm); font-variant-numeric: tabular-nums; text-align: right; transition: color var(--motion-fast) var(--ease-out); }
 .slider-row:has(.slider:active) .slider-value, .slider-row:has(.slider:focus-visible) .slider-value { color: var(--foreground); }
-.slider { width: 100%; height: var(--slider-thumb); margin: 0; background: transparent; appearance: none; -webkit-appearance: none; cursor: pointer; }
+.slider { grid-area: 1 / 1; width: 100%; height: var(--slider-thumb); margin: 0; background: transparent; appearance: none; -webkit-appearance: none; cursor: pointer; }
 .slider:disabled { cursor: not-allowed; }
-.slider::-webkit-slider-runnable-track { height: var(--slider-track); border-radius: var(--radius-pill); background: linear-gradient(to right, var(--primary) var(--slider-fill), var(--hairline-strong) var(--slider-fill)); }
+.slider::-webkit-slider-runnable-track { height: var(--slider-track); border-radius: var(--radius-pill); background: linear-gradient(to right, var(--hairline-strong) var(--slider-from, 0%), var(--primary) var(--slider-from, 0%) var(--slider-fill), var(--hairline-strong) var(--slider-fill)); }
 .slider::-webkit-slider-thumb { width: var(--slider-thumb); height: var(--slider-thumb); margin-top: calc((var(--slider-track) - var(--slider-thumb)) / 2); border: 0; border-radius: var(--radius-circle); background: var(--thumb); box-shadow: var(--shadow-thumb); appearance: none; -webkit-appearance: none; transition: transform var(--motion-spring) var(--ease-spring), box-shadow var(--motion-base) var(--ease-out); }
 .slider:hover:not(:disabled)::-webkit-slider-thumb { transform: scale(var(--scale-thumb-hover)); }
 .slider:active:not(:disabled)::-webkit-slider-thumb { transform: scale(var(--scale-thumb-active)); box-shadow: var(--shadow-thumb), var(--shadow-focus); }

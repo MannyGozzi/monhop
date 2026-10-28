@@ -6,12 +6,12 @@ use std::sync::Arc;
 use monhop_transport::session_native::set_autoscroll_enabled;
 use tauri::{AppHandle, Manager};
 
-use crate::switch_preference::{SwitchNames, SwitchPreference, SwitchView};
+use crate::switch_preference::{SettingNames, SwitchPreference, SwitchView};
 
 #[cfg(target_os = "macos")]
 mod macos;
 
-const NAMES: SwitchNames = SwitchNames {
+const NAMES: SettingNames = SettingNames {
     file: "autoscroll.json",
     setting: "autoscroll",
     logged: "middle-click autoscroll",
@@ -38,7 +38,7 @@ pub async fn autoscroll_status(app: AppHandle) -> Result<SwitchView, String> {
 #[tauri::command]
 pub async fn autoscroll_set_enabled(app: AppHandle, enabled: bool) -> Result<SwitchView, String> {
     let autoscroll = app.state::<Arc<Autoscroll>>().inner().clone();
-    tauri::async_runtime::spawn_blocking(move || autoscroll.0.set_enabled(enabled))
+    tauri::async_runtime::spawn_blocking(move || autoscroll.0.set(enabled))
         .await
         .map_err(|_| NAMES.not_saved())
 }

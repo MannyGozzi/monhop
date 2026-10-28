@@ -24,6 +24,7 @@ mod logging;
 mod minimize;
 mod page_turn;
 mod pairing;
+mod pointer_speed;
 mod public_code_copy;
 mod settings;
 mod sharing;
@@ -707,6 +708,8 @@ fn main() {
             swipe::swipe_set_enabled,
             control_as_command::control_as_command_status,
             control_as_command::control_as_command_set_enabled,
+            pointer_speed::pointer_speed_status,
+            pointer_speed::pointer_speed_set,
             window_hide,
             computers_load,
             computers_rename,
@@ -767,6 +770,7 @@ fn main() {
             page_turn::register(app.handle());
             app.manage(swipe::Swipe::start(app.handle()));
             app.manage(control_as_command::ControlAsCommand::start(app.handle()));
+            app.manage(pointer_speed::PointerSpeed::start(app.handle()));
             app.manage(updates::Updates::start(app.handle(), !check_ui));
             #[cfg(target_os = "macos")]
             app.manage(island::Island::start(app.handle(), !check_ui));
@@ -1085,6 +1089,8 @@ mod tests {
                 "allow-swipe-set-enabled",
                 "allow-control-as-command-status",
                 "allow-control-as-command-set-enabled",
+                "allow-pointer-speed-status",
+                "allow-pointer-speed-set",
                 "core:window:allow-start-dragging",
                 "core:window:allow-internal-toggle-maximize",
                 "core:window:allow-minimize",
