@@ -13,6 +13,7 @@ pub mod input;
 pub mod ownership;
 pub mod pointer;
 pub mod pointer_mark;
+pub mod pointer_speed;
 pub mod revocation;
 pub mod take_back;
 pub mod topology;

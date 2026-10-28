@@ -13,7 +13,7 @@
 
 use std::{
     fmt,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicI8, Ordering},
     time::Duration,
 };
 
@@ -42,6 +42,16 @@ static CONTROL_AS_COMMAND: AtomicBool = AtomicBool::new(false);
 /// the pointer enters that Mac.
 pub fn set_control_as_command(enabled: bool) {
     CONTROL_AS_COMMAND.store(enabled, Ordering::Release);
+}
+
+/// Same until the app applies the saved step.
+static POINTER_SPEED: AtomicI8 = AtomicI8::new(monhop_core::pointer_speed::SAME);
+
+/// How fast this computer's pointer moves on the computers it controls, in steps either side of
+/// Same, from the next motion it sends.
+pub fn set_pointer_speed(step: i8) {
+    use monhop_core::pointer_speed::{MAX_STEP, MIN_STEP};
+    POINTER_SPEED.store(step.clamp(MIN_STEP, MAX_STEP), Ordering::Release);
 }
 
 /// Maximum effects produced by one controller call.
