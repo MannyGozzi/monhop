@@ -4,6 +4,14 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- A Pointer speed slider in Settings sets how fast this computer's mouse moves the pointer on the computers it controls, from half to twice the speed. It is under Mouse on Windows and under Mouse and trackpad on a Mac. Each computer sets its own mouse, and each computer's page names where to change the mouse of every computer that controls it.
+
+### Changed
+
+- A Windows mouse now moves the pointer on another computer the way it moves on Windows, following the PC's pointer speed and Enhance pointer precision settings. Before, it moved at one flat speed that felt slow and unaccelerated, and half as fast again on a Mac's Retina display. A Mac's pointer on another computer is unchanged. Only the computer the mouse is plugged into needs this version.
+
 ## [0.2.15] - 2026-10-27
 
 ### Fixed

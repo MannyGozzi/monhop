@@ -248,6 +248,15 @@ Ctrl as Command tests drive a Windows keyboard on a Mac with the Windows Home sw
 - the switch flipped while Ctrl is held, take-back and a pulled cable leaving no key down;
 - the switch off, and a Mac keyboard, leaving Ctrl as Control.
 
+Pointer speed tests drive a Windows mouse on a Mac and on another PC, and a Mac trackpad on a PC. They cover:
+
+- `cargo run -p monhop-platform-windows --example windows_pointer_ballistics --release -- --run` in the PC's signed-in desktop printing PASS, with the mouse left alone for its second or two;
+- slow moves landing precisely and flicks crossing a screen as they do on the PC, on a Mac's built-in Retina display and on an external one;
+- the PC's pointer speed slider and Enhance pointer precision changed in Windows Settings taking effect from the next movement;
+- each Pointer speed step from Slower to Faster, while the pointer is on the other computer, from the next movement, with crossings home needing the same push at every step;
+- Same leaving a Mac trackpad's feel on the PC unchanged;
+- the Mouse page naming the right computer and Settings page for each computer that controls this one.
+
 Swipe-between-pages tests drive a Mac trackpad on a Windows PC and on another Mac. They cover:
 
 - a quick two-finger swipe right going back and left going forward in a browser, once per swipe;

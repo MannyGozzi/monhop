@@ -1393,6 +1393,8 @@ unsafe extern "system" fn window_proc(
                 false
             });
         }
+    } else if message == WM_SETTINGCHANGE && is_pointer_setting(wparam) {
+        refresh_pointer_settings();
     } else if message == WM_DISPLAYCHANGE {
         latch_failure(CallbackFailure::DisplayChanged);
     } else if message == WM_POWERBROADCAST {
@@ -1405,6 +1407,20 @@ unsafe extern "system" fn window_proc(
 /// Registration replays an arrival for every attached device; only a removal is a loss.
 fn device_change_is_loss(wparam: usize) -> bool {
     wparam == GIDC_REMOVAL as usize
+}
+
+/// The pointer speed slider and Enhance pointer precision, as Settings announces their changes.
+fn is_pointer_setting(wparam: usize) -> bool {
+    [SPI_SETMOUSE, SPI_SETMOUSESPEED].contains(&(wparam as u32))
+}
+
+/// Read outside the hook callback, which only takes the result.
+fn refresh_pointer_settings() {
+    let ballistics = crate::pointer_settings::read();
+    with_callback(|state| {
+        state.ballistics = ballistics;
+        false
+    });
 }
 
 fn run(
@@ -1512,11 +1528,7 @@ fn run(
         if let Some((revision, command)) = command {
             if matches!(command, CaptureCommand::ActivateRemote { .. }) {
                 // Read here, before the remote barrier, so every remote record moves with them.
-                let ballistics = crate::pointer_settings::read();
-                with_callback(|state| {
-                    state.ballistics = ballistics;
-                    false
-                });
+                refresh_pointer_settings();
             }
             let mut completion = ControlCompletion::Failed;
             if !shared.stop.is_stopped() {
@@ -2602,6 +2614,14 @@ mod tests {
     fn device_arrival_replays_do_not_end_capture() {
         assert!(!device_change_is_loss(GIDC_ARRIVAL as usize));
         assert!(device_change_is_loss(GIDC_REMOVAL as usize));
+    }
+
+    #[test]
+    fn only_pointer_speed_changes_reread_the_pointer_settings() {
+        assert!(is_pointer_setting(SPI_SETMOUSE as usize));
+        assert!(is_pointer_setting(SPI_SETMOUSESPEED as usize));
+        assert!(!is_pointer_setting(SPI_SETDOUBLECLICKTIME as usize));
+        assert!(!is_pointer_setting(0));
     }
 
     #[test]

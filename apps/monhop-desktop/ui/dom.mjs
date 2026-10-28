@@ -811,9 +811,12 @@ export function sliderRow(
     onInput?.(shown);
   });
   input.addEventListener("change", () => onChange?.(Number(input.value)));
-  if (key)
-    for (const event of ["pointerdown", "keydown"])
-      input.addEventListener(event, () => landSlider(key));
+  if (key) {
+    input.addEventListener("pointerdown", () => landSlider(key));
+    input.addEventListener("keydown", (event) => {
+      if (SLIDER_STEP_KEYS.has(event.key)) landSlider(key);
+    });
+  }
   if (onDragStart) input.addEventListener("pointerdown", () => onDragStart());
   // A release fires change after pointerup, so a render the drag held waits for it.
   if (onDragEnd)
@@ -846,6 +849,18 @@ export function sliderRow(
     ],
   });
 }
+
+// The keys a range input steps on; Tab, modifiers and the rest leave a glide running.
+const SLIDER_STEP_KEYS = new Set([
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+]);
 
 // Each keyed slider's glide toward a value it was given without a drag, carried across the renders that
 // rebuild its input: { animation, from, to, draw }, with no animation once it rests.
