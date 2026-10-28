@@ -36,6 +36,7 @@ fn discoverable_by_everyone() -> bool {
 }
 
 /// macOS stores "Everyone", "Contacts Only" or "Off"; a timed Everyone keeps the same prefix.
+#[cfg(any(target_os = "macos", test))]
 fn is_everyone(mode: &str) -> bool {
     mode.starts_with("Everyone")
 }
