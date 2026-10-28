@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-10-27
+
 ### Added
 
 - A Pointer speed slider in Settings sets how fast this computer's mouse moves the pointer on the computers it controls, from half to twice the speed. It is under Mouse on Windows and under Mouse and trackpad on a Mac. Each computer sets its own mouse, and each computer's page names where to change the mouse of every computer that controls it.
@@ -351,7 +353,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.15...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.16...HEAD
+[0.2.16]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.16
 [0.2.15]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.15
 [0.2.14]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.14
 [0.2.13]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.13

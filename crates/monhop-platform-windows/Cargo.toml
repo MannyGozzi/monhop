@@ -17,7 +17,7 @@ name = "windows_pointer_ballistics"
 path = "examples/pointer_ballistics.rs"
 
 [dependencies]
-monhop-core = { path = "../monhop-core", version = "=0.2.15" }
+monhop-core = { path = "../monhop-core", version = "=0.2.16" }
 log = "=0.4.34"
 
 [target.'cfg(windows)'.dependencies]
