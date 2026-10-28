@@ -83,15 +83,15 @@ mod enabled {
     use tauri::{AppHandle, Manager};
 
     use super::IslandView;
-    use crate::switch_preference::{SwitchNames, SwitchPreference, SwitchView};
+    use crate::switch_preference::{SettingNames, SwitchPreference, SwitchView};
 
-    const NAMES: SwitchNames = SwitchNames {
+    const NAMES: SettingNames = SettingNames {
         file: "island.json",
         setting: "notch island",
         logged: "notch island",
     };
 
-    const CLIPBOARD_NAMES: SwitchNames = SwitchNames {
+    const CLIPBOARD_NAMES: SettingNames = SettingNames {
         file: "island-clipboard.json",
         setting: "clipboard notices",
         logged: "notch island clipboard notices",
@@ -147,7 +147,7 @@ mod enabled {
         error: Option<String>,
     }
 
-    fn switch(view: SwitchView, names: &SwitchNames) -> Result<Switch, String> {
+    fn switch(view: SwitchView, names: &SettingNames) -> Result<Switch, String> {
         serde_json::to_value(&view)
             .and_then(serde_json::from_value)
             .map_err(|_| names.not_saved())
@@ -183,7 +183,7 @@ mod enabled {
     pub async fn set_enabled(app: AppHandle, enabled: bool) -> Result<IslandView, String> {
         let island = app.state::<Arc<Island>>().inner().clone();
         let changing = Arc::clone(&island);
-        tauri::async_runtime::spawn_blocking(move || changing.shown.set_enabled(enabled))
+        tauri::async_runtime::spawn_blocking(move || changing.shown.set(enabled))
             .await
             .map_err(|_| NAMES.not_saved())?;
         view_of(&app, &island).await
@@ -195,7 +195,7 @@ mod enabled {
     ) -> Result<IslandView, String> {
         let island = app.state::<Arc<Island>>().inner().clone();
         let changing = Arc::clone(&island);
-        tauri::async_runtime::spawn_blocking(move || changing.clipboard.set_enabled(enabled))
+        tauri::async_runtime::spawn_blocking(move || changing.clipboard.set(enabled))
             .await
             .map_err(|_| CLIPBOARD_NAMES.not_saved())?;
         view_of(&app, &island).await

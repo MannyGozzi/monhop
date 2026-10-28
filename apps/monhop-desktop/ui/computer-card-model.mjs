@@ -159,7 +159,7 @@ export const CONTROL_PAUSE_HINT = "Use Pause to stop sharing";
 // (`control.members`, one entry per computer other than this one). Legacy `control.peerToLocal` is
 // the fallback: no member list, or no fingerprint to look one up by, so every existing single-peer
 // caller reads exactly as it always has.
-function memberPeerToLocal(control, fingerprint) {
+export function memberPeerToLocal(control, fingerprint) {
   if (fingerprint && Array.isArray(control?.members)) {
     const entry = control.members.find((member) => member.fingerprint === fingerprint);
     if (entry) return entry.allowed;

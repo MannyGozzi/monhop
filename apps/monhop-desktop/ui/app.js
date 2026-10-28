@@ -111,6 +111,14 @@ import { clipboardContext, invokeSetComputerEnabled, pollFingerprint } from "./a
 import { autoscrollContext } from "./autoscroll-model.mjs";
 import { swipeContext } from "./swipe-model.mjs";
 import { controlAsCommandContext } from "./keyboard-model.mjs";
+import {
+  applyPointerSpeedStatus,
+  choosePointerSpeed,
+  failPointerSpeed,
+  initialPointerSpeed,
+  pointerSpeedContext,
+  settlePointerSpeed,
+} from "./pointer-speed-model.mjs";
 import { forgetArrangementMotion } from "./dashboard-arrangement.mjs";
 import {
   applyDimmingView,
@@ -213,11 +221,14 @@ const pointerSwitches = {
 };
 // Windows's keyboard switch, undefined until its status answers.
 const controlAsCommand = { view: undefined, pending: false };
+// This computer's pointer speed on the others, and whether a save is on its way to Rust.
+let pointerSpeed = initialPointerSpeed();
+let pointerSpeedSending = false;
 let theme = "system";
 let themePending = false;
 let dimmingRequest = 0;
 let dimPreview = null;
-let dimmingDrag = false;
+let sliderDrag = false;
 let renderAfterDrag = false;
 // The sidebar row the user picked; null follows the default. The harness may start on any row.
 let chosen = selectionFromKey(window.MONHOP_SELECT);
@@ -488,6 +499,7 @@ if (!uiCheck) {
   listenClipboard();
   if (platform === "macos") void loadPointerSwitches();
   if (platform === "windows") void loadControlAsCommand();
+  void loadPointerSpeed();
   void loadUpdatesStatus();
   void loadAutostartStatus();
   if (platform === "macos") void loadIslandStatus();
@@ -798,6 +810,7 @@ function context() {
       controlAsCommand.view,
       controlAsCommand.pending,
     ),
+    pointerSpeed: pointerSpeedContext(platform, pointerSpeed),
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
     island: islandContext(platform, island, islandPending),
@@ -839,14 +852,15 @@ function context() {
       previewDimLevel,
       setDimLevel,
       toggleDimming,
-      beginDimDrag,
-      endDimDrag,
+      beginSliderDrag,
+      endSliderDrag,
       useComputer,
       setComputerEnabled,
       setClipboardEnabled,
       setAutoscrollEnabled,
       setSwipeEnabled,
       setControlAsCommand,
+      setPointerSpeed,
       startRename,
       draftRename,
       cancelRename,
@@ -890,7 +904,7 @@ function context() {
 
 function render() {
   // A slider mid-drag must keep its element; the render runs when the pointer lets go.
-  if (dimmingDrag) {
+  if (sliderDrag) {
     renderAfterDrag = true;
     return;
   }
@@ -2106,12 +2120,12 @@ function toggleDimming() {
   void runDimming(() => core.invoke("dimming_toggle"));
 }
 
-function beginDimDrag() {
-  dimmingDrag = true;
+function beginSliderDrag() {
+  sliderDrag = true;
 }
 
-function endDimDrag() {
-  dimmingDrag = false;
+function endSliderDrag() {
+  sliderDrag = false;
   if (!renderAfterDrag) return;
   renderAfterDrag = false;
   render();
@@ -2198,6 +2212,35 @@ function setAutoscrollEnabled(enabled) {
 
 function setSwipeEnabled(enabled) {
   void setSavedSwitch(pointerSwitches.swipe, "swipe_set_enabled", enabled);
+}
+
+async function loadPointerSpeed() {
+  if (!core?.invoke) return;
+  const view = await core.invoke("pointer_speed_status").catch(() => undefined);
+  if (view === undefined) return;
+  pointerSpeed = applyPointerSpeedStatus(pointerSpeed, view);
+  render();
+}
+
+function setPointerSpeed(step) {
+  if (!core?.invoke) return;
+  pointerSpeed = choosePointerSpeed(pointerSpeed, step);
+  if (!pointerSpeedSending) void sendPointerSpeed();
+}
+
+// One save at a time, each sending the newest step chosen, so Rust always ends on the last choice.
+async function sendPointerSpeed() {
+  pointerSpeedSending = true;
+  const sent = pointerSpeed.wanted;
+  try {
+    const view = await core.invoke("pointer_speed_set", { step: sent });
+    pointerSpeed = settlePointerSpeed(pointerSpeed, sent, view);
+  } catch {
+    pointerSpeed = failPointerSpeed(pointerSpeed, sent);
+  }
+  pointerSpeedSending = false;
+  if (pointerSpeed.wanted !== null) void sendPointerSpeed();
+  else render();
 }
 
 // ---------- keyboard ----------

@@ -1,5 +1,5 @@
-//! One saved on-or-off setting, at its default until the user changes it, handed to the runtime
-//! flag that acts on it at startup and on every change. A failed save keeps the change for this run.
+//! One saved setting, at its default until the user changes it, handed to the runtime that acts on
+//! it at startup and on every change. A failed save keeps the change for this run.
 
 use std::{
     io,
@@ -7,14 +7,14 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tauri::{AppHandle, Manager};
 
 const FILE_VERSION: u32 = 1;
 const MAX_FILE_BYTES: u64 = 512;
 
 /// How one setting is named on disk, to the user and in the log.
-pub struct SwitchNames {
+pub struct SettingNames {
     /// In the app's local data folder.
     pub file: &'static str,
     /// As messages name it: "The {setting} setting could not be saved."
@@ -23,34 +23,34 @@ pub struct SwitchNames {
     pub logged: &'static str,
 }
 
-impl SwitchNames {
+impl SettingNames {
     /// The command error when the change never reached the saved setting.
     pub fn not_saved(&self) -> String {
         format!("The {} setting was not saved. Try again.", self.setting)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SwitchFile {
-    version: u32,
-    enabled: bool,
-}
+/// A setting's file: a version and the value, read and written whole. Each kind of value keeps its
+/// own file type, so what one kind writes never changes when another is added.
+pub trait SettingFile: Copy + Serialize + DeserializeOwned {
+    type Value: Copy;
+    /// What the window reads: the value and the last failure.
+    type View;
 
-impl SwitchFile {
-    const fn new(enabled: bool) -> Self {
-        Self {
-            version: FILE_VERSION,
-            enabled,
-        }
-    }
+    fn new(value: Self::Value) -> Self;
+    fn value(self) -> Self::Value;
+    /// This file version, holding a value the app accepts.
+    fn is_valid(self) -> bool;
+    fn view(self, error: Option<String>) -> Self::View;
+    /// The value as messages and the log name it: "on", "Same".
+    fn words(value: Self::Value) -> String;
 
-    fn load(path: &Path, default: bool) -> io::Result<Self> {
+    fn load(path: &Path, default: Self::Value) -> io::Result<Self> {
         let Some(bytes) = crate::sharing_preferences::read_bounded(path, MAX_FILE_BYTES)? else {
             return Ok(Self::new(default));
         };
         let file: Self = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if file.version != FILE_VERSION {
+        if !file.is_valid() {
             return Err(invalid());
         }
         Ok(file)
@@ -63,7 +63,45 @@ impl SwitchFile {
 }
 
 fn invalid() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "invalid switch preference")
+    io::Error::new(io::ErrorKind::InvalidData, "invalid saved setting")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SwitchFile {
+    version: u32,
+    enabled: bool,
+}
+
+impl SettingFile for SwitchFile {
+    type Value = bool;
+    type View = SwitchView;
+
+    fn new(enabled: bool) -> Self {
+        Self {
+            version: FILE_VERSION,
+            enabled,
+        }
+    }
+
+    fn value(self) -> bool {
+        self.enabled
+    }
+
+    fn is_valid(self) -> bool {
+        self.version == FILE_VERSION
+    }
+
+    fn view(self, error: Option<String>) -> SwitchView {
+        SwitchView {
+            enabled: self.enabled,
+            error,
+        }
+    }
+
+    fn words(enabled: bool) -> String {
+        if enabled { "on" } else { "off" }.to_owned()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -73,47 +111,55 @@ pub struct SwitchView {
     error: Option<String>,
 }
 
-struct State {
-    file: SwitchFile,
+struct State<F> {
+    file: F,
     /// A read or save failure the user should see.
     error: Option<String>,
 }
 
-pub struct SwitchPreference {
-    names: SwitchNames,
+pub struct SavedSetting<F: SettingFile> {
+    names: SettingNames,
     path: Option<PathBuf>,
-    apply: fn(bool),
-    state: Mutex<State>,
+    apply: fn(F::Value),
+    state: Mutex<State<F>>,
 }
 
-impl SwitchPreference {
-    /// Loads the switch, `default` until the user changes it, and applies it before any session
+/// An on-or-off setting.
+pub type SwitchPreference = SavedSetting<SwitchFile>;
+
+impl<F: SettingFile> SavedSetting<F> {
+    /// Loads the setting, `default` until the user changes it, and applies it before any session
     /// starts. Runs in setup.
-    pub fn start(app: &AppHandle, names: SwitchNames, default: bool, apply: fn(bool)) -> Self {
+    pub fn start(
+        app: &AppHandle,
+        names: SettingNames,
+        default: F::Value,
+        apply: fn(F::Value),
+    ) -> Self {
         let path = app
             .path()
             .app_local_data_dir()
             .ok()
             .map(|directory| directory.join(names.file));
-        let (file, error) = match path.as_deref().map(|path| SwitchFile::load(path, default)) {
+        let (file, error) = match path.as_deref().map(|path| F::load(path, default)) {
             Some(Ok(file)) => (file, None),
             Some(Err(_)) => (
-                SwitchFile::new(default),
+                F::new(default),
                 Some(format!(
                     "The saved {} setting could not be read. It is {} until you change it.",
                     names.setting,
-                    if default { "on" } else { "off" }
+                    F::words(default)
                 )),
             ),
             None => (
-                SwitchFile::new(default),
+                F::new(default),
                 Some(format!(
                     "The {} setting has nowhere to be saved.",
                     names.setting
                 )),
             ),
         };
-        apply(file.enabled);
+        apply(file.value());
         Self {
             names,
             path,
@@ -122,20 +168,16 @@ impl SwitchPreference {
         }
     }
 
-    pub fn view(&self) -> SwitchView {
+    pub fn view(&self) -> F::View {
         view_of(&lock(&self.state))
     }
 
     /// Applies at once even when saving fails; sharing keeps running.
-    pub fn set_enabled(&self, enabled: bool) -> SwitchView {
+    pub fn set(&self, value: F::Value) -> F::View {
         let mut state = lock(&self.state);
-        state.file.enabled = enabled;
-        (self.apply)(enabled);
-        log::info!(
-            "user: {} {}",
-            self.names.logged,
-            if enabled { "on" } else { "off" }
-        );
+        state.file = F::new(value);
+        (self.apply)(value);
+        log::info!("user: {} {}", self.names.logged, F::words(value));
         let saved = self
             .path
             .as_deref()
@@ -148,14 +190,11 @@ impl SwitchPreference {
     }
 }
 
-fn view_of(state: &State) -> SwitchView {
-    SwitchView {
-        enabled: state.file.enabled,
-        error: state.error.clone(),
-    }
+fn view_of<F: SettingFile>(state: &State<F>) -> F::View {
+    state.file.view(state.error.clone())
 }
 
-fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -201,6 +240,16 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_switch_keeps_its_bytes() {
+        let path = temporary_path("bytes");
+        SwitchFile::new(true).save(&path).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\n  \"version\": 1,\n  \"enabled\": true\n}"
+        );
+    }
+
+    #[test]
     fn a_view_carries_the_switch_and_the_last_failure() {
         let state = State {
             file: SwitchFile::new(true),
@@ -217,7 +266,7 @@ mod tests {
 
     #[test]
     fn messages_name_the_setting() {
-        let names = SwitchNames {
+        let names = SettingNames {
             file: "swipe.json",
             setting: "swipe",
             logged: "swipe between pages",

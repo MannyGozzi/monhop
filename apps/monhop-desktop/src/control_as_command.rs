@@ -6,9 +6,9 @@ use std::sync::Arc;
 use monhop_transport::session_source::set_control_as_command;
 use tauri::{AppHandle, Manager};
 
-use crate::switch_preference::{SwitchNames, SwitchPreference, SwitchView};
+use crate::switch_preference::{SettingNames, SwitchPreference, SwitchView};
 
-const NAMES: SwitchNames = SwitchNames {
+const NAMES: SettingNames = SettingNames {
     file: "control-as-command.json",
     setting: "Ctrl as Command",
     logged: "Ctrl as Command on a Mac",
@@ -40,7 +40,7 @@ pub async fn control_as_command_set_enabled(
     enabled: bool,
 ) -> Result<SwitchView, String> {
     let switch = app.state::<Arc<ControlAsCommand>>().inner().clone();
-    tauri::async_runtime::spawn_blocking(move || switch.0.set_enabled(enabled))
+    tauri::async_runtime::spawn_blocking(move || switch.0.set(enabled))
         .await
         .map_err(|_| NAMES.not_saved())
 }
