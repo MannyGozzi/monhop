@@ -7937,6 +7937,7 @@
         "monhop-protocol@0.2.16",
         "monhop-transport@0.2.16",
         "objc2-app-kit@0.3.2",
+        "objc2-core-foundation@0.3.2",
         "objc2-core-graphics@0.3.2",
         "objc2-core-image@0.3.2",
         "objc2-core-location@0.3.2",

@@ -63,6 +63,8 @@ Ctrl as Command (requested 2026-10-06): a Windows-only Home switch, off by defau
 Swipe between pages (requested 2026-09-30): when a Mac trackpad controls another computer, a quick two-finger sideways swipe goes back (fingers right) or forward (fingers left) there, the way it does in the Mac's own browsers, whatever the Mac's scroll direction setting. Slow sideways scrolling stays scrolling and the scroll itself still crosses. A Mac-only Home switch, on by default, turns it off. Local swipes on the Mac are left to macOS. Each page turn shows on the computer it lands on as a chevron blooming beside the pointer, pointing the way the page went (requested 2026-09-30).
 Pointer speed (requested 2026-10-27): a mouse moves the pointer on another computer the way it moves on the computer it is plugged into. A Windows mouse follows the PC's pointer speed and Enhance pointer precision, and a Windows DIP is one Mac point. A Settings slider on each computer, under Mouse on Windows and Mouse and trackpad on a Mac, at Same by default, scales that computer's own mouse and trackpad on the computers it controls from half to twice the speed. Crossing distances never change with it. Each computer's page names where to change the mouse of every computer that controls it.
 
+Wi-Fi stutter warning (requested 2026-10-27): a Mac sharing over Wi-Fi with AirDrop set to Everyone shows a small warning on the other computer's card, because that setting pauses the Mac's Wi-Fi a few times a second and the pointer stutters. MonHop only reads the setting and never changes it.
+
 * No file transfer
 * No shell commands received over the network
 * No arbitrary RPC mechanism

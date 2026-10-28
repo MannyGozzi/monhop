@@ -269,9 +269,16 @@ function stateBlock(ctx, computer, { name, status, enabled, on, key }) {
       }),
       fadingText(`${key}-state-detail`, "computer-state-detail", status.detail),
       presence(`${key}-release`, release ? inlineNote(release, "warning", icon("keyboard")) : null),
+      presence(`${key}-airdrop`, airdropNote(ctx, enabled, status)),
       presence(`${key}-notice`, noticeLine(ctx, computer, enabled)),
     ],
   });
+}
+
+// AirDrop open to everyone keeps pausing the Wi-Fi this Mac shares over; only a live session feels it.
+function airdropNote(ctx, enabled, status) {
+  if (!enabled || status.key !== "sharing" || !ctx.airdropWarning) return null;
+  return inlineNote(ctx.airdropWarning, "warning", icon("triangle-alert"));
 }
 
 // The kit's switch, lifted out of its row: the state above is its label, so the whole block is not

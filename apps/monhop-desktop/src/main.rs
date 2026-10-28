@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod airdrop;
 mod appearance;
 mod arrangement_library;
 mod autoscroll;
@@ -724,7 +725,8 @@ fn main() {
             autostart::autostart_open_settings,
             island::island_status,
             island::island_set_enabled,
-            island::island_set_clipboard_notices
+            island::island_set_clipboard_notices,
+            airdrop::airdrop_status
         ])
         .setup(move |app| {
             if check_ui {
@@ -1113,7 +1115,8 @@ mod tests {
                 "allow-autostart-open-settings",
                 "allow-island-status",
                 "allow-island-set-enabled",
-                "allow-island-set-clipboard-notices"
+                "allow-island-set-clipboard-notices",
+                "allow-airdrop-status"
             ])
         );
         let config: serde_json::Value =

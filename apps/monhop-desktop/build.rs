@@ -72,6 +72,7 @@ fn main() {
             "island_status",
             "island_set_enabled",
             "island_set_clipboard_notices",
+            "airdrop_status",
         ]),
     ))
     .expect("could not build the local setup app");

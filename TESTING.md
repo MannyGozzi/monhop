@@ -257,6 +257,13 @@ Pointer speed tests drive a Windows mouse on a Mac and on another PC, and a Mac 
 - Same leaving a Mac trackpad's feel on the PC unchanged;
 - the Mouse page naming the right computer and Settings page for each computer that controls this one.
 
+AirDrop warning tests run on a Mac sharing with a PC. They cover:
+
+- `cargo test -p monhop-desktop --locked airdrop -- --ignored` passing with AirDrop on Everyone and on Contacts Only;
+- the warning on the PC's card while sharing over Wi-Fi with AirDrop on Everyone, and none over Ethernet, while paused or on Windows;
+- the warning leaving within a few seconds of setting AirDrop to Contacts Only in Control Center, without leaving MonHop;
+- a 100 Hz ping from the PC to the Mac showing stalls of 70 ms or more about every half second with AirDrop on Everyone, and none on Contacts Only.
+
 Swipe-between-pages tests drive a Mac trackpad on a Windows PC and on another Mac. They cover:
 
 - a quick two-finger swipe right going back and left going forward in a browser, once per swipe;

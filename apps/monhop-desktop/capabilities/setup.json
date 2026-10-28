@@ -71,6 +71,7 @@
     "allow-autostart-open-settings",
     "allow-island-status",
     "allow-island-set-enabled",
-    "allow-island-set-clipboard-notices"
+    "allow-island-set-clipboard-notices",
+    "allow-airdrop-status"
   ]
 }

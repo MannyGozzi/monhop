@@ -4,6 +4,10 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- On a Mac sharing over Wi-Fi, the other computer's card now warns when AirDrop is set to Everyone. That setting pauses the Mac's Wi-Fi for tens of milliseconds a few times a second, so the pointer stutters, and MonHop cannot work around it. The warning names the fix, setting AirDrop to Contacts Only in Control Center or using a cable, and it goes away a few seconds after AirDrop changes.
+
 ## [0.2.16] - 2026-10-27
 
 ### Added

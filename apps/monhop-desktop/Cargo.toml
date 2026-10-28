@@ -35,6 +35,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std
 objc2-core-location = { version = "=0.3.2", default-features = false, features = ["std", "CLLocationManager", "CLLocationManagerDelegate"] }
 objc2-service-management = { version = "=0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSDictionary", "NSValue", "NSProcessInfo", "NSNotification", "NSOperation", "NSError", "NSData", "NSArray", "NSKeyValueCoding", "NSDistributedNotificationCenter", "NSRunLoop", "NSTimer", "objc2-core-foundation"] }
+objc2-core-foundation = { version = "=0.3.2", default-features = false, features = ["std", "CFBase", "CFPreferences", "CFString"] }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.38.2"

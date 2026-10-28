@@ -173,6 +173,7 @@ import {
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
 import { normalizeAutostartView } from "./autostart-model.mjs";
 import { islandContext, normalizeIslandView } from "./island-model.mjs";
+import { AIRDROP_RECHECK_MS, airdropWarning, normalizeAirDropView } from "./airdrop-model.mjs";
 import { localInspector } from "./screen-ready.mjs";
 import { computerInspector } from "./computer-card.mjs";
 import { banner, captureCanvas, renderCanvas, settleCanvas } from "./screen-displays.mjs";
@@ -270,6 +271,9 @@ let autostartPending = false;
 // Undefined until the Mac answers, so the section never shows on a platform that has no island.
 let island;
 let islandPending = false;
+// Undefined until the Mac answers; the one pending re-ask while it warns.
+let airdrop;
+let airdropRecheck = null;
 let computers = initialComputers();
 let computersRequest = 0;
 let computersLoad = initialComputersLoad();
@@ -503,6 +507,7 @@ if (!uiCheck) {
   void loadUpdatesStatus();
   void loadAutostartStatus();
   if (platform === "macos") void loadIslandStatus();
+  if (platform === "macos") void loadAirDropStatus();
   listenUpdates();
 }
 
@@ -512,6 +517,7 @@ function onReturn() {
   if (showsReadiness(currentSelection())) void requestAutomaticSnapshot("focus");
   void refreshSharingStatus();
   void loadComputers();
+  if (platform === "macos") void loadAirDropStatus();
 }
 
 // ---------- selection ----------
@@ -814,6 +820,7 @@ function context() {
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
     island: islandContext(platform, island, islandPending),
+    airdropWarning: airdropWarning(platform, airdrop, selectedInterface(state)),
     theme,
     themePending,
     busy: controlsBusy(),
@@ -2342,6 +2349,26 @@ function setAutostart(enabled) {
 
 function openAutostartSettings() {
   void runAutostartCommand(() => core.invoke("autostart_open_settings"));
+}
+
+// ---------- AirDrop ----------
+
+// Asked at launch and on each return; while it warns, asked again until AirDrop changes.
+async function loadAirDropStatus() {
+  if (!core?.invoke) return;
+  window.clearTimeout(airdropRecheck);
+  airdropRecheck = null;
+  try {
+    const next = normalizeAirDropView(await core.invoke("airdrop_status"));
+    const changed = next.everyone !== airdrop?.everyone;
+    airdrop = next;
+    if (changed) render();
+  } catch {
+    // The card keeps what it last showed; the next return to MonHop asks again.
+  }
+  if (!airdrop?.everyone || document.visibilityState !== "visible") return;
+  window.clearTimeout(airdropRecheck);
+  airdropRecheck = window.setTimeout(() => void loadAirDropStatus(), AIRDROP_RECHECK_MS);
 }
 
 // ---------- notch island ----------

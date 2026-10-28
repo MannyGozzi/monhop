@@ -287,16 +287,21 @@ export function interfaceAssessment(item) {
   return "Network recognized";
 }
 
+export function isWifiInterface(item) {
+  const kind = typeof item?.kind === "string" ? item.kind.trim().toLowerCase() : "";
+  return kind === "wi-fi" || kind === "wifi";
+}
+
 export function networkLabel(item) {
   const kind = item.kind.trim().toLowerCase();
-  if (kind === "wi-fi" || kind === "wifi") return item.networkName || "Wi-Fi";
+  if (isWifiInterface(item)) return item.networkName || "Wi-Fi";
   if (kind === "ethernet") return item.name || "Ethernet";
   return item.name || "Other network";
 }
 
 export function networkDetail(item) {
   const kind = item.kind.trim().toLowerCase();
-  const wifi = kind === "wi-fi" || kind === "wifi";
+  const wifi = isWifiInterface(item);
   const connection = wifi ? "Wi-Fi" : kind === "ethernet" ? "Ethernet" : "";
   const nameUnavailable = wifi && item.up && item.physical && !item.networkName;
   return [connection, interfaceAssessment(item), nameUnavailable ? "Name unavailable" : ""]
