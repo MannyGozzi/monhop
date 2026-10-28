@@ -2026,7 +2026,8 @@ mod tests {
     #[test]
     fn a_coalesced_raw_sample_counts_the_hook_moves_it_merged() {
         let (mut state, mut consumer) = callback_fixture();
-        let windows = Ballistics::default();
+        // Mirrors capture's own call sequence, so both climb the curve's segments alike.
+        let mut windows = Ballistics::default();
         assert_eq!(
             gain_after(&mut state, &mut consumer, 0),
             windows.gain(7.0, -3.0, 1)

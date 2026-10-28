@@ -89,7 +89,7 @@ mod windows {
 
     fn measure(saved: POINT) -> ExitCode {
         let started = Instant::now();
-        let ballistics = pointer_settings::read();
+        let mut ballistics = pointer_settings::read();
         let primary = pointer_settings::pixels_per_dip_at(0, 0);
         let here = pointer_settings::pixels_per_dip_at(saved.x, saved.y);
         let Some(bounds) = monitor_of(saved) else {
@@ -104,11 +104,13 @@ mod windows {
             "size", "moves", "runs", "model_px", "actual_px", "ratio", "worst_run"
         );
         let mut pass = true;
+        // Windows never clears its sub-pixel remainder, so the model carries one through every run.
+        let mut carry = 0.0;
         for size in SIZES {
             if started.elapsed() > DEADLINE {
                 return failed("deadline");
             }
-            let row = match measure_size(&ballistics, primary, size, bounds) {
+            let row = match measure_size(&mut ballistics, &mut carry, primary, size, bounds) {
                 Ok(row) => row,
                 Err(reason) => return failed(reason),
             };
@@ -134,12 +136,17 @@ mod windows {
     /// Runs of `size`-count moves out from the monitor's centre and back, each compared with the
     /// model's whole pixels, which carry their fraction to the next move as Windows does.
     fn measure_size(
-        ballistics: &Ballistics,
+        ballistics: &mut Ballistics,
+        carry: &mut f64,
         pixels_per_dip: f64,
         size: i32,
         bounds: RECT,
     ) -> Result<Row, &'static str> {
-        let per_move = ballistics.apply(f64::from(size), 0.0, 1).0 * pixels_per_dip;
+        let per_move = {
+            let mut probe = *ballistics;
+            probe.apply(f64::from(size), 0.0, 1);
+            probe.apply(f64::from(size), 0.0, 1).0 * pixels_per_dip
+        };
         let reach = f64::from(bounds.right - bounds.left) * RUN_REACH;
         let length = ((reach / per_move.max(1.0)) as usize).clamp(1, LONGEST_RUN);
         let runs = MIN_MOVES.div_ceil(length).next_multiple_of(2);
@@ -162,7 +169,7 @@ mod windows {
         for run in 0..runs {
             let direction = if run % 2 == 0 { 1 } else { -1 };
             let from = at;
-            let (mut carry, mut model) = (0.0, 0);
+            let mut model = 0;
             for _ in 0..length {
                 nudge(direction * size)?;
                 at = shown(at)?;
@@ -172,9 +179,9 @@ mod windows {
                 if !(bounds.left..bounds.right).contains(&at.x) {
                     return Err("cursor_left_monitor");
                 }
-                carry += f64::from(direction) * per_move;
+                *carry += ballistics.apply(f64::from(direction * size), 0.0, 1).0 * pixels_per_dip;
                 let whole = carry.trunc();
-                carry -= whole;
+                *carry -= whole;
                 model += whole as i32;
             }
             at = settled()?;

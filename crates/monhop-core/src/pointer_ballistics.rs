@@ -76,6 +76,9 @@ pub struct Ballistics {
     /// Without Enhance pointer precision a count moves whole pixels, which the primary display
     /// scales from DIPs.
     pixels_per_dip: f64,
+    /// The curve segment the last report reached: Windows averages a report that climbs into a
+    /// steeper segment with the line of the one it left.
+    segment: usize,
 }
 
 impl Default for Ballistics {
@@ -112,45 +115,63 @@ impl Ballistics {
             speed,
             curve,
             pixels_per_dip,
+            segment: 1,
         }
     }
 
     /// DIPs per count for a record of `dx` and `dy` counts that merged `reports` reports, each
     /// taken as an equal share: one gain for both axes keeps the direction.
-    pub fn gain(&self, dx: f64, dy: f64, reports: u32) -> f64 {
+    pub fn gain(&mut self, dx: f64, dy: f64, reports: u32) -> f64 {
         if !self.enhance {
             return LINEAR_PIXELS_PER_COUNT[self.speed as usize - 1] / self.pixels_per_dip;
         }
-        let reports = f64::from(reports.clamp(1, MAX_MERGED_REPORTS));
-        let (x, y) = ((dx / reports).abs(), (dy / reports).abs());
+        let reports = reports.clamp(1, MAX_MERGED_REPORTS);
+        let share = f64::from(reports);
+        let (x, y) = ((dx / share).abs(), (dy / share).abs());
         let magnitude = x.max(y) + x.min(y) / 2.0;
-        let scale = DIPS_PER_CURVE_UNIT * f64::from(self.speed) / 10.0;
-        let slope = |index: usize| {
-            let ((x0, y0), (x1, y1)) = (self.curve[index - 1], self.curve[index]);
-            (y1 - y0) / (x1 - x0)
-        };
         // Vanishing and unbounded reports take the curve's limits, so no gain is NaN or infinite.
         if magnitude.is_nan() || magnitude == 0.0 {
-            return scale * slope(1) / COUNTS_PER_CURVE_UNIT;
+            return self.scale() * self.slope(1) / COUNTS_PER_CURVE_UNIT;
         }
         if magnitude.is_infinite() {
-            return scale * slope(CURVE_POINTS - 1) / COUNTS_PER_CURVE_UNIT;
+            return self.scale() * self.slope(CURVE_POINTS - 1) / COUNTS_PER_CURVE_UNIT;
         }
         let along = magnitude / COUNTS_PER_CURVE_UNIT;
         // The last segment extends past the curve's last point.
         let index = (1..CURVE_POINTS)
             .find(|&index| along <= self.curve[index].0)
             .unwrap_or(CURVE_POINTS - 1);
-        let (x0, y0) = self.curve[index - 1];
-        let slope = slope(index);
-        // The segment's intercept over the magnitude, so a huge report cannot overflow.
-        (scale * ((y0 - slope * x0) / magnitude + slope / COUNTS_PER_CURVE_UNIT)).max(0.0)
+        let gain = self.segment_gain(index, magnitude);
+        let left = std::mem::replace(&mut self.segment, index);
+        if index <= left {
+            return gain;
+        }
+        // Only the message's first report climbs; the rest stay in the new segment.
+        let first = (gain + self.segment_gain(left, magnitude)) / 2.0;
+        (first + gain * f64::from(reports - 1)) / share
     }
 
     /// The record's motion in DIPs.
-    pub fn apply(&self, dx: f64, dy: f64, reports: u32) -> (f64, f64) {
+    pub fn apply(&mut self, dx: f64, dy: f64, reports: u32) -> (f64, f64) {
         let gain = self.gain(dx, dy, reports);
         (dx * gain, dy * gain)
+    }
+
+    fn scale(&self) -> f64 {
+        DIPS_PER_CURVE_UNIT * f64::from(self.speed) / 10.0
+    }
+
+    fn slope(&self, index: usize) -> f64 {
+        let ((x0, y0), (x1, y1)) = (self.curve[index - 1], self.curve[index]);
+        (y1 - y0) / (x1 - x0)
+    }
+
+    /// The gain along segment `index`'s line, extended either way.
+    fn segment_gain(&self, index: usize, magnitude: f64) -> f64 {
+        let (x0, y0) = self.curve[index - 1];
+        let slope = self.slope(index);
+        // The segment's intercept over the magnitude, so a huge report cannot overflow.
+        (self.scale() * ((y0 - slope * x0) / magnitude + slope / COUNTS_PER_CURVE_UNIT)).max(0.0)
     }
 }
 
@@ -179,6 +200,12 @@ fn decode(bytes: &[u8]) -> Option<[f64; CURVE_POINTS]> {
 mod tests {
     use super::*;
 
+    /// A record after one like it, so it climbs into no new segment.
+    fn steady(windows: &mut Ballistics, dx: f64, dy: f64, reports: u32) -> (f64, f64) {
+        windows.apply(dx, dy, reports);
+        windows.apply(dx, dy, reports)
+    }
+
     fn close(actual: f64, expected: f64) {
         assert!(
             (actual - expected).abs() < 1e-4,
@@ -202,7 +229,7 @@ mod tests {
 
     #[test]
     fn enhanced_precision_at_the_middle_notch_follows_the_default_curve() {
-        let windows = Ballistics::default();
+        let mut windows = Ballistics::default();
         for (counts, dips) in [
             (1.0, 0.568903),
             (2.0, 1.279839),
@@ -212,17 +239,17 @@ mod tests {
             (32.0, 64.860459),
             (-6.0, -5.424910),
         ] {
-            let (x, y) = windows.apply(counts, 0.0, 1);
+            let (x, y) = steady(&mut windows, counts, 0.0, 1);
             close(x, dips);
             assert_eq!(y, 0.0);
         }
         // 140 counts reach the curve's last point: 443.75 at 96/120.
-        assert!((windows.apply(140.0, 0.0, 1).0 - 355.0).abs() < 1e-9);
+        assert!((steady(&mut windows, 140.0, 0.0, 1).0 - 355.0).abs() < 1e-9);
     }
 
     #[test]
     fn one_gain_scales_both_axes_so_the_direction_holds() {
-        let (x, y) = Ballistics::default().apply(4.0, 2.0, 1);
+        let (x, y) = steady(&mut Ballistics::default(), 4.0, 2.0, 1);
         close(x, 3.299973);
         close(y, 1.649986);
         assert_eq!(x / y, 2.0);
@@ -230,16 +257,34 @@ mod tests {
 
     #[test]
     fn a_merged_message_moves_as_its_reports_would_one_by_one() {
-        let windows = Ballistics::default();
-        let merged = windows.apply(16.0, 0.0, 8).0;
+        let mut windows = Ballistics::default();
+        let merged = steady(&mut windows, 16.0, 0.0, 8).0;
         close(merged, 10.238711);
         assert!((merged - 8.0 * windows.apply(2.0, 0.0, 1).0).abs() < 1e-12);
         // Report counts outside 1 to MAX_MERGED_REPORTS clamp.
-        assert_eq!(windows.gain(16.0, 0.0, 0), windows.gain(16.0, 0.0, 1));
-        assert_eq!(
-            windows.gain(64.0, 0.0, 1000),
-            windows.gain(64.0, 0.0, MAX_MERGED_REPORTS)
-        );
+        let gain = |dx, reports| {
+            let mut windows = Ballistics::default();
+            windows.gain(dx, 0.0, reports);
+            windows.gain(dx, 0.0, reports)
+        };
+        assert_eq!(gain(16.0, 0), gain(16.0, 1));
+        assert_eq!(gain(64.0, 1000), gain(64.0, MAX_MERGED_REPORTS));
+    }
+
+    #[test]
+    fn a_report_climbing_into_a_steeper_segment_averages_it_with_the_one_left() {
+        let mut windows = Ballistics::default();
+        steady(&mut windows, 12.0, 0.0, 1);
+        // 16 counts after 12 cross from the third segment into the fourth: 21.877 on the fourth's
+        // line, 18.423 on the third's, so the climb moves their mean.
+        close(windows.apply(16.0, 0.0, 1).0, 20.150591);
+        close(windows.apply(16.0, 0.0, 1).0, 21.876823);
+        // Falling back into a gentler segment is not averaged.
+        let gentler = steady(&mut Ballistics::default(), 12.0, 0.0, 1).0;
+        assert_eq!(windows.apply(12.0, 0.0, 1).0, gentler);
+        // Of a merged message only the first report climbs: from the first segment, one of four
+        // 16-count reports takes the mean of the first and fourth lines.
+        close(Ballistics::default().apply(64.0, 0.0, 4).0, 81.120095);
     }
 
     #[test]
@@ -251,7 +296,7 @@ mod tests {
             1.137804,
         );
         for (speed, per_count) in [(1, 1.0 / 32.0), (6, 0.5), (10, 1.0), (11, 1.25), (20, 3.5)] {
-            let linear = Ballistics::new(false, speed, None, None, 1.0);
+            let mut linear = Ballistics::new(false, speed, None, None, 1.0);
             assert_eq!(linear.gain(1.0, 0.0, 1), per_count);
             assert_eq!(linear.gain(37.0, -5.0, 8), per_count);
         }
@@ -301,7 +346,7 @@ mod tests {
     #[test]
     fn a_custom_curve_is_used_as_read() {
         // The curve y = x: 0.8/3.5 DIPs a count at every speed of the hand.
-        let line = Ballistics::new(
+        let mut line = Ballistics::new(
             true,
             10,
             Some(&DEFAULT_X_CURVE),
@@ -339,7 +384,7 @@ mod tests {
         for index in 0..CURVE_POINTS {
             tiny_x[index * 8..index * 8 + 8].copy_from_slice(&(index as u64).to_le_bytes());
         }
-        for windows in [
+        for mut windows in [
             Ballistics::default(),
             Ballistics::new(true, MAX_SPEED, Some(&tiny_x), Some(&steep_y), 1.0),
             Ballistics::new(false, MIN_SPEED, None, None, 3.5),
