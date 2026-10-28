@@ -15,6 +15,8 @@ pub mod keymap;
 pub mod native_capture;
 #[cfg(any(windows, test))]
 pub mod page_turn;
+#[cfg(windows)]
+pub mod pointer_settings;
 
 #[cfg(windows)]
 pub mod identity;

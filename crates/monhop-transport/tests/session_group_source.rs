@@ -1,5 +1,10 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicI8, Ordering},
+    time::Duration,
+};
 
+use monhop_core::pointer_speed::{MAX_STEP, SAME};
 use monhop_core::{
     DeviceId, Display, DisplayId, Edge, EdgeLink, FloorPeer, FloorState, HidUsage, LogicalSize,
     Machine, ModifierState, MouseButton, NativeSize, NormalizedSpan, Platform, Point,
@@ -251,6 +256,13 @@ impl Group {
         group
     }
 
+    /// Both controllers read the pointer speed from `step`.
+    fn at_speed(mut self, step: &'static AtomicI8) -> Self {
+        let [x, y] = self.sources;
+        self.sources = [x.with_pointer_speed(step), y.with_pointer_speed(step)];
+        self
+    }
+
     /// Both peers are live, so each controller may hand over to the other.
     fn reach(&mut self) {
         self.source(Side::X).set_reachable(&[device(PEER_Y)]);
@@ -383,7 +395,7 @@ impl Group {
 }
 
 fn moved(dx: f64) -> NormalizedInput {
-    NormalizedInput::RelativeMotion(Point::new(dx, 0.0))
+    NormalizedInput::relative(Point::new(dx, 0.0))
 }
 
 /// One record carrying the full push along `direction`, 1 right or -1 left.
@@ -982,4 +994,36 @@ fn a_non_owned_remote_route_never_renews_suppression() {
     );
     // Declining a renewal is no failure: X's link runs on.
     assert_eq!(group.source(Side::X).failure(), None);
+}
+
+#[test]
+fn a_handover_moves_the_pointer_at_its_speed_exactly_once() {
+    static STEP: AtomicI8 = AtomicI8::new(SAME);
+    let mut group = Group::new().at_speed(&STEP);
+    group.reach();
+    cross_to_x(&mut group);
+    STEP.store(MAX_STEP, Ordering::Release);
+    assert!(group.capture(moved(98.0)).is_none());
+    // 10 past the full push enter Y's display 20 px in at twice the speed; 5 while X acknowledges
+    // the release and 3 while Y acknowledges its activation carry on 16 px from there.
+    assert!(group.capture(moved(PUSH_THROUGH_DISTANCE + 10.0)).is_none());
+    assert!(group.capture(moved(5.0)).is_none());
+    let handover = group.deliver(Side::X).expect("a handover");
+    group.accept(handover, Side::Y);
+    assert!(group.capture(moved(3.0)).is_none());
+    assert!(group.deliver(Side::Y).is_none());
+    assert_eq!(group.source(Side::Y).mode(), SourceMode::Remote);
+    assert_eq!(
+        group.injected(Side::Y),
+        [
+            Injected::Move(Point::new(21.0, 50.0)),
+            Injected::Move(Point::new(37.0, 50.0)),
+        ]
+    );
+    assert!(group.capture(moved(1.0)).is_none());
+    assert!(group.deliver(Side::Y).is_none());
+    assert_eq!(
+        group.injected(Side::Y).last(),
+        Some(&Injected::Move(Point::new(39.0, 50.0)))
+    );
 }

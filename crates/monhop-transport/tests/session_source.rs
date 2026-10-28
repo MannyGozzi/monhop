@@ -1,7 +1,15 @@
-use std::{cell::RefCell, sync::Once, time::Duration};
+use std::{
+    cell::RefCell,
+    sync::{
+        Once,
+        atomic::{AtomicI8, Ordering},
+    },
+    time::Duration,
+};
 
 use monhop_core::capture::DECLINE_RETRY_AFTER;
 use monhop_core::clicks::DOUBLE_CLICK_SLOP;
+use monhop_core::pointer_speed::{MAX_STEP, MIN_STEP, SAME};
 use monhop_core::{
     DeviceId, Display, DisplayId, Edge, EdgeLink, GesturePhase, HidUsage, LogicalSize, Machine,
     ModifierState, MouseButton, NativeSize, NormalizedSpan, Platform, Point, PointerGesture,
@@ -528,19 +536,11 @@ fn capture_on_route(
 }
 
 fn move_horizontally(source: &mut SourceController, dx: f64, now: Duration) -> SourceOutcome {
-    capture_on_route(
-        source,
-        NormalizedInput::RelativeMotion(Point::new(dx, 0.0)),
-        now,
-    )
+    capture_on_route(source, NormalizedInput::relative(Point::new(dx, 0.0)), now)
 }
 
 fn move_vertically(source: &mut SourceController, dy: f64, now: Duration) -> SourceOutcome {
-    capture_on_route(
-        source,
-        NormalizedInput::RelativeMotion(Point::new(0.0, dy)),
-        now,
-    )
+    capture_on_route(source, NormalizedInput::relative(Point::new(0.0, dy)), now)
 }
 
 fn scaled(push: Point, by: f64) -> Point {
@@ -552,7 +552,7 @@ fn scaled(push: Point, by: f64) -> Point {
 fn push_through(source: &mut SourceController, push: Point, now: Duration) -> SourceOutcome {
     capture_on_route(
         source,
-        NormalizedInput::RelativeMotion(scaled(push, PUSH_THROUGH_DISTANCE)),
+        NormalizedInput::relative(scaled(push, PUSH_THROUGH_DISTANCE)),
         now,
     )
 }
@@ -560,7 +560,7 @@ fn push_through(source: &mut SourceController, push: Point, now: Duration) -> So
 /// From a pointer resting on an edge: ten records 10 ms apart along the unit `push`, each a tenth
 /// of the full distance, so only the last, at `now + 90 ms`, can cross; yields its outcome.
 fn flick(source: &mut SourceController, push: Point, now: Duration) -> SourceOutcome {
-    let tenth = NormalizedInput::RelativeMotion(scaled(push, PUSH_THROUGH_DISTANCE / 10.0));
+    let tenth = NormalizedInput::relative(scaled(push, PUSH_THROUGH_DISTANCE / 10.0));
     for record in 0..9 {
         let held = capture_on_route(source, tenth, now + ms(10 * record));
         assert_eq!(held.failure, None);
@@ -579,7 +579,7 @@ fn sustained_push_crosses(source: &mut SourceController, by: Point, from: Durati
     let mut crossed = false;
     let mut now = from;
     loop {
-        let pushed = capture_on_route(source, NormalizedInput::RelativeMotion(by), now);
+        let pushed = capture_on_route(source, NormalizedInput::relative(by), now);
         assert_eq!(pushed.failure, None);
         crossed |= sends_activation(&pushed) || sends_release_all(&pushed);
         if now == last {
@@ -1085,11 +1085,7 @@ fn remote_relative_motion_and_fractional_scroll_keep_logical_units() {
     assert_eq!(target.platform, Platform::MacOs);
     assert_eq!(target.scale_factor, 1.0);
     let motion = source.fresh_capture(
-        routed(
-            NormalizedInput::RelativeMotion(Point::new(2.5, -1.25)),
-            true,
-            1,
-        ),
+        routed(NormalizedInput::relative(Point::new(2.5, -1.25)), true, 1),
         after_crossing(1),
     );
     assert_frame(
@@ -1215,11 +1211,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
     // Reaching the last pixel before the other computer's next display stays on this one; going
     // on past it moves there at once, as that computer's own pointer would.
     let last_pixel = remote_to_remote.fresh_capture(
-        routed(
-            NormalizedInput::RelativeMotion(Point::new(98.0, 0.0)),
-            true,
-            1,
-        ),
+        routed(NormalizedInput::relative(Point::new(98.0, 0.0)), true, 1),
         after_crossing(3),
     );
     assert_eq!(last_pixel.failure, None);
@@ -1287,11 +1279,7 @@ fn remote_edges_return_locally_and_reanchor_between_remote_displays() {
         }),
     );
     let resumed = remote_to_remote.fresh_capture(
-        routed(
-            NormalizedInput::RelativeMotion(Point::new(1.0, 0.0)),
-            true,
-            1,
-        ),
+        routed(NormalizedInput::relative(Point::new(1.0, 0.0)), true, 1),
         hop + ms(4),
     );
     assert_frame(
@@ -1326,11 +1314,7 @@ fn swipe(source: &mut SourceController, speed: f64, from: Duration) -> Option<(u
     reports(100, |t| Point::new(speed * t, 0.0))
         .into_iter()
         .find_map(|(t, counts)| {
-            let swiped = capture_on_route(
-                source,
-                NormalizedInput::RelativeMotion(counts),
-                from + ms(t),
-            );
+            let swiped = capture_on_route(source, NormalizedInput::relative(counts), from + ms(t));
             assert_eq!(swiped.failure, None);
             activation(&swiped).map(|(display, _)| (t, display))
         })
@@ -1397,7 +1381,7 @@ fn swipe_across_a_hop(duration: u64, ack_after: u64) -> Point {
     let mut hopped = None;
     for (t, counts) in reports(duration, |t| Point::new(3.0 * t, 0.0)) {
         let now = after_crossing(2) + ms(t);
-        let swiped = capture_on_route(&mut source, NormalizedInput::RelativeMotion(counts), now);
+        let swiped = capture_on_route(&mut source, NormalizedInput::relative(counts), now);
         assert_eq!(swiped.failure, None);
         at = moved_to(&swiped).unwrap_or(at);
         if sends_activation(&swiped) {
@@ -1615,7 +1599,7 @@ fn on_the_seam_home_at(x: f64) -> SourceController {
     ] {
         let moved = capture_on_route(
             &mut source,
-            NormalizedInput::RelativeMotion(delta),
+            NormalizedInput::relative(delta),
             after_crossing(at),
         );
         assert!(!sends_activation(&moved) && !sends_release_all(&moved));
@@ -1636,7 +1620,7 @@ fn a_push_home_keeps_its_corner_with_another_of_the_controlled_computers_display
             .find_map(|(t, counts)| {
                 let pushed = capture_on_route(
                     &mut source,
-                    NormalizedInput::RelativeMotion(counts),
+                    NormalizedInput::relative(counts),
                     after_crossing(3) + ms(t),
                 );
                 hopped |= sends_activation(&pushed);
@@ -1655,7 +1639,7 @@ fn a_push_home_keeps_its_corner_with_another_of_the_controlled_computers_display
         .find_map(|(t, counts)| {
             let slid = capture_on_route(
                 &mut source,
-                NormalizedInput::RelativeMotion(counts),
+                NormalizedInput::relative(counts),
                 after_crossing(3) + ms(t),
             );
             activation(&slid).map(|(display, _)| (t, display))
@@ -1694,11 +1678,7 @@ fn remote_motion_carries_the_tracked_position_so_the_far_edge_is_never_overshot(
     deltas.push(1_000.0);
     for (step, delta) in (1_u64..).zip(deltas) {
         let motion = source.fresh_capture(
-            routed(
-                NormalizedInput::RelativeMotion(Point::new(0.0, delta)),
-                true,
-                1,
-            ),
+            routed(NormalizedInput::relative(Point::new(0.0, delta)), true, 1),
             after_crossing(step),
         );
         bridge
@@ -1730,11 +1710,7 @@ fn remote_motion_carries_the_tracked_position_so_the_far_edge_is_never_overshot(
         Some(&RecordedAction::Move(Point::new(1.0, far_edge)))
     );
     let stalled = source.fresh_capture(
-        routed(
-            NormalizedInput::RelativeMotion(Point::new(0.0, 1.0)),
-            true,
-            1,
-        ),
+        routed(NormalizedInput::relative(Point::new(0.0, 1.0)), true, 1),
         after_crossing(78),
     );
     assert!(stalled.effects.is_empty());
@@ -1788,7 +1764,7 @@ fn a_pointer_held_on_a_far_edge_stays_inside_the_receivers_own_coordinates() {
     for (step, delta) in (1_u64..).zip([Point::new(0.0, 1_000.0), Point::new(1_000.0, 0.0)]) {
         let motion = capture_on_route(
             &mut source,
-            NormalizedInput::RelativeMotion(delta),
+            NormalizedInput::relative(delta),
             after_crossing(step),
         );
         bridge
@@ -1881,7 +1857,7 @@ fn click_captured(
 }
 
 fn nudge(source: &mut SourceController, bridge: &mut ReceiverBridge, by: Point, now: Duration) {
-    let outcome = capture_on_route(source, NormalizedInput::RelativeMotion(by), now);
+    let outcome = capture_on_route(source, NormalizedInput::relative(by), now);
     bridge.pump(source, outcome, now).unwrap();
 }
 
@@ -2232,11 +2208,7 @@ fn stale_ack_and_mismatched_capture_route_fail_closed() {
     let mut other = source();
     activate_remote(&mut other);
     let mismatch = other.fresh_capture(
-        routed(
-            NormalizedInput::RelativeMotion(Point::new(1.0, 0.0)),
-            false,
-            1,
-        ),
+        routed(NormalizedInput::relative(Point::new(1.0, 0.0)), false, 1),
         after_crossing(1),
     );
     assert_eq!(mismatch.failure, Some(SourceFailure::RouteMismatch));
@@ -2554,10 +2526,7 @@ fn a_local_source_holds_at_the_deadline_and_still_sends_the_barrier() {
 
 #[test]
 fn diagnostics_redact_normalized_input_values() {
-    let debug = format!(
-        "{:?}",
-        NormalizedInput::RelativeMotion(Point::new(41.5, -99.25))
-    );
+    let debug = format!("{:?}", NormalizedInput::relative(Point::new(41.5, -99.25)));
     assert!(debug.contains("redacted"));
     assert!(!debug.contains("41.5"));
 }
@@ -2870,7 +2839,7 @@ fn a_cursor_on_a_display_outside_the_layout_keeps_the_session() {
     assert!(outside.effects.is_empty());
     assert_eq!(source.mode(), SourceMode::Local);
     let wandering = source.fresh_capture(
-        local(NormalizedInput::RelativeMotion(Point::new(5.0, 5.0))),
+        local(NormalizedInput::relative(Point::new(5.0, 5.0))),
         ms(2),
     );
     assert_eq!(wandering.failure, None);
@@ -3233,7 +3202,7 @@ fn an_observed_pointer_position_on_the_pointer_display_only_moves_the_anchor() {
     assert_eq!(inside.failure, None);
     assert!(inside.effects.is_empty());
     let push = source.fresh_capture(
-        local(NormalizedInput::RelativeMotion(Point::new(1.0, 0.0))),
+        local(NormalizedInput::relative(Point::new(1.0, 0.0))),
         ms(2),
     );
     assert!(
@@ -3311,7 +3280,7 @@ fn a_stray_pixel_back_toward_the_entry_edge_keeps_the_pointer_on_the_entered_dis
     // A mostly vertical flick with a pixel of sideways noise slides along the edge.
     let flick = capture_on_route(
         &mut source,
-        NormalizedInput::RelativeMotion(Point::new(-1.0, 10.0)),
+        NormalizedInput::relative(Point::new(-1.0, 10.0)),
         after_crossing(2),
     );
     assert_frame(
@@ -3482,7 +3451,7 @@ fn an_entry_guard_leaves_the_other_edges_of_the_display_crossable() {
     activate_remote(&mut source);
     let up = capture_on_route(
         &mut source,
-        NormalizedInput::RelativeMotion(Point::new(0.0, -49.0)),
+        NormalizedInput::relative(Point::new(0.0, -49.0)),
         after_crossing(1),
     );
     assert_frame(
@@ -3493,7 +3462,7 @@ fn an_entry_guard_leaves_the_other_edges_of_the_display_crossable() {
     );
     let corner = capture_on_route(
         &mut source,
-        NormalizedInput::RelativeMotion(Point::new(-1.0, -1.0)),
+        NormalizedInput::relative(Point::new(-1.0, -1.0)),
         after_crossing(2),
     );
     assert_frame(
@@ -3515,7 +3484,7 @@ fn an_entry_guard_leaves_the_other_edges_of_the_display_crossable() {
     // Going mostly up moves onto the other computer's display above at once, straight above.
     let through = capture_on_route(
         &mut source,
-        NormalizedInput::RelativeMotion(Point::new(-0.25, -1.0)),
+        NormalizedInput::relative(Point::new(-0.25, -1.0)),
         shove + SUSTAINED + ms(10),
     );
     assert_eq!(through.failure, None);
@@ -3536,7 +3505,7 @@ fn round_trip(
     entry: Point,
 ) -> (DisplayId, Point) {
     activate_remote_from(source, at, push, entry);
-    let along = |by: f64| NormalizedInput::RelativeMotion(scaled(push, by));
+    let along = |by: f64| NormalizedInput::relative(scaled(push, by));
     assert_eq!(
         capture_on_route(source, along(ENTRY_GUARD_DISTANCE), after_crossing(1)).failure,
         None
@@ -3647,7 +3616,7 @@ fn push_across(
 ) -> SourceOutcome {
     capture_on_route(
         source,
-        NormalizedInput::RelativeMotion(across(edge, distance)),
+        NormalizedInput::relative(across(edge, distance)),
         now,
     )
 }
@@ -3999,7 +3968,7 @@ fn a_push_that_ran_long_enough_logs_one_line_when_it_ends() {
     move_to(&mut source, Point::new(50.0, 50.0), ms(0));
     move_to(&mut source, Point::new(99.0, 50.0), ms(0));
     let step = |source: &mut SourceController, delta: Point, at: u64| {
-        let stepped = capture_on_route(source, NormalizedInput::RelativeMotion(delta), ms(at));
+        let stepped = capture_on_route(source, NormalizedInput::relative(delta), ms(at));
         assert!(stepped.effects.is_empty());
     };
     let out = Point::new(1.0, 0.0);
@@ -4268,7 +4237,7 @@ fn windows_report_entry(
     let mut entry = None;
     for event in [
         NormalizedInput::AbsoluteMotion(hook),
-        NormalizedInput::RelativeMotion(counts),
+        NormalizedInput::relative(counts),
     ] {
         let outcome = capture_on_route(source, event, now);
         assert_eq!(outcome.failure, None);
@@ -4289,7 +4258,7 @@ fn mac_event(
     let mut crossed = false;
     for event in [
         NormalizedInput::AbsoluteMotion(cursor.at),
-        NormalizedInput::RelativeMotion(delta),
+        NormalizedInput::relative(delta),
     ] {
         let outcome = capture_on_route(source, event, now);
         assert_eq!(outcome.failure, None);
@@ -5076,11 +5045,14 @@ fn controlling_across_scales(
 
 #[test]
 fn a_push_home_counts_the_controlling_mouses_own_travel_on_any_display_scale() {
-    // Relative motion reaches the source in the controlled display's units: a Windows mouse's
-    // counts shrink onto Mac points by the Mac's scale, Mac points grow onto Windows pixels by the
-    // Windows scale. The push home takes the same hand travel either way: the 13th record of 20.
-    let home_on = |source: &mut SourceController, home: Point, per_unit: f64| {
-        let onto = |units: f64| NormalizedInput::RelativeMotion(scaled(home, units * per_unit));
+    // Relative motion reaches the source in the controlling mouse's own units, whatever the
+    // controlled display's scale and however far each unit moves there. The push home takes the
+    // same hand travel either way: the 13th record of 20.
+    let home_on = |source: &mut SourceController, home: Point, gain: f64| {
+        let onto = |units: f64| NormalizedInput::RelativeMotion {
+            delta: scaled(home, units),
+            gain,
+        };
         // Off the entry edge past its guard, then back onto it.
         assert!(!sends_release_all(&capture_on_route(
             source,
@@ -5097,27 +5069,26 @@ fn a_push_home_counts_the_controlling_mouses_own_travel_on_any_display_scale() {
         })
     };
     for mac_scale in [1.0, 2.0] {
-        let topology = scaled_pair(1.0, mac_scale);
-        let mut windows =
-            controlling_across_scales(topology, 1, Point::new(399.0, 50.0), Point::new(1.0, 0.0));
-        let per_unit = windows
-            .motion_target()
-            .unwrap()
-            .per_captured_unit(Platform::Windows);
-        assert_eq!(per_unit, 1.0 / mac_scale);
-        let crossed = home_on(&mut windows, Point::new(-1.0, 0.0), per_unit);
-        assert_eq!(crossed, Some(13), "Mac at {mac_scale}x");
+        for gain in [0.5, 1.0, 2.5] {
+            let topology = scaled_pair(1.0, mac_scale);
+            let mut windows = controlling_across_scales(
+                topology,
+                1,
+                Point::new(399.0, 50.0),
+                Point::new(1.0, 0.0),
+            );
+            assert_eq!(windows.motion_target().unwrap().per_logical_unit(), 1.0);
+            let crossed = home_on(&mut windows, Point::new(-1.0, 0.0), gain);
+            assert_eq!(crossed, Some(13), "Mac at {mac_scale}x, {gain} a count");
+        }
     }
     for windows_scale in [1.0, 1.5] {
         let topology = scaled_pair(windows_scale, 1.0);
         let mut mac =
             controlling_across_scales(topology, 2, Point::new(0.0, 50.0), Point::new(-1.0, 0.0));
-        let per_unit = mac
-            .motion_target()
-            .unwrap()
-            .per_captured_unit(Platform::MacOs);
+        let per_unit = mac.motion_target().unwrap().per_logical_unit();
         assert_eq!(per_unit, windows_scale);
-        let crossed = home_on(&mut mac, Point::new(1.0, 0.0), per_unit);
+        let crossed = home_on(&mut mac, Point::new(1.0, 0.0), 1.0);
         assert_eq!(crossed, Some(13), "Windows at {windows_scale}x");
     }
 }
@@ -5125,20 +5096,25 @@ fn a_push_home_counts_the_controlling_mouses_own_travel_on_any_display_scale() {
 #[test]
 fn the_record_that_carries_the_push_past_the_full_distance_crosses_and_enters_that_far_in() {
     // 200 in, then one record of 120: that record crosses, and the 70 past the full distance
-    // carries on past the entry, converted as relative motion onto that display is.
-    for (mac_scale, entry_x) in [(1.0, 71.0), (2.0, 36.0)] {
+    // carries on past the entry as that record moves on the other computer: a DIP is a Mac
+    // point at any Mac scale, and a Mac point is a Windows display's scale in pixels.
+    for (mac_scale, gain, entry_x) in [(1.0, 1.0, 71.0), (2.0, 1.0, 71.0), (2.0, 0.5, 36.0)] {
         let mut windows = scaled_source(scaled_pair(1.0, mac_scale), 1, Point::new(399.0, 50.0));
+        let counts = |dx: f64| NormalizedInput::RelativeMotion {
+            delta: Point::new(dx, 0.0),
+            gain,
+        };
         assert!(
-            move_horizontally(&mut windows, 200.0, ms(1))
+            capture_on_route(&mut windows, counts(200.0), ms(1))
                 .effects
                 .is_empty()
         );
-        let crossing = move_horizontally(&mut windows, 120.0, ms(2));
+        let crossing = capture_on_route(&mut windows, counts(120.0), ms(2));
         let entered = activation(&crossing);
         assert_eq!(
             entered,
             Some((DisplayId(2), Point::new(entry_x, 50.0))),
-            "Mac at {mac_scale}x"
+            "Mac at {mac_scale}x, {gain} a count"
         );
     }
     for (windows_scale, entry_x) in [(1.0, 329.0), (1.5, 294.0)] {
@@ -5160,7 +5136,7 @@ fn the_record_that_carries_the_push_past_the_full_distance_crosses_and_enters_th
     let topology = scaled_pair(1.0, 2.0);
     let mut returning =
         controlling_across_scales(topology, 1, Point::new(399.0, 50.0), Point::new(1.0, 0.0));
-    let onto = |counts: f64| NormalizedInput::RelativeMotion(Point::new(counts / 2.0, 0.0));
+    let onto = |counts: f64| NormalizedInput::relative(Point::new(counts, 0.0));
     capture_on_route(&mut returning, onto(60.0), ms(1));
     capture_on_route(&mut returning, onto(-66.0), ms(2));
     let short = capture_on_route(&mut returning, onto(-200.0), ms(3));
@@ -5207,8 +5183,7 @@ fn tap_key_and_button(source: &mut SourceController, now: Duration) -> Vec<Messa
         .collect()
 }
 
-/// A Windows source pushed through onto a Mac at 2x, awaiting the activation acknowledgement,
-/// with no route settled so its relative motion comes in counts.
+/// A Windows source pushed through onto a Mac at 2x, awaiting the activation acknowledgement.
 fn handing_over_to_a_retina_mac() -> SourceController {
     let mut source = scaled_source(scaled_pair(1.0, 2.0), 1, Point::new(399.0, 50.0));
     assert!(sends_activation(&push_through(
@@ -5222,20 +5197,21 @@ fn handing_over_to_a_retina_mac() -> SourceController {
 
 #[test]
 fn motion_while_a_crossing_is_acknowledged_lands_on_the_other_screen() {
-    // 40 counts right and 8 down while the Mac acknowledges and the route switches: 20 and 4
-    // points on from the entry, sent as the first motion once the route is remote.
+    // 40 counts right and 8 down at half a DIP a count while the Mac acknowledges and the route
+    // switches: 20 and 4 points on from the entry, whatever the Mac's scale, sent as the first
+    // motion once the route is remote.
     let mut source = handing_over_to_a_retina_mac();
+    let counts = |dx: f64, dy: f64| NormalizedInput::RelativeMotion {
+        delta: Point::new(dx, dy),
+        gain: 0.5,
+    };
     for at in [1, 2] {
-        let moved = capture_on_route(
-            &mut source,
-            NormalizedInput::RelativeMotion(Point::new(10.0, 4.0)),
-            ms(at),
-        );
+        let moved = capture_on_route(&mut source, counts(10.0, 4.0), ms(at));
         assert!(sent(&moved).is_empty());
     }
     let acknowledged = source.on_remote_frame(&activation_ack_for(4, 0, DisplayId(2)), ms(3));
     assert!(sent(&acknowledged).is_empty());
-    let moved = move_horizontally(&mut source, 20.0, ms(4));
+    let moved = capture_on_route(&mut source, counts(20.0, 0.0), ms(4));
     assert!(sent(&moved).is_empty());
     let request = route_request(&acknowledged);
     assert_eq!(source.bind_capture_route(request, 1, ms(5)).failure, None);
@@ -5295,7 +5271,7 @@ fn motion_while_a_crossing_is_acknowledged_is_dropped_if_the_crossing_does_not_h
     let wiggle = |source: &mut SourceController, at: u64| {
         let moved = capture_on_route(
             source,
-            NormalizedInput::RelativeMotion(Point::new(30.0, 6.0)),
+            NormalizedInput::relative(Point::new(30.0, 6.0)),
             ms(at),
         );
         assert!(sent(&moved).is_empty());
@@ -5360,7 +5336,7 @@ fn motion_while_a_return_is_acknowledged_lands_on_this_screen() {
         let topology = scaled_pair(1.0, 2.0);
         let mut source =
             controlling_across_scales(topology, 1, Point::new(399.0, 50.0), Point::new(1.0, 0.0));
-        let onto = |counts: f64| NormalizedInput::RelativeMotion(Point::new(counts / 2.0, 0.0));
+        let onto = |counts: f64| NormalizedInput::relative(Point::new(counts, 0.0));
         capture_on_route(&mut source, onto(60.0), ms(1));
         capture_on_route(&mut source, onto(-66.0), ms(2));
         let release = if edge_return {
@@ -5371,8 +5347,7 @@ fn motion_while_a_return_is_acknowledged_lands_on_this_screen() {
         assert!(sends_release_all(&release));
         assert_eq!(source.motion_target(), None);
         for (delta, at) in [(Point::new(-30.0, 6.0), 4), (Point::new(-10.0, 0.0), 5)] {
-            let moved =
-                capture_on_route(&mut source, NormalizedInput::RelativeMotion(delta), ms(at));
+            let moved = capture_on_route(&mut source, NormalizedInput::relative(delta), ms(at));
             assert!(moved.effects.is_empty());
         }
         complete_return(&mut source, 1, ms(6))
@@ -5388,7 +5363,7 @@ fn motion_leaning_more_along_the_edge_than_half_its_push_never_crosses() {
         (1..=20).find(|record| {
             let moved = capture_on_route(
                 source,
-                NormalizedInput::RelativeMotion(Point::new(out, along)),
+                NormalizedInput::relative(Point::new(out, along)),
                 ms(10 * record),
             );
             sends_activation(&moved)
@@ -5489,7 +5464,7 @@ fn a_pause_in_the_push_starts_it_over() {
 #[test]
 fn sliding_along_the_edge_keeps_the_push() {
     let half = PUSH_THROUGH_DISTANCE / 2.0;
-    let along = |dx: f64, dy: f64| NormalizedInput::RelativeMotion(Point::new(dx, dy));
+    let along = |dx: f64, dy: f64| NormalizedInput::relative(Point::new(dx, dy));
     let mut local = source();
     rest_on_right_edge(&mut local, ms(0));
     assert!(
@@ -5823,4 +5798,465 @@ fn an_activation_carries_the_keyboard_switch_as_the_pointer_enters() {
             control_as_command: true,
         },
     );
+}
+
+/// Windows displays 1 and 3, side by side at 1.25 and 1.5 pixels a logical unit, and to their
+/// right the Mac's display 10, 400 by 100 points at 2x.
+fn mac_beside_two_windows_scales() -> Topology {
+    let windows = |id: u64, x: f64, scale: f64| {
+        let (width, height) = ((400.0 * scale) as u32, (100.0 * scale) as u32);
+        Display::new(
+            DisplayId(id),
+            device(1),
+            format!("windows-{id}"),
+            NativeSize::new(width, height),
+            LogicalSize::new(f64::from(width), f64::from(height)),
+            Point::new(x, 0.0),
+            scale,
+            None,
+            true,
+        )
+    };
+    let mac = Display::new(
+        DisplayId(10),
+        device(2),
+        "mac".into(),
+        NativeSize::new(800, 200),
+        LogicalSize::new(400.0, 100.0),
+        Point::new(0.0, 0.0),
+        2.0,
+        None,
+        true,
+    );
+    two_machine_topology(
+        vec![windows(1, 0.0, 1.25), windows(3, 500.0, 1.5), mac],
+        vec![
+            full_link(10, Edge::Left, 3, Edge::Right),
+            full_link(3, Edge::Right, 10, Edge::Left),
+            full_link(3, Edge::Left, 1, Edge::Right),
+            full_link(1, Edge::Right, 3, Edge::Left),
+        ],
+    )
+}
+
+/// Every pointer position a Mac source sends or restores through a push onto Windows, fractional
+/// motion, a clamp, a hop between Windows scales with motion in flight, and a push home.
+fn mac_source_stream() -> Vec<(u8, u64, u64)> {
+    static AT_SAME: AtomicI8 = AtomicI8::new(SAME);
+    let mut source = SourceController::new(
+        mac_beside_two_windows_scales(),
+        device(2),
+        DisplayId(10),
+        SessionEpoch::new(3).unwrap(),
+        3,
+        Duration::ZERO,
+    )
+    .unwrap()
+    .with_pointer_speed(&AT_SAME);
+    let mut stream = Vec::new();
+    let keep = |stream: &mut Vec<(u8, u64, u64)>, outcome: &SourceOutcome| {
+        assert_eq!(outcome.failure, None);
+        for effect in outcome.effects.iter() {
+            match effect {
+                SourceEffect::RemoteFrame(Frame {
+                    message: Message::Motion(Motion::Absolute(at)),
+                    ..
+                }) => stream.push((0, at.x.to_bits(), at.y.to_bits())),
+                SourceEffect::RemoteFrame(Frame {
+                    message:
+                        Message::ActivateDisplayAt {
+                            display_id,
+                            position,
+                            ..
+                        },
+                    ..
+                }) => stream.push((
+                    display_id.0 as u8,
+                    position.x.to_bits(),
+                    position.y.to_bits(),
+                )),
+                SourceEffect::RestoreLocalAt { position, .. } => {
+                    stream.push((99, position.x.to_bits(), position.y.to_bits()))
+                }
+                _ => {}
+            }
+        }
+    };
+    let feed = |stream: &mut Vec<(u8, u64, u64)>,
+                source: &mut SourceController,
+                dx: f64,
+                dy: f64,
+                at: u64| {
+        let event = NormalizedInput::relative(Point::new(dx, dy));
+        let outcome = capture_on_route(source, event, ms(at));
+        keep(stream, &outcome);
+        outcome
+    };
+    move_to(&mut source, Point::new(30.0, 41.5), ms(0));
+    move_to(&mut source, Point::new(0.25, 41.5), ms(0));
+    let crossed = feed(&mut stream, &mut source, -263.7, 0.0, 1);
+    assert!(sends_activation(&crossed));
+    let acknowledged = source.on_remote_frame(&activation_ack_for(4, 0, DisplayId(3)), ms(2));
+    let ticket = source.capture_route().1 + 1;
+    assert_eq!(
+        source
+            .bind_capture_route(route_request(&acknowledged), ticket, ms(2))
+            .failure,
+        None
+    );
+    let barrier = source.fresh_capture(
+        routed(
+            NormalizedInput::RouteChanged {
+                remote: true,
+                revision: ticket,
+            },
+            true,
+            ticket,
+        ),
+        ms(2),
+    );
+    assert_eq!(barrier.failure, None);
+    assert_eq!(source.mode(), SourceMode::Remote);
+    let wander = [
+        (-3.1, 0.7),
+        (-0.35, -1.9),
+        (-17.3, 2.25),
+        (5.5, -0.125),
+        (-0.1, 0.3),
+        (0.0, -200.0),
+        (-12.875, 3.3),
+        (-1.0 / 3.0, 7.0 / 9.0),
+    ];
+    for (index, (dx, dy)) in wander.into_iter().enumerate() {
+        feed(&mut stream, &mut source, dx, dy, 3 + index as u64);
+    }
+    let hop = feed(&mut stream, &mut source, -500.0, 0.6, 12);
+    assert!(sends_activation(&hop));
+    for (index, (dx, dy)) in [(-2.3, 1.1), (-0.7, -0.45), (-4.1, 2.2)]
+        .into_iter()
+        .enumerate()
+    {
+        feed(&mut stream, &mut source, dx, dy, 13 + index as u64);
+    }
+    let landed = source.on_remote_frame(&activation_ack_for(5, 0, DisplayId(1)), ms(16));
+    keep(&mut stream, &landed);
+    for (index, (dx, dy)) in [(-6.2, 0.9), (1.75, -2.6), (-0.05, 0.05), (-330.0, 0.0)]
+        .into_iter()
+        .enumerate()
+    {
+        feed(&mut stream, &mut source, dx, dy, 17 + index as u64);
+    }
+    stay_alive(&mut source, 3, ms(21));
+    let back = feed(&mut stream, &mut source, 900.0, -0.2, 30);
+    assert!(sends_activation(&back));
+    let landed = source.on_remote_frame(&activation_ack_for(6, 0, DisplayId(3)), ms(31));
+    keep(&mut stream, &landed);
+    feed(&mut stream, &mut source, -40.0, 0.0, 32);
+    feed(&mut stream, &mut source, 60.0, 0.0, 33);
+    let home = feed(&mut stream, &mut source, 263.7, 0.0, 34);
+    assert!(sends_release_all(&home));
+    let restore = source.on_remote_frame(
+        &Frame::new(SessionEpoch::new(6).unwrap(), 1, Message::ReleaseAck),
+        ms(35),
+    );
+    keep(&mut stream, &restore);
+    stream
+}
+
+/// [`mac_source_stream`] as the build before Windows ballistics produced it: the activated
+/// display, or 0 for a motion and 99 for the local restore, and each coordinate's bits.
+const MAC_SOURCE_STREAM_BEFORE: [(u8, u64, u64); 20] = [
+    (3, 0x4090d9cccccccccd, 0x404f200000000000),
+    (0, 0x4090c73333333333, 0x404fa66666666666),
+    (0, 0x4090c51999999999, 0x404e399999999999),
+    (0, 0x40905d4ccccccccc, 0x404fe99999999999),
+    (0, 0x40907e4ccccccccc, 0x404fd19999999999),
+    (0, 0x40907db333333332, 0x4050059999999999),
+    (0, 0x40907db333333332, 0x0000000000000000),
+    (0, 0x4090307333333332, 0x4013cccccccccccc),
+    (0, 0x40902e7333333332, 0x4018777777777777),
+    (1, 0x407f300000000000, 0x4017638e38e38e38),
+    (0, 0x40713bccccccccc8, 0x4022d1c71c71c71c),
+    (0, 0x4070bfccccccccc8, 0x402511c71c71c71c),
+    (0, 0x4070e2ccccccccc8, 0x401d238e38e38e38),
+    (0, 0x4070e1ccccccccc8, 0x401d638e38e38e38),
+    (0, 0x0000000000000000, 0x401d638e38e38e38),
+    (3, 0x407f500000000000, 0x4021088888888888),
+    (0, 0x40912fffffffffff, 0x4021088888888888),
+    (0, 0x40903fffffffffff, 0x4021088888888888),
+    (0, 0x40912fffffffffff, 0x4021088888888888),
+    (99, 0x402d666666666660, 0x4016b60b60b60b60),
+];
+
+#[test]
+fn a_mac_source_at_the_same_speed_sends_exactly_what_it_did_before() {
+    assert_eq!(mac_source_stream(), MAC_SOURCE_STREAM_BEFORE);
+}
+
+/// Raw counts that each move `gain` DIPs on another computer.
+fn counts(dx: f64, dy: f64, gain: f64) -> NormalizedInput {
+    NormalizedInput::RelativeMotion {
+        delta: Point::new(dx, dy),
+        gain,
+    }
+}
+
+/// A Windows source at the pointer speed `step` holds, resting on display 1's seam in
+/// [`scaled_pair`] with a Mac at `mac_scale`, before any relative travel pushes.
+fn on_the_seam_at(mac_scale: f64, step: &'static AtomicI8) -> SourceController {
+    scaled_source(scaled_pair(1.0, mac_scale), 1, Point::new(399.0, 50.0)).with_pointer_speed(step)
+}
+
+#[test]
+fn the_full_push_crosses_at_every_pointer_speed_and_one_count_less_never_does() {
+    static STEP: AtomicI8 = AtomicI8::new(SAME);
+    for step in [MIN_STEP, MAX_STEP] {
+        STEP.store(step, Ordering::Release);
+        for gain in [0.455, 1.0, 3.5] {
+            let label = format!("step {step}, {gain} DIPs a count");
+            // Out: one count short holds, and the count that completes the full push crosses at
+            // the entry with nothing carried past it.
+            let mut source = on_the_seam_at(2.0, &STEP);
+            let short = counts(PUSH_THROUGH_DISTANCE - 1.0, 0.0, gain);
+            assert!(
+                capture_on_route(&mut source, short, ms(1))
+                    .effects
+                    .is_empty(),
+                "{label}"
+            );
+            let full = capture_on_route(&mut source, counts(1.0, 0.0, gain), ms(2));
+            assert_eq!(
+                activation(&full),
+                Some((DisplayId(2), Point::new(1.0, 50.0))),
+                "{label}"
+            );
+            // Home the same way, from back on the seam past the entry guard.
+            complete_activation(&mut source, DisplayId(2), ms(3));
+            capture_on_route(&mut source, counts(150.0, 0.0, gain), ms(4));
+            capture_on_route(&mut source, counts(-160.0, 0.0, gain), ms(5));
+            let short = counts(1.0 - PUSH_THROUGH_DISTANCE, 0.0, gain);
+            assert!(
+                !sends_release_all(&capture_on_route(&mut source, short, ms(6))),
+                "{label}"
+            );
+            let full = capture_on_route(&mut source, counts(-1.0, 0.0, gain), ms(7));
+            assert!(sends_release_all(&full), "{label}");
+            assert_eq!(
+                complete_return(&mut source, 1, ms(8)),
+                (DisplayId(1), Point::new(399.0, 50.0)),
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_new_pointer_speed_moves_the_next_motion_without_a_jump_or_a_click() {
+    static STEP: AtomicI8 = AtomicI8::new(SAME);
+    let mut source = on_the_seam_at(2.0, &STEP);
+    assert!(sends_activation(&push_through(
+        &mut source,
+        Point::new(1.0, 0.0),
+        ms(0)
+    )));
+    complete_activation(&mut source, DisplayId(2), ms(0));
+    let mut messages = Vec::new();
+    let mut nudge = |source: &mut SourceController, at: u64| {
+        let outcome = capture_on_route(source, counts(20.0, 0.0, 0.5), ms(at));
+        assert_eq!(outcome.failure, None);
+        messages.extend(sent(&outcome));
+        moved_to(&outcome)
+    };
+    // 20 counts at half a DIP are 10 points on a 2x Mac, then twice that, half that, and 10 again.
+    assert_eq!(nudge(&mut source, 1), Some(Point::new(11.0, 50.0)));
+    STEP.store(MAX_STEP, Ordering::Release);
+    assert_eq!(nudge(&mut source, 2), Some(Point::new(31.0, 50.0)));
+    STEP.store(MIN_STEP, Ordering::Release);
+    assert_eq!(nudge(&mut source, 3), Some(Point::new(36.0, 50.0)));
+    STEP.store(SAME, Ordering::Release);
+    assert_eq!(nudge(&mut source, 4), Some(Point::new(46.0, 50.0)));
+    assert_eq!(messages.len(), 4);
+    assert!(
+        messages
+            .iter()
+            .all(|message| matches!(message, Message::Motion(Motion::Absolute(_)))),
+        "{messages:?}"
+    );
+    assert_eq!(source.mode(), SourceMode::Remote);
+}
+
+#[test]
+fn at_half_speed_small_motions_add_up_exactly() {
+    static STEP: AtomicI8 = AtomicI8::new(MIN_STEP);
+    let mut source = on_the_seam_at(1.0, &STEP);
+    assert!(sends_activation(&push_through(
+        &mut source,
+        Point::new(1.0, 0.0),
+        ms(0)
+    )));
+    complete_activation(&mut source, DisplayId(2), ms(0));
+    // A count at a quarter DIP moves an eighth of a point at half speed, every one of them.
+    for record in 1..=40_u32 {
+        let eighths = f64::from(record) / 8.0;
+        assert_eq!(
+            moved_to(&capture_on_route(
+                &mut source,
+                counts(1.0, -1.0, 0.25),
+                ms(u64::from(record))
+            )),
+            Some(Point::new(1.0 + eighths, 50.0 - eighths))
+        );
+    }
+}
+
+/// This Windows computer's display 1 at 1.25x, and to its right another Windows computer's
+/// displays 2 at 1x and 3 at 1.5x, side by side; each is 400 by 100 DIPs.
+fn windows_beside_two_windows_scales() -> Topology {
+    let display = |id: u64, machine: u8, x: f64, scale: f64| {
+        let (width, height) = ((400.0 * scale) as u32, (100.0 * scale) as u32);
+        Display::new(
+            DisplayId(id),
+            device(machine),
+            format!("display-{id}"),
+            NativeSize::new(width, height),
+            LogicalSize::new(f64::from(width), f64::from(height)),
+            Point::new(x, 0.0),
+            scale,
+            None,
+            true,
+        )
+    };
+    Topology::new(
+        vec![
+            Machine::new(device(1), Platform::Windows),
+            Machine::new(device(2), Platform::Windows),
+        ],
+        vec![
+            display(1, 1, 0.0, 1.25),
+            display(2, 2, 0.0, 1.0),
+            display(3, 2, 400.0, 1.5),
+        ],
+        vec![
+            full_link(1, Edge::Right, 2, Edge::Left),
+            full_link(2, Edge::Left, 1, Edge::Right),
+            full_link(2, Edge::Right, 3, Edge::Left),
+            full_link(3, Edge::Left, 2, Edge::Right),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_dip_is_each_windows_displays_scale_in_pixels() {
+    static STEP: AtomicI8 = AtomicI8::new(SAME);
+    let mut source = scaled_source(
+        windows_beside_two_windows_scales(),
+        1,
+        Point::new(499.0, 62.5),
+    )
+    .with_pointer_speed(&STEP);
+    // 10 counts past the full push at half a DIP enter display 2, at 1x, 5 px in.
+    let crossing = capture_on_route(
+        &mut source,
+        counts(PUSH_THROUGH_DISTANCE + 10.0, 0.0, 0.5),
+        ms(1),
+    );
+    assert_eq!(
+        activation(&crossing),
+        Some((DisplayId(2), Point::new(6.0, 50.0)))
+    );
+    complete_activation(&mut source, DisplayId(2), ms(1));
+    assert_eq!(source.motion_target().unwrap().per_logical_unit(), 1.0);
+    let step = |source: &mut SourceController, at: u64| {
+        moved_to(&capture_on_route(source, counts(20.0, 0.0, 0.5), ms(at))).unwrap()
+    };
+    let first = step(&mut source, 2);
+    assert_eq!(step(&mut source, 3).x - first.x, 10.0);
+    // On across the other computer's own boundary onto display 3, at 1.5x.
+    assert!(sends_activation(&capture_on_route(
+        &mut source,
+        counts(800.0, 0.0, 0.5),
+        ms(4)
+    )));
+    let landed = source.on_remote_frame(&activation_ack_for(5, 0, DisplayId(3)), ms(5));
+    assert_eq!(landed.failure, None);
+    assert_eq!(source.motion_target().unwrap().per_logical_unit(), 1.5);
+    let first = step(&mut source, 6);
+    assert_eq!(step(&mut source, 7).x - first.x, 15.0);
+
+    // An absolute push from this computer's 1.25x display carries its pixels past the full push
+    // on as DIPs: 9 px are 7.2 DIPs, which display 2 shows 1:1.
+    let mut pushed = scaled_source(
+        windows_beside_two_windows_scales(),
+        1,
+        Point::new(499.0, 62.5),
+    )
+    .with_pointer_speed(&STEP);
+    let crossing = capture_on_route(
+        &mut pushed,
+        NormalizedInput::AbsoluteMotion(Point::new(500.0 + PUSH_THROUGH_DISTANCE + 9.0, 62.5)),
+        ms(1),
+    );
+    let (display, entry) = activation(&crossing).expect("the push crosses");
+    assert_eq!(display, DisplayId(2));
+    assert!((entry.x - 8.2).abs() < 1e-9, "{entry:?}");
+}
+
+#[test]
+fn extreme_motion_and_out_of_range_speeds_keep_the_session_and_the_pointer_on_the_display() {
+    static STEP: AtomicI8 = AtomicI8::new(SAME);
+    let mut source = on_the_seam_at(2.0, &STEP);
+    assert!(sends_activation(&push_through(
+        &mut source,
+        Point::new(1.0, 0.0),
+        ms(0)
+    )));
+    complete_activation(&mut source, DisplayId(2), ms(0));
+    let mut at = 1;
+    for step in [i8::MIN, MIN_STEP, SAME, MAX_STEP, i8::MAX] {
+        STEP.store(step, Ordering::Release);
+        for gain in [0.0, f64::MIN_POSITIVE, 1.0, 1e9] {
+            // Every direction but the seam's, which a push would cross.
+            for (dx, dy) in [
+                (1e9, 1e9),
+                (1e9, -1e9),
+                (0.0, 1e9),
+                (1e-9, -1e-9),
+                (1.0, 0.0),
+            ] {
+                let outcome = capture_on_route(&mut source, counts(dx, dy, gain), ms(at));
+                at += 1;
+                assert_eq!(outcome.failure, None, "step {step}, gain {gain}");
+                if let Some(point) = moved_to(&outcome) {
+                    assert!(
+                        (0.0..400.0).contains(&point.x) && (0.0..100.0).contains(&point.y),
+                        "{point:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(source.mode(), SourceMode::Remote);
+    // A speed out of range moves as the nearest step does.
+    STEP.store(i8::MIN, Ordering::Release);
+    let slowest = moved_to(&capture_on_route(
+        &mut source,
+        counts(-4.0, 0.0, 1.0),
+        ms(at),
+    ));
+    STEP.store(MIN_STEP, Ordering::Release);
+    let slow = moved_to(&capture_on_route(
+        &mut source,
+        counts(-4.0, 0.0, 1.0),
+        ms(at + 1),
+    ));
+    assert_eq!(slow.unwrap().x - slowest.unwrap().x, -2.0);
+    // A pointer that cannot move still pushes home with the hand, once the wild headings fade.
+    capture_on_route(&mut source, counts(-1e9, 0.0, 1.0), ms(at + 150));
+    let home = capture_on_route(
+        &mut source,
+        counts(-PUSH_THROUGH_DISTANCE, 0.0, 0.0),
+        ms(at + 151),
+    );
+    assert!(sends_release_all(&home));
 }

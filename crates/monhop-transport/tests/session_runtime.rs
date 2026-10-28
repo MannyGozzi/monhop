@@ -321,7 +321,7 @@ impl Coordinator {
     }
     /// One full distance more along the unit `along`.
     fn press(&mut self, along: Point) -> Vec<Frame> {
-        self.input(NormalizedInput::RelativeMotion(Point::new(
+        self.input(NormalizedInput::relative(Point::new(
             along.x * PUSH_THROUGH_DISTANCE,
             along.y * PUSH_THROUGH_DISTANCE,
         )))
@@ -493,7 +493,7 @@ fn stale_generation_motion_never_crosses() {
     let c = &mut p.computers[0];
     c.source.observe_pointer(Point::new(99.0, 50.0), ms(0));
     let record = TaggedInput {
-        event: NormalizedInput::RelativeMotion(Point::new(PUSH_THROUGH_DISTANCE, 0.0)),
+        event: NormalizedInput::relative(Point::new(PUSH_THROUGH_DISTANCE, 0.0)),
         routing_revision: 0,
         remote: false,
         floor_generation: 0,
@@ -579,7 +579,7 @@ fn reanchor_allowed_while_sending_and_receiving() {
     let a = p.computers[0].floor.snapshot();
     let b = p.computers[1].floor.snapshot();
     // Going on past the bottom of the other computer's display moves to its display below.
-    p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
+    p.input(0, NormalizedInput::relative(Point::new(0.0, 100.0)));
     p.pump();
     assert_eq!(p.computers[0].floor.snapshot(), a);
     assert_eq!(p.computers[1].floor.snapshot(), b);
@@ -608,7 +608,7 @@ fn take_back_during_reanchor_applies_on_remote() {
     let mut p = Pair::new();
     p.cross(0);
     p.pump();
-    p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
+    p.input(0, NormalizedInput::relative(Point::new(0.0, 100.0)));
     // Capture takes back before the destination consumes the already queued reanchor.
     p.take_back(1);
     let take = p.pipe.pop_back().unwrap();
@@ -711,7 +711,7 @@ fn crossings_rearm_from_fresh_poll_after_free() {
     p.pump();
     let c = &mut p.computers[1];
     let record = TaggedInput {
-        event: NormalizedInput::RelativeMotion(Point::new(5.0, 0.0)),
+        event: NormalizedInput::relative(Point::new(5.0, 0.0)),
         routing_revision: 0,
         remote: false,
         floor_generation: old,
@@ -870,7 +870,7 @@ fn sub_point_motion_accumulates_at_the_peer() {
     };
     let start = last_move(&p);
     for _ in 0..4 {
-        p.input(0, NormalizedInput::RelativeMotion(Point::new(0.25, -0.125)));
+        p.input(0, NormalizedInput::relative(Point::new(0.25, -0.125)));
         p.pump();
     }
     let end = last_move(&p);
@@ -1117,7 +1117,7 @@ fn a_take_back_delayed_past_a_reanchor_and_a_hold_is_ignored() {
     let mut p = Pair::new();
     p.cross(0);
     p.pump();
-    p.input(0, NormalizedInput::RelativeMotion(Point::new(0.0, 100.0)));
+    p.input(0, NormalizedInput::relative(Point::new(0.0, 100.0)));
     // The peer takes back in the old epoch; a stall delays its TakeBack past the reanchor.
     p.take_back(1);
     let (to, late) = p.pipe.pop_back().unwrap();

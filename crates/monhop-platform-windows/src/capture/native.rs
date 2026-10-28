@@ -17,6 +17,7 @@ use std::{
 use monhop_core::{
     CapturePermit, FloorState, MouseButton, NativeSessionClaim, Point, RevocationSignal,
     TakeBackGate,
+    pointer_ballistics::{Ballistics, MAX_MERGED_REPORTS},
 };
 use windows_sys::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -493,6 +494,11 @@ struct CallbackState {
     unsupported_presses_seen: [bool; 256],
     /// Presses held since capture start that the previous recheck trusted as up.
     read_up_last_time: Vec<HeldInput>,
+    /// The user's pointer settings, read at capture start and at each crossing onto another
+    /// computer.
+    ballistics: Ballistics,
+    /// Physical hook moves since the last raw motion: the reports a coalesced message merged.
+    moves_since_raw: u32,
 }
 
 #[derive(Default)]
@@ -753,6 +759,7 @@ impl CallbackState {
         let DecodedInput::Event(event @ CaptureEvent::AbsoluteMotion { x, y }) = decoded else {
             return self.decoded(decoded);
         };
+        self.moves_since_raw = self.moves_since_raw.saturating_add(1);
         let receiving = self
             .take_back
             .as_ref()
@@ -853,9 +860,14 @@ impl CallbackState {
         }
         // WM_INPUT arrives too late to withhold; hook_mouse withholds the same movement.
         if mouse.lLastX != 0 || mouse.lLastY != 0 {
+            let reports = std::mem::take(&mut self.moves_since_raw).clamp(1, MAX_MERGED_REPORTS);
+            let gain =
+                self.ballistics
+                    .gain(f64::from(mouse.lLastX), f64::from(mouse.lLastY), reports);
             self.event(CaptureEvent::RelativeMotion {
                 dx: mouse.lLastX,
                 dy: mouse.lLastY,
+                gain,
             });
         }
     }
@@ -1405,6 +1417,7 @@ fn run(
     ownership: &mut RawCaptureOwnership,
 ) -> Result<(), NativeCaptureError> {
     CALLBACK_STOP.with(|slot| *slot.borrow_mut() = Some(shared.stop.clone()));
+    let ballistics = crate::pointer_settings::read();
     CALLBACK.with(|slot| {
         *slot.borrow_mut() = Some(CallbackState {
             shared: shared.clone(),
@@ -1418,6 +1431,8 @@ fn run(
             unsupported_presses_seen: [false; 256],
             read_up_last_time: Vec::new(),
             press_revision: 0,
+            ballistics,
+            moves_since_raw: 0,
         })
     });
     if let Some(error) = startup_environment_error(ordinary_desktop_is_active()) {
@@ -1495,6 +1510,14 @@ fn run(
             last_ownership_check = now;
         }
         if let Some((revision, command)) = command {
+            if matches!(command, CaptureCommand::ActivateRemote { .. }) {
+                // Read here, before the remote barrier, so every remote record moves with them.
+                let ballistics = crate::pointer_settings::read();
+                with_callback(|state| {
+                    state.ballistics = ballistics;
+                    false
+                });
+            }
             let mut completion = ControlCompletion::Failed;
             if !shared.stop.is_stopped() {
                 completion = apply_control(revision, command);
@@ -1901,6 +1924,8 @@ mod tests {
                 unsupported_presses_seen: [false; 256],
                 read_up_last_time: Vec::new(),
                 press_revision: 0,
+                ballistics: Ballistics::default(),
+                moves_since_raw: 0,
             },
             consumer,
         )
@@ -1976,8 +2001,69 @@ mod tests {
         state.raw_mouse(&raw_motion(true, 0));
         assert!(matches!(
             consumer.try_pop().unwrap(),
-            Some(CaptureEvent::RelativeMotion { dx: 7, dy: -3 })
+            Some(CaptureEvent::RelativeMotion { dx: 7, dy: -3, .. })
         ));
+    }
+
+    /// The gain `raw_mouse` gave a 7, -3 count sample after `hook_moves` physical hook moves.
+    fn gain_after(
+        state: &mut CallbackState,
+        consumer: &mut CaptureConsumer,
+        hook_moves: u32,
+    ) -> f64 {
+        for x in 0..hook_moves {
+            state.hook_mouse(physical_move(x as i32), || None);
+        }
+        state.raw_mouse(&raw_motion(true, 0));
+        std::iter::from_fn(|| consumer.try_pop().unwrap())
+            .find_map(|event| match event {
+                CaptureEvent::RelativeMotion { gain, .. } => Some(gain),
+                _ => None,
+            })
+            .expect("raw motion is forwarded")
+    }
+
+    #[test]
+    fn a_coalesced_raw_sample_counts_the_hook_moves_it_merged() {
+        let (mut state, mut consumer) = callback_fixture();
+        let windows = Ballistics::default();
+        assert_eq!(
+            gain_after(&mut state, &mut consumer, 0),
+            windows.gain(7.0, -3.0, 1)
+        );
+        assert_eq!(
+            gain_after(&mut state, &mut consumer, 1),
+            windows.gain(7.0, -3.0, 1)
+        );
+        assert_eq!(
+            gain_after(&mut state, &mut consumer, 8),
+            windows.gain(7.0, -3.0, 8)
+        );
+        // The count starts over at each raw sample and never runs past the cap.
+        assert_eq!(
+            gain_after(&mut state, &mut consumer, 0),
+            windows.gain(7.0, -3.0, 1)
+        );
+        assert_eq!(
+            gain_after(&mut state, &mut consumer, 100),
+            windows.gain(7.0, -3.0, MAX_MERGED_REPORTS)
+        );
+        // An unsourced sample leaves the count to the motion it precedes.
+        state.hook_mouse(physical_move(1), || None);
+        state.hook_mouse(physical_move(2), || None);
+        state.raw_mouse(&raw_motion(false, 0));
+        assert_eq!(
+            gain_after(&mut state, &mut consumer, 1),
+            windows.gain(7.0, -3.0, 3)
+        );
+        assert_eq!(state.shared.stop.reason(), None);
+    }
+
+    #[test]
+    fn raw_motion_moves_with_the_settings_capture_holds() {
+        let (mut state, mut consumer) = callback_fixture();
+        state.ballistics = Ballistics::new(false, 6, None, None, 1.0);
+        assert_eq!(gain_after(&mut state, &mut consumer, 0), 0.5);
     }
 
     #[test]

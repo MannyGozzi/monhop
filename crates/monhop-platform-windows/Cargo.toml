@@ -12,6 +12,10 @@ name = "windows_native_window"
 path = "examples/native_window.rs"
 test = true
 
+[[example]]
+name = "windows_pointer_ballistics"
+path = "examples/pointer_ballistics.rs"
+
 [dependencies]
 monhop-core = { path = "../monhop-core", version = "=0.2.15" }
 log = "=0.4.34"

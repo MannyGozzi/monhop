@@ -6,12 +6,11 @@ use crate::{
     session_clock::SessionClock,
     session_native::{MAC_POINTS_PER_DETENT, WINDOWS_UNITS_PER_DETENT},
     session_source::{
-        MotionTarget, NormalizedInput, SourceController, SourceEffect, SourceEffects,
-        SourceOutcome, TaggedInput,
+        NormalizedInput, SourceController, SourceEffect, SourceEffects, SourceOutcome, TaggedInput,
     },
 };
 use monhop_core::{
-    Platform, Point, PointerGesture,
+    Point, PointerGesture,
     capture::{CaptureEvent, CapturedEvent, MAX_SUPPRESSION_TTL, StopReason},
     capture_physical::HeldInput,
 };
@@ -378,10 +377,9 @@ pub(crate) fn renew_lease<C: CaptureControl>(
     }
 }
 
-pub(crate) fn normalize(
-    record: CapturedEvent,
-    target: Option<MotionTarget>,
-) -> Result<Option<TaggedInput>, SessionFailure> {
+/// Relative motion stays in the mouse's own units: the source controller converts it for the
+/// display it lands on.
+pub(crate) fn normalize(record: CapturedEvent) -> Result<Option<TaggedInput>, SessionFailure> {
     let event = match record.event {
         CaptureEvent::Key {
             usage,
@@ -418,11 +416,12 @@ pub(crate) fn normalize(
             }
             NormalizedInput::AbsoluteMotion(Point::new(x, y))
         }
-        CaptureEvent::RelativeMotion { dx, dy } => {
-            relative(Platform::Windows, f64::from(dx), f64::from(dy), target)?
-        }
+        CaptureEvent::RelativeMotion { dx, dy, gain } => NormalizedInput::RelativeMotion {
+            delta: Point::new(f64::from(dx), f64::from(dy)),
+            gain,
+        },
         CaptureEvent::LogicalRelativeMotion { dx, dy } => {
-            relative(Platform::MacOs, dx, dy, target)?
+            NormalizedInput::relative(Point::new(dx, dy))
         }
         CaptureEvent::Scroll {
             horizontal,
@@ -452,45 +451,17 @@ pub(crate) fn normalize(
     }))
 }
 
-/// Relative motion a `source` computer captured, onto `target`'s display, or in the mouse's own
-/// units while no route is settled so the source can carry it into the one it settles on.
-fn relative(
-    source: Platform,
-    dx: f64,
-    dy: f64,
-    target: Option<MotionTarget>,
-) -> Result<NormalizedInput, SessionFailure> {
-    let per_unit = target.map_or(1.0, |target| target.per_captured_unit(source));
-    if !per_unit.is_finite() || per_unit <= 0.0 {
-        return Err(SessionFailure::InvalidLayout);
-    }
-    Ok(NormalizedInput::RelativeMotion(Point::new(
-        dx * per_unit,
-        dy * per_unit,
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn normalization_preserves_floor_generation_and_redacted_routing() {
-        let record = normalize(
-            CapturedEvent {
-                event: CaptureEvent::LogicalRelativeMotion { dx: 1.0, dy: 2.0 },
-                routing_revision: 7,
-                remote: true,
-                floor_generation: 42,
-            },
-            Some(MotionTarget {
-                target: monhop_core::PointerTarget::new(
-                    monhop_core::DeviceId([1; 16]),
-                    monhop_core::DisplayId(1),
-                ),
-                platform: Platform::MacOs,
-                scale_factor: 2.0,
-            }),
-        )
+        let record = normalize(CapturedEvent {
+            event: CaptureEvent::LogicalRelativeMotion { dx: 1.0, dy: 2.0 },
+            routing_revision: 7,
+            remote: true,
+            floor_generation: 42,
+        })
         .unwrap()
         .unwrap();
         assert_eq!(record.floor_generation, 42);
@@ -498,56 +469,53 @@ mod tests {
         assert!(record.remote);
         assert_eq!(
             record.event,
-            NormalizedInput::RelativeMotion(Point::new(1.0, 2.0))
+            NormalizedInput::relative(Point::new(1.0, 2.0))
         );
     }
     #[test]
-    fn relative_motion_converts_onto_its_target_or_keeps_the_mouses_units_without_one() {
-        let counts = |target: Option<MotionTarget>| {
-            normalize(
-                CapturedEvent {
-                    event: CaptureEvent::RelativeMotion { dx: 6, dy: -4 },
-                    routing_revision: 1,
-                    remote: false,
-                    floor_generation: 1,
-                },
-                target,
-            )
+    fn relative_motion_keeps_the_mouses_units_and_the_logical_distance_each_moves() {
+        let normalized = |event| {
+            normalize(CapturedEvent {
+                event,
+                routing_revision: 1,
+                remote: true,
+                floor_generation: 1,
+            })
             .unwrap()
             .unwrap()
             .event
         };
-        let retina_mac = MotionTarget {
-            target: monhop_core::PointerTarget::new(
-                monhop_core::DeviceId([2; 16]),
-                monhop_core::DisplayId(2),
-            ),
-            platform: Platform::MacOs,
-            scale_factor: 2.0,
-        };
         assert_eq!(
-            counts(Some(retina_mac)),
-            NormalizedInput::RelativeMotion(Point::new(3.0, -2.0))
+            normalized(CaptureEvent::RelativeMotion {
+                dx: 6,
+                dy: -4,
+                gain: 0.75,
+            }),
+            NormalizedInput::RelativeMotion {
+                delta: Point::new(6.0, -4.0),
+                gain: 0.75,
+            }
         );
+        // Mac points are logical already.
         assert_eq!(
-            counts(None),
-            NormalizedInput::RelativeMotion(Point::new(6.0, -4.0))
+            normalized(CaptureEvent::LogicalRelativeMotion { dx: 0.5, dy: -1.25 }),
+            NormalizedInput::RelativeMotion {
+                delta: Point::new(0.5, -1.25),
+                gain: 1.0,
+            }
         );
     }
     #[test]
     fn high_resolution_scroll_preserves_fraction_and_direction() {
-        let record = normalize(
-            CapturedEvent {
-                event: CaptureEvent::Scroll {
-                    horizontal: 30,
-                    vertical: -1,
-                },
-                routing_revision: 0,
-                remote: false,
-                floor_generation: 1,
+        let record = normalize(CapturedEvent {
+            event: CaptureEvent::Scroll {
+                horizontal: 30,
+                vertical: -1,
             },
-            None,
-        )
+            routing_revision: 0,
+            remote: false,
+            floor_generation: 1,
+        })
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -557,18 +525,15 @@ mod tests {
                 vertical: -1.0 / 120.0
             }
         );
-        let record = normalize(
-            CapturedEvent {
-                event: CaptureEvent::LogicalScroll {
-                    horizontal: 10.0,
-                    vertical: -0.5,
-                },
-                routing_revision: 0,
-                remote: false,
-                floor_generation: 1,
+        let record = normalize(CapturedEvent {
+            event: CaptureEvent::LogicalScroll {
+                horizontal: 10.0,
+                vertical: -0.5,
             },
-            None,
-        )
+            routing_revision: 0,
+            remote: false,
+            floor_generation: 1,
+        })
         .unwrap()
         .unwrap();
         assert_eq!(
@@ -582,15 +547,12 @@ mod tests {
     #[test]
     fn captured_gestures_normalize_to_the_semantic_they_carry() {
         let normalized = |event| {
-            normalize(
-                CapturedEvent {
-                    event,
-                    routing_revision: 2,
-                    remote: true,
-                    floor_generation: 1,
-                },
-                None,
-            )
+            normalize(CapturedEvent {
+                event,
+                routing_revision: 2,
+                remote: true,
+                floor_generation: 1,
+            })
             .unwrap()
             .unwrap()
             .event
@@ -613,15 +575,12 @@ mod tests {
     #[test]
     fn remote_absolute_samples_cannot_duplicate_relative_motion() {
         assert!(
-            normalize(
-                CapturedEvent {
-                    event: CaptureEvent::AbsoluteMotion { x: 10, y: 20 },
-                    routing_revision: 3,
-                    remote: true,
-                    floor_generation: 3
-                },
-                None
-            )
+            normalize(CapturedEvent {
+                event: CaptureEvent::AbsoluteMotion { x: 10, y: 20 },
+                routing_revision: 3,
+                remote: true,
+                floor_generation: 3
+            })
             .unwrap()
             .is_none()
         );
@@ -661,6 +620,7 @@ mod tests {
     fn group_topology() -> monhop_core::Topology {
         use monhop_core::{
             Display, DisplayId, Edge, EdgeLink, LogicalSize, Machine, NativeSize, NormalizedSpan,
+            Platform,
         };
         let full = NormalizedSpan::new(0.0, 1.0).unwrap();
         let link = |from: u8, from_edge, to: u8, to_edge| {
@@ -904,7 +864,7 @@ mod tests {
     }
 
     fn moved(dx: f64) -> NormalizedInput {
-        NormalizedInput::RelativeMotion(Point::new(dx, 0.0))
+        NormalizedInput::relative(Point::new(dx, 0.0))
     }
 
     #[test]

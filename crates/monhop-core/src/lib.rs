@@ -12,6 +12,7 @@ pub mod gesture_latch;
 pub mod input;
 pub mod ownership;
 pub mod pointer;
+pub mod pointer_ballistics;
 pub mod pointer_mark;
 pub mod pointer_speed;
 pub mod revocation;

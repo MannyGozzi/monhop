@@ -438,7 +438,7 @@ impl PhysicalCapture {
                 | CaptureEvent::SystemGesture(_) => true,
                 // A phase boundary without a change is not deliberate: it may end a local glide.
                 CaptureEvent::Gesture { kind, value, .. } => kind.is_discrete() || value != 0.0,
-                CaptureEvent::RelativeMotion { dx, dy } => self.motion.reaches_threshold(
+                CaptureEvent::RelativeMotion { dx, dy, .. } => self.motion.reaches_threshold(
                     floor.generation,
                     now,
                     f64::from(dx),
@@ -846,7 +846,7 @@ mod tests {
     }
 
     fn relative(dx: i32, dy: i32) -> CaptureEvent {
-        CaptureEvent::RelativeMotion { dx, dy }
+        CaptureEvent::RelativeMotion { dx, dy, gain: 1.0 }
     }
 
     fn button(pressed: bool) -> CaptureEvent {

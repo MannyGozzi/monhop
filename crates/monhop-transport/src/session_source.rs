@@ -23,6 +23,7 @@ use monhop_core::{
     PointerGesture, PointerOwnership, PointerTarget, SharedFloor, SystemGesture, Topology,
     TransitionAcknowledgement,
     clicks::{ClickCounter, SINGLE_CLICK},
+    pointer_speed,
 };
 use monhop_protocol::{
     Button, DeclineReason, Frame, Key, MAX_LOGICAL_ORIGIN_ABS, Message, Motion, RateLimiter,
@@ -83,14 +84,14 @@ pub const PUSH_THROUGH_LOGGED: Duration = Duration::from_millis(50);
 
 /// A platform event converted into source-controller units.
 ///
-/// `AbsoluteMotion` is a topology logical position. `RelativeMotion` is a logical delta in the
-/// target display's coordinate system, or in the capturing mouse's own units while
-/// [`SourceController::motion_target`] is `None`. Adapters convert physical desktop pixels and raw
-/// counts before constructing this type. Scroll is in signed wheel detents: positive horizontal is right
-/// and positive vertical is up. Windows adapters divide 120-unit detents, while macOS adapters
-/// divide 40-point detents after their horizontal inversion; both preserve fractional values.
-/// A `Button` keeps the capture clock reading it was stamped with when captured. Gestures are
-/// forwarded only while remote and never count as pointer motion.
+/// `AbsoluteMotion` is a topology logical position. `RelativeMotion` is a delta in the capturing
+/// mouse's own units, Windows raw counts or Mac points, which move as they are on this computer;
+/// on another, each moves `gain` logical units (DIPs, one Mac point each). Adapters convert
+/// physical desktop pixels before constructing this type. Scroll is in signed wheel detents:
+/// positive horizontal is right and positive vertical is up. Windows adapters divide 120-unit
+/// detents, while macOS adapters divide 40-point detents after their horizontal inversion; both
+/// preserve fractional values. A `Button` keeps the capture clock reading it was stamped with
+/// when captured. Gestures are forwarded only while remote and never count as pointer motion.
 #[derive(Clone, Copy, PartialEq)]
 pub enum NormalizedInput {
     Key {
@@ -105,7 +106,10 @@ pub enum NormalizedInput {
         at: Duration,
     },
     AbsoluteMotion(Point),
-    RelativeMotion(Point),
+    RelativeMotion {
+        delta: Point,
+        gain: f64,
+    },
     Scroll {
         horizontal: f64,
         vertical: f64,
@@ -125,7 +129,7 @@ impl fmt::Debug for NormalizedInput {
             Self::Key { .. } => "Key",
             Self::Button { .. } => "Button",
             Self::AbsoluteMotion(_) => "AbsoluteMotion",
-            Self::RelativeMotion(_) => "RelativeMotion",
+            Self::RelativeMotion { .. } => "RelativeMotion",
             Self::Scroll { .. } => "Scroll",
             Self::Gesture(_) => "Gesture",
             Self::SystemGesture(_) => "SystemGesture",
@@ -136,11 +140,19 @@ impl fmt::Debug for NormalizedInput {
 }
 
 impl NormalizedInput {
+    /// Relative motion in units that are already logical, as a Mac's points are.
+    pub const fn relative(delta: Point) -> Self {
+        Self::RelativeMotion { delta, gain: 1.0 }
+    }
+
     fn is_valid(self) -> bool {
         match self {
             Self::Key { usage, .. } => usage.is_valid(),
             Self::Button { .. } => true,
-            Self::AbsoluteMotion(point) | Self::RelativeMotion(point) => valid_point(point),
+            Self::AbsoluteMotion(point) => valid_point(point),
+            Self::RelativeMotion { delta, gain } => {
+                valid_point(delta) && gain.is_finite() && gain >= 0.0
+            }
             Self::Scroll {
                 horizontal,
                 vertical,
@@ -381,13 +393,12 @@ pub struct MotionTarget {
 }
 
 impl MotionTarget {
-    /// Target logical units per unit of relative motion a `source` computer captures: Windows raw
-    /// counts shrink onto Mac points, and Mac points grow onto Windows pixels, by the scale.
-    pub fn per_captured_unit(&self, source: Platform) -> f64 {
-        match (source, self.platform) {
-            (Platform::Windows, Platform::MacOs) => self.scale_factor.recip(),
-            (Platform::MacOs, Platform::Windows) => self.scale_factor,
-            _ => 1.0,
+    /// Target units per logical unit (a DIP, which is one Mac point): a Windows display's pixels
+    /// at its scale.
+    pub fn per_logical_unit(&self) -> f64 {
+        match self.platform {
+            Platform::Windows => self.scale_factor,
+            Platform::MacOs => 1.0,
         }
     }
 }
@@ -457,6 +468,8 @@ pub struct SourceController {
     held_max: Duration,
     /// Read as the pointer enters the peer, so a change applies from the next crossing.
     control_as_command: &'static AtomicBool,
+    /// Read once per motion record, so a change applies from the next one.
+    pointer_speed: &'static AtomicI8,
     /// Asked before each crossing: a program confining the cursor owns it.
     pointer_confined: fn() -> bool,
     /// A held crossing was logged since the last crossing the cursor was free for.
@@ -640,6 +653,15 @@ impl RecentMotion {
     }
 }
 
+/// One relative motion record: the controlling mouse's own units, the logical units each moves on
+/// another computer, and the pointer speed it moves there at.
+#[derive(Clone, Copy)]
+struct Relative {
+    delta: Point,
+    gain: f64,
+    speed: f64,
+}
+
 #[derive(Clone, Copy)]
 struct CaptureRoute {
     remote: bool,
@@ -758,6 +780,7 @@ impl SourceController {
             holds: 0,
             held_max: Duration::ZERO,
             control_as_command: &CONTROL_AS_COMMAND,
+            pointer_speed: &POINTER_SPEED,
             pointer_confined: || false,
             confinement_logged: false,
         })
@@ -774,6 +797,12 @@ impl SourceController {
     /// Reads the keyboard switch from `switch` instead of the app's [`set_control_as_command`].
     pub fn with_control_as_command(mut self, switch: &'static AtomicBool) -> Self {
         self.control_as_command = switch;
+        self
+    }
+
+    /// Reads the pointer speed from `step` instead of the app's [`set_pointer_speed`].
+    pub fn with_pointer_speed(mut self, step: &'static AtomicI8) -> Self {
+        self.pointer_speed = step;
         self
     }
 
@@ -1032,12 +1061,8 @@ impl SourceController {
     }
 
     /// Returns the display relative motion lands on, the active one or the one a hop between the
-    /// other computer's displays is landing on, and its native motion conversion details.
-    ///
-    /// Runtime adapters use this only for relative motion tagged with the active route. Local
-    /// absolute positions are already in the local topology's coordinate space. A Windows source
-    /// divides raw counts for a macOS target by `scale_factor`; a macOS source multiplies logical
-    /// deltas for a Windows target by it, as [`MotionTarget::per_captured_unit`] gives.
+    /// other computer's displays is landing on, and its logical scale; `None` while a route
+    /// change is pending.
     pub fn motion_target(&self) -> Option<MotionTarget> {
         let target = match self.state {
             State::Local { target, .. }
@@ -1197,11 +1222,11 @@ impl SourceController {
         }
         if matches!(
             record.event,
-            NormalizedInput::AbsoluteMotion(_) | NormalizedInput::RelativeMotion(_)
+            NormalizedInput::AbsoluteMotion(_) | NormalizedInput::RelativeMotion { .. }
         ) {
             let floor = self.floor.snapshot();
             let permitted = if self.carries_pending_motion() {
-                matches!(record.event, NormalizedInput::RelativeMotion(_))
+                matches!(record.event, NormalizedInput::RelativeMotion { .. })
                     && self.claimed_generation(record.floor_generation)
             } else if self.capture_route.remote {
                 floor.state == FloorState::Sending && record.floor_generation == floor.generation
@@ -1966,9 +1991,10 @@ impl SourceController {
             NormalizedInput::AbsoluteMotion(current) => {
                 self.apply_local_motion(current, now, effects)
             }
-            NormalizedInput::RelativeMotion(delta) => {
-                if !self.carry_pending(delta) {
-                    self.apply_local_relative(delta, now, effects)
+            NormalizedInput::RelativeMotion { delta, gain } => {
+                let motion = self.relative(delta, gain);
+                if !self.carry_pending(motion) {
+                    self.apply_local_relative(motion, now, effects)
                 }
             }
             NormalizedInput::Scroll { .. }
@@ -2085,11 +2111,13 @@ impl SourceController {
                     );
                 }
             }
-            NormalizedInput::RelativeMotion(delta) if forwarding => {
-                self.apply_remote_motion(delta, now, effects)
-            }
-            NormalizedInput::RelativeMotion(delta) => {
-                self.carry_pending(delta);
+            NormalizedInput::RelativeMotion { delta, gain } => {
+                let motion = self.relative(delta, gain);
+                if forwarding {
+                    self.apply_remote_motion(motion, now, effects)
+                } else {
+                    self.carry_pending(motion);
+                }
             }
             NormalizedInput::Scroll {
                 horizontal,
@@ -2216,7 +2244,9 @@ impl SourceController {
         // Measured from the last anchor, the step that reaches the edge can start the push.
         let bounds = display.bounds();
         if let Some(beyond) = self.push_to(target.display, edge, bounds, cursor, current, now) {
-            let transition = self.carried_into(transition, beyond);
+            // Positions are this computer's own units: a Windows pixel is 1/scale of a DIP.
+            let gain = self.logical_scale(target.display).recip();
+            let transition = self.carried_into(transition, beyond, gain, self.pointer_speed());
             self.begin_edge_transition(target, transition, effects);
         }
     }
@@ -2444,7 +2474,14 @@ impl SourceController {
         );
     }
 
-    fn apply_local_relative(&mut self, delta: Point, now: Duration, effects: &mut SourceEffects) {
+    fn apply_local_relative(
+        &mut self,
+        motion: Relative,
+        now: Duration,
+        effects: &mut SourceEffects,
+    ) {
+        // On this computer's own displays the mouse's units move as they are.
+        let delta = motion.delta;
         self.recent_motion.add(delta, now);
         let State::Local {
             target,
@@ -2471,7 +2508,7 @@ impl SourceController {
         if self.is_home_display(transition.to_display) {
             self.begin_edge_transition(target, transition, effects);
         } else if let Some(beyond) = self.push_by(target.display, edge, delta, now) {
-            let transition = self.carried_into(transition, beyond);
+            let transition = self.carried_into(transition, beyond, motion.gain, motion.speed);
             self.begin_edge_transition(target, transition, effects);
         }
     }
@@ -2658,20 +2695,48 @@ impl SourceController {
             .map(|machine| machine.platform)
     }
 
-    /// Units of relative motion onto `display` per unit the controlling mouse moved.
-    fn captured_scale(&self, display: DisplayId) -> f64 {
+    /// A relative record with the pointer speed it moves at, read once for it.
+    fn relative(&self, delta: Point, gain: f64) -> Relative {
+        Relative {
+            delta,
+            gain,
+            speed: self.pointer_speed(),
+        }
+    }
+
+    fn pointer_speed(&self) -> f64 {
+        pointer_speed::factor(self.pointer_speed.load(Ordering::Acquire))
+    }
+
+    /// `display`'s units per logical unit; 1 for a display the topology does not know.
+    fn logical_scale(&self, display: DisplayId) -> f64 {
         self.topology
             .display(display)
             .ok()
             .and_then(|found| self.motion_target_for(PointerTarget::new(found.machine, display)))
-            .zip(self.home_platform())
-            .map_or(1.0, |(motion, home)| motion.per_captured_unit(home))
+            .map_or(1.0, |target| target.per_logical_unit())
+    }
+
+    /// Units the pointer moves on `display` per unit the controlling mouse moved: its own units
+    /// on this computer, and `gain` logical units at `speed` on another.
+    fn travel_on(&self, display: DisplayId, gain: f64, speed: f64) -> f64 {
+        if self.is_home_display(display) {
+            1.0
+        } else {
+            gain * self.logical_scale(display) * speed
+        }
     }
 
     /// `transition` entering `beyond` controlling-mouse units further in, converted as relative
     /// motion onto its display is, so travel past the full push is not lost at the seam.
-    fn carried_into(&self, mut transition: EdgeTransition, beyond: f64) -> EdgeTransition {
-        let by = beyond * self.captured_scale(transition.to_display);
+    fn carried_into(
+        &self,
+        mut transition: EdgeTransition,
+        beyond: f64,
+        gain: f64,
+        speed: f64,
+    ) -> EdgeTransition {
+        let by = beyond * self.travel_on(transition.to_display, gain, speed);
         let entry = transition.entry_point;
         let carried = match transition.to_edge {
             Edge::Left => Point::new(entry.x + by, entry.y),
@@ -2692,30 +2757,28 @@ impl SourceController {
     }
 
     /// Adds relative motion captured mid-handover to what the pointer carries on with once it
-    /// lands; false when no handover carries motion.
-    fn carry_pending(&mut self, delta: Point) -> bool {
+    /// lands, in the landing display's units; false when no handover carries motion.
+    fn carry_pending(&mut self, motion: Relative) -> bool {
         let onto = match self.state {
-            // Routed remotely, this motion already comes in the landing display's units.
-            State::AwaitActivation {
-                capture_already_remote: true,
-                ..
-            } => None,
             State::AwaitActivation { target, .. } | State::AwaitRemoteBarrier { target, .. } => {
-                Some(target.display)
+                target.display
             }
             State::AwaitReleaseAcknowledgement {
                 carried: Some(_),
                 handover: Some(handover),
                 ..
-            } => Some(handover.to.display),
+            } => handover.to.display,
             State::AwaitReleaseAcknowledgement {
                 local,
                 carried: Some(_),
                 ..
-            } => Some(local.display),
+            } => local.display,
             _ => return false,
         };
-        let scale = onto.map_or(1.0, |display| self.captured_scale(display));
+        let moved = scaled(
+            motion.delta,
+            self.travel_on(onto, motion.gain, motion.speed),
+        );
         if let State::AwaitActivation { carried, .. }
         | State::AwaitRemoteBarrier { carried, .. }
         | State::AwaitReleaseAcknowledgement {
@@ -2723,7 +2786,7 @@ impl SourceController {
             ..
         } = &mut self.state
         {
-            *carried = Point::new(carried.x + delta.x * scale, carried.y + delta.y * scale);
+            *carried = Point::new(carried.x + moved.x, carried.y + moved.y);
         }
         true
     }
@@ -2737,7 +2800,7 @@ impl SourceController {
         self.inside_display(display, moved).unwrap_or(position)
     }
 
-    /// Adds a relative delta's outward part, in the controlling mouse's own units, to the push on
+    /// Adds the outward part of `delta`, in the controlling mouse's own units, to the push on
     /// `edge` while the hand's recent motion heads through it. Once it is through, yields how far
     /// past the full push this delta went. Other motion neither extends nor counts.
     fn push_by(
@@ -2750,7 +2813,7 @@ impl SourceController {
         let mut push = self
             .current_push(display, edge)
             .unwrap_or(EdgePush::new(display, edge));
-        let out = outward(edge, delta) / self.captured_scale(display);
+        let out = outward(edge, delta);
         let pushing = out > 0.0 && pushes(edge, self.recent_motion.sum);
         if pushing {
             if let Some(ended) = push.moved_out(now) {
@@ -2856,8 +2919,12 @@ impl SourceController {
 
     /// The modelled pointer moves on across the controlled computer's own display boundaries, as
     /// its OS would, and stops at the seam home, which only a push carries it over.
-    fn apply_remote_motion(&mut self, delta: Point, now: Duration, effects: &mut SourceEffects) {
-        self.recent_motion.add(delta, now);
+    fn apply_remote_motion(
+        &mut self,
+        motion: Relative,
+        now: Duration,
+        effects: &mut SourceEffects,
+    ) {
         let State::Remote {
             target,
             position,
@@ -2867,6 +2934,9 @@ impl SourceController {
         else {
             return;
         };
+        // The heading and the push follow the hand, so a pointer that cannot move still pushes.
+        let delta = motion.delta;
+        self.recent_motion.add(delta, now);
         let display = match self.topology.display(target.display) {
             Ok(display) => display,
             Err(_) => {
@@ -2875,7 +2945,9 @@ impl SourceController {
             }
         };
         let bounds = display.bounds();
-        let desired = Point::new(position.x + delta.x, position.y + delta.y);
+        let units = motion.gain * self.logical_scale(target.display);
+        let moved = scaled(delta, units * motion.speed);
+        let desired = Point::new(position.x + moved.x, position.y + moved.y);
         if !desired.is_finite() {
             self.fail(SourceFailure::InvalidCapturedInput, effects);
             return;
@@ -2916,7 +2988,7 @@ impl SourceController {
         if let Some((edge, transition)) = seam
             && let Some(beyond) = self.push_by(target.display, edge, delta, now)
         {
-            let transition = self.carried_into(transition, beyond);
+            let transition = self.carried_into(transition, beyond, motion.gain, motion.speed);
             self.apply_remote_edge(target, return_target, return_position, transition, effects);
             return;
         }
@@ -3561,6 +3633,10 @@ struct KeyChange {
 struct ButtonChange {
     was_physical: bool,
     was_remote: bool,
+}
+
+fn scaled(point: Point, by: f64) -> Point {
+    Point::new(point.x * by, point.y * by)
 }
 
 fn valid_point(point: Point) -> bool {

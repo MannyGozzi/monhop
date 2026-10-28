@@ -167,6 +167,42 @@ fn queue_preserves_mac_logical_f64_payload_bits_without_rounding() {
 }
 
 #[test]
+fn raw_counts_keep_their_ballistic_gain_bits_and_a_gain_that_is_no_distance_stops() {
+    let stop = CaptureStop::new();
+    let (mut producer, mut consumer) = capture_channel(stop.clone());
+    for gain in [0.0, 1.0 / 3.0, 4.75, f64::MIN_POSITIVE] {
+        let event = CaptureEvent::RelativeMotion {
+            dx: -7,
+            dy: 2,
+            gain,
+        };
+        assert_eq!(producer.try_push(event), Ok(()));
+        match consumer.try_pop().expect("queue remains active") {
+            Some(CaptureEvent::RelativeMotion {
+                dx: -7,
+                dy: 2,
+                gain: received,
+            }) => assert_eq!(received.to_bits(), gain.to_bits()),
+            _ => panic!("queue changed the raw motion"),
+        }
+    }
+    for gain in [-0.5, f64::NAN, f64::INFINITY] {
+        let event = CaptureEvent::RelativeMotion { dx: 1, dy: 0, gain };
+        assert!(!event.is_valid());
+    }
+    let (mut rejected, _consumer) = capture_channel(CaptureStop::new());
+    assert_eq!(
+        rejected.try_push(CaptureEvent::RelativeMotion {
+            dx: 1,
+            dy: 0,
+            gain: f64::NAN,
+        }),
+        Err(StopReason::InvalidInput)
+    );
+    assert_eq!(stop.reason(), None);
+}
+
+#[test]
 fn capture_event_debug_never_emits_input_values() {
     let event = CaptureEvent::Key {
         usage: HidUsage(0x04),
@@ -197,7 +233,11 @@ fn route_change_barrier_precedes_tagged_events_for_the_new_route() {
     let (mut rejected_producer, _rejected_consumer) = capture_channel(rejected_stop.clone());
     assert_eq!(
         rejected_producer.try_push_tagged(CapturedEvent {
-            event: CaptureEvent::RelativeMotion { dx: 3, dy: -2 },
+            event: CaptureEvent::RelativeMotion {
+                dx: 3,
+                dy: -2,
+                gain: 1.0,
+            },
             routing_revision: 1,
             remote: true,
             floor_generation: 0,
@@ -218,7 +258,11 @@ fn route_change_barrier_precedes_tagged_events_for_the_new_route() {
         floor_generation: 0,
     };
     let event = CapturedEvent {
-        event: CaptureEvent::RelativeMotion { dx: 3, dy: -2 },
+        event: CaptureEvent::RelativeMotion {
+            dx: 3,
+            dy: -2,
+            gain: 1.0,
+        },
         routing_revision: 1,
         remote: true,
         floor_generation: 0,
@@ -262,6 +306,7 @@ fn spsc_ring_preserves_100k_fifo_events_and_metadata_across_wraparound() {
                     event: CaptureEvent::RelativeMotion {
                         dx: value + 1,
                         dy: -(value + 1),
+                        gain: f64::from(value + 1) / 7.0,
                     },
                     routing_revision: 1,
                     remote: true,
@@ -299,6 +344,7 @@ fn spsc_ring_preserves_100k_fifo_events_and_metadata_across_wraparound() {
                         event: CaptureEvent::RelativeMotion {
                             dx: value,
                             dy: -value,
+                            gain: f64::from(value) / 7.0,
                         },
                         routing_revision: 1,
                         remote: true,

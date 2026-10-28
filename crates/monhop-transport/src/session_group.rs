@@ -21,8 +21,8 @@ use crate::{
     session_native::pointer_confined,
     session_runtime::POINTER_POLL_INTERVAL,
     session_source::{
-        Handover, MotionTarget, NormalizedInput, SourceController, SourceEffect, SourceEffects,
-        SourceFailure, SourceMode, SourceOutcome, TaggedInput,
+        Handover, NormalizedInput, SourceController, SourceEffect, SourceEffects, SourceFailure,
+        SourceMode, SourceOutcome, TaggedInput,
     },
     session_source_runtime::{
         CaptureControl, CaptureRefusal, OutboundFrames, apply_effects, blocking_presses, normalize,
@@ -560,15 +560,15 @@ impl HubCore {
         self.settle(capture, index, outcome)
     }
 
-    /// One record from native capture, in FIFO order. It is normalized once, for the floor
-    /// owner's display, then reaches every controller: a route barrier goes to the controller
-    /// that issued it and is adopted by every other.
+    /// One record from native capture, in FIFO order. It is normalized once, then reaches every
+    /// controller: a route barrier goes to the controller that issued it and is adopted by every
+    /// other.
     pub(crate) fn on_captured<C: CaptureControl>(
         &mut self,
         capture: &mut C,
         record: CapturedEvent,
     ) -> Result<(), SessionFailure> {
-        let Some(record) = normalize(record, self.motion_target())? else {
+        let Some(record) = normalize(record)? else {
             return Ok(());
         };
         self.capture_ready = capture.is_ready_for_suppression();
@@ -760,21 +760,6 @@ impl HubCore {
         (floor.state.owner() == Some(FloorOwner::Outbound)
             && matches!(&self.slots[index], Slot::Linked(link) if link.is_ready()))
         .then_some(index)
-    }
-
-    /// The floor owner's display; with the floor free or inbound every controller is local, so
-    /// any gives the same conversion.
-    fn motion_target(&self) -> Option<MotionTarget> {
-        if self.floor.snapshot().state.owner() == Some(FloorOwner::Outbound) {
-            let Slot::Linked(link) = &self.slots[self.outbound_owner()?] else {
-                return None;
-            };
-            return link.source.motion_target();
-        }
-        self.slots.iter().find_map(|slot| match slot {
-            Slot::Linked(link) => link.source.motion_target(),
-            _ => None,
-        })
     }
 
     fn note_physical(&mut self, event: NormalizedInput) {

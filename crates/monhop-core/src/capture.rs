@@ -107,8 +107,9 @@ impl fmt::Debug for InjectionPermit {
 
 /// A copied physical input event.
 ///
-/// `RelativeMotion` is expressed in unscaled raw-input counts. `AbsoluteMotion` is expressed in
-/// physical virtual-desktop pixels. The two coordinate systems are never converted here.
+/// `RelativeMotion` is expressed in unscaled raw-input counts, with the DIPs per count Windows'
+/// pointer ballistics move them. `AbsoluteMotion` is expressed in physical virtual-desktop pixels.
+/// The two coordinate systems are never converted here.
 /// `Scroll` is expressed in Windows wheel units, where one detent is 120 units. A `Button` is
 /// stamped `at` [`crate::clicks::capture_clock`] when the capture thread received it.
 ///
@@ -138,6 +139,7 @@ pub enum CaptureEvent {
     RelativeMotion {
         dx: i32,
         dy: i32,
+        gain: f64,
     },
     Scroll {
         horizontal: i32,
@@ -196,7 +198,9 @@ impl CaptureEvent {
         match self {
             Self::Key { usage, .. } => usage.is_valid(),
             Self::Button { .. } | Self::AbsoluteMotion { .. } => true,
-            Self::RelativeMotion { dx, dy } => dx != 0 || dy != 0,
+            Self::RelativeMotion { dx, dy, gain } => {
+                (dx != 0 || dy != 0) && gain.is_finite() && gain >= 0.0
+            }
             Self::Scroll {
                 horizontal,
                 vertical,
@@ -671,10 +675,10 @@ impl From<CaptureEvent> for EncodedEvent {
                 payload: pack_i32_pair(x, y),
                 revision: 0,
             },
-            CaptureEvent::RelativeMotion { dx, dy } => Self {
+            CaptureEvent::RelativeMotion { dx, dy, gain } => Self {
                 header: EVENT_RELATIVE_MOTION,
                 payload: pack_i32_pair(dx, dy),
-                revision: 0,
+                revision: gain.to_bits(),
             },
             CaptureEvent::Scroll {
                 horizontal,
@@ -755,7 +759,11 @@ impl CapturedEvent {
             }
             EVENT_RELATIVE_MOTION => {
                 let (dx, dy) = unpack_i32_pair(payload);
-                CaptureEvent::RelativeMotion { dx, dy }
+                CaptureEvent::RelativeMotion {
+                    dx,
+                    dy,
+                    gain: f64::from_bits(event_revision),
+                }
             }
             EVENT_SCROLL => {
                 let (horizontal, vertical) = unpack_i32_pair(payload);

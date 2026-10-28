@@ -159,7 +159,7 @@ impl Controller {
 
     fn wiggle(&mut self, step: u128, now: Duration) {
         let dy = if step.is_multiple_of(2) { 1.0 } else { -1.0 };
-        self.capture(NormalizedInput::RelativeMotion(Point::new(0.0, dy)), now);
+        self.capture(NormalizedInput::relative(Point::new(0.0, dy)), now);
     }
 
     fn scroll(&mut self, now: Duration) {
@@ -386,7 +386,7 @@ impl Session {
             }),
             (1, |controller, now| {
                 let push = Point::new(PUSH_THROUGH_DISTANCE, 0.0);
-                controller.capture(NormalizedInput::RelativeMotion(push), now);
+                controller.capture(NormalizedInput::relative(push), now);
             }),
             (100, |controller, now| controller.key(HELD_KEY, true, now)),
         ];

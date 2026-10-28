@@ -374,7 +374,7 @@ pub async fn run_session(
                         capture_drained = true;
                         break;
                     };
-                    let Some(record) = normalize(record, source.motion_target())? else {
+                    let Some(record) = normalize(record)? else {
                         continue;
                     };
                     if outbound.is_some() {
