@@ -37,8 +37,9 @@ pub const DEFAULT_Y_CURVE: [u8; CURVE_BYTES] = [
 /// A report's counts per unit along the curve's x axis.
 const COUNTS_PER_CURVE_UNIT: f64 = 3.5;
 
-/// The curve's y axis is pixels at the display's DPI over 150, which is 96/150 of a DIP at any DPI.
-const DIPS_PER_CURVE_UNIT: f64 = 96.0 / 150.0;
+/// The curve's y axis is pixels at the display's DPI over 120 since Windows 8 (150 in Windows 7),
+/// which is 96/120 of a DIP at any DPI.
+const DIPS_PER_CURVE_UNIT: f64 = 96.0 / 120.0;
 
 /// Pixels per count without Enhance pointer precision, by slider notch.
 const LINEAR_PIXELS_PER_COUNT: [f64; MAX_SPEED as usize] = [
@@ -203,27 +204,27 @@ mod tests {
     fn enhanced_precision_at_the_middle_notch_follows_the_default_curve() {
         let windows = Ballistics::default();
         for (counts, dips) in [
-            (1.0, 0.455122),
-            (2.0, 1.023871),
-            (4.0, 2.393243),
-            (8.0, 6.419840),
-            (16.0, 17.501458),
-            (32.0, 51.888367),
-            (-6.0, -4.339928),
+            (1.0, 0.568903),
+            (2.0, 1.279839),
+            (4.0, 2.991554),
+            (8.0, 8.024800),
+            (16.0, 21.876823),
+            (32.0, 64.860459),
+            (-6.0, -5.424910),
         ] {
             let (x, y) = windows.apply(counts, 0.0, 1);
             close(x, dips);
             assert_eq!(y, 0.0);
         }
-        // 140 counts reach the curve's last point: 443.75 at 96/150.
-        assert!((windows.apply(140.0, 0.0, 1).0 - 284.0).abs() < 1e-9);
+        // 140 counts reach the curve's last point: 443.75 at 96/120.
+        assert!((windows.apply(140.0, 0.0, 1).0 - 355.0).abs() < 1e-9);
     }
 
     #[test]
     fn one_gain_scales_both_axes_so_the_direction_holds() {
         let (x, y) = Ballistics::default().apply(4.0, 2.0, 1);
-        close(x, 2.639978);
-        close(y, 1.319989);
+        close(x, 3.299973);
+        close(y, 1.649986);
         assert_eq!(x / y, 2.0);
     }
 
@@ -231,7 +232,7 @@ mod tests {
     fn a_merged_message_moves_as_its_reports_would_one_by_one() {
         let windows = Ballistics::default();
         let merged = windows.apply(16.0, 0.0, 8).0;
-        close(merged, 8.190969);
+        close(merged, 10.238711);
         assert!((merged - 8.0 * windows.apply(2.0, 0.0, 1).0).abs() < 1e-12);
         // Report counts outside 1 to MAX_MERGED_REPORTS clamp.
         assert_eq!(windows.gain(16.0, 0.0, 0), windows.gain(16.0, 0.0, 1));
@@ -247,7 +248,7 @@ mod tests {
             Ballistics::new(true, 20, None, None, 1.0)
                 .apply(1.0, 0.0, 1)
                 .0,
-            0.910243,
+            1.137804,
         );
         for (speed, per_count) in [(1, 1.0 / 32.0), (6, 0.5), (10, 1.0), (11, 1.25), (20, 3.5)] {
             let linear = Ballistics::new(false, speed, None, None, 1.0);
@@ -299,7 +300,7 @@ mod tests {
 
     #[test]
     fn a_custom_curve_is_used_as_read() {
-        // The curve y = x: 0.64/3.5 DIPs a count at every speed of the hand.
+        // The curve y = x: 0.8/3.5 DIPs a count at every speed of the hand.
         let line = Ballistics::new(
             true,
             10,
@@ -308,7 +309,7 @@ mod tests {
             1.0,
         );
         for counts in [1.0, 7.0, 300.0] {
-            assert!((line.gain(counts, 0.0, 1) - 0.64 / 3.5).abs() < 1e-12);
+            assert!((line.gain(counts, 0.0, 1) - 0.8 / 3.5).abs() < 1e-12);
         }
     }
 
