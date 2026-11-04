@@ -11,12 +11,12 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard, PoisonError, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use core_foundation::{
@@ -25,7 +25,7 @@ use core_foundation::{
     string::{CFString, CFStringRef},
 };
 use monhop_core::{
-    HidUsage, MouseButton, Point, RevocationSignal, TakeBackGate,
+    HidUsage, LogicalRect, MouseButton, Point, RevocationSignal, TakeBackGate,
     capture::{
         CaptureConsumer, CaptureEvent, CapturePermit, CaptureProducer, CaptureStop, CapturedEvent,
         MAX_SUPPRESSION_TTL, NativeSessionClaim, OwnerWake, StopReason, SuppressionLease,
@@ -36,6 +36,7 @@ use monhop_core::{
         control_channel,
     },
     capture_physical::{HeldInput, LocalTransfer, PhysicalCapture},
+    display_settle::{DISPLAY_SETTLE_POLL, DisplayRead, DisplaySettle, DisplayVerdict},
     gesture_latch::{GestureLatch, TouchRecord},
 };
 
@@ -140,12 +141,6 @@ unsafe extern "C" {
         >,
         user_info: *mut c_void,
     ) -> CGError;
-    fn CGDisplayRemoveReconfigurationCallback(
-        callback: Option<
-            unsafe extern "C" fn(CGDirectDisplayID, CGDisplayChangeSummaryFlags, *mut c_void),
-        >,
-        user_info: *mut c_void,
-    ) -> CGError;
 }
 
 // SAFETY: These declarations match the current Core Foundation CFPreferences SDK declarations.
@@ -194,6 +189,8 @@ struct Shared {
     owner_wake: OwnerWake,
     /// Read by the owner thread in place of a TCC probe; see `PermissionWatch`.
     permissions: PermissionCell,
+    /// Raised by the display callout, taken by the owner loop, which rereads the displays.
+    displays_suspected: AtomicBool,
 }
 
 /// The presses refusing suppression as one bit each: key usages 0..256, then button slots.
@@ -317,6 +314,7 @@ impl NativeCapture {
             allows_suppression: diagnostic_duration.is_none(),
             owner_wake: OwnerWake::default(),
             permissions: PermissionCell::default(),
+            displays_suspected: AtomicBool::new(false),
         });
         let thread_shared = Arc::clone(&shared);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -1672,19 +1670,147 @@ unsafe extern "C" fn motion_hold_callback(
     event
 }
 
-unsafe extern "C" fn display_reconfiguration_callback(
+/// Every open `DisplayWatch`. The callout reaches captures only through these, never user_info.
+static DISPLAY_WATCHES: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
+
+fn display_watches() -> MutexGuard<'static, Vec<Weak<Shared>>> {
+    DISPLAY_WATCHES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Registered once per process and never removed: Quartz runs callouts on the main queue and one
+/// can arrive after a removal on the capture thread returns, so it must reach no freeable memory.
+fn register_display_callout() -> Result<(), NativeCaptureError> {
+    static REGISTERED: Mutex<bool> = Mutex::new(false);
+    let mut registered = REGISTERED.lock().unwrap_or_else(PoisonError::into_inner);
+    if !*registered {
+        // SAFETY: the callback is a plain function that never reads its null user_info.
+        let status = unsafe {
+            CGDisplayRegisterReconfigurationCallback(
+                Some(display_reconfiguration_callback),
+                ptr::null_mut(),
+            )
+        };
+        if status != CG_ERROR_SUCCESS {
+            return Err(NativeCaptureError::StartFailed);
+        }
+        *registered = true;
+    }
+    Ok(())
+}
+
+/// Only raises a suspicion: the owner loop rereads the displays and decides.
+extern "C" fn display_reconfiguration_callback(
     _: CGDirectDisplayID,
     flags: CGDisplayChangeSummaryFlags,
-    user_info: *mut c_void,
+    _: *mut c_void,
 ) {
-    // The preliminary notification precedes the new geometry; only the completion ends capture.
-    if flags == CG_DISPLAY_BEGIN_CONFIGURATION_FLAG || user_info.is_null() {
+    // The preliminary notification precedes the new geometry; only a completion is reread.
+    if flags == CG_DISPLAY_BEGIN_CONFIGURATION_FLAG {
         return;
     }
-    // SAFETY: DisplayWatch retains one Arc for the entire registered callback lifetime.
-    let shared = unsafe { &*user_info.cast::<Shared>() };
-    shared.stop.stop(StopReason::DisplaysChanged);
-    shared.stop.request_session_stop(&shared.revocation);
+    display_watches().retain(|watch| {
+        let Some(shared) = watch.upgrade() else {
+            return false;
+        };
+        shared.displays_suspected.store(true, Ordering::Release);
+        shared.owner_wake.wake();
+        true
+    });
+}
+
+/// Ends capture only on a display change that holds; while unsettled, capture keeps the geometry
+/// it started on.
+struct DisplayRecheck {
+    started_on: Vec<LogicalRect>,
+    settle: DisplaySettle,
+    next_read: Option<Instant>,
+    /// Some reread since the last recovery differed, so a recovery is a real return.
+    differed: bool,
+}
+
+impl DisplayRecheck {
+    fn new(started_on: Vec<LogicalRect>) -> Self {
+        Self {
+            started_on,
+            settle: DisplaySettle::new(),
+            next_read: None,
+            differed: false,
+        }
+    }
+
+    /// True once the displays stayed different or unreadable for the settle limit.
+    fn changed(
+        &mut self,
+        suspected: bool,
+        now: Instant,
+        reread: impl FnOnce() -> Result<Vec<LogicalRect>, NativeCaptureError>,
+    ) -> bool {
+        if suspected {
+            if !self.settle.is_unsettled() {
+                log::info!("native capture: displays reconfigured; rereading them before deciding");
+            }
+            self.settle.suspect(now);
+            self.next_read = Some(now);
+        }
+        if self.next_read.is_none_or(|due| now < due) {
+            return false;
+        }
+        let read = match reread() {
+            Ok(rectangles) if same_geometry(&self.started_on, &rectangles) => DisplayRead::Same,
+            Ok(_) => DisplayRead::Different,
+            Err(_) => DisplayRead::Unreadable,
+        };
+        self.differed |= read != DisplayRead::Same;
+        self.next_read = Some(now + DISPLAY_SETTLE_POLL);
+        match self.settle.observe(read, now) {
+            DisplayVerdict::Unsettled => false,
+            DisplayVerdict::Steady => {
+                self.next_read = None;
+                false
+            }
+            DisplayVerdict::Recovered(away) => {
+                self.next_read = None;
+                if std::mem::take(&mut self.differed) {
+                    log::info!(
+                        "native capture: displays changed and came back after {} ms; sharing continues",
+                        away.as_millis()
+                    );
+                } else {
+                    log::info!(
+                        "native capture: displays reconfigured without changing; sharing continues"
+                    );
+                }
+                false
+            }
+            DisplayVerdict::Changed => {
+                self.next_read = None;
+                true
+            }
+        }
+    }
+}
+
+/// Display order is not part of the geometry: Quartz may list a returning display elsewhere.
+fn same_geometry(started_on: &[LogicalRect], now: &[LogicalRect]) -> bool {
+    started_on.len() == now.len()
+        && started_on.iter().all(|rectangle| now.contains(rectangle))
+        && now.iter().all(|rectangle| started_on.contains(rectangle))
+}
+
+/// Owner loop: takes the callout's suspicion and stops capture once the change holds.
+fn recheck_displays(
+    shared: &Shared,
+    recheck: &mut DisplayRecheck,
+    now: Instant,
+    reread: impl FnOnce() -> Result<Vec<LogicalRect>, NativeCaptureError>,
+) {
+    let suspected = shared.displays_suspected.swap(false, Ordering::AcqRel);
+    if !shared.stop.is_stopped() && recheck.changed(suspected, now, reread) {
+        shared.stop.stop(StopReason::DisplaysChanged);
+        shared.stop.request_session_stop(&shared.revocation);
+    }
 }
 
 fn run(
@@ -1696,18 +1822,18 @@ fn run(
     diagnostic_duration: Option<Duration>,
     started: mpsc::SyncSender<Result<(), NativeCaptureError>>,
 ) -> Result<(), NativeCaptureError> {
-    let active_display_bounds = match read_while_capture_active(
-        &shared.stop,
-        &shared.revocation,
-        current_active_display_bounds,
-    ) {
-        Ok(bounds) => bounds,
-        Err(error) => {
-            shared.stop.stop(stop_reason(error));
-            let _ = started.send(Err(error));
-            return Err(error);
-        }
-    };
+    let (started_on, active_display_bounds) =
+        match read_while_capture_active(&shared.stop, &shared.revocation, || {
+            let rectangles = current_display_rectangles()?;
+            display_bounds(&rectangles).map(|bounds| (rectangles, bounds))
+        }) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                shared.stop.stop(stop_reason(error));
+                let _ = started.send(Err(error));
+                return Err(error);
+            }
+        };
     CALLBACK_SHARED.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&shared)));
     CALLBACK.with(|slot| {
         *slot.borrow_mut() = Some(CallbackState {
@@ -1763,6 +1889,7 @@ fn run(
     update_progress(&shared);
     let _ = started.send(Ok(()));
 
+    let mut display_recheck = DisplayRecheck::new(started_on);
     let mut previous_tick = shared.origin.elapsed();
     // The run-loop slice bounds each pass, so this deadline is met even with no input arriving.
     let mut held_poll_at =
@@ -1785,6 +1912,12 @@ fn run(
             shared.interception_failed.store(true, Ordering::Release);
             shared.stop.stop(StopReason::NativeFailure);
         }
+        recheck_displays(
+            &shared,
+            &mut display_recheck,
+            Instant::now(),
+            current_display_rectangles,
+        );
         pass.lap(LoopStep::Checks, shared.origin.elapsed());
         if let Some((revision, command)) = control.pending() {
             let completion = if with_callback(|state| {
@@ -1900,11 +2033,9 @@ fn close_native_resources(
     resources: &mut Resources,
     display_watch: &mut DisplayWatch,
 ) -> Result<(), NativeCaptureError> {
-    // Always remove the tap even if display-watch unregistration fails. The latter can retain
-    // its Arc defensively, but must not leave a suppressing callback active during cleanup.
-    let resources_result = resources.close();
-    let display_result = display_watch.close();
-    resources_result.and(display_result)
+    let result = resources.close();
+    display_watch.close();
+    result
 }
 
 fn permissions_still_sufficient(permissions: PermissionState, passive: bool) -> bool {
@@ -2108,10 +2239,22 @@ fn read_while_capture_active<T>(
     Ok(result)
 }
 
-fn current_active_display_bounds() -> Result<ActiveDisplayBounds, NativeCaptureError> {
+/// The read capture starts on and rereads after a display callout.
+fn current_display_rectangles() -> Result<Vec<LogicalRect>, NativeCaptureError> {
     let displays = enumerate_active_displays().map_err(NativeCaptureError::Mac)?;
-    ActiveDisplayBounds::from_rectangles(displays.into_iter().map(|display| display.logical_bounds))
+    Ok(displays
+        .into_iter()
+        .map(|display| display.logical_bounds)
+        .collect())
+}
+
+fn display_bounds(rectangles: &[LogicalRect]) -> Result<ActiveDisplayBounds, NativeCaptureError> {
+    ActiveDisplayBounds::from_rectangles(rectangles.iter().copied())
         .ok_or(NativeCaptureError::Mac(MacError::InvalidDisplayData))
+}
+
+fn current_active_display_bounds() -> Result<ActiveDisplayBounds, NativeCaptureError> {
+    display_bounds(&current_display_rectangles()?)
 }
 
 /// The pointer in the same global coordinates the event tap reports, for a poll between samples.
@@ -2274,53 +2417,36 @@ impl Resources {
     }
 }
 
+/// One capture's place in `DISPLAY_WATCHES`. Holding only a `Weak` lets a callout in flight
+/// outlive both the watch and the capture.
 struct DisplayWatch {
-    shared: *const Shared,
-    registered: bool,
+    shared: Option<Weak<Shared>>,
 }
 
 impl DisplayWatch {
     fn install(shared: &Arc<Shared>) -> Result<Self, NativeCaptureError> {
-        let retained = Arc::into_raw(Arc::clone(shared));
-        // SAFETY: retained stays live until a successful unregistration releases it below.
-        let status = unsafe {
-            CGDisplayRegisterReconfigurationCallback(
-                Some(display_reconfiguration_callback),
-                retained.cast_mut().cast(),
-            )
-        };
-        if status != CG_ERROR_SUCCESS {
-            // SAFETY: registration did not retain this pointer, so this balances into_raw.
-            unsafe { drop(Arc::from_raw(retained)) };
-            return Err(NativeCaptureError::StartFailed);
-        }
-        Ok(Self {
-            shared: retained,
-            registered: true,
-        })
+        register_display_callout()?;
+        Ok(Self::watching(shared))
     }
 
-    fn close(&mut self) -> Result<(), NativeCaptureError> {
-        if !self.registered {
-            return Ok(());
+    fn watching(shared: &Arc<Shared>) -> Self {
+        let watch = Arc::downgrade(shared);
+        display_watches().push(Weak::clone(&watch));
+        Self {
+            shared: Some(watch),
         }
-        // SAFETY: shared is the same stable pointer passed during registration.
-        let status = unsafe {
-            CGDisplayRemoveReconfigurationCallback(
-                Some(display_reconfiguration_callback),
-                self.shared.cast_mut().cast(),
-            )
-        };
-        if status != CG_ERROR_SUCCESS {
-            // The callback may still race after an unsuccessful removal. Retain this one Arc to
-            // prevent use-after-free; capture is already terminal and never reconnects itself.
-            self.registered = false;
-            return Err(NativeCaptureError::StartFailed);
+    }
+
+    fn close(&mut self) {
+        if let Some(watch) = self.shared.take() {
+            display_watches().retain(|listed| !listed.ptr_eq(&watch));
         }
-        self.registered = false;
-        // SAFETY: a successful removal guarantees this Arc is no longer reachable by the callback.
-        unsafe { drop(Arc::from_raw(self.shared)) };
-        Ok(())
+    }
+}
+
+impl Drop for DisplayWatch {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -2365,6 +2491,7 @@ mod callback_tests {
             allows_suppression: true,
             owner_wake: OwnerWake::default(),
             permissions: PermissionCell::default(),
+            displays_suspected: AtomicBool::new(false),
         });
         let physical = match &take_back {
             Some(gate) => PhysicalCapture::new(Duration::ZERO).with_take_back(gate.clone()),
@@ -2861,24 +2988,90 @@ mod callback_tests {
         assert_eq!(anchors, 2, "withheld positions still reach local routing");
     }
 
+    const DISPLAY_REMOVED: CGDisplayChangeSummaryFlags = 1 << 5;
+
+    /// The only test that runs the callout: every open watch in the process receives it.
     #[test]
-    fn display_reconfiguration_stops_capture_only_once_it_completes() {
-        const DISPLAY_REMOVED: CGDisplayChangeSummaryFlags = 1 << 5;
+    fn a_display_callout_only_raises_a_suspicion_and_never_reaches_a_closed_or_freed_watch() {
         let (state, _consumer) = callback_fixture();
         let shared = Arc::clone(&state.shared);
-        let user_info: *mut c_void = Arc::as_ptr(&shared).cast_mut().cast();
-        // SAFETY: shared outlives the call, as DisplayWatch's retained Arc does when registered.
-        unsafe {
-            display_reconfiguration_callback(1, CG_DISPLAY_BEGIN_CONFIGURATION_FLAG, user_info)
+        let suspected = || shared.displays_suspected.swap(false, Ordering::AcqRel);
+        let watch = DisplayWatch::watching(&shared);
+        display_reconfiguration_callback(1, CG_DISPLAY_BEGIN_CONFIGURATION_FLAG, ptr::null_mut());
+        assert!(!suspected(), "the new geometry does not exist yet");
+        display_reconfiguration_callback(1, DISPLAY_REMOVED, ptr::null_mut());
+        assert!(suspected());
+        assert_eq!(shared.stop.reason(), None, "a callout alone never stops");
+        assert!(!shared.revocation.is_stopping());
+
+        drop(watch);
+        display_reconfiguration_callback(1, DISPLAY_REMOVED, ptr::null_mut());
+        assert!(!suspected(), "a dropped watch is out of reach");
+
+        // A capture freed while its watch is still listed: the callout finds nothing to touch.
+        let (freed, _consumer) = callback_fixture();
+        let orphan = DisplayWatch::watching(&freed.shared);
+        drop(freed);
+        let listed = |watch: &DisplayWatch| {
+            watch.shared.as_ref().is_some_and(|ours| {
+                assert!(ours.upgrade().is_none(), "the capture is gone");
+                display_watches().iter().any(|listed| listed.ptr_eq(ours))
+            })
         };
-        assert_eq!(
-            shared.stop.reason(),
-            None,
-            "the new geometry does not exist yet"
-        );
-        assert!(!shared.revocation.is_revoked());
-        // SAFETY: as above.
-        unsafe { display_reconfiguration_callback(1, DISPLAY_REMOVED, user_info) };
+        assert!(listed(&orphan));
+        display_reconfiguration_callback(1, DISPLAY_REMOVED, ptr::null_mut());
+        assert!(!listed(&orphan), "the callout drops the entry unread");
+    }
+
+    fn display_at(x: f64) -> LogicalRect {
+        LogicalRect {
+            origin: Point::new(x, 0.0),
+            size: LogicalSize::new(100.0, 100.0),
+        }
+    }
+
+    #[test]
+    fn a_display_that_drops_out_and_returns_keeps_capture_and_only_a_held_change_stops_it() {
+        use monhop_core::display_settle::{DISPLAY_SETTLE_LIMIT, DISPLAY_STEADY_FOR};
+        let (state, _consumer) = callback_fixture();
+        let shared = &state.shared;
+        let mut recheck = DisplayRecheck::new(vec![display_at(0.0), display_at(100.0)]);
+        let one_display = || Ok(vec![display_at(0.0)]);
+        let start = Instant::now();
+        let mut now = start;
+        recheck_displays(shared, &mut recheck, now, || {
+            panic!("steady displays are never reread")
+        });
+
+        shared.displays_suspected.store(true, Ordering::Release);
+        recheck_displays(shared, &mut recheck, now, || {
+            Err(NativeCaptureError::Mac(MacError::InvalidDisplayData))
+        });
+        while now < start + Duration::from_secs(2) {
+            now += RUN_LOOP_SLICE;
+            recheck_displays(shared, &mut recheck, now, one_display);
+        }
+        // Back in another order, which is still the same geometry.
+        shared.displays_suspected.store(true, Ordering::Release);
+        let back = now;
+        while now < back + DISPLAY_STEADY_FOR + DISPLAY_SETTLE_POLL {
+            recheck_displays(shared, &mut recheck, now, || {
+                Ok(vec![display_at(100.0), display_at(0.0)])
+            });
+            now += RUN_LOOP_SLICE;
+        }
+        assert!(!recheck.settle.is_unsettled(), "the displays came back");
+        assert_eq!(shared.stop.reason(), None);
+        assert!(!shared.revocation.is_stopping());
+
+        shared.displays_suspected.store(true, Ordering::Release);
+        let changed_at = now;
+        while now < changed_at + DISPLAY_SETTLE_LIMIT {
+            recheck_displays(shared, &mut recheck, now, one_display);
+            assert_eq!(shared.stop.reason(), None, "capture carries on meanwhile");
+            now += RUN_LOOP_SLICE;
+        }
+        recheck_displays(shared, &mut recheck, now, one_display);
         assert_eq!(shared.stop.reason(), Some(StopReason::DisplaysChanged));
         assert!(shared.revocation.is_stopping(), "the session still ends");
         assert!(
