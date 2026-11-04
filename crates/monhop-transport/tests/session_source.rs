@@ -23,7 +23,7 @@ use monhop_transport::session_health::{
     BARRIER_RESEND_AFTER, HOLD_LIMIT, HealthError, PEER_LIVENESS, RETREAT_AFTER,
     SUPPRESSION_LEASE_CAP,
 };
-use monhop_transport::session_quality::LinkQuality;
+use monhop_transport::session_quality::{DEGRADED_MARKS, LinkQuality};
 use monhop_transport::session_receiver::{
     DestinationAction, DestinationFailure, InputDestination, InputReceiver, ReceiverFailure,
 };
@@ -6322,11 +6322,11 @@ fn positions(outcome: &SourceOutcome) -> Vec<Point> {
         .collect()
 }
 
-/// Controlling display 2 over a link whose replies came back 30 ms late: degraded, so motion
-/// goes at most every 4 ms. Yields when the link turned degraded and the next peer heartbeat.
+/// Controlling display 2 over a link whose replies keep coming back late: degraded, so motion goes
+/// at most every 4 ms. Yields when the link turned degraded and the next peer heartbeat.
 fn controlling_over_a_degraded_link(source: &mut SourceController) -> (Duration, u64) {
     activate_remote(source);
-    let degraded = answer_challenges(source, ms(1), ms(30), 3, 3);
+    let degraded = answer_challenges(source, ms(1), ms(35), DEGRADED_MARKS, 3);
     assert_eq!(source.link_quality(), LinkQuality::Degraded);
     degraded
 }
@@ -6358,7 +6358,7 @@ fn motion_coalesced_on_a_degraded_link_lands_exactly_where_every_record_would_ha
     let run = |delay: Duration| {
         let mut source = source().with_pointer_speed(&SPEED);
         activate_remote(&mut source);
-        let (mut now, _) = answer_challenges(&mut source, ms(1), delay, 3, 3);
+        let (mut now, _) = answer_challenges(&mut source, ms(1), delay, DEGRADED_MARKS, 3);
         let quality = source.link_quality();
         let mut sent = Vec::new();
         for _ in 0..5 {
@@ -6379,7 +6379,7 @@ fn motion_coalesced_on_a_degraded_link_lands_exactly_where_every_record_would_ha
         (quality, sent)
     };
     let (healthy, every) = run(ms(2));
-    let (degraded, paced) = run(ms(30));
+    let (degraded, paced) = run(ms(35));
     assert_eq!(
         (healthy, degraded),
         (LinkQuality::Healthy, LinkQuality::Degraded)
@@ -6550,12 +6550,12 @@ fn a_link_that_stays_clean_climbs_back_to_every_record_and_logs_each_change() {
     let (now, sequence) = controlling_over_a_degraded_link(&mut source);
     assert_eq!(
         logged(
-            "link quality for slot 1: healthy -> degraded, sending motion at most one every 4 ms (in the last 1000 ms: 3 replies, 0 unanswered, 3 late, 0 stalled, slowest 30 ms)"
+            "link quality for slot 1: healthy -> degraded, sending motion at most one every 4 ms (in the last 3000 ms: 10 replies, 0 unanswered, 10 late, 0 stalled, slowest 35 ms)"
         ),
         1
     );
     // Prompt replies for a while: the late ones age out of the window, then a clean stretch.
-    let (now, _) = answer_challenges(&mut source, now + ms(1), ms(2), 150, sequence);
+    let (now, _) = answer_challenges(&mut source, now + ms(1), ms(2), 220, sequence);
     assert_eq!(source.link_quality(), LinkQuality::Healthy);
     assert_eq!(source.unsteady_for(), Duration::ZERO);
     assert_eq!(

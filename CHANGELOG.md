@@ -4,6 +4,15 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- A note on a connected computer's card when the connection keeps having trouble for 2 seconds. A computer sharing over Wi-Fi says Wi-Fi looks unstable, and a wired one says the connection to the other computer looks unstable. One brief hiccup does not show the note. It leaves once the trouble stops, and the AirDrop warning shows instead when both apply.
+
+### Changed
+
+- A Windows mouse controlling another computer now sends its movement at the mouse's own rate instead of about 125 updates a second. Windows slows the input MonHop used to read while MonHop is in the background, so MonHop now sends each movement as it happens and corrects it from that slower input. No Windows setting changes. Pushing against a screen edge to come back now counts on-screen distance, as a Mac mouse already does, so a slow push takes a little more hand travel.
+- Pointer updates now adapt to the connection. A healthy connection sends every movement as it happens, a degraded one sends up to 250 updates a second, and a bad one up to 125. One brief hiccup leaves the rate alone, and the rate steps back up after 2 clean seconds. Clicks and keys are never held back, and the pointer always ends up in the same place.
+
 ## [0.2.18] - 2026-11-03
 
 ### Added

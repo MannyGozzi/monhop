@@ -4,18 +4,19 @@
 
 use std::{collections::VecDeque, fmt, time::Duration};
 
-/// A reply at least this late shows queueing or retransmission: a LAN, Wi-Fi included, answers
-/// within a few ms.
-pub const LATE_REPLY: Duration = Duration::from_millis(20);
+/// A reply at least this late shows queueing or retransmission. Wi-Fi with a busy channel routinely
+/// answers in 20-30 ms and carries input fine, so that jitter alone never counts.
+pub const LATE_REPLY: Duration = Duration::from_millis(30);
 /// A reply at least this late, or a challenge unanswered this long, is a stall: the link stopped
 /// carrying for a moment, as a Wi-Fi channel hop or a scan does.
 pub const STALLED_REPLY: Duration = Duration::from_millis(60);
-/// Evidence counts toward the link's tier for this long.
-pub const QUALITY_WINDOW: Duration = Duration::from_secs(1);
-/// Late marks within the window that degrade a link: about one heartbeat in ten, never one blip.
-pub const DEGRADED_MARKS: usize = 3;
-/// Stalled marks within the window that make a link bad.
-pub const BAD_MARKS: usize = 3;
+/// Evidence counts toward the link's tier for this long. One stall marks several heartbeats at
+/// once, so a short window would grade a single hiccup as a bad link.
+pub const QUALITY_WINDOW: Duration = Duration::from_secs(3);
+/// Late marks within the window that degrade a link: about one heartbeat in ten.
+pub const DEGRADED_MARKS: usize = 10;
+/// Stalled marks within the window that make a link bad: three 120 ms stalls or one of 300 ms.
+pub const BAD_MARKS: usize = 9;
 /// Quinn's packet loss over one judged span that counts as a late mark.
 pub const LATE_LOSS: f64 = 0.01;
 /// Quinn's packet loss over one judged span that counts as a stalled mark.
@@ -25,7 +26,7 @@ pub const LOSS_MIN_PACKETS: u64 = 50;
 /// How often a runtime reads quinn's path stats for a link.
 pub const PATH_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 /// A link climbs one tier only after its evidence has read better than its tier for this long.
-pub const UPGRADE_AFTER: Duration = Duration::from_secs(3);
+pub const UPGRADE_AFTER: Duration = Duration::from_secs(2);
 /// The least time between two motion frames on a degraded link: 250 Hz.
 pub const DEGRADED_MOTION_INTERVAL: Duration = Duration::from_millis(4);
 /// The least time between two motion frames on a bad link: 125 Hz.
@@ -432,53 +433,58 @@ mod tests {
     }
 
     #[test]
-    fn airdrop_hops_every_half_second_degrade_promptly() {
-        // An 80 ms stall every 500 ms: the challenges caught in it come back 80, 50 and 20 ms late.
-        let mut trace = vec![Some(3); 60];
-        for stall in [10, 27, 44] {
-            trace[stall] = Some(80);
-            trace[stall + 1] = Some(50);
-            trace[stall + 2] = Some(20);
-        }
+    fn airdrop_hops_every_half_second_degrade_within_a_few_hops_and_stop_there() {
+        let stalls: Vec<(u64, u64)> = (1..8).map(|hop| (hop * 500, 80)).collect();
         let mut monitor = LinkMonitor::default();
-        let changes = play(&mut monitor, 1, ms(0), &trace);
+        let changes = play(&mut monitor, 1, ms(0), &stalled_trace(140, &stalls));
         assert_eq!(
             changes.first().map(|(_, to)| *to),
             Some(LinkQuality::Degraded)
         );
         let (at, _) = changes[0];
-        assert!(
-            at <= ms(30 * 13),
-            "degraded within the first stall, at {at:?}"
-        );
+        assert!(at <= ms(3_000), "degraded within a few hops, at {at:?}");
         assert!(!changes.iter().any(|(_, to)| *to == LinkQuality::Bad));
     }
 
     #[test]
-    fn a_long_stall_is_bad_before_any_reply_arrives() {
+    fn a_stall_that_keeps_going_is_bad_before_any_reply_arrives() {
         let mut monitor = LinkMonitor::default();
-        // Six challenges vanish into a 200 ms stall, then all come back at once.
-        let trace = [
-            Some(3),
-            Some(3),
-            Some(200),
-            Some(170),
-            Some(140),
-            Some(110),
-            Some(80),
-            Some(50),
-            Some(23),
-        ];
-        let changes = play(&mut monitor, 1, ms(0), &trace);
+        let changes = play(&mut monitor, 1, ms(0), &stalled_trace(20, &[(60, 400)]));
         let bad = changes
             .iter()
             .find(|(_, to)| *to == LinkQuality::Bad)
             .expect("the stall makes the link bad");
         assert!(
-            bad.0 < ms(60 + 200),
+            bad.0 < ms(60 + 400),
             "bad while the stall is still running, at {:?}",
             bad.0
         );
+    }
+
+    #[test]
+    fn hiccups_a_healthy_session_rides_through_keep_the_full_rate() {
+        for (length, every) in [(100, 1_500), (120, 5_000), (150, 5_000), (250, 10_000)] {
+            let stalls: Vec<(u64, u64)> = (0..4).map(|n| (500 + n * every, length)).collect();
+            let heartbeats = (500 + 4 * every) / 30;
+            let mut monitor = LinkMonitor::default();
+            let changes = play(&mut monitor, 1, ms(0), &stalled_trace(heartbeats, &stalls));
+            assert!(
+                changes.is_empty(),
+                "{length} ms every {every} ms: {changes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stalls_that_keep_coming_make_the_link_bad_within_the_window() {
+        let stalls: Vec<(u64, u64)> = (1..8).map(|second| (second * 1_000, 150)).collect();
+        let mut monitor = LinkMonitor::default();
+        let changes = play(&mut monitor, 1, ms(0), &stalled_trace(250, &stalls));
+        let bad = changes
+            .iter()
+            .find(|(_, to)| *to == LinkQuality::Bad)
+            .expect("repeated stalls make the link bad");
+        assert!(bad.0 <= ms(4_000), "bad at {:?}", bad.0);
     }
 
     #[test]
@@ -489,13 +495,14 @@ mod tests {
             Some(LinkQuality::Bad)
         );
         assert_eq!(monitor.unsteady_for(), Duration::ZERO);
-        let changes = idle(&mut monitor, ms(1_000), ms(9_000));
-        // The hold ages out of the window at 2 s, then each tier waits out its own clean stretch.
+        let aged = ms(1_000) + QUALITY_WINDOW;
+        let changes = idle(&mut monitor, ms(1_000), aged + UPGRADE_AFTER * 3);
+        // The hold ages out of the window, then each tier waits out its own clean stretch.
         assert_eq!(
             changes,
             vec![
-                (ms(2_000) + UPGRADE_AFTER, LinkQuality::Degraded),
-                (ms(2_001) + UPGRADE_AFTER * 2, LinkQuality::Healthy),
+                (aged + UPGRADE_AFTER, LinkQuality::Degraded),
+                (aged + ms(1) + UPGRADE_AFTER * 2, LinkQuality::Healthy),
             ]
         );
         assert_eq!(monitor.unsteady_for(), Duration::ZERO);
@@ -504,26 +511,26 @@ mod tests {
     #[test]
     fn fresh_evidence_restarts_the_clean_stretch_and_can_drop_two_tiers_at_once() {
         let mut monitor = LinkMonitor::default();
-        let trace = [Some(30), Some(30), Some(30)];
+        let late = [Some(35); DEGRADED_MARKS];
         assert_eq!(
-            play(&mut monitor, 1, ms(0), &trace)
+            play(&mut monitor, 1, ms(0), &late)
                 .last()
                 .map(|(_, to)| *to),
             Some(LinkQuality::Degraded)
         );
-        // Late again 2.5 s into the clean stretch: the climb waits a full stretch from there.
-        let changes = idle(&mut monitor, ms(300), ms(3_500));
-        assert!(changes.is_empty());
-        let trace = [Some(25), Some(25), Some(25)];
-        assert!(play(&mut monitor, 10, ms(3_500), &trace).is_empty());
-        let changes = idle(&mut monitor, ms(3_800), ms(8_000));
+        // Late again partway through the clean stretch: the climb waits a full stretch from there.
+        assert!(idle(&mut monitor, ms(500), ms(4_500)).is_empty());
+        assert!(play(&mut monitor, 20, ms(4_500), &late).is_empty());
+        let changes = idle(&mut monitor, ms(5_000), ms(10_000));
         assert_eq!(
             changes,
-            vec![(ms(4_525) + UPGRADE_AFTER, LinkQuality::Healthy)]
+            vec![(
+                ms(4_535) + QUALITY_WINDOW + UPGRADE_AFTER,
+                LinkQuality::Healthy
+            )]
         );
-        // Three stalls in a row from healthy go straight to bad.
-        let trace = [None, None, None, Some(3)];
-        let changes = play(&mut monitor, 20, ms(9_000), &trace);
+        // An outage from healthy crosses the stalled count first and goes straight to bad.
+        let changes = play(&mut monitor, 40, ms(11_000), &[None; BAD_MARKS + 2]);
         assert_eq!(changes.first().map(|(_, to)| *to), Some(LinkQuality::Bad));
     }
 
@@ -546,7 +553,7 @@ mod tests {
 
     #[test]
     fn one_stall_never_earns_the_note_however_long_the_tier_takes_to_climb() {
-        for length in [100, 150, 400, 1_000] {
+        for length in [400, 1_000] {
             let mut monitor = LinkMonitor::default();
             // The trace ends inside the window, so the run is still live and at its longest.
             let heartbeats = (300 + length + 100) / 30;
@@ -554,7 +561,7 @@ mod tests {
             play(&mut monitor, 1, ms(0), &trace);
             assert_ne!(monitor.quality(), LinkQuality::Healthy, "{length} ms stall");
             let mut peak = monitor.unsteady_for();
-            for now in (length + 600)..9_000 {
+            for now in (length + 600)..12_000 {
                 monitor.tick(ms(now));
                 peak = peak.max(monitor.unsteady_for());
             }
@@ -571,7 +578,7 @@ mod tests {
         play(&mut monitor, 1, ms(0), &stalled_trace(170, &stalls));
         assert!(monitor.unsteady_for() >= NOTE_AFTER);
         // Well before the tier climbs back, the window has read clean.
-        idle(&mut monitor, ms(5_300), ms(6_300));
+        idle(&mut monitor, ms(5_300), ms(6_000));
         assert_eq!(monitor.unsteady_for(), Duration::ZERO);
         assert_ne!(monitor.quality(), LinkQuality::Healthy);
     }
@@ -597,18 +604,19 @@ mod tests {
         assert_eq!(monitor.summary().loss, None);
         assert_eq!(monitor.path(sample(2, 6, 300), ms(500)), None);
         assert_eq!(monitor.summary().loss, Some(0.03));
-        assert_eq!(monitor.path(sample(2, 8, 400), ms(750)), None);
-        let change = monitor
-            .path(sample(25, 8, 410), ms(1_000))
-            .expect("a third late mark");
+        let mut change = None;
+        for span in 3..=DEGRADED_MARKS as u64 + 1 {
+            assert_eq!(change, None);
+            change = monitor.path(sample(35, 8, 400), ms(250 * span));
+        }
+        let change = change.expect("enough late round trips degrade the link");
         assert_eq!(change.to, LinkQuality::Degraded);
-        assert_eq!(change.summary.late, 3);
+        assert_eq!(change.summary.late, DEGRADED_MARKS);
         let mut monitor = LinkMonitor::default();
         let mut tier = None;
-        for (index, rtt) in [70, 75, 80].into_iter().enumerate() {
-            let at = ms(250 * index as u64);
+        for index in 0..BAD_MARKS as u64 {
             tier = monitor
-                .path(sample(rtt, 0, 0), at)
+                .path(sample(70, 0, 0), ms(250 * index))
                 .map(|change| change.to)
                 .or(tier);
         }
@@ -649,7 +657,7 @@ mod tests {
         );
         assert_eq!(
             monitor.summary().to_string(),
-            "in the last 1000 ms: 1 replies, 0 unanswered, 1 late, 0 stalled, slowest 42 ms; path rtt 6.5 ms"
+            "in the last 3000 ms: 1 replies, 0 unanswered, 1 late, 0 stalled, slowest 42 ms; path rtt 6.5 ms"
         );
         assert_eq!(
             LinkQuality::from_code(LinkQuality::Bad.code()),
