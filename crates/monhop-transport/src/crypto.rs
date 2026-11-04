@@ -4,11 +4,14 @@
 //! over that very TLS session, never from a sharing connection attempt.
 
 use std::{
+    any::Any,
     fmt,
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics, CubicConfig};
+use quinn_proto::RttEstimator;
 use rcgen::{
     CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256,
@@ -50,6 +53,9 @@ const STREAM_RECEIVE_WINDOW: u32 = 16 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024;
 const SEND_WINDOW: u64 = 64 * 1024;
 const DATAGRAM_BUFFER_SIZE: usize = 8 * 1024;
+/// The input stream's credit plus a full datagram buffer, which a whole hold of heartbeats fits
+/// well inside; Cubic alone drops to 2 x 1200 B after a stall and leaves an outage only probes.
+const CONGESTION_WINDOW_FLOOR: u64 = STREAM_RECEIVE_WINDOW as u64 + DATAGRAM_BUFFER_SIZE as u64;
 const CRYPTO_BUFFER_SIZE: usize = 8 * 1024;
 const MAX_IDLE_TIMEOUT_MILLIS: u32 = 10_000;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(3);
@@ -889,6 +895,13 @@ fn verify_exact_leaf(
 }
 
 fn transport_config() -> Arc<quinn::TransportConfig> {
+    Arc::new(transport_config_with(Arc::new(FlooredCubic::default())))
+}
+
+/// Every transport setting, with `congestion` building each connection's congestion controller.
+fn transport_config_with(
+    congestion: Arc<dyn ControllerFactory + Send + Sync>,
+) -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_BIDIRECTIONAL_STREAMS));
     config.max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_UNIDIRECTIONAL_STREAMS));
@@ -906,7 +919,86 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     config.allow_spin(false);
     config.initial_rtt(INITIAL_RTT);
     config.ack_frequency_config(Some(peer_ack_frequency()));
-    Arc::new(config)
+    config.congestion_controller_factory(congestion);
+    config
+}
+
+/// Quinn's Cubic, whose window never drops below `CONGESTION_WINDOW_FLOOR`.
+#[derive(Default)]
+struct FlooredCubic(Arc<CubicConfig>);
+
+impl ControllerFactory for FlooredCubic {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(Floored(Arc::clone(&self.0).build(now, current_mtu)))
+    }
+}
+
+/// Delegates everything to Cubic and reports a window of at least the floor.
+struct Floored(Box<dyn Controller>);
+
+impl Controller for Floored {
+    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.0.on_sent(now, bytes, last_packet_number);
+    }
+
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        self.0.on_ack(now, sent, bytes, app_limited, rtt);
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+        self.0
+            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        self.0
+            .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.0.on_mtu_update(new_mtu);
+    }
+
+    fn window(&self) -> u64 {
+        self.0.window().max(CONGESTION_WINDOW_FLOOR)
+    }
+
+    fn metrics(&self) -> ControllerMetrics {
+        let mut metrics = self.0.metrics();
+        metrics.congestion_window = self.window();
+        metrics
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(Self(self.0.clone_box()))
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.0.initial_window().max(CONGESTION_WINDOW_FLOOR)
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
 }
 
 /// Asks the peer to acknowledge input at once, so a lost packet costs about one RTT-scaled PTO.
@@ -960,3 +1052,6 @@ impl Drop for ZeroizingKeyPair {
         self.0.zeroize();
     }
 }
+
+#[cfg(test)]
+mod stall_recovery_tests;

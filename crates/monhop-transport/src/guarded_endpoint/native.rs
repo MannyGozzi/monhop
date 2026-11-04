@@ -12,9 +12,12 @@ use std::{
 use monhop_core::RevocationSignal;
 use tokio::{runtime::Handle, task::AbortHandle};
 
-use crate::policy::{
-    InterfaceKind, InterfaceSnapshot, NetworkLock, PeerRoute, PolicyError, RouteSnapshot,
-    validate_interface, validate_peer,
+use crate::{
+    policy::{
+        InterfaceKind, InterfaceSnapshot, NetworkLock, PeerRoute, PolicyError, RouteSnapshot,
+        validate_interface, validate_peer,
+    },
+    session_health::HOLD_LIMIT,
 };
 
 #[cfg(target_os = "macos")]
@@ -184,6 +187,7 @@ pub(super) fn prepare_listener(selection: &ListenSelection) -> io::Result<Prepar
         Arc::new(move || {
             let settled = settle(
                 REREADS,
+                &SystemClock,
                 || session_ended(&ended),
                 |_| listener_verdict(&pinned, read_selected(&initial)),
             );
@@ -491,25 +495,60 @@ fn notice_check(check: &SharedCheck) -> network_watch::PinnedCheck {
 /// What one whole read finds: the selected adapter, and each pinned peer's route through it.
 type Observed = (InterfaceSnapshot, PeerRoutes);
 
-/// How long a check may keep reading a network it could not read whole, counted from its first
-/// read, and how long it waits between reads. No read starts once the window has ended, but a
-/// read already under way is not cut short, so a check takes at most the window plus one read.
+/// How a check rereads a network it could not read whole: at least `reads` reads, `interval`
+/// apart, each with its own `budget`, and past those only reads whose budget ends inside `window`
+/// of the first. A read already under way is never cut short.
 #[derive(Clone, Copy)]
 struct Rereads {
     window: Duration,
     interval: Duration,
+    reads: u32,
 }
 
-/// A network caught between states gets 1 s plus one read to read back whole, with reads 300 ms
-/// apart. Only a macOS route lookup gives up when that second ends; adapter, Wi-Fi and Windows
-/// route reads run to completion.
+impl Rereads {
+    /// Each read's own deadline, sized so the guaranteed reads and the waits between them fill the
+    /// window.
+    fn budget(self) -> Duration {
+        self.window
+            .saturating_sub(self.interval * self.reads.saturating_sub(1))
+            / self.reads.max(1)
+    }
+}
+
+/// A network caught between states gets at least three 800 ms reads, 300 ms apart, all within
+/// 3 s, so one read slowed by load cannot revoke a healthy session. Only a macOS route lookup
+/// gives up at its deadline; adapter, Wi-Fi and Windows route reads run to completion.
 const REREADS: Rereads = Rereads {
-    window: Duration::from_secs(1),
+    window: Duration::from_secs(3),
     interval: Duration::from_millis(300),
+    reads: 3,
 };
+
+// A network that never reads back revokes before a session holding a silent link gives up on it.
+const _: () = assert!(REREADS.window.as_millis() < HOLD_LIMIT.as_millis());
 
 /// How often a wait between reads looks for the session ending.
 const REREAD_POLL: Duration = Duration::from_millis(20);
+
+/// Where a check reads the time and waits between reads.
+trait Clock {
+    fn now(&self) -> Instant;
+    /// False as soon as `ended`, otherwise true once `interval` has passed.
+    fn wait(&self, interval: Duration, ended: &impl Fn() -> bool) -> bool;
+}
+
+#[derive(Clone, Copy)]
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn wait(&self, interval: Duration, ended: &impl Fn() -> bool) -> bool {
+        wait_unless_ended(interval, ended)
+    }
+}
 
 /// What one read decided; a read that revokes says why, for the log once the session is revoked.
 #[derive(Debug)]
@@ -530,18 +569,18 @@ enum Settled {
 
 /// The same adapter, attachment, peer, and on-link route revalidation the session performs, for
 /// every pinned peer. A read that shows a change revokes at once; one that cannot read the network
-/// whole is read again, and revokes once the `REREADS` window ends. A check before the first
+/// whole is read again, and revokes only once `REREADS` has run out. A check before the first
 /// snapshot revokes. A check that keeps the lock sets each member's reachability, so a member set
 /// aside earlier is admitted again once its route is back.
 fn pinned_check(initial: &Adapter, pinned: &PinnedNetwork, watched: &PinnedLock) -> SharedCheck {
     let initial = initial.clone();
     let pinned = pinned.clone();
-    checking(watched, REREADS, move |deadline| {
+    checking(watched, REREADS, SystemClock, move |deadline| {
         observe_pinned(&initial, &pinned, deadline)
     })
 }
 
-/// Its route lookups give up at `deadline`.
+/// Its route lookups give up at `deadline`, this read's own.
 fn observe_pinned(
     initial: &Adapter,
     pinned: &PinnedNetwork,
@@ -559,16 +598,18 @@ fn observe_pinned(
 }
 
 /// A check that applies each read `observe` makes to the watched lock, reading again while it
-/// cannot decide; `observe` is handed the window's deadline.
+/// cannot decide; `observe` is handed that read's deadline.
 fn checking(
     watched: &PinnedLock,
     rereads: Rereads,
+    clock: impl Clock + Send + Sync + 'static,
     observe: impl Fn(Instant) -> Result<Observed, Unread> + Send + Sync + 'static,
 ) -> SharedCheck {
     let watched = Arc::clone(watched);
     Arc::new(move || {
         let settled = settle(
             rereads,
+            &clock,
             || session_ended(&watched.ended),
             |deadline| recheck(&watched, observe(deadline)),
         );
@@ -592,33 +633,38 @@ fn concluded(settled: Settled, ended: &OnceLock<RevocationSignal>) -> bool {
     }
 }
 
-/// Reads until one read decides, handing each read the deadline one window after the first. An
-/// undecided read is read again `rereads.interval` later; once no further read starts before the
-/// deadline, or the session has ended, it revokes. Nothing about the socket changes in between:
+/// Reads until one read decides, handing each read its own deadline `rereads.budget()` after it
+/// starts. An undecided read is read again `rereads.interval` later; once `rereads` has run out it
+/// revokes, and once the session has ended it stops. Nothing about the socket changes in between:
 /// its interface, address, peers and pins stay as bound.
 fn settle(
     rereads: Rereads,
+    clock: &impl Clock,
     ended: impl Fn() -> bool,
     mut read: impl FnMut(Instant) -> Verdict,
 ) -> Settled {
-    let deadline = Instant::now() + rereads.window;
+    let budget = rereads.budget();
+    let window_ends = clock.now() + rereads.window;
+    let may_read =
+        |reads: u32, starting: Instant| reads < rereads.reads || starting + budget <= window_ends;
     let mut reads = 0_u32;
     loop {
-        reads += 1;
-        let error = match read(deadline) {
+        let error = match read(clock.now() + budget) {
             Verdict::Holds => return Settled::Holds,
             Verdict::Revokes(reason) => return Settled::Revokes(reason),
             Verdict::Undecided(error) => error,
         };
-        if Instant::now() + rereads.interval < deadline {
+        reads += 1;
+        if may_read(reads, clock.now() + rereads.interval) {
             log::info!(
                 "network recheck: the selected adapter did not read back ({:?}: {error}); reading again",
                 error.kind()
             );
-            if !wait_unless_ended(rereads.interval, &ended) {
+            if !clock.wait(rereads.interval, &ended) {
                 return Settled::Ended;
             }
-            if Instant::now() < deadline {
+            // A wait that overran on a loaded machine may leave no room for a read past the minimum.
+            if may_read(reads, clock.now()) {
                 continue;
             }
         }
@@ -1489,79 +1535,114 @@ mod tests {
         assert_eq!(reaches(&watched), [true, false, true]);
     }
 
-    /// Stands in for the one-second window and the 300 ms between rereads.
+    /// Stands in for `REREADS` where the readmission timer runs in real time.
     const REREAD: Rereads = Rereads {
         window: Duration::from_millis(300),
         interval: Duration::from_millis(50),
+        reads: 3,
     };
 
-    /// How late a loaded machine may run a sleep or a step past its due time.
-    const SLACK: Duration = Duration::from_millis(150);
+    /// A clock that moves only when a read or a wait moves it, a wait by exactly its interval.
+    #[derive(Clone)]
+    struct ManualClock(Arc<Mutex<Instant>>);
 
-    /// A window no test outlasts, for tests about what a read decides rather than when.
-    const PATIENT: Rereads = Rereads {
-        window: SETTLE,
-        interval: Duration::from_millis(30),
-    };
+    impl ManualClock {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Instant::now())))
+        }
 
-    /// A check on a lock bound to `selected` and one peer, whose `n`th read returns
-    /// `read(n, deadline)`, and when it made each read with the deadline it was handed.
+        fn advance(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+
+        fn wait(&self, interval: Duration, ended: &impl Fn() -> bool) -> bool {
+            if ended() {
+                return false;
+            }
+            self.advance(interval);
+            true
+        }
+    }
+
+    /// A `REREADS` check on a lock bound to `selected` and one peer, on a manual clock, whose `n`th
+    /// read returns `read(clock, n, deadline)`; it notes when each read started and its deadline.
     struct Scripted {
         watched: PinnedLock,
         check: SharedCheck,
+        clock: ManualClock,
+        started: Instant,
         reads: Arc<Mutex<Vec<(Instant, Instant)>>>,
     }
 
     impl Scripted {
         fn new(
             selected: &InterfaceSnapshot,
-            rereads: Rereads,
-            read: impl Fn(usize, Instant) -> Result<Observed, Unread> + Send + Sync + 'static,
+            read: impl Fn(&ManualClock, usize, Instant) -> Result<Observed, Unread>
+            + Send
+            + Sync
+            + 'static,
         ) -> Self {
             let watched = Arc::new(watching(selected, &peer_routes(route())));
+            let clock = ManualClock::new();
             let reads = Arc::new(Mutex::new(Vec::new()));
             let check = {
-                let reads = Arc::clone(&reads);
-                checking(&watched, rereads, move |deadline| {
+                let (reads, reading) = (Arc::clone(&reads), clock.clone());
+                checking(&watched, REREADS, clock.clone(), move |deadline| {
                     let read_number = {
                         let mut reads = reads.lock().unwrap();
-                        reads.push((Instant::now(), deadline));
+                        reads.push((reading.now(), deadline));
                         reads.len() - 1
                     };
-                    read(read_number, deadline)
+                    read(&reading, read_number, deadline)
                 })
             };
             Self {
                 watched,
                 check,
+                started: clock.now(),
+                clock,
                 reads,
             }
         }
 
-        fn reads(&self) -> Vec<Instant> {
-            self.reads
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|read| read.0)
-                .collect()
+        /// When each read started, counted from the check's start.
+        fn starts(&self) -> Vec<Duration> {
+            let reads = self.reads.lock().unwrap();
+            reads.iter().map(|(at, _)| *at - self.started).collect()
         }
 
-        fn deadlines(&self) -> Vec<Instant> {
-            self.reads
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|read| read.1)
-                .collect()
+        /// How long each read was allowed, counted from its own start.
+        fn budgets(&self) -> Vec<Duration> {
+            let reads = self.reads.lock().unwrap();
+            reads.iter().map(|(at, deadline)| *deadline - *at).collect()
         }
+
+        fn took(&self) -> Duration {
+            self.clock.now() - self.started
+        }
+    }
+
+    fn every_interval(reads: u32) -> Vec<Duration> {
+        (0..reads).map(|read| REREADS.interval * read).collect()
+    }
+
+    #[test]
+    fn the_guaranteed_reads_and_their_waits_fill_the_window() {
+        let guaranteed = REREADS.budget() * REREADS.reads + REREADS.interval * (REREADS.reads - 1);
+        assert_eq!(guaranteed, REREADS.window);
     }
 
     #[test]
     fn a_read_caught_between_states_is_read_again_and_an_unchanged_one_keeps_the_session() {
         let selected = interface_snapshot(&adapter()).unwrap();
         let current = selected.clone();
-        let script = Scripted::new(&selected, PATIENT, move |read, _| {
+        let script = Scripted::new(&selected, move |_, read, _| {
             if read < 2 {
                 Err(unreadable())
             } else {
@@ -1569,63 +1650,63 @@ mod tests {
             }
         });
         assert!((script.check)());
-        let reads = script.reads();
-        assert_eq!(reads.len(), 3);
-        assert!(
-            reads
-                .windows(2)
-                .all(|pair| pair[1] - pair[0] >= PATIENT.interval)
-        );
+        assert_eq!(script.starts(), every_interval(3));
         assert!(!revoked(&script.watched));
     }
 
     #[test]
-    fn a_network_unreadable_for_the_whole_window_revokes_when_it_ends() {
+    fn a_network_that_never_reads_back_revokes_once_its_reads_run_out() {
         let selected = interface_snapshot(&adapter()).unwrap();
-        let script = Scripted::new(&selected, REREAD, |_, _| Err(unreadable()));
-        let started = Instant::now();
+        let script = Scripted::new(&selected, |_, _, _| Err(unreadable()));
         assert!(!(script.check)());
-        let took = started.elapsed();
-        // Every 50 ms up to 250 ms on an idle machine; a loaded one fits fewer, never one.
-        assert!((2..=6).contains(&script.reads().len()));
-        assert!(took >= REREAD.window - REREAD.interval);
-        assert!(took < SETTLE);
+        // Past the guaranteed reads, one starts each interval while its budget ends in the window.
+        let last = (REREADS.window - REREADS.budget()).as_millis() / REREADS.interval.as_millis();
+        let starts = every_interval(u32::try_from(last).unwrap() + 1);
+        assert!(starts.len() > REREADS.reads as usize);
+        assert_eq!(script.starts(), starts);
+        assert!(
+            script
+                .budgets()
+                .iter()
+                .all(|budget| *budget == REREADS.budget())
+        );
+        assert!(script.took() + REREADS.budget() <= REREADS.window);
     }
 
     #[test]
-    fn every_read_shares_one_deadline_so_slow_reads_cannot_stretch_the_window() {
+    fn each_read_gets_its_own_deadline_so_slow_reads_cannot_use_up_the_others() {
         let selected = interface_snapshot(&adapter()).unwrap();
-        let rereads = Rereads {
-            window: Duration::from_millis(300),
-            interval: Duration::from_millis(30),
-        };
-        let slow = Duration::from_millis(120);
-        // Four reads of 120 ms would take 570 ms; the window stops the third from starting.
-        let script = Scripted::new(&selected, rereads, move |_, _| {
-            std::thread::sleep(slow);
-            Err(unreadable())
+        // As macOS route lookups the kernel never answers: each gives up at its own deadline.
+        let script = Scripted::new(&selected, |clock, _, deadline| {
+            clock.advance(deadline - clock.now());
+            Err(Unread::Unreadable(io::Error::from(io::ErrorKind::TimedOut)))
         });
-        let started = Instant::now();
         assert!(!(script.check)());
-        let finished = Instant::now();
-        let (reads, deadlines) = (script.reads(), script.deadlines());
-        assert!(reads.len() <= 2);
-        assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
-        assert!(deadlines[0] >= started + rereads.window);
-        assert!(deadlines[0] <= reads[0] + rereads.window);
-        // No read starts after the deadline, and the check ends with its last read.
-        assert!(reads.iter().all(|read| *read < deadlines[0]));
-        assert!(finished < reads[reads.len() - 1] + slow + SLACK);
+        let budget = REREADS.budget();
+        let spaced = budget + REREADS.interval;
+        assert_eq!(script.starts(), [Duration::ZERO, spaced, spaced * 2]);
+        assert_eq!(script.budgets(), [budget; 3]);
+        assert_eq!(script.took(), REREADS.window);
+    }
 
-        // A lookup that gives up only at its deadline leaves no time for another read.
-        let script = Scripted::new(&selected, rereads, |_, deadline| {
-            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-            Err(unreadable())
+    #[test]
+    fn two_reads_slower_than_the_old_window_then_a_good_read_keep_the_session() {
+        let selected = interface_snapshot(&adapter()).unwrap();
+        let current = selected.clone();
+        // The old rule handed every read one shared 1 s deadline, so the first of these revoked.
+        let slow = Duration::from_millis(1_200);
+        let script = Scripted::new(&selected, move |clock, read, _| {
+            if read < 2 {
+                clock.advance(slow);
+                Err(Unread::Unreadable(io::Error::from(io::ErrorKind::TimedOut)))
+            } else {
+                whole(&current, peer_routes(route()))
+            }
         });
-        assert!(!(script.check)());
-        let finished = Instant::now();
-        assert_eq!(script.reads().len(), 1);
-        assert!(finished < script.deadlines()[0] + SLACK);
+        assert!((script.check)());
+        let spaced = slow + REREADS.interval;
+        assert_eq!(script.starts(), [Duration::ZERO, spaced, spaced * 2]);
+        assert!(!revoked(&script.watched));
     }
 
     #[test]
@@ -1633,49 +1714,56 @@ mod tests {
         let selected = interface_snapshot(&adapter()).unwrap();
         let mut moved = selected.clone();
         moved.network_signature = vec![2; 32];
-        let script = Scripted::new(&selected, PATIENT, move |_, _| {
+        let script = Scripted::new(&selected, move |_, _, _| {
             whole(&moved, peer_routes(route()))
         });
         assert!(!(script.check)());
-        assert_eq!(script.reads().len(), 1);
+        assert_eq!(script.starts().len(), 1);
         assert!(revoked(&script.watched));
 
-        let script = Scripted::new(&selected, PATIENT, |_, _| Err(changed()));
+        let script = Scripted::new(&selected, |_, _, _| Err(changed()));
         assert!(!(script.check)());
-        assert_eq!(script.reads().len(), 1);
+        assert_eq!(script.starts().len(), 1);
+        assert_eq!(script.took(), Duration::ZERO);
         assert!(revoked(&script.watched));
 
-        // A change found on a reread revokes on that read.
-        let script = Scripted::new(&selected, PATIENT, |read, _| {
+        // A change found on a reread revokes on that read, with guaranteed reads still to come.
+        let script = Scripted::new(&selected, |_, read, _| {
             Err(if read == 0 { unreadable() } else { changed() })
         });
         assert!(!(script.check)());
-        assert_eq!(script.reads().len(), 2);
+        assert_eq!(script.starts(), every_interval(2));
         assert!(revoked(&script.watched));
     }
 
     #[test]
     fn a_session_that_ends_between_reads_stops_reading_at_once() {
         let selected = interface_snapshot(&adapter()).unwrap();
+        let watched = Arc::new(watching(&selected, &peer_routes(route())));
         let signal = RevocationSignal::default();
-        let ending = signal.clone();
+        assert!(watched.ended.set(signal.clone()).is_ok());
         let long = Rereads {
             window: SETTLE * 4,
             interval: SETTLE * 2,
+            reads: 3,
         };
-        let script = Scripted::new(&selected, long, move |_, _| {
-            ending.revoke();
-            Err(unreadable())
-        });
-        assert!(script.watched.ended.set(signal).is_ok());
+        let reads = Arc::new(Mutex::new(0_usize));
+        let check = {
+            let reads = Arc::clone(&reads);
+            checking(&watched, long, SystemClock, move |_| {
+                *reads.lock().unwrap() += 1;
+                signal.revoke();
+                Err(unreadable())
+            })
+        };
         let started = Instant::now();
-        assert!(!(script.check)());
+        assert!(!check());
         assert!(started.elapsed() < SETTLE);
-        assert_eq!(script.reads().len(), 1);
+        assert_eq!(*reads.lock().unwrap(), 1);
     }
 
     #[test]
-    fn a_lone_member_whose_route_stays_unreadable_revokes_once_the_window_ends() {
+    fn a_lone_member_whose_route_stays_unreadable_revokes_once_its_reads_run_out() {
         // Its lone member's route failing fails the read, whatever the platform calls it.
         for kind in [
             io::ErrorKind::HostUnreachable,
@@ -1692,14 +1780,15 @@ mod tests {
         }
         let selected = interface_snapshot(&adapter()).unwrap();
         let current = selected.clone();
-        let script = Scripted::new(&selected, REREAD, move |_, _| {
+        let script = Scripted::new(&selected, move |_, _, _| {
             let route = read_route(&current, PEER, true, |_, _| {
                 Err(io::Error::from(io::ErrorKind::HostUnreachable))
             })?;
             whole(&current, vec![(PEER, route)])
         });
         assert!(!(script.check)());
-        assert!((2..=6).contains(&script.reads().len()));
+        assert!(script.starts().len() > REREADS.reads as usize);
+        assert!(script.took() + REREADS.budget() <= REREADS.window);
 
         // The lock refuses a lone unreachable member too, at bind and on a whole read.
         let alone = vec![(PEER, PeerRoute::Unreachable)];
@@ -1765,7 +1854,7 @@ mod tests {
                 reads: Mutex::default(),
             });
             let reading = Arc::clone(&network);
-            let check = checking(&watched, REREAD, move |_| reading.observe());
+            let check = checking(&watched, REREAD, SystemClock, move |_| reading.observe());
             let signal = RevocationSignal::default();
             let probes = Arc::new(Mutex::new(Vec::new()));
             let probe: Probe = {
