@@ -9,7 +9,7 @@ use crate::{
     session_startup::ReadyControl,
 };
 use monhop_core::{
-    InjectionPermit, RevocationSignal, TakeBackGate,
+    InjectionPermit, Platform, RevocationSignal, TakeBackGate,
     display_settle::{
         DISPLAY_SETTLE_LIMIT, DISPLAY_STEADY_FOR, DisplayRead, DisplaySettle, DisplayVerdict,
     },
@@ -243,6 +243,8 @@ pub trait WatchedEnvironment: Send + 'static {
 struct StartupHandoff {
     control: ReadyControl,
     origin: SessionClock,
+    /// The platform of the source's keyboard, from the session handshake.
+    keyboard: Option<Platform>,
 }
 
 pub struct DestinationActor {
@@ -352,7 +354,9 @@ impl DestinationActor {
                 };
                 let mut receiver =
                     match InputReceiver::after_startup(displays, handoff.control, now) {
-                        Ok(receiver) => receiver.with_floor(gate, local_lower, enabled),
+                        Ok(receiver) => receiver
+                            .with_floor(gate, local_lower, enabled)
+                            .keyboard_from(handoff.keyboard),
                         Err(failure) => {
                             status.stop(note_receiver_failure(failure));
                             cleanup_without_receiver(&mut destination, &status);
@@ -410,6 +414,7 @@ impl DestinationActor {
         &self,
         control: ReadyControl,
         origin: SessionClock,
+        keyboard: Option<Platform>,
     ) -> Result<(), ActorFailure> {
         if let Some(failure) = self.failure() {
             return Err(failure);
@@ -426,7 +431,11 @@ impl DestinationActor {
             return Err(ActorFailure::Startup);
         }
         self.startup
-            .try_send(StartupHandoff { control, origin })
+            .try_send(StartupHandoff {
+                control,
+                origin,
+                keyboard,
+            })
             .map_err(|error| {
                 let failure = match error {
                     mpsc::TrySendError::Full(_) => ActorFailure::Startup,
@@ -1159,6 +1168,7 @@ mod tests {
             .handoff_ready(
                 ready_control(SessionEpoch::new(1).unwrap(), 3),
                 SessionClock::try_now().unwrap(),
+                None,
             )
             .unwrap();
         wait_until(|| actor.is_started());
@@ -1648,7 +1658,7 @@ mod tests {
         .unwrap();
         wait_until(|| actor.is_native_ready());
         actor
-            .handoff_ready(ready_control(SessionEpoch::new(1).unwrap(), 3), clock)
+            .handoff_ready(ready_control(SessionEpoch::new(1).unwrap(), 3), clock, None)
             .unwrap();
         wait_for_pause.recv_timeout(Duration::from_secs(1)).unwrap();
         now.store(31 + liveness_millis(), Ordering::Release);
@@ -1713,7 +1723,7 @@ mod tests {
         .unwrap();
         wait_until(|| actor.is_native_ready());
         actor
-            .handoff_ready(ready_control(SessionEpoch::new(1).unwrap(), 3), clock)
+            .handoff_ready(ready_control(SessionEpoch::new(1).unwrap(), 3), clock, None)
             .unwrap();
         wait_until(|| actor.is_started());
         actor.try_submit(activation()).unwrap();
@@ -1830,6 +1840,7 @@ mod tests {
             .handoff_ready(
                 ready_control(SessionEpoch::new(1).unwrap(), 3),
                 SessionClock::try_now().unwrap(),
+                None,
             )
             .unwrap();
         wait_until(|| actor.is_started());

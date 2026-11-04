@@ -709,6 +709,8 @@ fn main() {
             swipe::swipe_set_enabled,
             control_as_command::control_as_command_status,
             control_as_command::control_as_command_set_enabled,
+            control_as_command::command_as_control_status,
+            control_as_command::command_as_control_set_enabled,
             pointer_speed::pointer_speed_status,
             pointer_speed::pointer_speed_set,
             window_hide,
@@ -771,7 +773,7 @@ fn main() {
             app.manage(autoscroll::Autoscroll::start(app.handle()));
             page_turn::register(app.handle());
             app.manage(swipe::Swipe::start(app.handle()));
-            app.manage(control_as_command::ControlAsCommand::start(app.handle()));
+            app.manage(control_as_command::KeyboardSwitches::start(app.handle()));
             app.manage(pointer_speed::PointerSpeed::start(app.handle()));
             app.manage(updates::Updates::start(app.handle(), !check_ui));
             #[cfg(target_os = "macos")]
@@ -1091,6 +1093,8 @@ mod tests {
                 "allow-swipe-set-enabled",
                 "allow-control-as-command-status",
                 "allow-control-as-command-set-enabled",
+                "allow-command-as-control-status",
+                "allow-command-as-control-set-enabled",
                 "allow-pointer-speed-status",
                 "allow-pointer-speed-set",
                 "core:window:allow-start-dragging",

@@ -12,7 +12,8 @@ use crate::{
     session_startup::ReadyControl,
 };
 use monhop_core::{
-    DisplayId, FloorPeer, InjectionPermit, MAX_GROUP_PEERS, RevocationSignal, TakeBackGate,
+    DisplayId, FloorPeer, InjectionPermit, MAX_GROUP_PEERS, Platform, RevocationSignal,
+    TakeBackGate,
 };
 use monhop_protocol::{DisplayTopology, Frame};
 use std::{
@@ -80,6 +81,8 @@ enum Command {
 
 struct Join {
     slot: FloorPeer,
+    /// The platform of the peer's keyboard, from its session handshake.
+    keyboard: Option<Platform>,
     control: ReadyControl,
     origin: SessionClock,
     local_lower: bool,
@@ -187,6 +190,7 @@ impl HubDestinationActor {
     pub(crate) fn add_peer(
         &mut self,
         slot: FloorPeer,
+        keyboard: Option<Platform>,
         control: ReadyControl,
         origin: SessionClock,
         local_lower: bool,
@@ -203,6 +207,7 @@ impl HubDestinationActor {
         let status = Arc::new(Status::default());
         self.command(Command::Join(Box::new(Join {
             slot,
+            keyboard,
             control,
             origin,
             local_lower,
@@ -453,6 +458,7 @@ impl<D: WatchedDestination> Worker<D> {
     fn join(&mut self, join: Join) {
         let Join {
             slot,
+            keyboard,
             control,
             origin,
             local_lower,
@@ -466,10 +472,13 @@ impl<D: WatchedDestination> Worker<D> {
         let next_heartbeat_out = control.next_heartbeat_out;
         let joined =
             match InputReceiver::after_startup(self.displays.clone(), control, origin.elapsed()) {
-                Ok(receiver) => {
-                    self.set
-                        .add(slot, receiver, local_lower, enabled, next_heartbeat_out)
-                }
+                Ok(receiver) => self.set.add(
+                    slot,
+                    receiver.keyboard_from(keyboard),
+                    local_lower,
+                    enabled,
+                    next_heartbeat_out,
+                ),
                 Err(failure) => {
                     status.stop(note_receiver_failure(failure));
                     Err(SlotFailure::Receiver(failure))
@@ -845,11 +854,15 @@ mod tests {
             }
         }
 
-        /// On a clock that never advances, so the peer never goes silent mid-test.
         fn join(&mut self, slot: FloorPeer) {
+            self.join_from(slot, None);
+        }
+
+        /// On a clock that never advances, so the peer never goes silent mid-test.
+        fn join_from(&mut self, slot: FloorPeer, keyboard: Option<Platform>) {
             let frozen = SessionClock::with_test_reader(|| Duration::from_millis(1));
             self.actor
-                .add_peer(slot, ready_control(), frozen, false, true)
+                .add_peer(slot, keyboard, ready_control(), frozen, false, true)
                 .unwrap();
             wait_until(|| self.actor.is_started(slot));
         }
@@ -1051,6 +1064,57 @@ mod tests {
         assert_eq!(hub.actor.peer_failure(slot(2)), None);
         assert!(hub.wakes.load(Ordering::Acquire) > 0);
         assert_eq!(actions(&hub.finish()), [ReleaseAll]);
+    }
+
+    #[test]
+    fn a_keyboard_of_the_other_platform_is_translated_when_its_activation_asks() {
+        let _test = lock_test();
+        let mut hub = Hub::start();
+        let other = if cfg!(target_os = "macos") {
+            Platform::Windows
+        } else {
+            Platform::MacOs
+        };
+        hub.join_from(slot(1), Some(other));
+        hub.submit(
+            slot(1),
+            frame(
+                2,
+                0,
+                Message::ActivateDisplayAt {
+                    display_id: DisplayId(1),
+                    position: Point::new(10.0, 10.0),
+                    control_as_command: true,
+                },
+            ),
+        );
+        // Left Ctrl or Control either way, which becomes left Command or the Windows key.
+        hub.submit(
+            slot(1),
+            frame(
+                2,
+                1,
+                Message::Key(Key {
+                    usage: HidUsage(0xE0),
+                    is_down: true,
+                    repeat: false,
+                    modifiers: ModifierState(1),
+                }),
+            ),
+        );
+        hub.events_until(
+            slot(1),
+            SlotEvent::Response(frame(2, 0, Message::ActivationAck(DisplayId(1)))),
+        );
+        assert_eq!(hub.next_action().0, MoveTo(Point::new(10.0, 10.0)));
+        assert_eq!(
+            hub.next_action().0,
+            DestinationAction::Key {
+                usage: HidUsage(0xE3),
+                pressed: true
+            }
+        );
+        hub.finish();
     }
 
     #[test]

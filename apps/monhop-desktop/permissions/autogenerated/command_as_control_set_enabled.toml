@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-command-as-control-set-enabled"
+description = "Enables the command_as_control_set_enabled command without any pre-configured scope."
+commands.allow = ["command_as_control_set_enabled"]
+
+[[permission]]
+identifier = "deny-command-as-control-set-enabled"
+description = "Denies the command_as_control_set_enabled command without any pre-configured scope."
+commands.deny = ["command_as_control_set_enabled"]

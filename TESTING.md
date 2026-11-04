@@ -248,6 +248,17 @@ Ctrl as Command tests drive a Windows keyboard on a Mac with the Windows Home sw
 - the switch flipped while Ctrl is held, take-back and a pulled cable leaving no key down;
 - the switch off, and a Mac keyboard, leaving Ctrl as Control.
 
+Command as Ctrl tests drive a Mac keyboard on a PC with the Mac's Keyboard switch on. They cover:
+
+- Command+C, Command+V, Command+Z, Command+A, Command+S and Command+click acting as their Ctrl shortcuts, with both Command keys;
+- Control acting as the Windows key (Control alone opening Start, Control+D showing the desktop);
+- Control+Tab and Control+Shift+Tab switching browser tabs with no Start menu opening, and Command+Tab switching apps while Command stays down;
+- Option+Left, Option+Right, Option+Shift+Left, Option+Delete and Fn+Option+Delete acting by word with no menu bar opening, in Notepad and in a browser;
+- Control+Option+0 dimming the PC;
+- the switch flipped while Command is held, take-back and a pulled cable leaving no key down;
+- the switch off, a Windows keyboard on another PC, and a Mac keyboard on another Mac, leaving every key as it is;
+- the Keyboard page on each computer showing its own switch with the other platform's row right below it.
+
 Pointer speed tests drive a Windows mouse on a Mac and on another PC, and a Mac trackpad on a PC. They cover:
 
 - `cargo run -p monhop-platform-windows --example windows_pointer_ballistics --release -- --run` in the PC's signed-in desktop printing PASS, with the mouse left alone for its second or two;

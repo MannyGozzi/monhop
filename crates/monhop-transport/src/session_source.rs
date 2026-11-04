@@ -39,8 +39,9 @@ use crate::session_startup::ReadyControl;
 /// Off until the app applies the saved switch, so no activation asks for it before it decides.
 static CONTROL_AS_COMMAND: AtomicBool = AtomicBool::new(false);
 
-/// Whether this computer's keyboard asks a Mac it controls for Ctrl as Command, from the next time
-/// the pointer enters that Mac.
+/// Whether this computer's keyboard asks a computer of the other platform it controls to translate
+/// its modifiers (Ctrl as Command on a Mac, Command as Ctrl on Windows), from the next time the
+/// pointer enters it.
 pub fn set_control_as_command(enabled: bool) {
     CONTROL_AS_COMMAND.store(enabled, Ordering::Release);
 }
@@ -2468,7 +2469,7 @@ impl SourceController {
             Message::ActivateDisplayAt {
                 display_id: target.display,
                 position: self.peer_point(target.display, entry),
-                control_as_command: self.control_as_command.load(Ordering::Acquire),
+                control_as_command: self.asks_translation(target.display),
             },
             effects,
         );
@@ -2689,10 +2690,23 @@ impl SourceController {
     }
 
     fn home_platform(&self) -> Option<Platform> {
+        self.platform_of(self.home.display)
+    }
+
+    fn platform_of(&self, display: DisplayId) -> Option<Platform> {
         self.topology
-            .machine_for_display(self.home.display)
+            .machine_for_display(display)
             .ok()
             .map(|machine| machine.platform)
+    }
+
+    /// The keyboard switch, asked only of a computer of the other platform: an earlier receiver
+    /// translates for any source that asks.
+    fn asks_translation(&self, display: DisplayId) -> bool {
+        let target = self.platform_of(display);
+        self.control_as_command.load(Ordering::Acquire)
+            && target.is_some()
+            && target != self.home_platform()
     }
 
     /// A relative record with the pointer speed it moves at, read once for it.
@@ -3821,6 +3835,56 @@ mod startup_tests {
                 .failure,
             Some(SourceFailure::RateLimited)
         );
+    }
+
+    #[test]
+    fn only_a_computer_of_the_other_platform_is_asked_to_translate_the_keyboard() {
+        static ON: AtomicBool = AtomicBool::new(true);
+        static OFF: AtomicBool = AtomicBool::new(false);
+        let display = |id: u64, machine: DeviceId| {
+            Display::new(
+                DisplayId(id),
+                machine,
+                format!("fixture-{id}"),
+                NativeSize::new(100, 100),
+                LogicalSize::new(100.0, 100.0),
+                Point::default(),
+                1.0,
+                None,
+                true,
+            )
+        };
+        let (home, peer) = (DeviceId([1; 16]), DeviceId([2; 16]));
+        for local in [Platform::Windows, Platform::MacOs] {
+            for (other, switch, asked) in [
+                (Platform::Windows, &ON, local != Platform::Windows),
+                (Platform::MacOs, &ON, local != Platform::MacOs),
+                (Platform::Windows, &OFF, false),
+                (Platform::MacOs, &OFF, false),
+            ] {
+                let topology = Topology::new(
+                    vec![Machine::new(home, local), Machine::new(peer, other)],
+                    vec![display(1, home), display(2, peer)],
+                    Vec::new(),
+                )
+                .unwrap();
+                let source = SourceController::new(
+                    topology,
+                    home,
+                    DisplayId(1),
+                    SessionEpoch::new(3).unwrap(),
+                    3,
+                    Duration::ZERO,
+                )
+                .unwrap()
+                .with_control_as_command(switch);
+                assert_eq!(
+                    source.asks_translation(DisplayId(2)),
+                    asked,
+                    "{local:?} keyboard on {other:?}"
+                );
+            }
+        }
     }
 
     #[test]

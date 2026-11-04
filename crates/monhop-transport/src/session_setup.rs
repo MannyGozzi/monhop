@@ -268,7 +268,7 @@ fn selected_adapter(
     ))
 }
 
-const fn this_platform() -> Platform {
+pub(crate) const fn this_platform() -> Platform {
     #[cfg(windows)]
     let platform = Platform::Windows;
     #[cfg(target_os = "macos")]

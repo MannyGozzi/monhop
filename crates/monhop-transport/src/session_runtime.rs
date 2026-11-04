@@ -127,7 +127,8 @@ pub async fn run_session(
     }
     let local = session.local.device_id;
     let peer = session.peer.device_id;
-    let sources = SourcePlatforms::sole(session.peer.platform);
+    let peer_platform = session.peer.platform;
+    let sources = SourcePlatforms::sole(peer_platform);
     let expected_displays = session.local.topology.clone();
     let permissions = session.permissions;
     let outbound_scope = session.outbound_scope();
@@ -432,7 +433,7 @@ pub async fn run_session(
                     .as_ref()
                     .ok_or(SessionFailure::Destination)?;
                 actor
-                    .handoff_ready(control, origin.clone())
+                    .handoff_ready(control, origin.clone(), Some(peer_platform))
                     .map_err(destination_failure)?;
                 while let Some(frame) = early_input.pop_front() {
                     actor.try_submit(frame).map_err(destination_failure)?;

@@ -4,6 +4,17 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- Use Command as Ctrl on Windows: a new switch on a Mac's Keyboard settings page, off by default. With it on, a Mac keyboard controlling a Windows PC types Command+C, Command+V, Command+Z and other Command shortcuts as the PC's Ctrl shortcuts, and the Mac's Control key becomes the Windows key. Command+Tab switches apps, Control+Tab still switches tabs, Option+Left, Option+Right and Option+Delete move and delete by word, and Control+Option+0 still dims the PC. The Keyboard page now appears on both computers with both switches side by side: each computer sets the switch for its own keyboard, and the other row names the computer to change it on. Both computers need this version for the new switch.
+
+### Fixed
+
+- MonHop on a Mac no longer crashes when a display flickers, connects or disconnects just as sharing stops or starts. Before, it quit and stayed closed until you opened it again.
+- A display that drops out and comes back within 3 seconds, such as a monitor connected to both computers that briefly switches inputs, no longer ends sharing on either computer. A change that lasts still updates the layout as before, about 3 seconds after it happens.
+- When Wi-Fi comes back after a dropout, sharing now picks up again within a few hundredths of a second. Before, it waited up to 1.5 seconds longer, so dropouts of about 3.5 seconds or more ended sharing.
+- A busy Mac no longer ends sharing because one network check was slow to answer. MonHop now reads the network at least three times over 3 seconds before it gives up on an unanswered check, and a real network change still ends sharing at once.
+
 ## [0.2.17] - 2026-10-28
 
 ### Added

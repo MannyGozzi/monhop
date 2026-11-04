@@ -30,7 +30,6 @@ import {
 } from "./dimming-model.mjs";
 import { AUTOSCROLL_LABEL, AUTOSCROLL_NOTE } from "./autoscroll-model.mjs";
 import { SWIPE_LABEL, SWIPE_NOTE } from "./swipe-model.mjs";
-import { CONTROL_AS_COMMAND_LABEL, CONTROL_AS_COMMAND_NOTE } from "./keyboard-model.mjs";
 import {
   MAX_STEP,
   MIN_STEP,
@@ -115,7 +114,7 @@ const PAGES = [
     key: "keyboard",
     title: "Keyboard",
     icon: "keyboard",
-    available: (ctx) => Boolean(ctx.controlAsCommand),
+    available: (ctx) => Boolean(ctx.keyboard),
     build: keyboardPage,
   },
   { key: "general", title: "General", icon: "settings", cluster: true, build: generalPage },
@@ -635,23 +634,25 @@ function pointerPeerPanels({ computers, sharing, active }) {
   return panels;
 }
 
-// Only on Windows, once app.js has Rust's view: the switch matters when this keyboard controls a Mac.
-function keyboardPage({ core, controlAsCommand, actions }) {
-  const { view, pending } = controlAsCommand;
+// Once app.js has Rust's view: the switch for this computer's keyboard, then beside it the other
+// platform's, which that computer's keyboard sets.
+function keyboardPage({ core, keyboard, actions }) {
+  const { view, pending, other } = keyboard;
   return {
-    description: "When this keyboard controls a Mac.",
+    description: keyboard.description,
     groups: [
       group({
         id: "settings-keyboard",
         children: [
           rows([
-            switchRow(CONTROL_AS_COMMAND_LABEL, {
+            switchRow(keyboard.label, {
               checked: view.enabled,
-              description: CONTROL_AS_COMMAND_NOTE,
+              description: keyboard.note,
               disabled: !core || pending,
-              focusKey: "settings-control-as-command-enable",
-              onChange: actions.setControlAsCommand,
+              focusKey: "settings-keyboard-switch",
+              onChange: actions.setKeyboardSwitch,
             }),
+            row({ title: other.title, detail: other.detail }),
           ]),
           fadingText("settings-keyboard-message", "note", view.error, "danger"),
         ],

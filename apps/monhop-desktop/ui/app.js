@@ -110,7 +110,7 @@ import {
 import { clipboardContext, invokeSetComputerEnabled, pollFingerprint } from "./app-actions.mjs";
 import { autoscrollContext } from "./autoscroll-model.mjs";
 import { swipeContext } from "./swipe-model.mjs";
-import { controlAsCommandContext } from "./keyboard-model.mjs";
+import { keyboardCommands, keyboardContext } from "./keyboard-model.mjs";
 import {
   applyPointerSpeedStatus,
   choosePointerSpeed,
@@ -220,8 +220,8 @@ const pointerSwitches = {
   autoscroll: { view: undefined, pending: false },
   swipe: { view: undefined, pending: false },
 };
-// Windows's keyboard switch, undefined until its status answers.
-const controlAsCommand = { view: undefined, pending: false };
+// The switch for this computer's keyboard, undefined until its status answers.
+const keyboardSwitch = { view: undefined, pending: false };
 // This computer's pointer speed on the others, and whether a save is on its way to Rust.
 let pointerSpeed = initialPointerSpeed();
 let pointerSpeedSending = false;
@@ -502,7 +502,7 @@ if (!uiCheck) {
   void loadClipboard();
   listenClipboard();
   if (platform === "macos") void loadPointerSwitches();
-  if (platform === "windows") void loadControlAsCommand();
+  void loadKeyboardSwitch();
   void loadPointerSpeed();
   void loadUpdatesStatus();
   void loadAutostartStatus();
@@ -811,11 +811,7 @@ function context() {
       pointerSwitches.autoscroll.pending,
     ),
     swipe: swipeContext(platform, pointerSwitches.swipe.view, pointerSwitches.swipe.pending),
-    controlAsCommand: controlAsCommandContext(
-      platform,
-      controlAsCommand.view,
-      controlAsCommand.pending,
-    ),
+    keyboard: keyboardContext(platform, keyboardSwitch.view, keyboardSwitch.pending),
     pointerSpeed: pointerSpeedContext(platform, pointerSpeed),
     updates: { view: updates, pending: updatesPending },
     autostart: { view: autostart, pending: autostartPending },
@@ -866,7 +862,7 @@ function context() {
       setClipboardEnabled,
       setAutoscrollEnabled,
       setSwipeEnabled,
-      setControlAsCommand,
+      setKeyboardSwitch,
       setPointerSpeed,
       startRename,
       draftRename,
@@ -2252,15 +2248,17 @@ async function sendPointerSpeed() {
 
 // ---------- keyboard ----------
 
-async function loadControlAsCommand() {
-  if (!core?.invoke) return;
-  // A backend without the command leaves the card out.
-  controlAsCommand.view = await core.invoke("control_as_command_status").catch(() => undefined);
+async function loadKeyboardSwitch() {
+  const commands = keyboardCommands(platform);
+  if (!core?.invoke || !commands) return;
+  // A backend without the command leaves the page out.
+  keyboardSwitch.view = await core.invoke(commands.status).catch(() => undefined);
   render();
 }
 
-function setControlAsCommand(enabled) {
-  void setSavedSwitch(controlAsCommand, "control_as_command_set_enabled", enabled);
+function setKeyboardSwitch(enabled) {
+  const commands = keyboardCommands(platform);
+  if (commands) void setSavedSwitch(keyboardSwitch, commands.set, enabled);
 }
 
 // ---------- updates ----------

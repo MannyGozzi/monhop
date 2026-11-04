@@ -1307,7 +1307,14 @@ impl<N: NativeInput> HubLoop<N> {
             .destination
             .as_mut()
             .ok_or(SessionFailure::Destination)?;
-        match actor.add_peer(slot, control, self.origin.clone(), local_lower, enabled) {
+        match actor.add_peer(
+            slot,
+            platform,
+            control,
+            self.origin.clone(),
+            local_lower,
+            enabled,
+        ) {
             Ok(()) => {
                 if let Seat::Live(link) = &mut self.seats[seat(slot)] {
                     link.joined = true;

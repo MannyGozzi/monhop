@@ -396,7 +396,8 @@ pub enum Message {
     ActivateDisplayAt {
         display_id: DisplayId,
         position: Point,
-        /// The source's keyboard asks a Mac for Ctrl as Command until the next activation.
+        /// The source's keyboard asks the receiving computer to translate its modifiers until the
+        /// next activation.
         control_as_command: bool,
     },
     /// Confirms a completed activation. An acknowledgement is not authority by itself; the session

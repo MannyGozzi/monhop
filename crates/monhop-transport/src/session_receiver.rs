@@ -5,8 +5,11 @@ use crate::session_health::{HOLD_LIMIT, HealthError, PEER_LIVENESS, PeerHealth, 
 use crate::session_startup::ReadyControl;
 use monhop_core::{
     DisplayId, FloorOwner, FloorPeer, FloorSnapshot, FloorState, GesturePhase, HidUsage,
-    ModifierState, MouseButton, Point, PointerGesture, SharedFloor, SystemGesture, TakeBackGate,
-    chord::KeyPlan, control_as_command::ControlAsCommand, gesture_latch::TOUCH_STREAM_IDLE,
+    ModifierState, MouseButton, Platform, Point, PointerGesture, SharedFloor, SystemGesture,
+    TakeBackGate,
+    chord::KeyPlan,
+    control_as_command::{Direction, Translator},
+    gesture_latch::TOUCH_STREAM_IDLE,
 };
 use monhop_protocol::{
     DeclineReason, DeliveryClass, DisplayTopology, Frame, Message, Motion, RateLimiter,
@@ -107,12 +110,14 @@ pub struct InputReceiver {
     /// time is ended, so a lost end never leaves a synthetic modifier held.
     gesture_seen: Duration,
     gesture_normalizations: u32,
-    /// Whether this computer honours a source's Ctrl as Command; a Mac's receivers do.
-    translates_keys: bool,
-    /// What the source's last activation asked for its keyboard.
+    /// The platform injected on, and the one the source's keyboard belongs to: only a keyboard of
+    /// the other platform is translated, and an unknown one never is.
+    local_platform: Option<Platform>,
+    source_platform: Option<Platform>,
+    /// Whether the source's last activation asked to translate its keyboard's modifiers.
     control_as_command: bool,
     /// Follows the keys injected here, so it forgets them whenever they are all released.
-    keyboard: ControlAsCommand,
+    keyboard: Translator,
 }
 
 impl InputReceiver {
@@ -152,15 +157,22 @@ impl InputReceiver {
             open_gestures: [false; 2],
             gesture_seen: now,
             gesture_normalizations: 0,
-            translates_keys: cfg!(target_os = "macos"),
+            local_platform: Some(crate::session_setup::this_platform()),
+            source_platform: None,
             control_as_command: false,
-            keyboard: ControlAsCommand::default(),
+            keyboard: Translator::default(),
         }
     }
 
-    /// Overrides whether this receiver honours a source's Ctrl as Command, which follows the OS.
-    pub fn translating_keys(mut self, translates: bool) -> Self {
-        self.translates_keys = translates;
+    /// The platform of the source's keyboard, as the session's handshake names its peer.
+    pub fn keyboard_from(mut self, platform: Option<Platform>) -> Self {
+        self.source_platform = platform;
+        self
+    }
+
+    #[cfg(test)]
+    fn injecting_on(mut self, platform: Option<Platform>) -> Self {
+        self.local_platform = platform;
         self
     }
 
@@ -628,7 +640,9 @@ impl InputReceiver {
                     return Err(ReceiverFailure::InvalidPressedState);
                 }
                 if !self.suppress_injection() {
-                    let plan = self.keyboard.key(key.usage, key.is_down, self.translates());
+                    let plan = self
+                        .keyboard
+                        .key(key.usage, key.is_down, self.translation());
                     deliver_keys(destination, plan)?;
                 }
                 Ok(None)
@@ -641,7 +655,7 @@ impl InputReceiver {
                 }
                 if !self.suppress_injection() {
                     if button.is_down {
-                        deliver_keys(destination, self.keyboard.click(self.translates()))?;
+                        deliver_keys(destination, self.keyboard.click(self.translation()))?;
                     }
                     destination
                         .apply(DestinationAction::Button {
@@ -796,8 +810,11 @@ impl InputReceiver {
         deliver(destination, DestinationAction::Gesture(gesture))
     }
 
-    fn translates(&self) -> bool {
-        self.translates_keys && self.control_as_command
+    fn translation(&self) -> Option<Direction> {
+        if !self.control_as_command {
+            return None;
+        }
+        Direction::between(self.source_platform, self.local_platform)
     }
 
     fn require_active(&self) -> Result<(DisplayId, Point), ReceiverFailure> {
@@ -2243,7 +2260,7 @@ mod tests {
     }
 
     impl Keyboard {
-        /// Activates display 1 in epoch 2, asking for Ctrl as Command or not.
+        /// Activates display 1 in epoch 2, asking to translate the keyboard or not.
         fn activate(
             receiver: &mut InputReceiver,
             target: &mut Destination,
@@ -2304,17 +2321,28 @@ mod tests {
             .collect()
     }
 
+    // A Windows keyboard's Ctrl and Windows key are a Mac's Control and Command.
     const CTRL: u16 = 0xE0;
     const COMMAND: u16 = 0xE3;
     const OPTION: u16 = 0xE2;
     const C: u16 = 0x06;
     const LEFT_ARROW: u16 = 0x50;
 
-    fn ctrl_c(receiver: InputReceiver, control_as_command: bool) -> Vec<(u16, bool)> {
+    /// A receiver injecting on `local`, driven by a keyboard on `source`.
+    fn driven(local: Platform, source: Option<Platform>) -> InputReceiver {
+        receiver().injecting_on(Some(local)).keyboard_from(source)
+    }
+
+    fn mac_driven_by_windows() -> InputReceiver {
+        driven(Platform::MacOs, Some(Platform::Windows))
+    }
+
+    /// What `receiver` injects for `modifier`+C, asked to translate or not.
+    fn chord_c(receiver: InputReceiver, modifier: u16, asked: bool) -> Vec<(u16, bool)> {
         let mut receiver = receiver;
         let mut target = Destination::default();
-        let mut wire = Keyboard::activate(&mut receiver, &mut target, control_as_command);
-        for (usage, down) in [(CTRL, true), (C, true), (C, false), (CTRL, false)] {
+        let mut wire = Keyboard::activate(&mut receiver, &mut target, asked);
+        for (usage, down) in [(modifier, true), (C, true), (C, false), (modifier, false)] {
             assert_eq!(
                 receiver.receive(&wire.key(usage, down), Duration::ZERO, &mut target),
                 Ok(None)
@@ -2323,29 +2351,50 @@ mod tests {
         keys(&target)
     }
 
+    fn typed(modifier: u16) -> [(u16, bool); 4] {
+        [(modifier, true), (C, true), (C, false), (modifier, false)]
+    }
+
     #[test]
     fn a_mac_types_ctrl_c_as_command_c_only_when_the_source_asks() {
+        assert_eq!(chord_c(mac_driven_by_windows(), CTRL, true), typed(COMMAND));
+        assert_eq!(chord_c(mac_driven_by_windows(), CTRL, false), typed(CTRL));
+    }
+
+    #[test]
+    fn windows_types_command_c_as_ctrl_c_only_when_the_source_asks() {
+        let windows = || driven(Platform::Windows, Some(Platform::MacOs));
+        assert_eq!(chord_c(windows(), COMMAND, true), typed(CTRL));
+        assert_eq!(chord_c(windows(), COMMAND, false), typed(COMMAND));
+    }
+
+    #[test]
+    fn a_keyboard_of_the_same_or_an_unknown_platform_is_never_translated() {
+        use Platform::{MacOs, Windows};
+        for (local, source) in [
+            (Windows, Some(Windows)),
+            (MacOs, Some(MacOs)),
+            (MacOs, None),
+            (Windows, None),
+        ] {
+            for modifier in [CTRL, COMMAND] {
+                assert_eq!(
+                    chord_c(driven(local, source), modifier, true),
+                    typed(modifier),
+                    "{source:?} keyboard on {local:?}"
+                );
+            }
+        }
         assert_eq!(
-            ctrl_c(receiver().translating_keys(true), true),
-            [(COMMAND, true), (C, true), (C, false), (COMMAND, false)]
-        );
-        let untouched = [(CTRL, true), (C, true), (C, false), (CTRL, false)];
-        assert_eq!(ctrl_c(receiver().translating_keys(true), false), untouched);
-        assert_eq!(
-            ctrl_c(receiver().translating_keys(false), true),
-            untouched,
-            "a Windows computer keeps Ctrl"
-        );
-        assert_eq!(
-            receiver().translates_keys,
-            cfg!(target_os = "macos"),
-            "only a Mac translates by default"
+            chord_c(receiver(), CTRL, true),
+            typed(CTRL),
+            "no named keyboard"
         );
     }
 
     #[test]
     fn a_click_after_ctrl_left_is_a_command_click() {
-        let mut receiver = receiver().translating_keys(true);
+        let mut receiver = mac_driven_by_windows();
         let mut target = Destination::default();
         let mut wire = Keyboard::activate(&mut receiver, &mut target, true);
         for (usage, down) in [(CTRL, true), (LEFT_ARROW, true), (LEFT_ARROW, false)] {
@@ -2380,8 +2429,45 @@ mod tests {
     }
 
     #[test]
+    fn windows_moves_by_word_with_option_and_a_click_puts_alt_back() {
+        let mut receiver = driven(Platform::Windows, Some(Platform::MacOs));
+        let mut target = Destination::default();
+        let mut wire = Keyboard::activate(&mut receiver, &mut target, true);
+        for (usage, down) in [(OPTION, true), (LEFT_ARROW, true), (LEFT_ARROW, false)] {
+            receiver
+                .receive(&wire.key(usage, down), Duration::ZERO, &mut target)
+                .unwrap();
+        }
+        let press = wire.next(Message::Button(monhop_protocol::Button {
+            button: MouseButton::Left,
+            is_down: true,
+            click_count: 1,
+        }));
+        receiver
+            .receive(&press, Duration::ZERO, &mut target)
+            .unwrap();
+        // On Windows, Option's Alt is Alt and its word move Ctrl.
+        assert_eq!(
+            keys(&target),
+            [
+                (OPTION, true),
+                (CTRL, true),
+                (OPTION, false),
+                (LEFT_ARROW, true),
+                (LEFT_ARROW, false),
+                (OPTION, true),
+                (CTRL, false)
+            ]
+        );
+        assert!(matches!(
+            target.calls.last(),
+            Some(DestinationAction::Button { pressed: true, .. })
+        ));
+    }
+
+    #[test]
     fn a_release_all_forgets_translated_keys_and_a_late_release_lifts_nothing() {
-        let mut receiver = receiver().translating_keys(true);
+        let mut receiver = mac_driven_by_windows();
         let mut target = Destination::default();
         let mut wire = Keyboard::activate(&mut receiver, &mut target, true);
         receiver
