@@ -7,6 +7,7 @@ pub mod chord;
 pub mod clicks;
 pub mod control_as_command;
 pub mod dimming;
+pub mod display_settle;
 pub mod floor;
 pub mod gesture_latch;
 pub mod input;
