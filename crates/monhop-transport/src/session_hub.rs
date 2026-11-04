@@ -1186,7 +1186,6 @@ impl<N: NativeInput> HubLoop<N> {
     /// Each link's route, active half, hold and blocking presses, as a pairwise session reports
     /// its own.
     fn report(&mut self) {
-        let now = self.origin.elapsed();
         let floor = self.core.floor();
         if self.last_floor != Some((floor.state, floor.peer)) {
             self.last_floor = Some((floor.state, floor.peer));
@@ -1227,7 +1226,7 @@ impl<N: NativeInput> HubLoop<N> {
             );
             if let Some(source) = source {
                 link.progress
-                    .link_quality(source.link_quality(), source.unsteady_for(now));
+                    .link_quality(source.link_quality(), source.unsteady_for());
             }
             link.progress.block(self.core.blocking_presses());
         }

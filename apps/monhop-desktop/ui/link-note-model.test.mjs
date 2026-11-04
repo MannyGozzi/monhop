@@ -38,7 +38,7 @@ test("only a computer sharing over Wi-Fi blames its Wi-Fi; a wired one names the
   const wired = linkWarning(unsteady("bad", 9000), ethernet, "Office PC");
   assert.equal(wired, connectionUnstableCopy("Office PC"));
   assert.doesNotMatch(wired, /Wi-Fi/);
-  assert.match(wired, /The connection to Office PC is unstable/);
+  assert.match(wired, /The connection to Office PC looks unstable/);
   assert.equal(linkWarning(unsteady("bad", 9000), null, "Office PC"), wired);
 });
 
@@ -46,7 +46,7 @@ test("both notes say MonHop slows the pointer updates until the link steadies", 
   for (const copy of [WIFI_UNSTABLE_COPY, connectionUnstableCopy("Studio Mac")]) {
     assert.match(copy, /MonHop is sending pointer updates less often until it steadies\.$/);
   }
-  assert.match(WIFI_UNSTABLE_COPY, /^This computer's Wi-Fi is unstable\./);
+  assert.match(WIFI_UNSTABLE_COPY, /^Wi-Fi looks unstable\./);
 });
 
 test("AirDrop keeps priority, so a card shows one note at most", () => {

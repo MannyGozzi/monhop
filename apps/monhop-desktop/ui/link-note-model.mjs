@@ -1,18 +1,19 @@
 // A link that keeps stalling makes MonHop send pointer updates less often until it steadies. The
-// card says so, and names this computer's Wi-Fi only when it shares over Wi-Fi, the likely cause.
+// card says so, and names Wi-Fi only when this computer shares over it: the other side may be the
+// cause, so neither note says whose fault it is.
 
 import { isWifiInterface } from "./model.mjs";
 
-// A link degraded or bad this long earns the note, so one stall never flashes it.
+// Trouble that keeps arriving this long earns the note, so one stall never flashes it.
 export const LINK_NOTE_AFTER_MS = 2000;
 
 const UNSTEADY = new Set(["degraded", "bad"]);
 const SLOWER = "MonHop is sending pointer updates less often until it steadies.";
 
-export const WIFI_UNSTABLE_COPY = `This computer's Wi-Fi is unstable. ${SLOWER}`;
+export const WIFI_UNSTABLE_COPY = `Wi-Fi looks unstable. ${SLOWER}`;
 
 export function connectionUnstableCopy(name) {
-  return `The connection to ${name} is unstable. ${SLOWER}`;
+  return `The connection to ${name} looks unstable. ${SLOWER}`;
 }
 
 // The note for a computer's live link, from its `peers[]` entry; null while the link is steady.

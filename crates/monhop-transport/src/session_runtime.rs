@@ -549,7 +549,7 @@ pub async fn run_session(
                         last_path_sample = now;
                         source.observe_path(io.path_sample(), now);
                     }
-                    progress.link_quality(source.link_quality(), source.unsteady_for(now));
+                    progress.link_quality(source.link_quality(), source.unsteady_for());
                     progress.block(&blocking_presses(&*capture));
                 }
             }

@@ -900,6 +900,17 @@ impl CallbackState {
         }
     }
 
+    /// Sends overshoot still owed once the hand rests. Waits out a held press, where motion can
+    /// read as a drag on the other computer.
+    fn settle_motion(&mut self, now: Duration) {
+        if self.physical.has_suppressed_presses() {
+            return;
+        }
+        if let Some((dx, dy)) = self.motion.settle(now) {
+            self.event(CaptureEvent::LogicalRelativeMotion { dx, dy });
+        }
+    }
+
     fn seed_held_key(&mut self, virtual_key: u32, scan: u32) {
         // Reuse hook decoding so Pause cannot seed NumLock or an unsupported E1 sequence.
         let flags = match scan >> 8 {
@@ -1830,9 +1841,7 @@ fn run(
             let now = shared.origin.elapsed();
             state.physical.tick(now, &shared.stop);
             state.remote();
-            if let Some((dx, dy)) = state.motion.settle(now) {
-                state.event(CaptureEvent::LogicalRelativeMotion { dx, dy });
-            }
+            state.settle_motion(now);
             draining = state.physical.has_suppressed_presses();
             if now.saturating_sub(last_held_recheck) >= HELD_RECHECK_INTERVAL {
                 last_held_recheck = now;
@@ -2521,6 +2530,25 @@ mod tests {
         assert_eq!(state.motion.settle(rested), None);
         assert!(consumer.try_pop().unwrap().is_none());
         assert_eq!(state.shared.stop.reason(), None);
+    }
+
+    #[test]
+    fn overshoot_owed_at_rest_waits_out_a_held_press() {
+        let (mut state, mut consumer) = remote_callback();
+        assert!(state.hook_mouse(move_by(40, 0), || Some(RESTING), false));
+        state.raw_mouse(&raw_counts(1, 0));
+        assert!(state.decoded(decode_mouse(WM_LBUTTONDOWN, 0, 0, 0, 0, 0)));
+        while consumer.try_pop().unwrap().is_some() {}
+        let rested = state.shared.origin.elapsed() + crate::capture_motion::SETTLE_AFTER;
+        state.settle_motion(rested);
+        assert!(consumer.try_pop().unwrap().is_none());
+        assert!(state.decoded(decode_mouse(WM_LBUTTONUP, 0, 0, 0, 0, 0)));
+        while consumer.try_pop().unwrap().is_some() {}
+        state.settle_motion(rested);
+        assert!(matches!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::LogicalRelativeMotion { dx, .. }) if dx < 0.0
+        ));
     }
 
     #[test]

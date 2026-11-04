@@ -104,6 +104,8 @@ pub(crate) struct RemoteMotion {
     reports: u32,
     /// A hook move since the last raw sample was sent from the hook.
     hook_sent: bool,
+    /// A sourced raw sample arrived since the hand last rested, so raw samples cover this motion.
+    sourced_in_run: bool,
     last_move: Option<Duration>,
     stats: MotionStats,
 }
@@ -119,6 +121,7 @@ impl RemoteMotion {
             y: Axis::default(),
             reports: 0,
             hook_sent: false,
+            sourced_in_run: false,
             last_move: None,
             stats: MotionStats::default(),
         };
@@ -162,6 +165,7 @@ impl RemoteMotion {
         ballistics: &mut Ballistics,
         now: Duration,
     ) -> RawMotion {
+        self.sourced_in_run = true;
         let reports = std::mem::take(&mut self.reports).clamp(1, MAX_MERGED_REPORTS);
         let gain = ballistics.gain(f64::from(dx), f64::from(dy), reports);
         if !std::mem::take(&mut self.hook_sent) {
@@ -183,9 +187,12 @@ impl RemoteMotion {
     }
 
     /// A raw sample with no device or absolute coordinates: hook moves sent since the last raw
-    /// sample are its, which no sourced sample will cover, so they stand as sent.
+    /// sample are its, which no sourced sample will cover, so they stand as sent. While sourced
+    /// samples cover this motion it is someone else's injected input, and owns none of them.
     pub(crate) fn unsourced(&mut self) {
-        self.stand_uncovered();
+        if !self.sourced_in_run {
+            self.stand_uncovered();
+        }
     }
 
     /// Once the hand has rested [`SETTLE_AFTER`], yields overshoot still owed back.
@@ -197,7 +204,11 @@ impl RemoteMotion {
             return None;
         }
         self.last_move = None;
-        self.stand_uncovered();
+        if std::mem::take(&mut self.sourced_in_run) {
+            self.charge_back_uncovered();
+        } else {
+            self.stand_uncovered();
+        }
         let owed = (self.x.take_owed(), self.y.take_owed());
         if owed == (0.0, 0.0) {
             return None;
@@ -220,6 +231,18 @@ impl RemoteMotion {
         self.scale += (ratio - self.scale) * SCALE_SMOOTHING;
     }
 
+    /// Raw samples cover this motion, so hook moves still uncovered at rest were paid for by a
+    /// sample handled before their hook. One that does arrive later is sent whole: totals hold.
+    fn charge_back_uncovered(&mut self) {
+        if std::mem::take(&mut self.hook_sent) {
+            self.stats.charged_back += 1;
+            self.withheld = (0.0, 0.0);
+            self.reports = 0;
+            self.x.owed -= std::mem::take(&mut self.x.predicted);
+            self.y.owed -= std::mem::take(&mut self.y.predicted);
+        }
+    }
+
     fn stand_uncovered(&mut self) {
         if std::mem::take(&mut self.hook_sent) {
             self.stats.uncovered += 1;
@@ -233,7 +256,7 @@ impl RemoteMotion {
     pub(crate) fn summary(&self, elapsed: Duration) -> String {
         let stats = &self.stats;
         format!(
-            "pointer motion: {} events in {:.1} s ({} hook moves, {} whole raw samples), peak {} in any second; {} raw corrections totalling {:.1} DIPs; {} overshoots returned totalling {:.1} DIPs; {} hook runs no raw sample covered; hook-to-model scale {:.3}",
+            "pointer motion: {} events in {:.1} s ({} hook moves, {} whole raw samples), peak {} in any second; {} raw corrections totalling {:.1} DIPs; {} overshoots returned totalling {:.1} DIPs; {} hook runs no raw sample covered; {} charged back; hook-to-model scale {:.3}",
             stats.hook_moves + stats.whole_samples + stats.corrections + stats.returns,
             elapsed.as_secs_f64(),
             stats.hook_moves,
@@ -244,6 +267,7 @@ impl RemoteMotion {
             stats.returns,
             stats.returned_dips,
             stats.uncovered,
+            stats.charged_back,
             self.scale,
         )
     }
@@ -259,6 +283,8 @@ struct MotionStats {
     returned_dips: f64,
     /// Runs of hook moves left standing without a raw sample.
     uncovered: u64,
+    /// Runs of hook moves a raw sample handled before their hook had already paid for.
+    charged_back: u64,
     buckets: [u32; RATE_BUCKETS],
     /// The bucket the latest event fell in, counted from capture start.
     bucket: u64,
@@ -276,6 +302,7 @@ impl Default for MotionStats {
             returns: 0,
             returned_dips: 0.0,
             uncovered: 0,
+            charged_back: 0,
             buckets: [0; RATE_BUCKETS],
             bucket: 0,
             in_window: 0,
@@ -584,6 +611,87 @@ mod tests {
     }
 
     #[test]
+    fn a_raw_sample_handled_before_its_hook_is_not_sent_twice() {
+        let mut motion = RemoteMotion::new(1.0);
+        let mut windows = Ballistics::default();
+        let mut model = Ballistics::default();
+        let truth = modelled(&mut model, (8, 0), 7);
+        let mut sent = (0.0, 0.0);
+        for report in 0..7 {
+            add(
+                &mut sent,
+                motion.hook_move(Some((3.0, 0.0)), at(report)).unwrap(),
+            );
+        }
+        // The sample holds all eight reports, the eighth's hook runs after it, then the hand stops.
+        add(&mut sent, dips(motion.raw(8, 0, &mut windows, at(7))));
+        add(
+            &mut sent,
+            motion.hook_move(Some((3.0, 0.0)), at(8)).unwrap(),
+        );
+        add(
+            &mut sent,
+            motion.settle(at(8) + SETTLE_AFTER).unwrap_or_default(),
+        );
+        close(sent, truth);
+        assert_eq!(motion.stats.charged_back, 1);
+        assert_eq!(motion.stats.uncovered, 0);
+    }
+
+    #[test]
+    fn a_raw_sample_arriving_after_the_rest_it_missed_keeps_the_total() {
+        let mut motion = RemoteMotion::new(1.0);
+        let mut windows = Ballistics::default();
+        let mut model = Ballistics::default();
+        let first = modelled(&mut model, (8, 0), 1);
+        let late = modelled(&mut model, (4, 0), 1);
+        let mut sent = (0.0, 0.0);
+        add(
+            &mut sent,
+            motion.hook_move(Some((6.0, 0.0)), at(0)).unwrap(),
+        );
+        add(&mut sent, dips(motion.raw(8, 0, &mut windows, at(1))));
+        add(
+            &mut sent,
+            motion.hook_move(Some((3.0, 0.0)), at(2)).unwrap(),
+        );
+        add(
+            &mut sent,
+            motion.settle(at(2) + SETTLE_AFTER).unwrap_or_default(),
+        );
+        add(&mut sent, dips(motion.raw(4, 0, &mut windows, at(200))));
+        close(sent, (first.0 + late.0, first.1 + late.1));
+    }
+
+    #[test]
+    fn another_programs_injected_sample_owns_no_hook_moves_of_a_covered_motion() {
+        let mut motion = RemoteMotion::new(1.0);
+        let mut windows = Ballistics::default();
+        let mut model = Ballistics::default();
+        let mut truth = (0.0, 0.0);
+        let mut sent = (0.0, 0.0);
+        add(
+            &mut sent,
+            motion.hook_move(Some((6.0, 0.0)), at(0)).unwrap(),
+        );
+        add(&mut truth, modelled(&mut model, (8, 0), 1));
+        add(&mut sent, dips(motion.raw(8, 0, &mut windows, at(1))));
+        add(
+            &mut sent,
+            motion.hook_move(Some((6.0, 0.0)), at(2)).unwrap(),
+        );
+        motion.unsourced();
+        add(&mut truth, modelled(&mut model, (8, 0), 1));
+        add(&mut sent, dips(motion.raw(8, 0, &mut windows, at(3))));
+        add(
+            &mut sent,
+            motion.settle(at(3) + SETTLE_AFTER).unwrap_or_default(),
+        );
+        close(sent, truth);
+        assert_eq!(motion.stats.uncovered, 0);
+    }
+
+    #[test]
     fn the_summary_reports_counts_only() {
         let mut motion = RemoteMotion::new(1.0);
         let mut windows = Ballistics::default();
@@ -592,7 +700,7 @@ mod tests {
         assert_eq!(
             motion.summary(Duration::from_millis(2500)),
             format!(
-                "pointer motion: 2 events in 2.5 s (1 hook moves, 0 whole raw samples), peak 2 in any second; 1 raw corrections totalling {:.1} DIPs; 0 overshoots returned totalling 0.0 DIPs; 0 hook runs no raw sample covered; hook-to-model scale 1.000",
+                "pointer motion: 2 events in 2.5 s (1 hook moves, 0 whole raw samples), peak 2 in any second; 1 raw corrections totalling {:.1} DIPs; 0 overshoots returned totalling 0.0 DIPs; 0 hook runs no raw sample covered; 0 charged back; hook-to-model scale 1.000",
                 motion.stats.correction_dips
             )
         );

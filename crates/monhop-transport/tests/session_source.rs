@@ -6557,7 +6557,7 @@ fn a_link_that_stays_clean_climbs_back_to_every_record_and_logs_each_change() {
     // Prompt replies for a while: the late ones age out of the window, then a clean stretch.
     let (now, _) = answer_challenges(&mut source, now + ms(1), ms(2), 150, sequence);
     assert_eq!(source.link_quality(), LinkQuality::Healthy);
-    assert_eq!(source.unsteady_for(now), Duration::ZERO);
+    assert_eq!(source.unsteady_for(), Duration::ZERO);
     assert_eq!(
         logged("link quality for slot 1: degraded -> healthy, sending motion each as it comes"),
         1
@@ -6580,5 +6580,5 @@ fn a_silence_long_enough_to_hold_makes_the_link_bad() {
     assert_eq!(held.failure, None);
     assert!(source.held_since().is_some());
     assert_eq!(source.link_quality(), LinkQuality::Bad);
-    assert_eq!(source.unsteady_for(RETREAT_AFTER + ms(100)), ms(100));
+    assert_eq!(source.unsteady_for(), Duration::ZERO);
 }

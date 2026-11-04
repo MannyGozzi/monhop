@@ -211,7 +211,8 @@ pub struct TierChange {
 pub struct LinkMonitor {
     tier: LinkQuality,
     better_since: Option<Duration>,
-    unsteady_since: Option<Duration>,
+    /// When the current run of trouble first and last showed; a clean window ends the run.
+    trouble: Option<(Duration, Duration)>,
     /// Sent and neither answered nor overdue, oldest first.
     challenges: VecDeque<(u64, Duration)>,
     marks: VecDeque<(Duration, Evidence)>,
@@ -224,10 +225,11 @@ impl LinkMonitor {
         self.tier
     }
 
-    /// How long the tier has stayed below healthy without a break; zero while healthy.
-    pub fn unsteady_for(&self, now: Duration) -> Duration {
-        self.unsteady_since
-            .map_or(Duration::ZERO, |since| now.saturating_sub(since))
+    /// How long trouble has kept arriving, first evidence to latest: one stall stays as short as
+    /// itself however long the tier takes to climb back, and a clean window reads zero.
+    pub fn unsteady_for(&self) -> Duration {
+        self.trouble
+            .map_or(Duration::ZERO, |(first, last)| last.saturating_sub(first))
     }
 
     pub fn challenge_sent(&mut self, token: u64, now: Duration) {
@@ -316,6 +318,10 @@ impl LinkMonitor {
             self.marks.pop_front();
         }
         self.marks.push_back((now, evidence));
+        if evidence.severity() >= Severity::Late {
+            let first = self.trouble.map_or(now, |(first, _)| first);
+            self.trouble = Some((first, now));
+        }
     }
 
     fn settle(&mut self, now: Duration) -> Option<TierChange> {
@@ -328,6 +334,9 @@ impl LinkMonitor {
         }
         let summary = self.summary();
         let evidence = summary.tier();
+        if evidence == LinkQuality::Healthy {
+            self.trouble = None;
+        }
         let from = self.tier;
         if evidence > from {
             self.tier = evidence;
@@ -344,10 +353,6 @@ impl LinkMonitor {
             self.better_since = None;
             return None;
         }
-        self.unsteady_since = match self.tier {
-            LinkQuality::Healthy => None,
-            LinkQuality::Degraded | LinkQuality::Bad => Some(self.unsteady_since.unwrap_or(now)),
-        };
         Some(TierChange {
             from,
             to: self.tier,
@@ -423,7 +428,7 @@ mod tests {
         trace[70] = Some(25);
         assert!(play(&mut monitor, 1, ms(0), &trace).is_empty());
         assert_eq!(monitor.quality(), LinkQuality::Healthy);
-        assert_eq!(monitor.unsteady_for(ms(5_000)), Duration::ZERO);
+        assert_eq!(monitor.unsteady_for(), Duration::ZERO);
     }
 
     #[test]
@@ -483,7 +488,7 @@ mod tests {
             monitor.held(ms(1_000)).map(|change| change.to),
             Some(LinkQuality::Bad)
         );
-        assert_eq!(monitor.unsteady_for(ms(1_500)), ms(500));
+        assert_eq!(monitor.unsteady_for(), Duration::ZERO);
         let changes = idle(&mut monitor, ms(1_000), ms(9_000));
         // The hold ages out of the window at 2 s, then each tier waits out its own clean stretch.
         assert_eq!(
@@ -493,7 +498,7 @@ mod tests {
                 (ms(2_001) + UPGRADE_AFTER * 2, LinkQuality::Healthy),
             ]
         );
-        assert_eq!(monitor.unsteady_for(ms(9_000)), Duration::ZERO);
+        assert_eq!(monitor.unsteady_for(), Duration::ZERO);
     }
 
     #[test]
@@ -520,7 +525,62 @@ mod tests {
         let trace = [None, None, None, Some(3)];
         let changes = play(&mut monitor, 20, ms(9_000), &trace);
         assert_eq!(changes.first().map(|(_, to)| *to), Some(LinkQuality::Bad));
-        assert_eq!(monitor.unsteady_for(ms(9_500)), ms(9_500) - changes[0].0);
+    }
+
+    /// Heartbeats 30 ms apart answered in 2 ms, except that the link carries nothing during each
+    /// `(start, length)` stall, so a reply waits for its end.
+    fn stalled_trace(heartbeats: u64, stalls: &[(u64, u64)]) -> Vec<Option<u64>> {
+        (0..heartbeats)
+            .map(|beat| {
+                let sent = beat * 30;
+                let stall = stalls
+                    .iter()
+                    .find(|(start, length)| (*start..start + length).contains(&sent));
+                Some(stall.map_or(2, |(start, length)| start + length - sent))
+            })
+            .collect()
+    }
+
+    /// The card's note waits for this much trouble (LINK_NOTE_AFTER_MS in link-note-model.mjs).
+    const NOTE_AFTER: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn one_stall_never_earns_the_note_however_long_the_tier_takes_to_climb() {
+        for length in [100, 150, 400, 1_000] {
+            let mut monitor = LinkMonitor::default();
+            // The trace ends inside the window, so the run is still live and at its longest.
+            let heartbeats = (300 + length + 100) / 30;
+            let trace = stalled_trace(heartbeats, &[(300, length)]);
+            play(&mut monitor, 1, ms(0), &trace);
+            assert_ne!(monitor.quality(), LinkQuality::Healthy, "{length} ms stall");
+            let mut peak = monitor.unsteady_for();
+            for now in (length + 600)..9_000 {
+                monitor.tick(ms(now));
+                peak = peak.max(monitor.unsteady_for());
+            }
+            assert!(peak < NOTE_AFTER, "{length} ms stall peaked at {peak:?}");
+            assert_eq!(monitor.quality(), LinkQuality::Healthy, "{length} ms stall");
+            assert_eq!(monitor.unsteady_for(), Duration::ZERO, "{length} ms stall");
+        }
+    }
+
+    #[test]
+    fn stalls_that_keep_coming_earn_the_note_and_it_leaves_once_they_stop() {
+        let stalls: Vec<(u64, u64)> = (0..10).map(|stall| (stall * 500, 80)).collect();
+        let mut monitor = LinkMonitor::default();
+        play(&mut monitor, 1, ms(0), &stalled_trace(170, &stalls));
+        assert!(monitor.unsteady_for() >= NOTE_AFTER);
+        // Well before the tier climbs back, the window has read clean.
+        idle(&mut monitor, ms(5_300), ms(6_300));
+        assert_eq!(monitor.unsteady_for(), Duration::ZERO);
+        assert_ne!(monitor.quality(), LinkQuality::Healthy);
+    }
+
+    #[test]
+    fn an_outage_that_lasts_earns_the_note_while_it_runs() {
+        let mut monitor = LinkMonitor::default();
+        play(&mut monitor, 1, ms(0), &[None; 100]);
+        assert!(monitor.unsteady_for() >= NOTE_AFTER);
     }
 
     #[test]

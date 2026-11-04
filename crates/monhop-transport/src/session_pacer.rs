@@ -12,6 +12,10 @@ pub(crate) struct MotionPacer {
 }
 
 impl MotionPacer {
+    pub(crate) fn has_waiting(&self) -> bool {
+        self.waiting.is_some()
+    }
+
     /// `position` to send now when its slot is open; otherwise it waits in place of any older one.
     pub(crate) fn offer(
         &mut self,
@@ -87,7 +91,9 @@ mod tests {
         let interval = ms(8);
         assert!(pacer.offer(Point::new(1.0, 0.0), interval, ms(0)).is_some());
         assert_eq!(pacer.offer(Point::new(2.0, 0.0), interval, ms(2)), None);
+        assert!(pacer.has_waiting());
         assert_eq!(pacer.flush(ms(3)), Some(Point::new(2.0, 0.0)));
+        assert!(!pacer.has_waiting());
         assert_eq!(pacer.flush(ms(3)), None);
         assert_eq!(pacer.offer(Point::new(3.0, 0.0), interval, ms(9)), None);
         assert_eq!(pacer.due(interval, ms(11)), Some(Point::new(3.0, 0.0)));

@@ -1796,9 +1796,9 @@ impl SourceController {
         self.quality.quality()
     }
 
-    /// How long the link has been degraded or bad without a break; zero while healthy.
-    pub fn unsteady_for(&self, now: Duration) -> Duration {
-        self.quality.unsteady_for(now)
+    /// How long trouble on the link has kept arriving; zero once it reads clean.
+    pub fn unsteady_for(&self) -> Duration {
+        self.quality.unsteady_for()
     }
 
     fn note_quality(&self, change: Option<TierChange>) {
@@ -3213,7 +3213,8 @@ impl SourceController {
             .iter()
             .filter(|state| state.remote != state.physical)
             .count();
-        if key_changes + button_changes > MAX_SOURCE_EFFECTS - effects.len {
+        let waiting_motion = usize::from(self.pacer.has_waiting());
+        if key_changes + button_changes + waiting_motion > MAX_SOURCE_EFFECTS - effects.len {
             self.fail(SourceFailure::EffectCapacityExceeded, effects);
             return;
         }
