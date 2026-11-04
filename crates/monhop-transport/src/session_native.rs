@@ -1,7 +1,7 @@
 //! Native destination adapters. Construction is explicit and never enables capture.
 
 use crate::{
-    session::check_read_displays,
+    session::DisplayCheck,
     session_actor::{EnvironmentFailure, WatchedDestination, WatchedEnvironment},
     session_receiver::{DestinationAction, DestinationFailure, InputDestination},
 };
@@ -100,7 +100,10 @@ impl SourcePlatforms {
     }
 
     /// None for an unknown or empty slot, which never starts autoscroll.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS autoscroll reads it so far")
+    )]
     pub(crate) fn of(&self, slot: FloorPeer) -> Option<Platform> {
         match self.cell(slot)?.load(Ordering::Acquire) {
             1 => Some(Platform::Windows),
@@ -250,7 +253,8 @@ impl MacAutoscroll {
 }
 
 /// What must still hold for injection: no revocation, the ordinary desktop on Windows or the
-/// Accessibility permission on macOS, and the displays the session started with.
+/// Accessibility permission on macOS, and the displays the session started with, which the
+/// running watch lets settle.
 pub(crate) struct NativeEnvironment {
     device: DeviceId,
     displays: DisplayTopology,
@@ -386,6 +390,25 @@ impl WatchedDestination for NativeDestination {
 
 impl WatchedEnvironment for NativeEnvironment {
     fn validate(&mut self) -> Result<(), EnvironmentFailure> {
+        if self.recheck()? == DisplayCheck::Same {
+            return Ok(());
+        }
+        note_step(8);
+        Err(EnvironmentFailure::DisplaysChanged)
+    }
+
+    fn recheck(&mut self) -> Result<DisplayCheck, EnvironmentFailure> {
+        self.check_strict()?;
+        Ok(DisplayCheck::of(
+            &self.displays,
+            current_displays(self.device),
+        ))
+    }
+}
+
+impl NativeEnvironment {
+    /// The checks no settle window covers: each fails at once, before displays are read.
+    fn check_strict(&mut self) -> Result<(), EnvironmentFailure> {
         if self.revocation.is_stopping() {
             return Err(note_step(5).into());
         }
@@ -405,10 +428,6 @@ impl WatchedEnvironment for NativeEnvironment {
                 return Err(note_step(6).into());
             }
             self.permission_checked = Some(std::time::Instant::now());
-        }
-        if check_read_displays(&self.displays, current_displays(self.device)).is_err() {
-            note_step(8);
-            return Err(EnvironmentFailure::DisplaysChanged);
         }
         Ok(())
     }

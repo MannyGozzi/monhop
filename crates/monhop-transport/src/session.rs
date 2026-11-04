@@ -230,7 +230,7 @@ pub enum SessionFailure {
     LocalDisplaysChanged,
 }
 
-/// A fresh native display snapshot never continues a session on stale geometry.
+/// Whether a fresh native display snapshot still has the geometry the session started on.
 pub fn check_local_displays(
     expected: &monhop_protocol::DisplayTopology,
     current: &monhop_protocol::DisplayTopology,
@@ -242,15 +242,102 @@ pub fn check_local_displays(
     }
 }
 
-/// A fresh read that failed mid-change counts as a change: the session ends at once either way.
+/// One strict read, for checks made before input flows: a read that differs or failed is a change.
+/// A running destination's watch settles its rereads instead, so a flap that clears in time keeps
+/// the session.
 pub(crate) fn check_read_displays<E>(
     expected: &monhop_protocol::DisplayTopology,
     current: Result<monhop_protocol::DisplayTopology, E>,
 ) -> Result<(), SessionFailure> {
-    check_local_displays(
-        expected,
-        &current.map_err(|_| SessionFailure::LocalDisplaysChanged)?,
-    )
+    match DisplayCheck::of(expected, current) {
+        DisplayCheck::Same => Ok(()),
+        DisplayCheck::Different { .. } | DisplayCheck::Unreadable => {
+            Err(SessionFailure::LocalDisplaysChanged)
+        }
+    }
+}
+
+/// A fresh display read compared with the displays the session started on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayCheck {
+    Same,
+    Different {
+        expected: DisplaySummary,
+        observed: DisplaySummary,
+    },
+    Unreadable,
+}
+
+impl DisplayCheck {
+    pub(crate) fn of<E>(
+        expected: &monhop_protocol::DisplayTopology,
+        current: Result<monhop_protocol::DisplayTopology, E>,
+    ) -> Self {
+        match current {
+            Err(_) => Self::Unreadable,
+            Ok(current) if check_local_displays(expected, &current).is_ok() => Self::Same,
+            Ok(current) => Self::Different {
+                expected: DisplaySummary::of(expected),
+                observed: DisplaySummary::of(&current),
+            },
+        }
+    }
+
+    pub(crate) const fn read(&self) -> monhop_core::display_settle::DisplayRead {
+        use monhop_core::display_settle::DisplayRead;
+        match self {
+            Self::Same => DisplayRead::Same,
+            Self::Different { .. } => DisplayRead::Different,
+            Self::Unreadable => DisplayRead::Unreadable,
+        }
+    }
+}
+
+/// "2 displays #1a2b3c4d" for log lines: a count and an order-blind digest of the geometry
+/// `same_geometry` compares, never a name or monitor identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplaySummary {
+    count: usize,
+    digest: u32,
+}
+
+impl DisplaySummary {
+    pub(crate) fn of(topology: &monhop_protocol::DisplayTopology) -> Self {
+        use std::hash::{DefaultHasher, Hasher};
+        let mut displays = topology.displays().iter().collect::<Vec<_>>();
+        displays.sort_by_key(|display| display.id.0);
+        let mut hasher = DefaultHasher::new();
+        for display in displays {
+            hasher.write_u64(display.id.0);
+            hasher.write_u32(display.native_width);
+            hasher.write_u32(display.native_height);
+            for value in [
+                display.logical_origin.x,
+                display.logical_origin.y,
+                display.logical_size.x,
+                display.logical_size.y,
+            ] {
+                hasher.write_u64(value.to_bits());
+            }
+            hasher.write_u32(display.scale_factor.to_bits());
+            hasher.write_u8(u8::from(display.is_primary));
+        }
+        Self {
+            count: topology.displays().len(),
+            digest: hasher.finish() as u32,
+        }
+    }
+}
+
+impl std::fmt::Display for DisplaySummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let noun = if self.count == 1 {
+            "display"
+        } else {
+            "displays"
+        };
+        write!(formatter, "{} {noun} #{:08x}", self.count, self.digest)
+    }
 }
 
 /// A bounded failure observed during session startup before input delivery begins.
@@ -804,28 +891,85 @@ mod close_tests {
         );
     }
 
+    fn fixture_display(id: u64, x: f64, name: &str) -> monhop_protocol::DisplayDescription {
+        monhop_protocol::DisplayDescription {
+            id: DisplayId(id),
+            name: name.into(),
+            native_width: 100,
+            native_height: 100,
+            logical_origin: monhop_core::Point::new(x, 0.0),
+            logical_size: monhop_core::Point::new(100.0, 100.0),
+            scale_factor: 1.0,
+            is_primary: id == 1,
+            monitor: None,
+        }
+    }
+
+    fn fixture_topology(
+        displays: Vec<monhop_protocol::DisplayDescription>,
+    ) -> monhop_protocol::DisplayTopology {
+        monhop_protocol::DisplayTopology::new(displays).unwrap()
+    }
+
     #[test]
-    fn an_unreadable_display_list_is_a_display_change() {
-        let displays =
-            monhop_protocol::DisplayTopology::new(vec![monhop_protocol::DisplayDescription {
-                id: DisplayId(1),
-                name: "fixture".into(),
-                native_width: 100,
-                native_height: 100,
-                logical_origin: monhop_core::Point::default(),
-                logical_size: monhop_core::Point::new(100.0, 100.0),
-                scale_factor: 1.0,
-                is_primary: true,
-                monitor: None,
-            }])
-            .unwrap();
+    fn a_reread_names_how_it_differs_and_the_strict_check_admits_only_a_match() {
+        let one = fixture_topology(vec![fixture_display(1, 0.0, "fixture")]);
+        let two = fixture_topology(vec![
+            fixture_display(1, 0.0, "fixture"),
+            fixture_display(2, 100.0, "fixture"),
+        ]);
+        let unreadable = || Err::<monhop_protocol::DisplayTopology, ()>(());
         assert_eq!(
-            check_read_displays(&displays, Err::<monhop_protocol::DisplayTopology, ()>(())),
-            Err(SessionFailure::LocalDisplaysChanged)
+            DisplayCheck::of(&one, Ok::<_, ()>(one.clone())),
+            DisplayCheck::Same
         );
         assert_eq!(
-            check_read_displays(&displays, Ok::<_, ()>(displays.clone())),
-            Ok(())
+            DisplayCheck::of(&one, unreadable()),
+            DisplayCheck::Unreadable
+        );
+        assert_eq!(
+            DisplayCheck::of(&one, Ok::<_, ()>(two.clone())),
+            DisplayCheck::Different {
+                expected: DisplaySummary::of(&one),
+                observed: DisplaySummary::of(&two),
+            }
+        );
+
+        assert_eq!(check_read_displays(&one, Ok::<_, ()>(one.clone())), Ok(()));
+        for strict in [
+            check_read_displays(&one, unreadable()),
+            check_read_displays(&one, Ok::<_, ()>(two)),
+        ] {
+            assert_eq!(strict, Err(SessionFailure::LocalDisplaysChanged));
+        }
+    }
+
+    #[test]
+    fn a_display_summary_counts_and_digests_geometry_without_names_or_order() {
+        let pair = fixture_topology(vec![
+            fixture_display(1, 0.0, "Studio Display"),
+            fixture_display(2, 100.0, "Studio Display"),
+        ]);
+        let reordered_and_renamed = fixture_topology(vec![
+            fixture_display(2, 100.0, "Other"),
+            fixture_display(1, 0.0, "Other"),
+        ]);
+        let moved = fixture_topology(vec![
+            fixture_display(1, 0.0, "Studio Display"),
+            fixture_display(2, 200.0, "Studio Display"),
+        ]);
+        let summary = DisplaySummary::of(&pair);
+        assert_eq!(summary, DisplaySummary::of(&reordered_and_renamed));
+        assert_ne!(summary, DisplaySummary::of(&moved));
+        let text = summary.to_string();
+        assert!(text.starts_with("2 displays #"), "{text}");
+        assert_eq!(text.len(), "2 displays #".len() + 8, "{text}");
+        assert!(!text.contains("Studio"));
+        let single = fixture_topology(vec![fixture_display(1, 0.0, "fixture")]);
+        assert!(
+            DisplaySummary::of(&single)
+                .to_string()
+                .starts_with("1 display #")
         );
     }
 

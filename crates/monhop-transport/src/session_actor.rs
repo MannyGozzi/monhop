@@ -1,13 +1,19 @@
 //! A destination watchdog whose progress never depends on the network writer.
 
 use crate::{
+    session::DisplayCheck,
     session_clock::{SessionClock, micros_u64, millis_u64},
     session_receiver::{
         DestinationAction, DestinationFailure, InputDestination, InputReceiver, ReceiverFailure,
     },
     session_startup::ReadyControl,
 };
-use monhop_core::{InjectionPermit, RevocationSignal, TakeBackGate};
+use monhop_core::{
+    InjectionPermit, RevocationSignal, TakeBackGate,
+    display_settle::{
+        DISPLAY_SETTLE_LIMIT, DISPLAY_STEADY_FOR, DisplayRead, DisplaySettle, DisplayVerdict,
+    },
+};
 use monhop_protocol::{DisplayTopology, Frame, Message, SessionEpoch};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -17,7 +23,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const CAPACITY: usize = crate::session::SESSION_QUEUE_CAPACITY;
@@ -225,7 +231,13 @@ pub trait WatchedDestination: InputDestination {
 }
 
 pub trait WatchedEnvironment: Send + 'static {
+    /// Every check strictly, as before input flows: displays that differ or fail to read fail.
     fn validate(&mut self) -> Result<(), EnvironmentFailure>;
+    /// The running watch's pass: the other checks still fail at once, but displays are only read
+    /// and compared, for the watch to settle. Without an override the watch stays strict.
+    fn recheck(&mut self) -> Result<DisplayCheck, EnvironmentFailure> {
+        self.validate().map(|()| DisplayCheck::Same)
+    }
 }
 
 struct StartupHandoff {
@@ -573,15 +585,92 @@ impl<D: WatchedDestination> InputDestination for DestinationGuard<D> {
     }
 }
 
-/// A panicking check stops the session like a panicking injection.
 pub(crate) fn check_environment<E: WatchedEnvironment>(
     environment: &mut E,
 ) -> Result<(), ActorFailure> {
-    match catch_unwind(AssertUnwindSafe(|| environment.validate())) {
+    unwind_guarded(|| environment.validate())
+}
+
+/// A panicking check stops the session like a panicking injection.
+fn unwind_guarded<T>(
+    check: impl FnOnce() -> Result<T, EnvironmentFailure>,
+) -> Result<T, ActorFailure> {
+    match catch_unwind(AssertUnwindSafe(check)) {
         Ok(result) => result.map_err(ActorFailure::from),
         Err(payload) => {
             std::mem::forget(payload);
             Err(ActorFailure::Panicked)
+        }
+    }
+}
+
+/// Settles the watch's display rereads: a flap or failed read that clears inside the limit keeps
+/// the session, while one that holds ends it as a display change.
+pub(crate) struct DisplayWatch {
+    settle: DisplaySettle,
+    limit: Duration,
+}
+
+impl Default for DisplayWatch {
+    fn default() -> Self {
+        Self::with_timing(DISPLAY_SETTLE_LIMIT, DISPLAY_STEADY_FOR)
+    }
+}
+
+impl DisplayWatch {
+    pub(crate) fn with_timing(limit: Duration, steady_for: Duration) -> Self {
+        Self {
+            settle: DisplaySettle::with_timing(limit, steady_for),
+            limit,
+        }
+    }
+
+    /// `read_at` runs once the read returns, so a slow read never backdates what it saw.
+    fn recheck<E: WatchedEnvironment>(
+        &mut self,
+        environment: &mut E,
+        read_at: impl FnOnce() -> Instant,
+    ) -> Result<(), ActorFailure> {
+        let check = unwind_guarded(|| environment.recheck())?;
+        self.observe(check, read_at()).map_err(ActorFailure::from)
+    }
+
+    fn observe(&mut self, check: DisplayCheck, now: Instant) -> Result<(), EnvironmentFailure> {
+        let read = check.read();
+        if !self.settle.is_unsettled() {
+            match check {
+                DisplayCheck::Same => {}
+                DisplayCheck::Different { expected, observed } => log::warn!(
+                    "destination: displays changed (expected {expected}, read {observed}); \
+                     sharing continues while they settle"
+                ),
+                DisplayCheck::Unreadable => log::warn!(
+                    "destination: displays could not be read; sharing continues while they settle"
+                ),
+            }
+        }
+        match self.settle.observe(read, now) {
+            DisplayVerdict::Steady | DisplayVerdict::Unsettled => Ok(()),
+            DisplayVerdict::Recovered(away) => {
+                log::info!(
+                    "destination: displays changed and came back after {} ms; sharing continues",
+                    millis_u64(away)
+                );
+                Ok(())
+            }
+            DisplayVerdict::Changed => {
+                let kind = if read == DisplayRead::Unreadable {
+                    "unreadable"
+                } else {
+                    "changed"
+                };
+                log::warn!(
+                    "destination: displays stayed {kind} past the {} ms settle limit; ending the \
+                     session",
+                    millis_u64(self.limit)
+                );
+                Err(EnvironmentFailure::DisplaysChanged)
+            }
         }
     }
 }
@@ -595,7 +684,16 @@ pub(crate) struct EnvironmentWatch {
 
 impl EnvironmentWatch {
     pub(crate) fn start<E: WatchedEnvironment>(
+        environment: E,
+        status: Arc<Status>,
+        revocation: RevocationSignal,
+    ) -> std::io::Result<Self> {
+        Self::start_settling(environment, DisplayWatch::default(), status, revocation)
+    }
+
+    pub(crate) fn start_settling<E: WatchedEnvironment>(
         mut environment: E,
+        mut displays: DisplayWatch,
         status: Arc<Status>,
         revocation: RevocationSignal,
     ) -> std::io::Result<Self> {
@@ -613,8 +711,8 @@ impl EnvironmentWatch {
                     {
                         return;
                     }
-                    let started = std::time::Instant::now();
-                    let checked = check_environment(&mut environment);
+                    let started = Instant::now();
+                    let checked = displays.recheck(&mut environment, Instant::now);
                     Stats::max(&status.stats.env_max_micros, micros_u64(started.elapsed()));
                     if let Err(failure) = checked {
                         // A revocation that raced the check is the injection loop's to report.
@@ -1308,6 +1406,159 @@ mod tests {
             assert!(!actor.cleanup_pending());
             assert!(!monhop_core::NativeSessionClaim::is_claimed());
         }
+    }
+
+    /// Answers each watch pass by the simulated time it runs at.
+    struct TimedEnvironment {
+        at: Duration,
+        answer: Box<dyn FnMut(Duration) -> Result<DisplayCheck, EnvironmentFailure> + Send>,
+    }
+
+    impl TimedEnvironment {
+        fn answering(
+            answer: impl FnMut(Duration) -> Result<DisplayCheck, EnvironmentFailure> + Send + 'static,
+        ) -> Self {
+            Self {
+                at: Duration::ZERO,
+                answer: Box::new(answer),
+            }
+        }
+    }
+
+    impl WatchedEnvironment for TimedEnvironment {
+        fn validate(&mut self) -> Result<(), EnvironmentFailure> {
+            match self.recheck()? {
+                DisplayCheck::Same => Ok(()),
+                DisplayCheck::Different { .. } | DisplayCheck::Unreadable => {
+                    Err(EnvironmentFailure::DisplaysChanged)
+                }
+            }
+        }
+
+        fn recheck(&mut self) -> Result<DisplayCheck, EnvironmentFailure> {
+            (self.answer)(self.at)
+        }
+    }
+
+    /// Production-timed passes every `DISPLAY_CHECK_INTERVAL` of simulated time through `span`:
+    /// the watch if every pass held, else the first failure and when it came.
+    fn watch_for(
+        span: Duration,
+        answer: impl FnMut(Duration) -> Result<DisplayCheck, EnvironmentFailure> + Send + 'static,
+    ) -> Result<DisplayWatch, (Duration, ActorFailure)> {
+        let mut environment = TimedEnvironment::answering(answer);
+        let mut watch = DisplayWatch::default();
+        let start = Instant::now();
+        while environment.at <= span {
+            let at = environment.at;
+            watch
+                .recheck(&mut environment, || start + at)
+                .map_err(|failure| (at, failure))?;
+            environment.at += crate::session::DISPLAY_CHECK_INTERVAL;
+        }
+        Ok(watch)
+    }
+
+    /// The session's display read back somewhere else.
+    fn moved_display() -> DisplayCheck {
+        let mut moved = displays().into_displays();
+        moved[0].logical_origin = Point::new(100.0, 0.0);
+        DisplayCheck::of(
+            &displays(),
+            Ok::<_, ()>(DisplayTopology::new(moved).unwrap()),
+        )
+    }
+
+    #[test]
+    fn a_two_second_display_flap_keeps_the_session_and_then_clears() {
+        let (from, back) = (Duration::from_millis(500), Duration::from_millis(2_500));
+        let watch = watch_for(DISPLAY_SETTLE_LIMIT * 2, move |at| {
+            Ok(if at < from || at >= back {
+                DisplayCheck::Same
+            } else if at < (from + back) / 2 {
+                moved_display()
+            } else {
+                DisplayCheck::Unreadable
+            })
+        })
+        .unwrap_or_else(|(at, failure)| panic!("a flap ended the session at {at:?}: {failure:?}"));
+        assert!(!watch.settle.is_unsettled(), "the displays came back");
+    }
+
+    #[test]
+    fn displays_that_stay_changed_or_unreadable_end_the_session_at_the_settle_limit() {
+        let from = Duration::from_millis(500);
+        for held in [moved_display(), DisplayCheck::Unreadable] {
+            let Err((at, failure)) = watch_for(DISPLAY_SETTLE_LIMIT * 2, move |at| {
+                Ok(if at < from { DisplayCheck::Same } else { held })
+            }) else {
+                panic!("{held:?} held past the limit and the session went on");
+            };
+            assert_eq!(failure, ActorFailure::LocalDisplaysChanged, "{held:?}");
+            let interval = crate::session::DISPLAY_CHECK_INTERVAL;
+            let limit = from + DISPLAY_SETTLE_LIMIT;
+            assert!(
+                (limit..limit + 2 * interval).contains(&at),
+                "{held:?} ended at {at:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_strict_check_still_stops_the_session_at_once_even_mid_flap() {
+        let revoked = Duration::from_millis(500);
+        let Err((at, failure)) = watch_for(DISPLAY_SETTLE_LIMIT, move |at| {
+            if at < revoked {
+                Ok(DisplayCheck::Unreadable)
+            } else {
+                Err(EnvironmentFailure::Native)
+            }
+        }) else {
+            panic!("a revocation mid-flap was ignored");
+        };
+        assert_eq!(failure, ActorFailure::Native);
+        assert!(
+            (revoked..revoked + crate::session::DISPLAY_CHECK_INTERVAL).contains(&at),
+            "{at:?}"
+        );
+        let Err(panicked) = watch_for(DISPLAY_SETTLE_LIMIT, |_| panic!("native read panicked"))
+        else {
+            panic!("a panicking read was ignored");
+        };
+        assert_eq!(panicked, (Duration::ZERO, ActorFailure::Panicked));
+    }
+
+    #[test]
+    fn the_running_watch_ends_the_session_only_once_a_change_holds_for_its_limit() {
+        let limit = Duration::from_millis(300);
+        let unreadable = Arc::new(AtomicBool::new(false));
+        let reads = unreadable.clone();
+        let status = Arc::new(Status::default());
+        let _watch = EnvironmentWatch::start_settling(
+            TimedEnvironment::answering(move |_| {
+                Ok(if reads.load(Ordering::Acquire) {
+                    DisplayCheck::Unreadable
+                } else {
+                    DisplayCheck::Same
+                })
+            }),
+            DisplayWatch::with_timing(limit, DISPLAY_STEADY_FOR),
+            status.clone(),
+            RevocationSignal::default(),
+        )
+        .unwrap();
+        let since = Instant::now();
+        unreadable.store(true, Ordering::Release);
+        let deadline = since + Duration::from_secs(5);
+        while status.failure().is_none() {
+            assert!(Instant::now() < deadline, "the held change never ended it");
+            thread::sleep(TICK);
+        }
+        assert!(
+            since.elapsed() >= limit,
+            "a strict watch ends within one pass"
+        );
+        assert_eq!(status.failure(), Some(ActorFailure::LocalDisplaysChanged));
     }
 
     struct Pause {
