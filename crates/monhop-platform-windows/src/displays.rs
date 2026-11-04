@@ -247,6 +247,20 @@ pub fn enumerate_displays(_device: DeviceId) -> Result<Vec<Display>, DisplayErro
     Err(DisplayError::UnsupportedPlatform)
 }
 
+/// The fields `DisplayTopology::same_geometry` compares, keyed by device name; no `Debug`, so
+/// device names never reach a log.
+#[cfg(windows)]
+#[derive(PartialEq)]
+pub(crate) struct DisplayGeometrySnapshot(DisplayGeometrySet);
+
+/// Skips the label and EDID reads and the shared label cache that `enumerate_displays` adds, so a
+/// watcher can poll it cheaply. Can still block for hundreds of ms mid-change: never call it on a
+/// hook thread.
+#[cfg(windows)]
+pub(crate) fn read_display_geometry() -> Result<DisplayGeometrySnapshot, DisplayError> {
+    windows::read_geometry().map(DisplayGeometrySnapshot)
+}
+
 /// Requests a best-effort friendly-name refresh after the next display enumeration.
 /// This only changes cosmetic labels and never changes Windows display configuration.
 #[cfg(windows)]
@@ -352,9 +366,9 @@ mod windows {
     };
 
     use super::{
-        DisplayError, DisplayNameCache, DisplayNameEntry, EDID_MIN_BYTES, display_geometry_set,
-        display_id_from_device_name, edid_monitor_identity, monitor_device_registry_path,
-        unique_display_entries,
+        DisplayError, DisplayGeometrySet, DisplayNameCache, DisplayNameEntry, EDID_MIN_BYTES,
+        display_geometry_set, display_id_from_device_name, edid_monitor_identity,
+        monitor_device_registry_path, unique_display_entries,
     };
 
     const MAX_ACTIVE_DISPLAY_PATHS: u32 = (MAX_DISPLAYS as u32) * 4;
@@ -374,6 +388,27 @@ mod windows {
     }
 
     pub(super) fn enumerate_displays(device: DeviceId) -> Result<Vec<Display>, DisplayError> {
+        let displays = active_monitors(device)?;
+        let entries = cached_display_entries(&displays);
+        Ok(displays
+            .into_iter()
+            .map(|mut display| {
+                let entry = entries.get(&display.name).cloned().unwrap_or_default();
+                if let Some(friendly_name) = entry.friendly_name {
+                    display.name = friendly_name;
+                }
+                display.with_monitor(entry.monitor)
+            })
+            .collect())
+    }
+
+    pub(super) fn read_geometry() -> Result<DisplayGeometrySet, DisplayError> {
+        display_geometry_set(&active_monitors(DeviceId::default())?)
+            .ok_or(DisplayError::InvalidMonitorGeometry)
+    }
+
+    /// Displays named by GDI device name, before any friendly label replaces it.
+    fn active_monitors(device: DeviceId) -> Result<Vec<Display>, DisplayError> {
         let mut collector = MonitorCollector {
             device,
             displays: Vec::new(),
@@ -400,19 +435,7 @@ mod windows {
         if collector.displays.is_empty() {
             return Err(DisplayError::NoDisplays);
         }
-
-        let entries = cached_display_entries(&collector.displays);
-        Ok(collector
-            .displays
-            .into_iter()
-            .map(|mut display| {
-                let entry = entries.get(&display.name).cloned().unwrap_or_default();
-                if let Some(friendly_name) = entry.friendly_name {
-                    display.name = friendly_name;
-                }
-                display.with_monitor(entry.monitor)
-            })
-            .collect())
+        Ok(collector.displays)
     }
 
     struct MonitorCollector {

@@ -17,6 +17,9 @@ use std::{
 use monhop_core::{
     CapturePermit, FloorState, MouseButton, NativeSessionClaim, Point, RevocationSignal,
     TakeBackGate,
+    display_settle::{
+        DISPLAY_SETTLE_LIMIT, DISPLAY_SETTLE_POLL, DisplayRead, DisplaySettle, DisplayVerdict,
+    },
     pointer_ballistics::{Ballistics, MAX_MERGED_REPORTS},
 };
 use windows_sys::Win32::{
@@ -52,6 +55,7 @@ use crate::{
     capture_decode::{DecodedInput, decode_keyboard, decode_mouse},
     capture_physical::{HeldInput, LocalTransfer, PhysicalCapture},
     desktop_state::ordinary_desktop_is_active,
+    displays::{DisplayGeometrySnapshot, read_display_geometry},
     input::{
         MONHOP_INJECTED_MARKER, RawCaptureOwnership, VirtualDesktop,
         absolute_send_input_coordinates,
@@ -64,6 +68,8 @@ const CLASS_NAME: &[u16] = &[
 ];
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 const CLOSE_ATTEMPTS: usize = 3;
+/// The loop's longest message wait, which also bounds how late its watchdogs and rereads run.
+const MESSAGE_WAIT_MS: u32 = 5;
 const KEYBOARD_INJECTED_FLAGS: u32 = 0x12;
 const MOUSE_INJECTED_FLAGS: u32 = 0x03;
 
@@ -527,6 +533,8 @@ thread_local! {
     static CALLBACK_FAILURE: Cell<Option<CallbackFailure>> = const { Cell::new(None) };
     static CALLBACK_SITE: Cell<Option<u32>> = const { Cell::new(None) };
     static CALLBACK_REENTRY: Cell<Option<(Option<u32>, u32)>> = const { Cell::new(None) };
+    /// Set by `window_proc`; the loop turns it into a suspicion and does the rereads.
+    static DISPLAY_CHANGE_SEEN: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1396,7 +1404,8 @@ unsafe extern "system" fn window_proc(
     } else if message == WM_SETTINGCHANGE && is_pointer_setting(wparam) {
         refresh_pointer_settings();
     } else if message == WM_DISPLAYCHANGE {
-        latch_failure(CallbackFailure::DisplayChanged);
+        // Mode re-probes and monitor input flaps send this too; `watch_displays` decides.
+        DISPLAY_CHANGE_SEEN.set(true);
     } else if message == WM_POWERBROADCAST {
         latch_failure(CallbackFailure::PowerBroadcast(wparam));
     }
@@ -1423,6 +1432,248 @@ fn refresh_pointer_settings() {
     });
 }
 
+enum StartDisplays<G> {
+    Pending,
+    Known(G),
+    Unreadable,
+}
+
+/// What a finished display read meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadLanded {
+    StartKnown,
+    StartUnreadable,
+    Reread(DisplayVerdict),
+}
+
+/// Holds a display-change notice as a suspicion until rereads, compared with the displays capture
+/// started on, show a change that holds; capture keeps its geometry meanwhile. Reads are only
+/// requested here and land later, so this never blocks.
+struct DisplayWatch<G> {
+    start: StartDisplays<G>,
+    settle: DisplaySettle,
+    /// When the read in flight was requested.
+    in_flight: Option<Instant>,
+    last_request: Option<Instant>,
+}
+
+impl<G: PartialEq> DisplayWatch<G> {
+    fn new() -> Self {
+        Self {
+            start: StartDisplays::Pending,
+            settle: DisplaySettle::new(),
+            in_flight: None,
+            last_request: None,
+        }
+    }
+
+    /// True when this notice unsettles steady displays. Before the start read lands it waits for it.
+    fn suspect(&mut self, now: Instant) -> bool {
+        let first = !self.settle.is_unsettled();
+        self.settle.suspect(now);
+        first
+    }
+
+    /// True when the caller must start a read now: the start read, then at most one per poll
+    /// interval while unsettled, never while one is in flight.
+    fn start_read(&mut self, now: Instant) -> bool {
+        if self.in_flight.is_some() {
+            return false;
+        }
+        let due = match self.start {
+            StartDisplays::Pending => true,
+            StartDisplays::Known(_) => {
+                self.settle.is_unsettled()
+                    && self.last_request.is_none_or(|last| {
+                        now.saturating_duration_since(last) >= DISPLAY_SETTLE_POLL
+                    })
+            }
+            StartDisplays::Unreadable => false,
+        };
+        if due {
+            self.in_flight = Some(now);
+            self.last_request = Some(now);
+        }
+        due
+    }
+
+    /// The first read becomes the start displays; later ones are judged at the instant they finished.
+    fn read_landed(&mut self, read: Option<G>, finished: Instant) -> ReadLanded {
+        self.in_flight = None;
+        let StartDisplays::Known(start) = &self.start else {
+            self.start = read.map_or(StartDisplays::Unreadable, StartDisplays::Known);
+            return match self.start {
+                StartDisplays::Known(_) => ReadLanded::StartKnown,
+                _ => ReadLanded::StartUnreadable,
+            };
+        };
+        let observed = match read {
+            Some(current) if current == *start => DisplayRead::Same,
+            Some(_) => DisplayRead::Different,
+            None => DisplayRead::Unreadable,
+        };
+        ReadLanded::Reread(self.settle.observe(observed, finished))
+    }
+
+    /// Decides what no landed read can: a suspicion with no start displays to come back to, or a
+    /// read that has not answered for the whole settle window.
+    fn decide_without_read(&mut self, now: Instant) -> Option<DisplayVerdict> {
+        if !self.settle.is_unsettled() {
+            return None;
+        }
+        if matches!(self.start, StartDisplays::Unreadable) {
+            return Some(DisplayVerdict::Changed);
+        }
+        let stuck = self
+            .in_flight
+            .is_some_and(|asked| now.saturating_duration_since(asked) >= DISPLAY_SETTLE_LIMIT);
+        stuck.then(|| self.settle.observe(DisplayRead::Unreadable, now))
+    }
+}
+
+const DISPLAY_READER_NAME: &str = "monhop-capture-displays";
+
+/// Reads displays on its own thread: one read has taken 240-545 ms during a monitor flap, longer
+/// than the hook thread may block before Windows bypasses or removes its hooks.
+struct DisplayReader<G> {
+    requests: Option<mpsc::SyncSender<()>>,
+    results: mpsc::Receiver<(Option<G>, Instant)>,
+    worker: Option<JoinHandle<()>>,
+    in_flight: bool,
+}
+
+impl<G: Send + 'static> DisplayReader<G> {
+    fn spawn(read: impl Fn() -> Option<G> + Send + 'static) -> Option<Self> {
+        let (requests, asked) = mpsc::sync_channel::<()>(1);
+        let (answer, results) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name(DISPLAY_READER_NAME.into())
+            .spawn(move || {
+                while asked.recv().is_ok() {
+                    let geometry = read();
+                    if answer.send((geometry, Instant::now())).is_err() {
+                        break;
+                    }
+                }
+            });
+        match worker {
+            Ok(worker) => Some(Self {
+                requests: Some(requests),
+                results,
+                worker: Some(worker),
+                in_flight: false,
+            }),
+            Err(error) => {
+                log::warn!("native capture display reader could not start: {error}");
+                None
+            }
+        }
+    }
+
+    /// Never blocks; false when no read can start.
+    fn request(&mut self) -> bool {
+        let sent = self
+            .requests
+            .as_ref()
+            .is_some_and(|requests| requests.try_send(()).is_ok());
+        self.in_flight |= sent;
+        sent
+    }
+
+    /// Never blocks: the read that finished, with when it finished. A reader that died mid-read
+    /// answers unreadable.
+    fn take(&mut self) -> Option<(Option<G>, Instant)> {
+        if !self.in_flight {
+            return None;
+        }
+        let landed = match self.results.try_recv() {
+            Ok(landed) => landed,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => (None, Instant::now()),
+        };
+        self.in_flight = false;
+        Some(landed)
+    }
+}
+
+impl<G> Drop for DisplayReader<G> {
+    /// Joins an idle helper at once. One mid-read is left to finish, since capture cleanup must
+    /// not wait on it; its answer then fails to send and it exits, holding nothing of capture.
+    fn drop(&mut self) {
+        self.requests = None;
+        if let Some(worker) = self.worker.take()
+            && !self.in_flight
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Runs in the loop, never in `window_proc`. `landed` is the read that finished since the last
+/// pass; `request` starts the next one without blocking and is false when it cannot.
+fn watch_displays<G: PartialEq>(
+    watch: &mut DisplayWatch<G>,
+    now: Instant,
+    landed: Option<(Option<G>, Instant)>,
+    request: impl FnOnce() -> bool,
+) {
+    if let Some((read, finished)) = landed
+        && handle_landed_read(watch, read, finished)
+    {
+        return;
+    }
+    if DISPLAY_CHANGE_SEEN.take() && watch.suspect(now) {
+        log::info!(
+            "native capture: displays changed; rereading them for up to {} ms before ending sharing",
+            DISPLAY_SETTLE_LIMIT.as_millis()
+        );
+    }
+    if let Some(verdict) = watch.decide_without_read(now)
+        && report_display_verdict(verdict)
+    {
+        return;
+    }
+    if watch.start_read(now) && !request() {
+        handle_landed_read(watch, None, now);
+    }
+}
+
+/// True when capture stops.
+fn handle_landed_read<G: PartialEq>(
+    watch: &mut DisplayWatch<G>,
+    read: Option<G>,
+    finished: Instant,
+) -> bool {
+    match watch.read_landed(read, finished) {
+        ReadLanded::StartKnown => false,
+        ReadLanded::StartUnreadable => {
+            log::warn!(
+                "native capture: displays unreadable at start; a display change ends sharing at once"
+            );
+            false
+        }
+        ReadLanded::Reread(verdict) => report_display_verdict(verdict),
+    }
+}
+
+/// True when capture stops.
+fn report_display_verdict(verdict: DisplayVerdict) -> bool {
+    match verdict {
+        DisplayVerdict::Recovered(away) => {
+            log::info!(
+                "native capture: displays changed and came back after {} ms; sharing continues",
+                away.as_millis()
+            );
+            false
+        }
+        DisplayVerdict::Changed => {
+            latch_failure(CallbackFailure::DisplayChanged);
+            true
+        }
+        DisplayVerdict::Steady | DisplayVerdict::Unsettled => false,
+    }
+}
+
 fn run(
     shared: Arc<Shared>,
     parts: CallbackParts,
@@ -1433,6 +1684,12 @@ fn run(
     ownership: &mut RawCaptureOwnership,
 ) -> Result<(), NativeCaptureError> {
     CALLBACK_STOP.with(|slot| *slot.borrow_mut() = Some(shared.stop.clone()));
+    // Asked first, so the start displays are read while hooks install and are known soonest.
+    let mut display_reader = DisplayReader::spawn(|| read_display_geometry().ok());
+    let mut displays = DisplayWatch::<DisplayGeometrySnapshot>::new();
+    watch_displays(&mut displays, Instant::now(), None, || {
+        display_reader.as_mut().is_some_and(DisplayReader::request)
+    });
     let ballistics = crate::pointer_settings::read();
     CALLBACK.with(|slot| {
         *slot.borrow_mut() = Some(CallbackState {
@@ -1539,6 +1796,12 @@ fn run(
             }
             control.complete(revision, completion);
         }
+        if !shared.stop.is_stopped() {
+            let landed = display_reader.as_mut().and_then(DisplayReader::take);
+            watch_displays(&mut displays, Instant::now(), landed, || {
+                display_reader.as_mut().is_some_and(DisplayReader::request)
+            });
+        }
         let mut draining = false;
         with_callback(|state| {
             let now = shared.origin.elapsed();
@@ -1587,7 +1850,13 @@ fn run(
         }
         // SAFETY: zero handles waits only for messages, with a finite callback watchdog interval.
         if unsafe {
-            MsgWaitForMultipleObjectsEx(0, ptr::null(), 5, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+            MsgWaitForMultipleObjectsEx(
+                0,
+                ptr::null(),
+                MESSAGE_WAIT_MS,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            )
         } == u32::MAX
         {
             shared.stop.stop(StopReason::NativeFailure);
@@ -1616,6 +1885,7 @@ fn clear_callback() {
 fn clear_callback_stop() {
     CALLBACK_FAILURE.set(None);
     CALLBACK_REENTRY.set(None);
+    DISPLAY_CHANGE_SEEN.set(false);
     CALLBACK_STOP.with(|slot| *slot.borrow_mut() = None);
 }
 
@@ -1900,6 +2170,7 @@ fn windows_error(operation: &'static str) -> NativeCaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monhop_core::display_settle::DISPLAY_STEADY_FOR;
 
     fn callback_fixture() -> (CallbackState, CaptureConsumer) {
         callback_fixture_with(None)
@@ -3372,6 +3643,355 @@ mod tests {
         assert_eq!(stop.origin().unwrap().line(), expected_line);
         assert_eq!(stop.reason(), Some(StopReason::DisplaysChanged));
         clear_callback_stop();
+    }
+
+    const START_DISPLAYS: u8 = 1;
+    const OTHER_DISPLAYS: u8 = 2;
+    const LOOP_PASS: Duration = Duration::from_millis(MESSAGE_WAIT_MS as u64);
+    /// A read that lands on the loop's next pass.
+    const FAST_READ: Duration = LOOP_PASS;
+    /// The slowest enumeration the PC measured during a monitor flap.
+    const SLOW_READ: Duration = Duration::from_millis(545);
+    /// When scripted displays change: after even a slow start read has landed.
+    const CHANGE_AT: Duration = Duration::from_secs(1);
+    /// Long enough for every script to settle or stop.
+    const SCRIPT_SPAN: Duration = Duration::from_secs(10);
+    const TEST_WAIT: Duration = Duration::from_secs(5);
+
+    struct DrivenWatch {
+        stop: CaptureStop,
+        stopped_at: Option<Duration>,
+        failure: Option<CallbackFailure>,
+        requests: usize,
+        unsettled: bool,
+    }
+
+    /// Runs the loop's display step every pass, as `run` does until capture stops. A read asked at
+    /// `asked` finishes `latency(asked)` later and answers `displays(finished)`; asking for a
+    /// second read while one is in flight fails the test.
+    fn drive_display_watch(
+        notice_at: impl Fn(Duration) -> bool,
+        latency: impl Fn(Duration) -> Duration,
+        displays: impl Fn(Duration) -> Option<u8>,
+    ) -> DrivenWatch {
+        let stop = CaptureStop::default();
+        CALLBACK_STOP.with(|slot| *slot.borrow_mut() = Some(stop.clone()));
+        let mut watch = DisplayWatch::new();
+        let origin = Instant::now();
+        let mut elapsed = Duration::ZERO;
+        let mut in_flight: Option<(Duration, Option<u8>)> = None;
+        let mut requests = 0;
+        let mut stopped_at = None;
+        while elapsed <= SCRIPT_SPAN && stopped_at.is_none() {
+            if notice_at(elapsed) {
+                DISPLAY_CHANGE_SEEN.set(true);
+            }
+            let landed = match in_flight {
+                Some((finished, read)) if finished <= elapsed => {
+                    in_flight = None;
+                    Some((read, origin + finished))
+                }
+                _ => None,
+            };
+            watch_displays(&mut watch, origin + elapsed, landed, || {
+                assert!(in_flight.is_none(), "a second read while one is in flight");
+                requests += 1;
+                let finished = elapsed + latency(elapsed);
+                in_flight = Some((finished, displays(finished)));
+                true
+            });
+            if stop.is_stopped() {
+                stopped_at = Some(elapsed);
+            }
+            elapsed += LOOP_PASS;
+        }
+        assert!(!DISPLAY_CHANGE_SEEN.get(), "the loop consumes every notice");
+        let failure = CALLBACK_FAILURE.get();
+        clear_callback_stop();
+        DrivenWatch {
+            stop,
+            stopped_at,
+            failure,
+            requests,
+            unsettled: watch.settle.is_unsettled(),
+        }
+    }
+
+    fn notice_at_change(elapsed: Duration) -> bool {
+        elapsed == CHANGE_AT
+    }
+
+    /// The start displays until `CHANGE_AT`, then `after`.
+    fn change_to(after: Option<u8>) -> impl Fn(Duration) -> Option<u8> {
+        move |at| {
+            if at < CHANGE_AT {
+                Some(START_DISPLAYS)
+            } else {
+                after
+            }
+        }
+    }
+
+    fn assert_never_stopped(driven: &DrivenWatch) {
+        assert_eq!(driven.stop.reason(), None);
+        assert_eq!(driven.failure, None);
+        assert!(!driven.unsettled, "the suspicion clears");
+    }
+
+    /// Stopped by the first read to finish at or past the limit, which is at most one poll and
+    /// one read late.
+    fn assert_stopped_at_the_limit(
+        driven: &DrivenWatch,
+        suspected_at: Duration,
+        latency: Duration,
+    ) {
+        assert_eq!(driven.stop.reason(), Some(StopReason::DisplaysChanged));
+        assert_eq!(driven.failure, Some(CallbackFailure::DisplayChanged));
+        let held = driven.stopped_at.expect("capture stopped") - suspected_at;
+        assert!(held >= DISPLAY_SETTLE_LIMIT, "{held:?}");
+        assert!(
+            held <= DISPLAY_SETTLE_LIMIT + DISPLAY_SETTLE_POLL + latency,
+            "{held:?}"
+        );
+    }
+
+    #[test]
+    fn a_display_change_whose_rereads_match_never_stops_capture() {
+        // Notices closer together than the steady time keep the suspicion open through the burst.
+        let notice_every = DISPLAY_STEADY_FOR - LOOP_PASS * 10;
+        let burst_end = CHANGE_AT + DISPLAY_SETTLE_LIMIT - DISPLAY_SETTLE_POLL * 5;
+        for latency in [FAST_READ, SLOW_READ] {
+            let driven = drive_display_watch(
+                |at| {
+                    (CHANGE_AT..burst_end).contains(&at)
+                        && (at - CHANGE_AT)
+                            .as_millis()
+                            .is_multiple_of(notice_every.as_millis())
+                },
+                |_| latency,
+                |_| Some(START_DISPLAYS),
+            );
+            assert_never_stopped(&driven);
+            assert!(driven.requests > 1, "{latency:?}");
+        }
+    }
+
+    #[test]
+    fn a_display_flap_that_returns_inside_the_settle_window_never_stops_capture() {
+        let back_at = CHANGE_AT + DISPLAY_SETTLE_LIMIT - DISPLAY_SETTLE_POLL * 5;
+        for latency in [FAST_READ, SLOW_READ] {
+            let driven = drive_display_watch(
+                notice_at_change,
+                |_| latency,
+                |at| {
+                    Some(if (CHANGE_AT..back_at).contains(&at) {
+                        OTHER_DISPLAYS
+                    } else {
+                        START_DISPLAYS
+                    })
+                },
+            );
+            assert_never_stopped(&driven);
+        }
+    }
+
+    #[test]
+    fn displays_that_stay_different_stop_capture_as_displays_changed_at_the_limit() {
+        for latency in [FAST_READ, SLOW_READ] {
+            let driven = drive_display_watch(
+                notice_at_change,
+                |_| latency,
+                change_to(Some(OTHER_DISPLAYS)),
+            );
+            assert_stopped_at_the_limit(&driven, CHANGE_AT, latency);
+        }
+    }
+
+    #[test]
+    fn displays_that_stay_unreadable_stop_capture_as_displays_changed_at_the_limit() {
+        for latency in [FAST_READ, SLOW_READ] {
+            let driven = drive_display_watch(notice_at_change, |_| latency, change_to(None));
+            assert_stopped_at_the_limit(&driven, CHANGE_AT, latency);
+        }
+    }
+
+    #[test]
+    fn a_reread_that_never_answers_stops_capture_at_the_limit() {
+        let never = SCRIPT_SPAN * 2;
+        let driven = drive_display_watch(
+            notice_at_change,
+            |asked| if asked < CHANGE_AT { FAST_READ } else { never },
+            change_to(Some(OTHER_DISPLAYS)),
+        );
+        assert_stopped_at_the_limit(&driven, CHANGE_AT, Duration::ZERO);
+        assert_eq!(driven.requests, 2);
+    }
+
+    #[test]
+    fn a_notice_before_the_start_read_lands_waits_for_it_and_matching_rereads_continue() {
+        let driven = drive_display_watch(
+            |at| at == LOOP_PASS,
+            |_| SLOW_READ,
+            |_| Some(START_DISPLAYS),
+        );
+        assert_never_stopped(&driven);
+        assert!(driven.requests > 1);
+    }
+
+    #[test]
+    fn a_notice_before_the_start_read_lands_is_judged_against_it_and_a_held_change_stops() {
+        let notice = LOOP_PASS;
+        let driven = drive_display_watch(
+            |at| at == notice,
+            |_| SLOW_READ,
+            |at| {
+                Some(if at <= SLOW_READ {
+                    START_DISPLAYS
+                } else {
+                    OTHER_DISPLAYS
+                })
+            },
+        );
+        assert_stopped_at_the_limit(&driven, notice, SLOW_READ);
+    }
+
+    #[test]
+    fn a_notice_after_an_unreadable_start_read_stops_capture_at_once() {
+        let driven = drive_display_watch(notice_at_change, |_| FAST_READ, |_| None);
+        assert_eq!(driven.stop.reason(), Some(StopReason::DisplaysChanged));
+        assert_eq!(driven.failure, Some(CallbackFailure::DisplayChanged));
+        assert_eq!(driven.stopped_at, Some(CHANGE_AT));
+        assert_eq!(
+            driven.requests, 1,
+            "nothing is reread without start displays"
+        );
+    }
+
+    #[test]
+    fn a_notice_waiting_on_a_start_read_that_fails_stops_capture_when_it_lands() {
+        let driven = drive_display_watch(|at| at == LOOP_PASS, |_| SLOW_READ, |_| None);
+        assert_eq!(driven.stop.reason(), Some(StopReason::DisplaysChanged));
+        assert_eq!(driven.stopped_at, Some(SLOW_READ));
+        assert_eq!(driven.requests, 1);
+    }
+
+    #[test]
+    fn a_display_reader_that_cannot_read_leaves_an_unreadable_start() {
+        let stop = CaptureStop::default();
+        CALLBACK_STOP.with(|slot| *slot.borrow_mut() = Some(stop.clone()));
+        let mut watch = DisplayWatch::<u8>::new();
+        let origin = Instant::now();
+        watch_displays(&mut watch, origin, None, || false);
+        assert!(!stop.is_stopped());
+        DISPLAY_CHANGE_SEEN.set(true);
+        watch_displays(&mut watch, origin + CHANGE_AT, None, || {
+            panic!("no read is asked after an unreadable start")
+        });
+        assert_eq!(stop.reason(), Some(StopReason::DisplaysChanged));
+        clear_callback_stop();
+    }
+
+    #[test]
+    fn no_second_display_read_is_requested_while_one_is_in_flight() {
+        let mut watch = DisplayWatch::<u8>::new();
+        let origin = Instant::now();
+        assert!(watch.start_read(origin), "the start read");
+        assert!(!watch.start_read(origin + SLOW_READ - LOOP_PASS));
+        assert_eq!(
+            watch.read_landed(Some(START_DISPLAYS), origin + SLOW_READ),
+            ReadLanded::StartKnown
+        );
+        let suspected = origin + CHANGE_AT;
+        assert!(watch.suspect(suspected));
+        assert!(watch.start_read(suspected));
+        let mut now = suspected;
+        while now < suspected + SLOW_READ {
+            now += LOOP_PASS;
+            assert!(!watch.start_read(now), "{:?}", now - suspected);
+            assert_eq!(watch.decide_without_read(now), None);
+        }
+        assert_eq!(
+            watch.read_landed(Some(OTHER_DISPLAYS), now),
+            ReadLanded::Reread(DisplayVerdict::Unsettled)
+        );
+        assert!(
+            watch.start_read(now),
+            "a read slower than the poll is followed at once"
+        );
+    }
+
+    #[test]
+    fn displays_are_reread_only_while_unsettled_and_at_most_once_per_poll() {
+        let steady = drive_display_watch(|_| false, |_| FAST_READ, |_| Some(START_DISPLAYS));
+        assert_eq!(steady.requests, 1, "only the start read");
+
+        let held = drive_display_watch(
+            notice_at_change,
+            |_| FAST_READ,
+            change_to(Some(OTHER_DISPLAYS)),
+        );
+        assert_eq!(held.stop.reason(), Some(StopReason::DisplaysChanged));
+        let most = 2 + DISPLAY_SETTLE_LIMIT.as_millis() / DISPLAY_SETTLE_POLL.as_millis();
+        assert!(held.requests as u128 <= most, "{}", held.requests);
+    }
+
+    fn wait_for<T>(mut ready: impl FnMut() -> Option<T>) -> T {
+        let waited = Instant::now();
+        loop {
+            if let Some(value) = ready() {
+                return value;
+            }
+            assert!(waited.elapsed() < TEST_WAIT, "timed out");
+            thread::sleep(LOOP_PASS);
+        }
+    }
+
+    #[test]
+    fn the_display_reader_reads_on_its_own_thread_and_an_idle_drop_joins_it() {
+        let alive = Arc::new(());
+        let held = alive.clone();
+        let mut reader = DisplayReader::spawn(move || {
+            let _held = &held;
+            (thread::current().name() == Some(DISPLAY_READER_NAME)).then_some(START_DISPLAYS)
+        })
+        .expect("the reader starts");
+        assert_eq!(reader.take(), None, "nothing was asked");
+        let asked = Instant::now();
+        assert!(reader.request());
+        let (read, finished) = wait_for(|| reader.take());
+        assert_eq!(read, Some(START_DISPLAYS), "read on the reader thread");
+        assert!(finished >= asked);
+        drop(reader);
+        assert_eq!(Arc::strong_count(&alive), 1, "the idle helper was joined");
+    }
+
+    #[test]
+    fn dropping_the_display_reader_mid_read_never_waits_and_the_helper_exits_after_it() {
+        let (reading, read_started) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let alive = Arc::new(());
+        let held = alive.clone();
+        let mut reader = DisplayReader::spawn(move || {
+            let _held = &held;
+            let _ = reading.send(());
+            let _ = released.lock().map(|gate| gate.recv());
+            Some(START_DISPLAYS)
+        })
+        .expect("the reader starts");
+        assert!(reader.request());
+        read_started
+            .recv_timeout(TEST_WAIT)
+            .expect("the read starts");
+        let (dropped, drop_done) = mpsc::channel();
+        thread::spawn(move || {
+            drop(reader);
+            let _ = dropped.send(());
+        });
+        let drop_waited = drop_done.recv_timeout(TEST_WAIT).is_err();
+        release.send(()).expect("the read is still waiting");
+        assert!(!drop_waited, "dropping the reader waited for its read");
+        wait_for(|| (Arc::strong_count(&alive) == 1).then_some(()));
     }
 
     #[test]
