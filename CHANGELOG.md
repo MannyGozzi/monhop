@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-11-03
+
 ### Added
 
 - Use Command as Ctrl on Windows: a new switch on a Mac's Keyboard settings page, off by default. With it on, a Mac keyboard controlling a Windows PC types Command+C, Command+V, Command+Z and other Command shortcuts as the PC's Ctrl shortcuts, and the Mac's Control key becomes the Windows key. Command+Tab switches apps, Control+Tab still switches tabs, Option+Left, Option+Right and Option+Delete move and delete by word, and Control+Option+0 still dims the PC. The Keyboard page now appears on both computers with both switches side by side: each computer sets the switch for its own keyboard, and the other row names the computer to change it on. Both computers need this version for the new switch.
@@ -370,7 +372,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.17...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.18...HEAD
+[0.2.18]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.18
 [0.2.17]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.17
 [0.2.16]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.16
 [0.2.15]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.15
