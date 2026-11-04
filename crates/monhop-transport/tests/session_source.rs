@@ -23,6 +23,7 @@ use monhop_transport::session_health::{
     BARRIER_RESEND_AFTER, HOLD_LIMIT, HealthError, PEER_LIVENESS, RETREAT_AFTER,
     SUPPRESSION_LEASE_CAP,
 };
+use monhop_transport::session_quality::LinkQuality;
 use monhop_transport::session_receiver::{
     DestinationAction, DestinationFailure, InputDestination, InputReceiver, ReceiverFailure,
 };
@@ -6259,4 +6260,325 @@ fn extreme_motion_and_out_of_range_speeds_keep_the_session_and_the_pointer_on_th
         ms(at + 151),
     );
     assert!(sends_release_all(&home));
+}
+
+/// Answers `count` challenges, one per tick as health sends them from `from`, each `delay` after
+/// it went out; yields when the last reply landed and the next unused peer heartbeat sequence.
+fn answer_challenges(
+    source: &mut SourceController,
+    from: Duration,
+    delay: Duration,
+    count: usize,
+    mut sequence: u64,
+) -> (Duration, u64) {
+    let mut due: Vec<(Duration, u64)> = Vec::new();
+    let (mut sent, mut answered) = (0, 0);
+    let mut now = from;
+    while answered < count {
+        if sent < count {
+            let tick = source.tick(now);
+            assert_eq!(tick.failure, None);
+            for effect in tick.effects.iter() {
+                if let SourceEffect::RemoteFrame(Frame {
+                    message: Message::Ping(token),
+                    ..
+                }) = effect
+                {
+                    due.push((now + delay, *token));
+                    sent += 1;
+                }
+            }
+        }
+        while let Some(index) = due.iter().position(|(at, _)| *at <= now) {
+            let (_, token) = due.remove(index);
+            let pong = Frame::new(
+                SessionEpoch::new(3).unwrap(),
+                sequence,
+                Message::Pong(token),
+            );
+            sequence += 1;
+            assert_eq!(source.on_remote_frame(&pong, now).failure, None);
+            answered += 1;
+        }
+        if answered < count {
+            now += ms(1);
+        }
+    }
+    (now, sequence)
+}
+
+/// Every absolute position `outcome` sends the other computer, in order.
+fn positions(outcome: &SourceOutcome) -> Vec<Point> {
+    outcome
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            SourceEffect::RemoteFrame(Frame {
+                message: Message::Motion(Motion::Absolute(at)),
+                ..
+            }) => Some(*at),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Controlling display 2 over a link whose replies came back 30 ms late: degraded, so motion
+/// goes at most every 4 ms. Yields when the link turned degraded and the next peer heartbeat.
+fn controlling_over_a_degraded_link(source: &mut SourceController) -> (Duration, u64) {
+    activate_remote(source);
+    let degraded = answer_challenges(source, ms(1), ms(30), 3, 3);
+    assert_eq!(source.link_quality(), LinkQuality::Degraded);
+    degraded
+}
+
+/// The input-epoch frames `outcome` sends, with their sequences.
+fn input_frames(outcome: &SourceOutcome) -> Vec<(u64, Message)> {
+    outcome
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            SourceEffect::RemoteFrame(frame) if frame.epoch == SessionEpoch::new(4).unwrap() => {
+                Some((frame.sequence, frame.message.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn motion_coalesced_on_a_degraded_link_lands_exactly_where_every_record_would_have() {
+    static SPEED: AtomicI8 = AtomicI8::new(2);
+    // Counts at several gains and a faster pointer, so each record moves its own logical distance.
+    let records = [
+        (Point::new(3.0, 1.0), 0.5),
+        (Point::new(-2.0, 2.0), 1.25),
+        (Point::new(4.0, -1.0), 2.0),
+        (Point::new(1.0, 1.0), 0.75),
+    ];
+    let run = |delay: Duration| {
+        let mut source = source().with_pointer_speed(&SPEED);
+        activate_remote(&mut source);
+        let (mut now, _) = answer_challenges(&mut source, ms(1), delay, 3, 3);
+        let quality = source.link_quality();
+        let mut sent = Vec::new();
+        for _ in 0..5 {
+            for (delta, gain) in records {
+                now += ms(1);
+                let event = NormalizedInput::RelativeMotion { delta, gain };
+                let moved = capture_on_route(&mut source, event, now);
+                assert_eq!(moved.failure, None);
+                sent.extend(positions(&moved));
+                sent.extend(positions(&source.tick(now)));
+            }
+        }
+        // The last record waits out its interval and then goes on its own.
+        for _ in 0..10 {
+            now += ms(1);
+            sent.extend(positions(&source.tick(now)));
+        }
+        (quality, sent)
+    };
+    let (healthy, every) = run(ms(2));
+    let (degraded, paced) = run(ms(30));
+    assert_eq!(
+        (healthy, degraded),
+        (LinkQuality::Healthy, LinkQuality::Degraded)
+    );
+    assert_eq!(every.len(), 20, "a healthy link sends every record");
+    assert!(
+        (5..=6).contains(&paced.len()),
+        "one position per 4 ms of 20 records 1 ms apart, got {}",
+        paced.len()
+    );
+    assert_eq!(
+        paced.last(),
+        every.last(),
+        "the pointer ends exactly where it would have"
+    );
+    // Each paced position is one the unpaced pointer passed through, in order: none invented,
+    // none sent twice.
+    let mut passed = every.iter();
+    for position in &paced {
+        assert!(
+            passed.any(|at| at == position),
+            "{position:?} out of order or invented"
+        );
+    }
+}
+
+#[test]
+fn waiting_motion_goes_out_before_the_click_scroll_or_return_that_follows_it() {
+    let mut source = source();
+    let (now, _) = controlling_over_a_degraded_link(&mut source);
+    let first = move_horizontally(&mut source, 2.0, now + ms(1));
+    assert_eq!(positions(&first), vec![Point::new(3.0, 50.0)]);
+    let waiting = move_horizontally(&mut source, 2.0, now + ms(2));
+    assert!(
+        waiting.effects.is_empty(),
+        "inside the interval motion waits"
+    );
+    let press = capture_on_route(
+        &mut source,
+        NormalizedInput::Button {
+            button: MouseButton::Left,
+            pressed: true,
+            at: now + ms(2),
+        },
+        now + ms(2),
+    );
+    let frames = input_frames(&press);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames[0].1,
+        Message::Motion(Motion::Absolute(Point::new(5.0, 50.0)))
+    );
+    assert!(
+        matches!(frames[1].1, Message::Button(_)),
+        "the press lands where the hand was"
+    );
+    assert_eq!(frames[1].0, frames[0].0 + 1, "sequences stay contiguous");
+    move_horizontally(&mut source, 2.0, now + ms(7));
+    assert!(
+        move_horizontally(&mut source, 2.0, now + ms(8))
+            .effects
+            .is_empty()
+    );
+    let scroll = capture_on_route(
+        &mut source,
+        NormalizedInput::Scroll {
+            horizontal: 0.0,
+            vertical: 1.0,
+        },
+        now + ms(8),
+    );
+    let frames = input_frames(&scroll);
+    assert_eq!(
+        frames[0].1,
+        Message::Motion(Motion::Absolute(Point::new(9.0, 50.0)))
+    );
+    assert!(matches!(frames[1].1, Message::Scroll(_)));
+    move_horizontally(&mut source, 2.0, now + ms(13));
+    assert!(
+        move_horizontally(&mut source, 2.0, now + ms(14))
+            .effects
+            .is_empty()
+    );
+    let home = source.request_local(now + ms(14));
+    let frames = input_frames(&home);
+    assert_eq!(
+        frames[0].1,
+        Message::Motion(Motion::Absolute(Point::new(13.0, 50.0)))
+    );
+    assert_eq!(frames[1].1, Message::ReleaseAll);
+}
+
+#[test]
+fn waiting_motion_goes_out_in_its_own_epoch_before_a_hop_to_another_display() {
+    let mut source = source_on(
+        topology_with_two_displays_side_by_side_on_the_other_computer(),
+        DisplayId(1),
+    );
+    let (now, _) = controlling_over_a_degraded_link(&mut source);
+    assert_eq!(
+        positions(&move_horizontally(&mut source, 90.0, now + ms(1))),
+        vec![Point::new(91.0, 50.0)]
+    );
+    assert!(
+        move_horizontally(&mut source, 5.0, now + ms(2))
+            .effects
+            .is_empty()
+    );
+    let hop = move_horizontally(&mut source, 10.0, now + ms(3));
+    let frames: Vec<(u64, Message)> = hop
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            SourceEffect::RemoteFrame(frame) => Some((frame.epoch.get(), frame.message.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        frames[0],
+        (4, Message::Motion(Motion::Absolute(Point::new(96.0, 50.0))))
+    );
+    assert!(matches!(
+        frames[1],
+        (
+            5,
+            Message::ActivateDisplayAt {
+                display_id: DisplayId(3),
+                ..
+            }
+        )
+    ));
+}
+
+#[test]
+fn waiting_motion_goes_on_its_own_when_its_interval_ends() {
+    let mut source = source();
+    let (now, _) = controlling_over_a_degraded_link(&mut source);
+    assert_eq!(
+        positions(&move_horizontally(&mut source, 1.0, now + ms(1))).len(),
+        1
+    );
+    assert!(
+        move_horizontally(&mut source, 1.0, now + ms(2))
+            .effects
+            .is_empty()
+    );
+    assert!(
+        move_vertically(&mut source, 1.0, now + ms(3))
+            .effects
+            .is_empty()
+    );
+    assert!(positions(&source.tick(now + ms(4))).is_empty());
+    assert_eq!(
+        positions(&source.tick(now + ms(5))),
+        vec![Point::new(3.0, 51.0)]
+    );
+    assert!(positions(&source.tick(now + ms(6))).is_empty());
+    assert!(
+        positions(&source.tick(now + ms(20))).is_empty(),
+        "nothing goes twice"
+    );
+}
+
+#[test]
+fn a_link_that_stays_clean_climbs_back_to_every_record_and_logs_each_change() {
+    capture_log();
+    let mut source = source();
+    let (now, sequence) = controlling_over_a_degraded_link(&mut source);
+    assert_eq!(
+        logged(
+            "link quality for slot 1: healthy -> degraded, sending motion at most one every 4 ms (in the last 1000 ms: 3 replies, 0 unanswered, 3 late, 0 stalled, slowest 30 ms)"
+        ),
+        1
+    );
+    // Prompt replies for a while: the late ones age out of the window, then a clean stretch.
+    let (now, _) = answer_challenges(&mut source, now + ms(1), ms(2), 150, sequence);
+    assert_eq!(source.link_quality(), LinkQuality::Healthy);
+    assert_eq!(source.unsteady_for(now), Duration::ZERO);
+    assert_eq!(
+        logged("link quality for slot 1: degraded -> healthy, sending motion each as it comes"),
+        1
+    );
+    assert_eq!(
+        positions(&move_horizontally(&mut source, 1.0, now + ms(1))).len(),
+        1
+    );
+    assert_eq!(
+        positions(&move_horizontally(&mut source, 1.0, now + ms(2))).len(),
+        1
+    );
+}
+
+#[test]
+fn a_silence_long_enough_to_hold_makes_the_link_bad() {
+    let mut source = source();
+    activate_remote(&mut source);
+    let held = source.tick(RETREAT_AFTER);
+    assert_eq!(held.failure, None);
+    assert!(source.held_since().is_some());
+    assert_eq!(source.link_quality(), LinkQuality::Bad);
+    assert_eq!(source.unsteady_for(RETREAT_AFTER + ms(100)), ms(100));
 }

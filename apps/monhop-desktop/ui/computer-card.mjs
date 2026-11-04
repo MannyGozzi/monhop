@@ -1,5 +1,5 @@
 import { ACCORDION_TOGGLE, createAccordion, presence } from "./accordion.mjs";
-import { computerStatus } from "./computer-status.mjs";
+import { computerStatus, findPeer } from "./computer-status.mjs";
 import { computerArrangements, displayName } from "./computers-model.mjs";
 import { platformLabel } from "./pairing-model.mjs";
 import {
@@ -13,6 +13,7 @@ import { DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
 import { normalizeClipboardView } from "./clipboard-model.mjs";
 import { clipboardLine } from "./studio-model.mjs";
 import { inspectorHeader } from "./screen-ready.mjs";
+import { linkWarning, networkNote } from "./link-note-model.mjs";
 import { pairBadgeLabel } from "./pair-badge-model.mjs";
 import {
   computerMeta,
@@ -269,16 +270,22 @@ function stateBlock(ctx, computer, { name, status, enabled, on, key }) {
       }),
       fadingText(`${key}-state-detail`, "computer-state-detail", status.detail),
       presence(`${key}-release`, release ? inlineNote(release, "warning", icon("keyboard")) : null),
-      presence(`${key}-airdrop`, airdropNote(ctx, enabled, status)),
+      presence(`${key}-network`, networkLine(ctx, computer, { name, status, enabled, key })),
       presence(`${key}-notice`, noticeLine(ctx, computer, enabled)),
     ],
   });
 }
 
-// AirDrop open to everyone keeps pausing the Wi-Fi this Mac shares over; only a live session feels it.
-function airdropNote(ctx, enabled, status) {
-  if (!enabled || status.key !== "sharing" || !ctx.airdropWarning) return null;
-  return inlineNote(ctx.airdropWarning, "warning", icon("triangle-alert"));
+// AirDrop open to everyone keeps pausing the Wi-Fi this Mac shares over, and a link that keeps
+// stalling slows the pointer. Only a live session feels either, and one note at most shows; a change
+// between them cross-fades in place.
+function networkLine(ctx, computer, { name, status, enabled, key }) {
+  if (!enabled || status.key !== "sharing") return null;
+  const peer = findPeer(ctx.sharing.view, computer.fingerprint);
+  const text = networkNote(ctx.airdropWarning, linkWarning(peer, ctx.network, name));
+  if (!text) return null;
+  const node = inlineNote(text, "warning", icon("triangle-alert"));
+  return swap(`${key}-network-text`, node, text, { block: true });
 }
 
 // The kit's switch, lifted out of its row: the state above is its label, so the whole block is not

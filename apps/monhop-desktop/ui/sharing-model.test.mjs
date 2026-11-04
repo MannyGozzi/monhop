@@ -126,6 +126,24 @@ const place = (state, offset) => setArrangement(state, groupedPlacement(groupsOf
 const offsetOf = (state) =>
   placementOffset(groupsOf(state), arrangementForSharing(state).placement);
 
+test("each computer's link quality survives normalizing and anything malformed reads as unknown", () => {
+  const peer = (patch) =>
+    normalizeSharingView({ ...connectedView, peers: [{ fingerprint: "b".repeat(64), ...patch }] })
+      .peers[0];
+  assert.deepEqual(
+    (({ linkQuality, linkUnsteadyMs }) => ({ linkQuality, linkUnsteadyMs }))(
+      peer({ linkQuality: "degraded", linkUnsteadyMs: 2400 }),
+    ),
+    { linkQuality: "degraded", linkUnsteadyMs: 2400 },
+  );
+  assert.equal(peer({ linkQuality: "bad" }).linkQuality, "bad");
+  assert.equal(peer({ linkQuality: "awful" }).linkQuality, null);
+  assert.equal(peer({}).linkQuality, null);
+  assert.equal(peer({ linkUnsteadyMs: -1 }).linkUnsteadyMs, 0);
+  assert.equal(peer({ linkUnsteadyMs: 1.5 }).linkUnsteadyMs, 0);
+  assert.equal(peer({ linkUnsteadyMs: "3000" }).linkUnsteadyMs, 0);
+});
+
 test("the view names which computer is live and which one is in use, in one case", () => {
   const view = normalizeSharingView({
     ...connectedView,

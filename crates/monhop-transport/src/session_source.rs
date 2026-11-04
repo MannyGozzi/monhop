@@ -34,6 +34,8 @@ use crate::session_clock::millis_u64;
 use crate::session_health::{
     BARRIER_RESEND_AFTER, HOLD_LIMIT, HealthError, PeerHealth, RETREAT_AFTER, hold_stats,
 };
+use crate::session_pacer::MotionPacer;
+use crate::session_quality::{LinkMonitor, LinkQuality, PathSample, TierChange};
 use crate::session_startup::ReadyControl;
 
 /// Off until the app applies the saved switch, so no activation asks for it before it decides.
@@ -87,7 +89,8 @@ pub const PUSH_THROUGH_LOGGED: Duration = Duration::from_millis(50);
 ///
 /// `AbsoluteMotion` is a topology logical position. `RelativeMotion` is a delta in the capturing
 /// mouse's own units, Windows raw counts or Mac points, which move as they are on this computer;
-/// on another, each moves `gain` logical units (DIPs, one Mac point each). Adapters convert
+/// on another, each moves `gain` logical units (DIPs, one Mac point each). A Windows mouse driving
+/// another computer sends logical DIPs, so its edge pushes count DIPs as a Mac's count points. Adapters convert
 /// physical desktop pixels before constructing this type. Scroll is in signed wheel detents:
 /// positive horizontal is right and positive vertical is up. Windows adapters divide 120-unit
 /// detents, while macOS adapters divide 40-point detents after their horizontal inversion; both
@@ -454,6 +457,10 @@ pub struct SourceController {
     /// Numbers forwarded presses at the tracked peer cursor with this user's double-click interval.
     clicks: ClickCounter,
     health: PeerHealth,
+    /// The link's quality, from this controller's challenges and the runtime's path samples.
+    quality: LinkMonitor,
+    /// Motion waiting for its slot while the link is degraded or bad.
+    pacer: MotionPacer,
     remote_limiter: RateLimiter,
     last_now: Duration,
     remote_target: Option<PointerTarget>,
@@ -770,6 +777,8 @@ impl SourceController {
             buttons: [ButtonState::default(); 5],
             clicks: ClickCounter::default(),
             health: PeerHealth::new(now),
+            quality: LinkMonitor::default(),
+            pacer: MotionPacer::default(),
             remote_limiter: RateLimiter::new(20_000).expect("bounded remote control rate"),
             last_now: now,
             remote_target: None,
@@ -1728,6 +1737,8 @@ impl SourceController {
         if !self.observe_time(now, &mut effects) {
             return self.outcome(effects);
         }
+        let change = self.quality.tick(now);
+        self.note_quality(change);
         if let Some(since) = self.held_since {
             if now.saturating_sub(since) >= HOLD_LIMIT {
                 let failure = SourceFailure::PeerHealth(HealthError::DeadlineExpired);
@@ -1743,7 +1754,7 @@ impl SourceController {
                 }
             }
             match self.health.poll_while_held(now) {
-                Ok(Some(token)) => self.push_control(Message::Ping(token), &mut effects),
+                Ok(Some(token)) => self.challenge(token, now, &mut effects),
                 Ok(None) => {}
                 Err(error) => self.fail(SourceFailure::PeerHealth(error), &mut effects),
             }
@@ -1754,26 +1765,80 @@ impl SourceController {
             return self.outcome(effects);
         }
         match self.health.poll(now) {
-            Ok(Some(token)) => self.push_control(Message::Ping(token), &mut effects),
+            Ok(Some(token)) => self.challenge(token, now, &mut effects),
             Ok(None) => {}
             Err(HealthError::DeadlineExpired) => self.hold(now, &mut effects),
             Err(error) => self.fail(SourceFailure::PeerHealth(error), &mut effects),
         }
+        if self.failure.is_none()
+            && let Some(position) = self
+                .pacer
+                .due(self.quality.quality().motion_interval(), now)
+        {
+            self.send_input(Message::Motion(Motion::Absolute(position)), &mut effects);
+        }
         self.outcome(effects)
     }
 
+    fn challenge(&mut self, token: u64, now: Duration, effects: &mut SourceEffects) {
+        self.quality.challenge_sent(token, now);
+        self.push_control(Message::Ping(token), effects);
+    }
+
+    /// Quinn's path counters for this link, which the runtime reads every
+    /// [`PATH_SAMPLE_INTERVAL`](crate::session_quality::PATH_SAMPLE_INTERVAL).
+    pub fn observe_path(&mut self, sample: PathSample, now: Duration) {
+        let change = self.quality.path(sample, now.max(self.last_now));
+        self.note_quality(change);
+    }
+
+    pub fn link_quality(&self) -> LinkQuality {
+        self.quality.quality()
+    }
+
+    /// How long the link has been degraded or bad without a break; zero while healthy.
+    pub fn unsteady_for(&self, now: Duration) -> Duration {
+        self.quality.unsteady_for(now)
+    }
+
+    fn note_quality(&self, change: Option<TierChange>) {
+        let Some(TierChange { from, to, summary }) = change else {
+            return;
+        };
+        let pace = match to.motion_interval().as_millis() {
+            0 => "each as it comes".to_owned(),
+            interval => format!("at most one every {interval} ms"),
+        };
+        log::info!(
+            "link quality for slot {}: {from} -> {to}, sending motion {pace} ({summary})",
+            self.slot.get()
+        );
+    }
+
     fn on_pong(&mut self, token: u64, now: Duration, effects: &mut SourceEffects) {
-        if self.held_since.is_some() {
+        let answered = if self.held_since.is_some() {
             match self.health.receive_pong_while_held(token, now) {
-                Ok(true) => {
-                    self.hold_pong_seen = true;
-                    self.try_resume(now);
+                Ok(fresh) => {
+                    if fresh {
+                        self.hold_pong_seen = true;
+                        self.try_resume(now);
+                    }
+                    true
                 }
-                Ok(false) => {}
-                Err(error) => self.fail(SourceFailure::PeerHealth(error), effects),
+                Err(error) => {
+                    self.fail(SourceFailure::PeerHealth(error), effects);
+                    false
+                }
             }
         } else if let Err(error) = self.health.receive_pong(token, now) {
             self.fail(SourceFailure::PeerHealth(error), effects);
+            false
+        } else {
+            true
+        };
+        if answered {
+            let change = self.quality.reply(token, now);
+            self.note_quality(change);
         }
     }
 
@@ -1791,6 +1856,8 @@ impl SourceController {
             self.fail(SourceFailure::PeerHealth(error), effects);
             return;
         }
+        let change = self.quality.held(now);
+        self.note_quality(change);
         log::warn!(
             "source held: no fresh reply for {} ms (mode {:?}, capture route remote={}); input returns local",
             now.saturating_sub(self.health.last_response()).as_millis(),
@@ -2446,6 +2513,10 @@ impl SourceController {
             self.fail(SourceFailure::ProtocolEpochExhausted, effects);
             return;
         };
+        // Waiting motion belongs to the epoch it was tracked in.
+        if !self.flush_motion(effects) {
+            return;
+        }
         self.input_epoch = next_epoch;
         self.outbound_input_sequence = 0;
         self.entry_guard = Some((target.display, to_edge));
@@ -3493,7 +3564,31 @@ impl SourceController {
         .clamp_half_open(translated)
     }
 
+    /// Absolute motion waits for its slot while the link is degraded; any other input first sends
+    /// the motion waiting before it, so nothing overtakes the motion that preceded it.
     fn push_input(&mut self, message: Message, effects: &mut SourceEffects) {
+        if let Message::Motion(Motion::Absolute(position)) = message {
+            let interval = self.quality.quality().motion_interval();
+            if let Some(position) = self.pacer.offer(position, interval, self.last_now) {
+                self.send_input(Message::Motion(Motion::Absolute(position)), effects);
+            }
+            return;
+        }
+        if self.flush_motion(effects) {
+            self.send_input(message, effects);
+        }
+    }
+
+    /// False when sending the waiting motion failed the controller.
+    fn flush_motion(&mut self, effects: &mut SourceEffects) -> bool {
+        let Some(position) = self.pacer.flush(self.last_now) else {
+            return true;
+        };
+        self.send_input(Message::Motion(Motion::Absolute(position)), effects);
+        self.failure.is_none()
+    }
+
+    fn send_input(&mut self, message: Message, effects: &mut SourceEffects) {
         let Some(sequence) = advance_counter(&mut self.outbound_input_sequence) else {
             self.fail(SourceFailure::SequenceExhausted, effects);
             return;
@@ -3538,6 +3633,7 @@ impl SourceController {
         self.failure = Some(failure);
         self.state = State::Failed;
         self.entry_guard = None;
+        self.pacer.discard();
         self.end_pushes(PushEnd::Cleared, |_| true);
         let _ = self.ownership.on_timeout();
         if remote_may_hold {

@@ -12,6 +12,7 @@ use crate::{
         NativeDestination, SourcePlatforms, current_displays, current_pointer_position,
         double_click_interval, pointer_confined,
     },
+    session_quality::PATH_SAMPLE_INTERVAL,
     session_source::{SourceController, SourceEffect, SourceMode},
     session_source_runtime::{
         CaptureControl, NativeCapture, NativeCaptureError, apply_outcome, blocking_presses,
@@ -180,6 +181,7 @@ pub async fn run_session(
     let mut submitted: Option<(u64, Duration)> = None;
     let mut last_renewed = origin.elapsed();
     let mut last_pointer_poll = origin.elapsed();
+    let mut last_path_sample = origin.elapsed();
     let mut last_control = None;
     let mut tick = tokio::time::interval(SESSION_POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -543,6 +545,11 @@ pub async fn run_session(
                                 .as_ref()
                                 .is_some_and(DestinationActor::is_held),
                     );
+                    if now.saturating_sub(last_path_sample) >= PATH_SAMPLE_INTERVAL {
+                        last_path_sample = now;
+                        source.observe_path(io.path_sample(), now);
+                    }
+                    progress.link_quality(source.link_quality(), source.unsteady_for(now));
                     progress.block(&blocking_presses(&*capture));
                 }
             }

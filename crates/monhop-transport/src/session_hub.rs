@@ -26,6 +26,7 @@ use crate::{
         NativeDestination, SourcePlatforms, current_displays, current_pointer_position,
         double_click_interval,
     },
+    session_quality::PATH_SAMPLE_INTERVAL,
     session_source::SourceController,
     session_source_runtime::{
         CaptureControl, NativeCapture, NativeCaptureError, native_capture_start_failure,
@@ -327,6 +328,7 @@ fn start_with<N: NativeInput>(
         cursor: 0,
         batch: Vec::new(),
         gaps: TickGap::new(now),
+        last_path_sample: now,
         last_floor: None,
         #[cfg(test)]
         passes: Rc::default(),
@@ -843,6 +845,8 @@ pub(crate) struct HubLoop<N: NativeInput> {
     cursor: usize,
     batch: Vec<HubAction>,
     gaps: TickGap,
+    /// When every link's quinn path stats were last read for its quality.
+    last_path_sample: Duration,
     last_floor: Option<(FloorState, FloorPeer)>,
     /// Loop passes so far.
     #[cfg(test)]
@@ -1123,6 +1127,15 @@ impl<N: NativeInput> HubLoop<N> {
             }
         }
         self.check_queued();
+        if now.saturating_sub(self.last_path_sample) >= PATH_SAMPLE_INTERVAL {
+            self.last_path_sample = now;
+            for (index, seat) in self.seats.iter().enumerate() {
+                if let Seat::Live(link) = seat {
+                    self.core
+                        .observe_path(slot_at(index), link.io.path_sample());
+                }
+            }
+        }
         let Workers { input, capture, .. } = &mut self.workers;
         self.core.on_tick(capture.as_mut(), || input.pointer())?;
         self.execute()?;
@@ -1173,6 +1186,7 @@ impl<N: NativeInput> HubLoop<N> {
     /// Each link's route, active half, hold and blocking presses, as a pairwise session reports
     /// its own.
     fn report(&mut self) {
+        let now = self.origin.elapsed();
         let floor = self.core.floor();
         if self.last_floor != Some((floor.state, floor.peer)) {
             self.last_floor = Some((floor.state, floor.peer));
@@ -1211,6 +1225,10 @@ impl<N: NativeInput> HubLoop<N> {
                 source.is_some_and(|source| source.held_since().is_some())
                     || actor.is_some_and(|actor| actor.is_held(slot)),
             );
+            if let Some(source) = source {
+                link.progress
+                    .link_quality(source.link_quality(), source.unsteady_for(now));
+            }
             link.progress.block(self.core.blocking_presses());
         }
     }

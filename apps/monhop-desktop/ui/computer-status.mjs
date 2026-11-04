@@ -70,7 +70,8 @@ function startingAfterApply(value, phase, sharingView) {
   return status("connecting", "Starting sharing…", "Applied on both computers.");
 }
 
-function findPeer(sharingView, fingerprint) {
+// A computer's entry in `sharingView.peers`, or null.
+export function findPeer(sharingView, fingerprint) {
   if (!fingerprint || !Array.isArray(sharingView?.peers)) return null;
   return sharingView.peers.find((entry) => entry?.fingerprint === fingerprint) ?? null;
 }

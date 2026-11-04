@@ -207,6 +207,10 @@ pub(crate) struct PeerView {
     /// Sessions with this computer that ended in a real drop since MonHop started.
     drops: u64,
     peer_arranging: bool,
+    /// While a session runs, how well its link carries input: "healthy", "degraded" or "bad".
+    link_quality: Option<&'static str>,
+    /// How long that link has been degraded or bad without a break, in ms; 0 while healthy.
+    link_unsteady_ms: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -4422,6 +4426,10 @@ fn peer_views(state: &State, live: Option<bool>) -> Vec<PeerView> {
             let inspection = peer
                 .filter(|peer| peer.running.is_some())
                 .and_then(|peer| peer.inspection.as_ref());
+            let session = peer
+                .filter(|peer| live.is_some() && peer.running.is_some())
+                .and_then(|peer| peer.progress.as_ref())
+                .map(session::SessionProgress::diagnostics);
             // A session reports no displays into its view; the ones it met are the live ones.
             let displays = match inspection {
                 Some(inspection) if view.peer_displays.is_empty() => {
@@ -4462,6 +4470,8 @@ fn peer_views(state: &State, live: Option<bool>) -> Vec<PeerView> {
                 ),
                 drops: peer.map_or(0, |peer| peer.drops),
                 peer_arranging: peer.is_some_and(|peer| peer.peer_arranging),
+                link_quality: session.map(|stats| stats.link_quality.name()),
+                link_unsteady_ms: session.map_or(0, |stats| stats.unsteady_millis),
             }
         })
         .collect()
@@ -8229,6 +8239,8 @@ pub(crate) mod tests {
                 "held",
                 "lastFailure",
                 "link",
+                "linkQuality",
+                "linkUnsteadyMs",
                 "message",
                 "peerArranging",
                 "phase",

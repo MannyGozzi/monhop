@@ -817,6 +817,7 @@ function context() {
     autostart: { view: autostart, pending: autostartPending },
     island: islandContext(platform, island, islandPending),
     airdropWarning: airdropWarning(platform, airdrop, selectedInterface(state)),
+    network: selectedInterface(state),
     theme,
     themePending,
     busy: controlsBusy(),

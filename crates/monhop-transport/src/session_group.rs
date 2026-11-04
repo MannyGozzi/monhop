@@ -19,6 +19,7 @@ use crate::{
     session_clock::SessionClock,
     session_hub_actor::SlotEvent,
     session_native::pointer_confined,
+    session_quality::PathSample,
     session_runtime::POINTER_POLL_INTERVAL,
     session_source::{
         Handover, NormalizedInput, SourceController, SourceEffect, SourceEffects, SourceFailure,
@@ -689,6 +690,17 @@ impl HubCore {
         }
         self.poll_pointer(capture, pointer)?;
         self.renew_owner_lease(capture)
+    }
+
+    /// Quinn's path counters for `slot`'s link, which its ready controller judges the link by.
+    pub(crate) fn observe_path(&mut self, slot: FloorPeer, sample: PathSample) {
+        let now = self.now();
+        if let Some(index) = index_of(slot)
+            && let Slot::Linked(link) = &mut self.slots[index]
+            && link.is_ready()
+        {
+            link.source.observe_path(sample, now);
+        }
     }
 
     /// Brings input home from whichever peer this computer controls. Asked while that trip is

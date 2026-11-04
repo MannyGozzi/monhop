@@ -46,6 +46,8 @@ const LINK_PHASES = new Set(["connecting", "connected", "reconnecting"]);
 const SESSION_PHASES = new Set([...LINK_PHASES, "stopping", "starting", "sharing"]);
 const SYNC_STATES = new Set(["idle", "sending", "receiving", "applied", "rejected"]);
 const PEER_PHASES = new Set([...PHASES, "notPaired"]);
+// How well a running session's link carries input, as its source judges it.
+const LINK_QUALITIES = new Set(["healthy", "degraded", "bad"]);
 const EDGES = new Set(["left", "right", "top", "bottom"]);
 const WHOLE_EDGE = [0, 1];
 const DEFAULT_HYSTERESIS = 1;
@@ -1338,6 +1340,11 @@ function normalizePeerView(value) {
     displays: normalizeDisplays(source.displays),
     lastFailure: boundedText(source.lastFailure, 1000),
     peerArranging: source.peerArranging === true,
+    linkQuality: LINK_QUALITIES.has(source.linkQuality) ? source.linkQuality : null,
+    linkUnsteadyMs:
+      Number.isSafeInteger(source.linkUnsteadyMs) && source.linkUnsteadyMs >= 0
+        ? source.linkUnsteadyMs
+        : 0,
   };
 }
 

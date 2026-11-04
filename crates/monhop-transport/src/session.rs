@@ -8,6 +8,7 @@ use crate::{
     session_handshake::NegotiatedSession,
     session_health::STREAM_STALL_LIMIT,
     session_outbox::{Outbox, Refusal},
+    session_quality::{LinkQuality, PathSample},
     session_wire::{FrameReader, FrameWriter, decode_datagram},
 };
 use monhop_core::{
@@ -18,7 +19,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -40,6 +41,9 @@ struct ProgressState {
     half: AtomicU64,
     /// The peer went silent past the deadline; input is local until the link proves itself.
     held: AtomicBool,
+    /// The source controller's [`LinkQuality`] code and how long it has been below healthy.
+    quality: AtomicU8,
+    unsteady_ms: AtomicU64,
     /// Presses held since capture started, which keep the pointer from crossing until released.
     blocking: std::sync::Mutex<Vec<HeldInput>>,
     /// The user ended this session (pause, switch, quit): its close tells the peer it was no failure.
@@ -98,6 +102,10 @@ pub struct SessionDiagnostics {
     pub active_half: Option<SessionHalf>,
     /// True while the session waits for the other computer to answer again.
     pub held: bool,
+    /// The link's tier as the source controller judges it now.
+    pub link_quality: LinkQuality,
+    /// How long the link has been degraded or bad without a break; zero while healthy.
+    pub unsteady_millis: u64,
     /// Receiving-side load at the end of a destination session.
     pub receiver: Option<crate::session_actor::ReceiverStats>,
     /// Transport facts at the end of the session.
@@ -122,6 +130,12 @@ impl SessionProgress {
     }
     pub(crate) fn hold(&self, held: bool) {
         self.0.held.store(held, Ordering::Release);
+    }
+    pub(crate) fn link_quality(&self, quality: LinkQuality, unsteady: Duration) {
+        self.0.quality.store(quality.code(), Ordering::Relaxed);
+        self.0
+            .unsteady_ms
+            .store(millis_u64(unsteady), Ordering::Relaxed);
     }
     /// Empty while nothing keeps the pointer from crossing to another computer.
     pub fn blocking_presses(&self) -> Vec<HeldInput> {
@@ -167,6 +181,8 @@ impl SessionProgress {
                 _ => None,
             },
             held: self.0.held.load(Ordering::Acquire),
+            link_quality: LinkQuality::from_code(self.0.quality.load(Ordering::Relaxed)),
+            unsteady_millis: self.0.unsteady_ms.load(Ordering::Relaxed),
             receiver: self.0.receiver.lock().ok().and_then(|slot| *slot),
             link: self.0.link.lock().ok().and_then(|slot| *slot),
         }
@@ -475,6 +491,9 @@ impl SessionIo {
     pub(crate) fn check(&self) -> Result<(), SessionFailure> {
         self.link.check()
     }
+    pub(crate) fn path_sample(&self) -> PathSample {
+        self.link.path_sample()
+    }
 }
 
 /// The receiving half of one peer link: its ordered control stream, plus the heartbeat datagrams
@@ -614,6 +633,14 @@ impl LinkIo {
             received_datagrams: stats.udp_rx.datagrams,
             congestion_events: stats.path.congestion_events,
             close: classify_close(self.connection.close_reason()),
+        }
+    }
+    pub(crate) fn path_sample(&self) -> PathSample {
+        let path = self.connection.stats().path;
+        PathSample {
+            rtt: path.rtt,
+            lost_packets: path.lost_packets,
+            sent_packets: path.sent_packets,
         }
     }
     pub(crate) fn close_after(
