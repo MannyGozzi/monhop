@@ -515,11 +515,11 @@ impl Rereads {
     }
 }
 
-/// A network caught between states gets at least three 800 ms reads, 300 ms apart, all within
-/// 3 s, so one read slowed by load cannot revoke a healthy session. Only a macOS route lookup
+/// A network caught between states gets at least three 1 s reads, 300 ms apart, all within
+/// 3.6 s, so one read slowed by load cannot revoke a healthy session. Only a macOS route lookup
 /// gives up at its deadline; adapter, Wi-Fi and Windows route reads run to completion.
 const REREADS: Rereads = Rereads {
-    window: Duration::from_secs(3),
+    window: Duration::from_millis(3_600),
     interval: Duration::from_millis(300),
     reads: 3,
 };
