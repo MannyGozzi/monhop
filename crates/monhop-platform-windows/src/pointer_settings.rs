@@ -32,9 +32,14 @@ pub fn read() -> Ballistics {
         speed,
         x.as_ref().map(|bytes| &bytes[..]),
         y.as_ref().map(|bytes| &bytes[..]),
-        // The primary display sits at the desktop's origin.
-        pixels_per_dip_at(0, 0),
+        primary_pixels_per_dip(),
     )
+}
+
+/// The scale of the primary display, which sits at the desktop's origin: Windows' pointer
+/// ballistics measure their DIPs on it.
+pub fn primary_pixels_per_dip() -> f64 {
+    pixels_per_dip_at(0, 0)
 }
 
 /// One curve's registry bytes, if it holds exactly a curve's worth.

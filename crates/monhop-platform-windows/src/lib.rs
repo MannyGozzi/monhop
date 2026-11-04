@@ -3,6 +3,9 @@
 pub use monhop_core::{capture, capture_control, capture_physical};
 #[path = "capture/decode.rs"]
 pub mod capture_decode;
+#[cfg(any(windows, test))]
+#[path = "capture/motion.rs"]
+mod capture_motion;
 #[cfg(windows)]
 pub mod desktop_state;
 pub mod displays;

@@ -20,7 +20,7 @@ use monhop_core::{
     display_settle::{
         DISPLAY_SETTLE_LIMIT, DISPLAY_SETTLE_POLL, DisplayRead, DisplaySettle, DisplayVerdict,
     },
-    pointer_ballistics::{Ballistics, MAX_MERGED_REPORTS},
+    pointer_ballistics::Ballistics,
 };
 use windows_sys::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -52,7 +52,8 @@ use crate::{
         CaptureCommand, ControlCompletion, ControlError, ControlReader, ControlWriter,
         control_channel,
     },
-    capture_decode::{DecodedInput, decode_keyboard, decode_mouse},
+    capture_decode::{DecodedInput, decode_keyboard, decode_mouse, is_pen_or_touch},
+    capture_motion::{RawMotion, RemoteMotion},
     capture_physical::{HeldInput, LocalTransfer, PhysicalCapture},
     desktop_state::ordinary_desktop_is_active,
     displays::{DisplayGeometrySnapshot, read_display_geometry},
@@ -503,8 +504,8 @@ struct CallbackState {
     /// The user's pointer settings, read at capture start and at each crossing onto another
     /// computer.
     ballistics: Ballistics,
-    /// Physical hook moves since the last raw motion: the reports a coalesced message merged.
-    moves_since_raw: u32,
+    /// Hook moves sent to another computer and the raw samples that settle them.
+    motion: RemoteMotion,
 }
 
 #[derive(Default)]
@@ -524,6 +525,7 @@ impl Drop for CallbackState {
             self.ignored.unmapped_held_keys,
             self.ignored.recovered_releases,
         );
+        log::info!("{}", self.motion.summary(self.shared.origin.elapsed()));
     }
 }
 
@@ -758,25 +760,38 @@ impl CallbackState {
     }
 
     /// The low-level hook is the only point that can withhold before delivery, so it measures a
-    /// physical move's travel from `cursor_before`, read only while take-back can fire.
+    /// physical move's travel from `cursor_before`, read only while take-back can fire or the move
+    /// is withheld for another computer. A withheld move's travel is the pixels Windows would have
+    /// moved it, unclipped by the desktop's edges, and is sent at once instead of its position.
     fn hook_mouse(
         &mut self,
         decoded: DecodedInput,
         cursor_before: impl FnOnce() -> Option<Point>,
+        pen_or_touch: bool,
     ) -> bool {
         let DecodedInput::Event(event @ CaptureEvent::AbsoluteMotion { x, y }) = decoded else {
             return self.decoded(decoded);
         };
-        self.moves_since_raw = self.moves_since_raw.saturating_add(1);
         let receiving = self
             .take_back
             .as_ref()
             .is_some_and(|gate| gate.floor().snapshot().state == FloorState::Receiving);
-        let travel = receiving
+        // Pen and touch positions jump to the contact, so they never predict relative motion.
+        let withheld = !receiving && !pen_or_touch && self.suppresses_as_remote();
+        let travel = (receiving || withheld)
             .then(cursor_before)
             .flatten()
             .map(|before| (f64::from(x) - before.x, f64::from(y) - before.y));
-        self.event_with_travel(event, travel)
+        let now = self.shared.origin.elapsed();
+        if let Some((dx, dy)) = self.motion.hook_move(travel.filter(|_| withheld), now) {
+            return self.event(CaptureEvent::LogicalRelativeMotion { dx, dy });
+        }
+        self.event_with_travel(event, travel.filter(|_| receiving))
+    }
+
+    /// Whether the physical ledger would suppress a move now as one for another computer.
+    fn suppresses_as_remote(&mut self) -> bool {
+        self.remote() && self.physical.is_ready_for_suppression() && !self.shared.stop.is_stopped()
     }
 
     fn decoded(&mut self, event: DecodedInput) -> bool {
@@ -864,19 +879,24 @@ impl CallbackState {
         if raw.header.hDevice.is_null() || mouse.usFlags & 1 != 0 {
             self.ignored.unsourced_motion_samples =
                 self.ignored.unsourced_motion_samples.saturating_add(1);
+            self.motion.unsourced();
             return;
         }
         // WM_INPUT arrives too late to withhold; hook_mouse withholds the same movement.
         if mouse.lLastX != 0 || mouse.lLastY != 0 {
-            let reports = std::mem::take(&mut self.moves_since_raw).clamp(1, MAX_MERGED_REPORTS);
-            let gain =
-                self.ballistics
-                    .gain(f64::from(mouse.lLastX), f64::from(mouse.lLastY), reports);
-            self.event(CaptureEvent::RelativeMotion {
-                dx: mouse.lLastX,
-                dy: mouse.lLastY,
-                gain,
-            });
+            let now = self.shared.origin.elapsed();
+            match self
+                .motion
+                .raw(mouse.lLastX, mouse.lLastY, &mut self.ballistics, now)
+            {
+                RawMotion::Whole { dx, dy, gain } => {
+                    self.event(CaptureEvent::RelativeMotion { dx, dy, gain });
+                }
+                RawMotion::Correction { dx, dy } => {
+                    self.event(CaptureEvent::LogicalRelativeMotion { dx, dy });
+                }
+                RawMotion::Covered => {}
+            }
         }
     }
 
@@ -1348,6 +1368,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     mouse.pt.y,
                 ),
                 current_pointer_position,
+                is_pen_or_touch(mouse.dwExtraInfo),
             )
         }) {
             return 1;
@@ -1426,8 +1447,10 @@ fn is_pointer_setting(wparam: usize) -> bool {
 /// Read outside the hook callback, which only takes the result.
 fn refresh_pointer_settings() {
     let ballistics = crate::pointer_settings::read();
+    let pixels_per_dip = crate::pointer_settings::primary_pixels_per_dip();
     with_callback(|state| {
         state.ballistics = ballistics;
+        state.motion.set_pixels_per_dip(pixels_per_dip);
         false
     });
 }
@@ -1705,7 +1728,7 @@ fn run(
             read_up_last_time: Vec::new(),
             press_revision: 0,
             ballistics,
-            moves_since_raw: 0,
+            motion: RemoteMotion::new(crate::pointer_settings::primary_pixels_per_dip()),
         })
     });
     if let Some(error) = startup_environment_error(ordinary_desktop_is_active()) {
@@ -1807,6 +1830,9 @@ fn run(
             let now = shared.origin.elapsed();
             state.physical.tick(now, &shared.stop);
             state.remote();
+            if let Some((dx, dy)) = state.motion.settle(now) {
+                state.event(CaptureEvent::LogicalRelativeMotion { dx, dy });
+            }
             draining = state.physical.has_suppressed_presses();
             if now.saturating_sub(last_held_recheck) >= HELD_RECHECK_INTERVAL {
                 last_held_recheck = now;
@@ -2170,7 +2196,7 @@ fn windows_error(operation: &'static str) -> NativeCaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monhop_core::display_settle::DISPLAY_STEADY_FOR;
+    use monhop_core::{display_settle::DISPLAY_STEADY_FOR, pointer_ballistics::MAX_MERGED_REPORTS};
 
     fn callback_fixture() -> (CallbackState, CaptureConsumer) {
         callback_fixture_with(None)
@@ -2208,7 +2234,7 @@ mod tests {
                 read_up_last_time: Vec::new(),
                 press_revision: 0,
                 ballistics: Ballistics::default(),
-                moves_since_raw: 0,
+                motion: RemoteMotion::new(1.0),
             },
             consumer,
         )
@@ -2295,7 +2321,7 @@ mod tests {
         hook_moves: u32,
     ) -> f64 {
         for x in 0..hook_moves {
-            state.hook_mouse(physical_move(x as i32), || None);
+            state.hook_mouse(physical_move(x as i32), || None, false);
         }
         state.raw_mouse(&raw_motion(true, 0));
         std::iter::from_fn(|| consumer.try_pop().unwrap())
@@ -2333,8 +2359,8 @@ mod tests {
             windows.gain(7.0, -3.0, MAX_MERGED_REPORTS)
         );
         // An unsourced sample leaves the count to the motion it precedes.
-        state.hook_mouse(physical_move(1), || None);
-        state.hook_mouse(physical_move(2), || None);
+        state.hook_mouse(physical_move(1), || None, false);
+        state.hook_mouse(physical_move(2), || None, false);
         state.raw_mouse(&raw_motion(false, 0));
         assert_eq!(
             gain_after(&mut state, &mut consumer, 1),
@@ -2348,6 +2374,153 @@ mod tests {
         let (mut state, mut consumer) = callback_fixture();
         state.ballistics = Ballistics::new(false, 6, None, None, 1.0);
         assert_eq!(gain_after(&mut state, &mut consumer, 0), 0.5);
+    }
+
+    fn raw_counts(dx: i32, dy: i32) -> RAWINPUT {
+        let mut raw = raw_motion(true, 0);
+        raw.data.mouse = windows_sys::Win32::UI::Input::RAWMOUSE {
+            lLastX: dx,
+            lLastY: dy,
+            ..Default::default()
+        };
+        raw
+    }
+
+    const RESTING: Point = Point::new(500.0, 400.0);
+
+    /// A physical move Windows would carry `dx`, `dy` pixels from a cursor resting at RESTING.
+    fn move_by(dx: i32, dy: i32) -> DecodedInput {
+        decode_mouse(WM_MOUSEMOVE, 0, 0, 0, 500 + dx, 400 + dy)
+    }
+
+    #[test]
+    fn withheld_moves_are_sent_as_they_arrive_and_their_raw_sample_settles_the_total() {
+        let (mut state, mut consumer) = remote_callback();
+        let mut sent = 0.0;
+        for pixels in [1, 1, 2, 1, 1, 2, 1, 1] {
+            assert!(
+                state.hook_mouse(move_by(pixels, 0), || Some(RESTING), false),
+                "a move for another computer stays withheld"
+            );
+            let event = consumer.try_pop_tagged().unwrap().unwrap();
+            assert!(event.remote);
+            assert_eq!(
+                event.event,
+                CaptureEvent::LogicalRelativeMotion {
+                    dx: f64::from(pixels),
+                    dy: 0.0
+                }
+            );
+            sent += f64::from(pixels);
+        }
+        state.raw_mouse(&raw_counts(16, 0));
+        let truth = 16.0 * Ballistics::default().gain(16.0, 0.0, 8);
+        let Some(CaptureEvent::LogicalRelativeMotion { dx, dy }) = consumer.try_pop().unwrap()
+        else {
+            panic!("the raw sample sends what the hook moves fell short of");
+        };
+        assert!(
+            (sent + dx - truth).abs() < 1e-9,
+            "{sent} + {dx} is not {truth}"
+        );
+        assert_eq!(dy, 0.0);
+        assert!(consumer.try_pop().unwrap().is_none());
+        assert_eq!(state.shared.stop.reason(), None);
+    }
+
+    #[test]
+    fn a_withheld_move_of_no_whole_pixel_stays_withheld_as_a_position() {
+        let (mut state, mut consumer) = remote_callback();
+        assert!(state.hook_mouse(move_by(0, 0), || Some(RESTING), false));
+        assert_eq!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::AbsoluteMotion { x: 500, y: 400 })
+        );
+        state.raw_mouse(&raw_counts(1, 0));
+        let truth = Ballistics::default().gain(1.0, 0.0, 1);
+        assert_eq!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::LogicalRelativeMotion { dx: truth, dy: 0.0 })
+        );
+    }
+
+    #[test]
+    fn a_raw_sample_no_hook_move_predicted_is_sent_whole_on_either_route() {
+        for (mut state, mut consumer) in [callback_fixture(), remote_callback()] {
+            let gain = Ballistics::default().gain(7.0, -3.0, 1);
+            state.raw_mouse(&raw_counts(7, -3));
+            assert_eq!(
+                consumer.try_pop().unwrap(),
+                Some(CaptureEvent::RelativeMotion {
+                    dx: 7,
+                    dy: -3,
+                    gain
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn local_moves_are_never_predicted_or_read_against_the_cursor() {
+        let (mut state, mut consumer) = callback_fixture();
+        assert!(!state.hook_mouse(
+            move_by(3, 0),
+            || panic!("a local move needs no cursor read"),
+            false
+        ));
+        assert_eq!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::AbsoluteMotion { x: 503, y: 400 })
+        );
+        state.raw_mouse(&raw_counts(5, 0));
+        assert!(matches!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::RelativeMotion { dx: 5, dy: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn injected_and_pen_moves_are_never_predicted() {
+        let (mut state, mut consumer) = remote_callback();
+        for flags in [0x01, 0x02] {
+            assert!(!state.hook_mouse(
+                decode_mouse(WM_MOUSEMOVE, flags, 0, 0, 900, 400),
+                || panic!("injected input is never measured"),
+                false
+            ));
+        }
+        assert!(!state.hook_mouse(
+            decode_mouse(WM_MOUSEMOVE, 0, MONHOP_INJECTED_MARKER, 0, 900, 400),
+            || panic!("injected input is never measured"),
+            false
+        ));
+        assert!(consumer.try_pop().unwrap().is_none());
+        // A pen jumps to its contact: still withheld, never sent as motion.
+        assert!(state.hook_mouse(move_by(400, 0), || Some(RESTING), true));
+        assert_eq!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::AbsoluteMotion { x: 900, y: 400 })
+        );
+        let gain = Ballistics::default().gain(7.0, 0.0, 1);
+        state.raw_mouse(&raw_counts(7, 0));
+        assert_eq!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::RelativeMotion { dx: 7, dy: 0, gain })
+        );
+    }
+
+    #[test]
+    fn a_withheld_move_no_raw_sample_follows_is_sent_once_and_never_charged_back() {
+        let (mut state, mut consumer) = remote_callback();
+        assert!(state.hook_mouse(move_by(4, -2), || Some(RESTING), false));
+        assert_eq!(
+            consumer.try_pop().unwrap(),
+            Some(CaptureEvent::LogicalRelativeMotion { dx: 4.0, dy: -2.0 })
+        );
+        let rested = state.shared.origin.elapsed() + crate::capture_motion::SETTLE_AFTER;
+        assert_eq!(state.motion.settle(rested), None);
+        assert!(consumer.try_pop().unwrap().is_none());
+        assert_eq!(state.shared.stop.reason(), None);
     }
 
     #[test]
@@ -2994,18 +3167,20 @@ mod tests {
         let (mut state, mut consumer) = callback_fixture_with(Some(gate.clone()));
         let at = |x| move || Some(Point::new(x, 100.0));
         assert!(
-            !state.hook_mouse(physical_move(904), at(900.0)),
+            !state.hook_mouse(physical_move(904), at(900.0), false),
             "sub-threshold travel is delivered"
         );
         assert_eq!(gate.take_triggered(), None);
         assert!(
-            state.hook_mouse(physical_move(907), at(904.0)),
+            state.hook_mouse(physical_move(907), at(904.0), false),
             "the movement that takes back is withheld before delivery"
         );
         assert!(gate.take_triggered().is_some());
-        assert!(state.hook_mouse(physical_move(908), || {
-            panic!("the cursor is read only while take-back can fire")
-        }));
+        assert!(state.hook_mouse(
+            physical_move(908),
+            || panic!("the cursor is read only while take-back can fire"),
+            false
+        ));
         assert_eq!(state.shared.stop.reason(), None);
         let positions = std::iter::from_fn(|| consumer.try_pop().unwrap())
             .filter(|event| matches!(event, CaptureEvent::AbsoluteMotion { .. }))
@@ -3017,10 +3192,10 @@ mod tests {
     fn injected_travel_between_physical_moves_never_takes_back() {
         let gate = receiving_gate_holding_injected_input();
         let (mut state, _consumer) = callback_fixture_with(Some(gate.clone()));
-        assert!(!state.hook_mouse(physical_move(100), || Some(Point::new(99.0, 100.0))));
+        assert!(!state.hook_mouse(physical_move(100), || Some(Point::new(99.0, 100.0)), false));
         // The peer's injected motion moved the cursor 800 units before the next physical nudge.
-        assert!(!state.hook_mouse(physical_move(901), || Some(Point::new(900.0, 100.0))));
-        assert!(!state.hook_mouse(physical_move(902), || None));
+        assert!(!state.hook_mouse(physical_move(901), || Some(Point::new(900.0, 100.0)), false));
+        assert!(!state.hook_mouse(physical_move(902), || None, false));
         assert_eq!(gate.take_triggered(), None);
     }
 

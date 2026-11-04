@@ -150,7 +150,8 @@ pub enum CaptureEvent {
         x: f64,
         y: f64,
     },
-    /// A macOS Quartz cursor delta in logical desktop points.
+    /// A cursor delta in logical units: macOS Quartz points, or Windows DIPs for motion sent to
+    /// another computer.
     LogicalRelativeMotion {
         dx: f64,
         dy: f64,

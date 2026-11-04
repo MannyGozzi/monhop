@@ -44,6 +44,9 @@ const LLMHF_INJECTED: u32 = 0x01;
 const LLMHF_LOWER_IL_INJECTED: u32 = 0x02;
 const XBUTTON1: u16 = 0x0001;
 const XBUTTON2: u16 = 0x0002;
+/// `MI_WP_SIGNATURE` under `SIGNATURE_MASK`, from the pen and touch input documentation.
+const PEN_OR_TOUCH_SIGNATURE: usize = 0xFF51_5700;
+const SIGNATURE_MASK: usize = 0xFFFF_FF00;
 
 /// Decodes one `KBDLLHOOKSTRUCT` record without retaining any physical state.
 pub fn decode_keyboard(
@@ -117,6 +120,11 @@ pub fn decode_mouse(
         WM_MOUSEHWHEEL => scroll(signed_high_word(mouse_data), 0),
         _ => DecodedInput::Unsupported,
     }
+}
+
+/// A mouse record Windows made from pen or touch input, whose position jumps to the contact.
+pub fn is_pen_or_touch(extra_info: usize) -> bool {
+    extra_info & SIGNATURE_MASK == PEN_OR_TOUCH_SIGNATURE
 }
 
 fn keyboard_pressed(message: u32) -> Option<bool> {
@@ -411,6 +419,22 @@ mod tests {
                 assert!((before..=after).contains(&at));
             }
             _ => panic!("expected a button event"),
+        }
+    }
+
+    #[test]
+    fn only_the_pen_and_touch_signature_marks_pen_or_touch() {
+        for extra_info in [0xFF51_5700, 0xFF51_5780, 0xFF51_57FF] {
+            assert!(is_pen_or_touch(extra_info));
+        }
+        for extra_info in [
+            0,
+            MONHOP_INJECTED_MARKER,
+            0xFF51_5600,
+            0x7F51_5700,
+            0xFF51_5800,
+        ] {
+            assert!(!is_pen_or_touch(extra_info));
         }
     }
 
