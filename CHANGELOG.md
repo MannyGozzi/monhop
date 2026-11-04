@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-11-04
+
 ### Added
 
 - A note on a connected computer's card when the connection keeps having trouble for 2 seconds. A computer sharing over Wi-Fi says Wi-Fi looks unstable, and a wired one says the connection to the other computer looks unstable. One brief hiccup does not show the note. It leaves once the trouble stops, and the AirDrop warning shows instead when both apply.
@@ -381,7 +383,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.18...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.19...HEAD
+[0.2.19]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.19
 [0.2.18]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.18
 [0.2.17]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.17
 [0.2.16]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.16
