@@ -10,10 +10,10 @@ pub use pairing::PairingEndpoint;
 use std::{
     fmt, io,
     marker::PhantomData,
-    net::{SocketAddr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     rc::Rc,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, PoisonError, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -21,17 +21,21 @@ use std::{
 
 use monhop_core::revocation::RevocationSignal;
 use quinn::AsyncUdpSocket;
-use tokio::{sync::watch, task::JoinSet, time::Instant};
+use tokio::{
+    sync::{mpsc, watch},
+    task::{AbortHandle, JoinSet},
+    time::Instant,
+};
 
 use crate::{
     crypto::{
         CertificateFingerprint, DeviceIdentity, LOCAL_TLS_SERVER_NAME, RefusedCertificate,
-        SecureQuicConfig, VerifiedPeer, presented_certificate,
+        SecureQuicConfig, VerifiedPeer, is_probe, presented_certificate,
     },
     policy::{MAX_PINNED_PEERS, is_private_or_link_local},
 };
 use runtime::HandleRuntime;
-use socket::{DatagramIo, GuardedSocket, Reachability, SendRefusals};
+use socket::{DatagramIo, GuardedSocket, Knocks, MemberSlots, Prober, Reachability, SendRefusals};
 
 /// Incoming handshakes one member may have running at once; more are refused until one ends.
 const MAX_MEMBER_HANDSHAKES: usize = 2;
@@ -39,8 +43,50 @@ const MAX_MEMBER_HANDSHAKES: usize = 2;
 const MEMBER_HANDSHAKE_BURST: u32 = 4;
 /// How often a member's budget regains one incoming handshake.
 const MEMBER_HANDSHAKE_REFILL: Duration = Duration::from_secs(1);
-/// An incoming handshake still unfinished after this is closed, freeing its member's slot.
+/// An incoming handshake still unfinished after this is closed, freeing its member's slot; a
+/// dial-back to a knocking host gets the same.
 const INCOMING_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
+/// Why a dial-back's connection closes once it proved who answered.
+pub(crate) const DIAL_BACK_DONE: &[u8] = b"address checked";
+/// A dial-back's answer: the answering side's own pinned address, IPv4 then port, big-endian.
+/// TLS binds the key, not the address, so only this answer binds the address.
+const PROBE_ANSWER_BYTES: usize = 6;
+
+fn probe_answer(address: SocketAddrV4) -> [u8; PROBE_ANSWER_BYTES] {
+    let mut answer = [0; PROBE_ANSWER_BYTES];
+    answer[..4].copy_from_slice(&address.ip().octets());
+    answer[4..].copy_from_slice(&address.port().to_be_bytes());
+    answer
+}
+
+/// Sends the answer on one stream the answering side opens and finishes, then waits, bounded,
+/// for the dialer to close before closing itself.
+async fn answer_probe(connection: quinn::Connection, address: SocketAddrV4) {
+    let answered = tokio::time::timeout(INCOMING_HANDSHAKE_DEADLINE, async {
+        let (mut answer, _) = connection.open_bi().await.ok()?;
+        answer.write_all(&probe_answer(address)).await.ok()?;
+        answer.finish().ok()?;
+        connection.closed().await;
+        Some(())
+    })
+    .await;
+    if !matches!(answered, Ok(Some(()))) {
+        log::debug!("guarded endpoint: a dial-back ended before its answer was taken");
+    }
+    connection.close(0_u32.into(), DIAL_BACK_DONE);
+}
+
+/// The address a dial-back's answer reports: exactly `PROBE_ANSWER_BYTES` on the first stream the
+/// answering side opens.
+pub(crate) async fn read_probe_answer(connection: &quinn::Connection) -> Option<SocketAddrV4> {
+    let (_, mut answer) = connection.accept_bi().await.ok()?;
+    let read = answer.read_to_end(PROBE_ANSWER_BYTES).await.ok()?;
+    let [a, b, c, d, high, low]: [u8; PROBE_ANSWER_BYTES] = read.try_into().ok()?;
+    Some(SocketAddrV4::new(
+        Ipv4Addr::new(a, b, c, d),
+        u16::from_be_bytes([high, low]),
+    ))
+}
 
 /// Identifies a failed native route check without exposing platform error details.
 #[derive(Debug)]
@@ -285,9 +331,8 @@ impl PinnedNetwork {
 }
 
 /// One member's configurations. Its verifiers pin exactly its certificate, and the accept path
-/// picks them only for its exact recorded address.
+/// picks them only for its exact recorded address, which its slot in `Shared::slots` holds.
 struct Member {
-    address: SocketAddrV4,
     fingerprint: CertificateFingerprint,
     client: quinn::ClientConfig,
     server: Arc<quinn::ServerConfig>,
@@ -303,13 +348,40 @@ impl Member {
     }
 }
 
-fn member_configs(identity: &DeviceIdentity, members: &[GroupMember]) -> io::Result<Box<[Member]>> {
-    members
+/// Every member's configurations, which members are wanted, and the client config a dial-back
+/// proves a wanted member with.
+struct MemberSet {
+    members: Box<[Member]>,
+    wanted: Arc<[AtomicBool]>,
+    recognizer: Option<quinn::ClientConfig>,
+}
+
+fn member_configs(identity: &DeviceIdentity, members: &[GroupMember]) -> io::Result<MemberSet> {
+    let wanted: Arc<[AtomicBool]> = members.iter().map(|_| AtomicBool::new(false)).collect();
+    let recognizer = {
+        let prints: Box<[CertificateFingerprint]> = members
+            .iter()
+            .map(|member| member.pin.fingerprint())
+            .collect();
+        let wanted = Arc::clone(&wanted);
+        let pins: Vec<VerifiedPeer> = members.iter().map(|member| member.pin.clone()).collect();
+        SecureQuicConfig::client_recognizing(
+            identity,
+            &pins,
+            Arc::new(move |presented| {
+                prints
+                    .iter()
+                    .position(|print| *print == presented)
+                    .is_some_and(|index| wanted[index].load(Ordering::Acquire))
+            }),
+        )
+        .map_err(io::Error::other)?
+    };
+    let members = members
         .iter()
         .map(|member| {
             let refused = RefusedCertificate::default();
             Ok(Member {
-                address: member.address,
                 fingerprint: member.pin.fingerprint(),
                 client: SecureQuicConfig::client_recording(identity, &member.pin, refused.clone())
                     .map_err(io::Error::other)?,
@@ -321,20 +393,80 @@ fn member_configs(identity: &DeviceIdentity, members: &[GroupMember]) -> io::Res
                 forgotten: AtomicBool::new(false),
             })
         })
-        .collect()
+        .collect::<io::Result<_>>()?;
+    Ok(MemberSet {
+        members,
+        wanted,
+        recognizer: Some(recognizer),
+    })
+}
+
+/// A paired computer that proved its pinned certificate at a new address, now recorded there.
+#[derive(Clone, Copy)]
+pub struct MemberMoved {
+    pub member: CertificateFingerprint,
+    pub from: SocketAddrV4,
+    pub to: SocketAddrV4,
+}
+
+/// Re-addresses one member of the pinned network: the route check and the lock move that a
+/// member proven at a new address must pass before the socket hears it there.
+pub(super) trait Relocation: Send + Sync {
+    /// A direct route to `peer` through the selected interface, checked before it is dialed back.
+    fn route_holds(&self, peer: Ipv4Addr) -> io::Result<()>;
+    /// Moves member `slot` to `peer` in the network lock.
+    fn move_member(&self, slot: usize, peer: Ipv4Addr) -> io::Result<()>;
+}
+
+/// What a socket gives its endpoint for following a member to a new address.
+struct Readdressing {
+    slots: Arc<MemberSlots>,
+    knocks: Arc<Knocks>,
+    /// None on a test socket that cannot send a knock.
+    knocker: Option<Prober>,
+    relocation: Arc<dyn Relocation>,
 }
 
 /// What the endpoint's cross-thread handles share. The slot empties when the owner drops, so a
 /// stray handle never keeps the pinned socket open.
 struct Shared {
     members: Box<[Member]>,
+    /// Each member's recorded address, shared with the socket, in member order.
+    slots: Arc<MemberSlots>,
+    /// Per member, whether a connect runs for it without a live link.
+    wanted: Arc<[AtomicBool]>,
+    knocks: Arc<Knocks>,
+    knocker: Option<Prober>,
+    /// None on a pairing endpoint, which has no members to dial back.
+    recognizer: Option<quinn::ClientConfig>,
     /// The socket's route verdict for each member, in member order.
     reachability: Arc<Reachability>,
     signal: RevocationSignal,
     endpoint: Mutex<Option<quinn::Endpoint>>,
+    /// How a test answers dial-backs instead.
+    #[cfg(test)]
+    answers_as: Mutex<Option<TestAnswer>>,
+}
+
+/// A test's stand-in for this endpoint's own dial-back answer.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TestAnswer {
+    /// Answers as if this endpoint were at the address.
+    At(SocketAddrV4),
+    /// Sends no answer and closes with the address as the reason, as a forged close would.
+    ClosingWith(SocketAddrV4),
 }
 
 impl Shared {
+    /// The pinned address a dial-back answer reports.
+    fn answering_address(&self) -> Option<SocketAddrV4> {
+        match self.endpoint()?.local_addr().ok()? {
+            SocketAddr::V4(address) => Some(address),
+            SocketAddr::V6(_) => None,
+        }
+    }
+
     /// Only a member still admitted: a forgotten one is no longer paired on this endpoint.
     fn member(&self, fingerprint: CertificateFingerprint) -> io::Result<&Member> {
         self.admitted_member(fingerprint).map(|(_, member)| member)
@@ -366,10 +498,48 @@ impl Shared {
         let SocketAddr::V4(remote) = remote else {
             return None;
         };
+        self.slots
+            .position(remote)
+            .filter(|&index| self.members[index].admitted())
+    }
+
+    fn address(&self, index: usize) -> io::Result<SocketAddrV4> {
+        self.slots
+            .get(index)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
+    }
+
+    /// Marks whether a connect runs for `member` without a live link; knocks count only while one
+    /// does.
+    fn set_wanted(&self, member: CertificateFingerprint, wanted: bool) {
+        let Some(index) = self
+            .members
+            .iter()
+            .position(|known| known.fingerprint == member)
+        else {
+            return;
+        };
+        self.wanted[index].store(wanted, Ordering::Release);
+        self.knocks.set_wanted(
+            self.wanted
+                .iter()
+                .any(|wanted| wanted.load(Ordering::Acquire)),
+        );
+    }
+
+    fn wanted(&self, member: CertificateFingerprint) -> bool {
         self.members
             .iter()
-            .position(|member| member.address == remote)
-            .filter(|&index| self.members[index].admitted())
+            .position(|known| known.fingerprint == member)
+            .is_some_and(|index| self.wanted[index].load(Ordering::Acquire))
+    }
+
+    fn knock(&self, member: CertificateFingerprint) {
+        if let (Some(knocker), Ok((index, _))) = (&self.knocker, self.admitted_member(member))
+            && let Ok(address) = self.address(index)
+        {
+            knocker(address);
+        }
     }
 
     fn admits(&self, fingerprint: CertificateFingerprint) -> bool {
@@ -442,7 +612,7 @@ impl Shared {
         };
         let connecting = match endpoint.connect_with(
             member.client.clone(),
-            member.address.into(),
+            self.address(index)?.into(),
             LOCAL_TLS_SERVER_NAME,
         ) {
             Ok(connecting) => connecting,
@@ -458,14 +628,14 @@ impl Shared {
         fingerprint: CertificateFingerprint,
         connection: &quinn::Connection,
     ) -> io::Result<()> {
-        let member = self.member(fingerprint).inspect_err(|_| {
+        let (index, member) = self.admitted_member(fingerprint).inspect_err(|_| {
             connection.close(0_u32.into(), b"not a paired computer");
         })?;
         if let Err(error) = self.check_active() {
             connection.close(0_u32.into(), b"network revoked");
             return Err(error);
         }
-        if bind_to_member(member, connection) {
+        if bind_to_member(member, self.slots.get(index), connection) {
             Ok(())
         } else {
             Err(unbound(member).into_io_error())
@@ -473,10 +643,14 @@ impl Shared {
     }
 }
 
-/// A finished connection must come from the member's recorded address and present exactly its
+/// A finished connection must come from the member's recorded `address` and present exactly its
 /// pinned certificate; anything else is closed.
-fn bind_to_member(member: &Member, connection: &quinn::Connection) -> bool {
-    if connection.remote_address() == SocketAddr::V4(member.address)
+fn bind_to_member(
+    member: &Member,
+    address: Option<SocketAddrV4>,
+    connection: &quinn::Connection,
+) -> bool {
+    if address.is_some_and(|address| connection.remote_address() == SocketAddr::V4(address))
         && observed_fingerprint(connection) == Some(member.fingerprint)
     {
         return true;
@@ -510,6 +684,9 @@ pub struct GuardedEndpoint {
     /// Empty once an accept loop elsewhere took it; incoming connections never have two owners.
     acceptor: tokio::sync::Mutex<Option<Acceptor>>,
     socket_lifetime: watch::Receiver<()>,
+    /// Each member the dial-backs moved; empty once taken.
+    moves: Mutex<Option<mpsc::UnboundedReceiver<MemberMoved>>>,
+    _readdressing: Aborting,
     _readmission: Option<native::Readmission>,
     _watch: Option<native::Watch>,
     _owner_thread: PhantomData<Rc<()>>,
@@ -739,7 +916,37 @@ impl Acceptor {
             connection.close(0_u32.into(), b"not a paired computer");
             return Ok(None);
         }
-        Ok(Some(if bind_to_member(member, &connection) {
+        if is_probe(&connection) {
+            log::info!(
+                "guarded endpoint: paired computer {} checked this computer's address",
+                member.fingerprint.short_hex()
+            );
+            #[cfg(test)]
+            let answer = *self
+                .shared
+                .answers_as
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            let address = match answer {
+                Some(TestAnswer::At(address)) => Some(address),
+                Some(TestAnswer::ClosingWith(address)) => {
+                    connection.close(0_u32.into(), &probe_answer(address));
+                    return Ok(None);
+                }
+                None => self.shared.answering_address(),
+            };
+            #[cfg(not(test))]
+            let address = self.shared.answering_address();
+            // The answer runs on its own bounded task, so the accept loop goes on at once.
+            match address {
+                Some(address) => drop(self.network.spawn(answer_probe(connection, address))),
+                None => connection.close(0_u32.into(), DIAL_BACK_DONE),
+            }
+            return Ok(None);
+        }
+        let address = self.shared.slots.get(handshake.member);
+        Ok(Some(if bind_to_member(member, address, &connection) {
             Accepted::Member(member.fingerprint, connection)
         } else {
             Accepted::Failed(unbound(member))
@@ -810,6 +1017,148 @@ impl EndpointHandle {
             shared: self.shared.clone(),
         }
     }
+
+    /// Marks whether a connect runs for `member` without a live link. Only while some member is
+    /// wanted does a knock from an unrecorded host count, and a dial-back proves only a wanted one.
+    pub fn set_wanted(&self, member: CertificateFingerprint, wanted: bool) {
+        self.shared.set_wanted(member, wanted);
+    }
+
+    pub fn wanted(&self, member: CertificateFingerprint) -> bool {
+        self.shared.wanted(member)
+    }
+
+    /// Knocks at `member`'s recorded address with one datagram that carries nothing, so a member
+    /// that never heard this computer's new address dials it back.
+    pub fn knock(&self, member: CertificateFingerprint) {
+        self.shared.knock(member);
+    }
+}
+
+/// Aborts its task when dropped.
+struct Aborting(AbortHandle);
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Dials back each knocking host as a client and moves the one wanted member whose pinned
+/// certificate it proves; nothing from it is answered as a server. Runs for the endpoint's life.
+async fn readdress(
+    shared: Weak<Shared>,
+    knocks: Arc<Knocks>,
+    relocation: Arc<dyn Relocation>,
+    moves: mpsc::UnboundedSender<MemberMoved>,
+) {
+    loop {
+        let candidate = knocks.next().await;
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let moved = dial_back(&shared, &relocation, candidate).await;
+        let recorded = moved.is_some();
+        if let Some(moved) = moved {
+            let _ = moves.send(moved);
+        }
+        knocks.finish(candidate, recorded, Instant::now());
+    }
+}
+
+async fn dial_back(
+    shared: &Shared,
+    relocation: &Arc<dyn Relocation>,
+    candidate: SocketAddrV4,
+) -> Option<MemberMoved> {
+    shared.check_active().ok()?;
+    let checking = Arc::clone(relocation);
+    let route = tokio::task::spawn_blocking(move || checking.route_holds(*candidate.ip())).await;
+    if !matches!(route, Ok(Ok(()))) {
+        log::info!("guarded endpoint: {candidate} knocked but has no direct route; ignored");
+        return None;
+    }
+    let endpoint = shared.endpoint()?;
+    let connecting = endpoint
+        .connect_with(
+            shared.recognizer.clone()?,
+            candidate.into(),
+            LOCAL_TLS_SERVER_NAME,
+        )
+        .ok()?;
+    let deadline = tokio::time::Instant::now() + INCOMING_HANDSHAKE_DEADLINE;
+    let connection = match tokio::time::timeout_at(deadline, connecting).await {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
+            log::info!("guarded endpoint: the dial-back to {candidate} failed: {error}");
+            return None;
+        }
+        Err(_) => {
+            log::info!("guarded endpoint: {candidate} did not answer its dial-back");
+            return None;
+        }
+    };
+    // The answer must arrive in 1-RTT: quinn still accepts a close in an Initial packet after the
+    // handshake, keyed only by the plaintext connection ID, but never a stream frame there.
+    let reported = tokio::time::timeout_at(deadline, read_probe_answer(&connection))
+        .await
+        .ok()
+        .flatten();
+    connection.close(0_u32.into(), DIAL_BACK_DONE);
+    if reported != Some(candidate) {
+        log::warn!(
+            "guarded endpoint: the computer answering at {candidate} reported {reported:?}; not \
+             moved"
+        );
+        return None;
+    }
+    let proven = observed_fingerprint(&connection);
+    let index = proven.and_then(|print| {
+        shared
+            .members
+            .iter()
+            .position(|member| member.fingerprint == print && member.admitted())
+            .filter(|&index| shared.wanted[index].load(Ordering::Acquire))
+    })?;
+    let member = shared.members[index].fingerprint;
+    if connection.remote_address() != SocketAddr::V4(candidate)
+        || shared.slots.position(candidate).is_some()
+    {
+        log::warn!(
+            "guarded endpoint: paired computer {} proved itself at {candidate}, which another \
+             computer holds; not moved",
+            member.short_hex()
+        );
+        return None;
+    }
+    let from = shared.slots.get(index)?;
+    let moving = Arc::clone(relocation);
+    let moved =
+        tokio::task::spawn_blocking(move || moving.move_member(index, *candidate.ip())).await;
+    match moved {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            log::warn!(
+                "guarded endpoint: paired computer {} proved itself at {candidate} but the move \
+                 was refused: {error}",
+                member.short_hex()
+            );
+            return None;
+        }
+        Err(_) => return None,
+    }
+    shared.knocks.spend(from, Instant::now());
+    shared.slots.set(index, candidate);
+    log::info!(
+        "guarded endpoint: paired computer {} proved its pairing at {candidate} (recorded at \
+         {from}); recorded there",
+        member.short_hex()
+    );
+    Some(MemberMoved {
+        member,
+        from,
+        to: candidate,
+    })
 }
 
 /// What carries QUIC for one endpoint: the socket, its revocation, its lifetime, its members'
@@ -852,7 +1201,7 @@ fn member_probe(shared: &Arc<Shared>, prober: socket::Prober) -> native::Probe {
                 .members
                 .get(slot)
                 .filter(|member| member.admitted())
-                .map(|member| member.address)
+                .and_then(|_| shared.slots.get(slot))
         });
         if let Some(address) = address {
             prober(address);
@@ -918,9 +1267,11 @@ impl GuardedEndpoint {
             cadence: native::CADENCE,
             prober: socket.prober(),
         };
+        let readdressing = Readdressing::of(&socket, prepared.relocation)?;
         Self::assemble(
             Carrier::guarded(socket),
             members,
+            readdressing,
             refusing,
             runtime,
             Some(prepared.watch),
@@ -932,7 +1283,8 @@ impl GuardedEndpoint {
     /// readmission timer runs on `runtime`.
     fn assemble(
         carrier: Carrier,
-        members: Box<[Member]>,
+        members: MemberSet,
+        readdressing: Readdressing,
         refusing: quinn::ServerConfig,
         runtime: HandleRuntime,
         watch: Option<native::Watch>,
@@ -945,7 +1297,18 @@ impl GuardedEndpoint {
             reachability,
             refusals: _,
         } = carrier;
-        if reachability.len() != members.len() {
+        let MemberSet {
+            members,
+            wanted,
+            recognizer,
+        } = members;
+        let Readdressing {
+            slots,
+            knocks,
+            knocker,
+            relocation,
+        } = readdressing;
+        if reachability.len() != members.len() || slots.len() != members.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the socket's members differ from the endpoint's",
@@ -964,10 +1327,28 @@ impl GuardedEndpoint {
         }
         let shared = Arc::new(Shared {
             members,
+            slots,
+            wanted,
+            knocks: Arc::clone(&knocks),
+            knocker,
+            recognizer,
             reachability,
             signal,
             endpoint: Mutex::new(Some(endpoint.clone())),
+            #[cfg(test)]
+            answers_as: Mutex::new(None),
         });
+        let (moved, moves) = mpsc::unbounded_channel();
+        let readdressing = Aborting(
+            network
+                .spawn(readdress(
+                    Arc::downgrade(&shared),
+                    knocks,
+                    relocation,
+                    moved,
+                ))
+                .abort_handle(),
+        );
         let readmission = readmitting.and_then(|readmitting| {
             native::Readmission::for_group(
                 &network,
@@ -983,6 +1364,8 @@ impl GuardedEndpoint {
             shared,
             endpoint,
             socket_lifetime: lifetime,
+            moves: Mutex::new(Some(moves)),
+            _readdressing: readdressing,
             _readmission: readmission,
             _watch: watch,
             _owner_thread: PhantomData,
@@ -1056,6 +1439,14 @@ impl GuardedEndpoint {
         self.shared.take_refused(member)
     }
 
+    /// Every member a dial-back moves to a new address, in order; None once taken.
+    pub fn take_moves(&self) -> Option<mpsc::UnboundedReceiver<MemberMoved>> {
+        self.moves
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
     /// A handle other threads can hold to dial members or revoke.
     pub fn handle(&self) -> EndpointHandle {
         EndpointHandle {
@@ -1127,7 +1518,7 @@ impl GuardedEndpoint {
         selection: &GroupSelection,
         identity: &DeviceIdentity,
     ) -> io::Result<Self> {
-        Self::over_socket_rechecking(socket, selection, identity, None)
+        Self::over_socket_rechecking(socket, selection, identity, None, Arc::new(Unchecked))
     }
 
     /// As `over_socket`, and while a member is set aside the timer runs `recheck`'s check and
@@ -1137,6 +1528,7 @@ impl GuardedEndpoint {
         selection: &GroupSelection,
         identity: &DeviceIdentity,
         recheck: Option<(native::SharedCheck, native::Cadence)>,
+        relocation: Arc<dyn Relocation>,
     ) -> io::Result<Self> {
         selection.validate(identity)?;
         let socket = Arc::new(socket);
@@ -1145,9 +1537,11 @@ impl GuardedEndpoint {
             cadence,
             prober: socket.prober(),
         });
+        let readdressing = Readdressing::of(&socket, relocation)?;
         Self::assemble(
             Carrier::guarded(socket),
             member_configs(identity, &selection.members)?,
+            readdressing,
             SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?,
             HandleRuntime::current()?,
             None,
@@ -1158,6 +1552,61 @@ impl GuardedEndpoint {
     /// Sets each member's reachability, in member order, as a route check would.
     pub(crate) fn set_reachable(&self, reachable: &[bool]) {
         self.shared.reachability.set(reachable);
+    }
+
+    /// Answers dial-backs as `answer` says instead of from this endpoint's own address.
+    pub(crate) fn answer_as(&self, answer: TestAnswer) {
+        *self
+            .shared
+            .answers_as
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(answer);
+    }
+
+    /// Whether `address` failed a dial-back lately and is ignored.
+    pub(crate) fn ignores(&self, address: SocketAddrV4) -> bool {
+        self.shared.knocks.ignores(address)
+    }
+
+    /// Each member's recorded address now, in member order.
+    pub(crate) fn recorded(&self) -> Vec<SocketAddrV4> {
+        (0..self.shared.members.len())
+            .filter_map(|slot| self.shared.slots.get(slot))
+            .collect()
+    }
+}
+
+/// A relocation for test endpoints with no native network: every route holds, every move passes.
+#[cfg(test)]
+pub(crate) struct Unchecked;
+
+#[cfg(test)]
+impl Relocation for Unchecked {
+    fn route_holds(&self, _: Ipv4Addr) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn move_member(&self, _: usize, _: Ipv4Addr) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Readdressing {
+    fn of<I: DatagramIo>(
+        socket: &Arc<GuardedSocket<I>>,
+        relocation: Arc<dyn Relocation>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            slots: socket.slots().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a pairing socket has no members",
+                )
+            })?,
+            knocks: socket.knocks(),
+            knocker: Some(socket.knocker()),
+            relocation,
+        })
     }
 }
 
@@ -1320,9 +1769,17 @@ pub(crate) mod loopback {
                 reachability: Reachability::new(members.len()),
                 refusals: SendRefusals::new(members.len()),
             };
+            let addresses: Vec<_> = members.iter().map(|member| member.address).collect();
+            let readdressing = Readdressing {
+                slots: MemberSlots::new(&addresses),
+                knocks: Knocks::new(),
+                knocker: None,
+                relocation: Arc::new(Unchecked),
+            };
             Self::assemble(
                 carrier,
                 member_configs(identity, members)?,
+                readdressing,
                 SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?,
                 HandleRuntime::current()?,
                 None,

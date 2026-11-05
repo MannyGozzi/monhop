@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt,
     future::Future,
     io::{self, IoSliceMut},
@@ -36,8 +37,15 @@ const RECEIVE_BUDGET: usize = 32;
 const FIRST_PACKET_BURST: u32 = 8;
 /// How often a member's first-packet budget regains one packet.
 const FIRST_PACKET_REFILL: Duration = Duration::from_millis(100);
-// Every member's whole burst fits Quinn's incoming queue at once, so no member's flood fills it.
-const _: () = assert!(MAX_PINNED_PEERS * FIRST_PACKET_BURST as usize <= MAX_PENDING_INCOMING);
+// Every member's whole burst, and the dial-back candidate's, fits Quinn's incoming queue at once,
+// so no flood fills it.
+const _: () = assert!((MAX_PINNED_PEERS + 1) * FIRST_PACKET_BURST as usize <= MAX_PENDING_INCOMING);
+/// A new dial-back candidate is taken at most this often.
+const KNOCK_INTERVAL: Duration = Duration::from_secs(2);
+/// A candidate whose dial-back failed is ignored this long.
+const KNOCK_IGNORE: Duration = Duration::from_secs(30);
+/// The most failed candidates ignored at once; the oldest makes room.
+const KNOCK_IGNORED: usize = 8;
 type WritableFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync>>;
 
 /// Raw send errors, beyond the unreachable kinds, that say one destination cannot take a datagram
@@ -262,10 +270,203 @@ impl DatagramIo for NativeSocket {
     }
 }
 
+/// Each member slot's recorded address, in member order. Only a member that proved its pinned
+/// certificate at a new address moves; the set of slots never changes.
+pub(super) struct MemberSlots(Box<[AtomicU64]>);
+
+impl MemberSlots {
+    pub(super) fn new(addresses: &[SocketAddrV4]) -> Arc<Self> {
+        Arc::new(Self(
+            addresses
+                .iter()
+                .map(|address| AtomicU64::new(pack(*address)))
+                .collect(),
+        ))
+    }
+
+    pub(super) fn get(&self, slot: usize) -> Option<SocketAddrV4> {
+        self.0
+            .get(slot)
+            .map(|address| unpack(address.load(Ordering::Acquire)))
+    }
+
+    pub(super) fn position(&self, address: SocketAddrV4) -> Option<usize> {
+        let packed = pack(address);
+        self.0
+            .iter()
+            .position(|slot| slot.load(Ordering::Acquire) == packed)
+    }
+
+    pub(super) fn set(&self, slot: usize, address: SocketAddrV4) {
+        if let Some(stored) = self.0.get(slot) {
+            stored.store(pack(address), Ordering::Release);
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+fn pack(address: SocketAddrV4) -> u64 {
+    (u64::from(u32::from(*address.ip())) << 16) | u64::from(address.port())
+}
+
+fn unpack(packed: u64) -> SocketAddrV4 {
+    SocketAddrV4::new(Ipv4Addr::from((packed >> 16) as u32), packed as u16)
+}
+
+/// Datagrams from an unrecorded host of the selected subnet on MonHop's port, heard while some
+/// member is wanted: each may name a paired computer that moved, which the endpoint then dials
+/// back as a client. A knock itself never reaches Quinn; only the one candidate being dialed back
+/// is heard and sent to, and only for that dial-back.
+pub(super) struct Knocks {
+    state: Mutex<KnockState>,
+    candidate: Notify,
+}
+
+struct KnockState {
+    wanted: bool,
+    candidate: Option<Candidate>,
+    budget: TokenBucket,
+    /// Candidates whose dial-back failed, oldest first, with when each stops being ignored.
+    ignored: VecDeque<(SocketAddrV4, Instant)>,
+}
+
+#[derive(Clone, Copy)]
+struct Candidate {
+    address: SocketAddrV4,
+    dialing: bool,
+}
+
+impl Knocks {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(KnockState {
+                wanted: false,
+                candidate: None,
+                budget: TokenBucket::new(1, KNOCK_INTERVAL, Instant::now()),
+                ignored: VecDeque::new(),
+            }),
+            candidate: Notify::new(),
+        })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, KnockState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Knocks count only while some member is wanted; a candidate not yet dialed is dropped once
+    /// none is.
+    pub(super) fn set_wanted(&self, wanted: bool) {
+        let mut state = self.state();
+        state.wanted = wanted;
+        if !wanted && state.candidate.is_some_and(|candidate| !candidate.dialing) {
+            state.candidate = None;
+        }
+    }
+
+    /// Takes `source` as the candidate when none is held, a member is wanted, it is not ignored
+    /// and the budget allows one more. True when it became the candidate.
+    pub(super) fn knock(&self, source: SocketAddrV4, now: Instant) -> bool {
+        let mut state = self.state();
+        while state
+            .ignored
+            .front()
+            .is_some_and(|(_, until)| *until <= now)
+        {
+            state.ignored.pop_front();
+        }
+        if !state.wanted
+            || state.candidate.is_some()
+            || state.ignored.iter().any(|(ignored, _)| *ignored == source)
+            || !state.budget.take(now)
+        {
+            return false;
+        }
+        state.candidate = Some(Candidate {
+            address: source,
+            dialing: false,
+        });
+        drop(state);
+        self.candidate.notify_one();
+        true
+    }
+
+    /// The next candidate, marked as being dialed back.
+    pub(super) async fn next(&self) -> SocketAddrV4 {
+        loop {
+            let notified = self.candidate.notified();
+            {
+                let mut state = self.state();
+                if let Some(candidate) = state.candidate.as_mut().filter(|c| !c.dialing) {
+                    candidate.dialing = true;
+                    return candidate.address;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Ends `address`'s dial-back. One that did not move a member is spent.
+    pub(super) fn finish(&self, address: SocketAddrV4, moved: bool, now: Instant) {
+        let mut state = self.state();
+        if state
+            .candidate
+            .is_some_and(|candidate| candidate.address == address)
+        {
+            state.candidate = None;
+        }
+        if !moved {
+            Self::spend_in(&mut state, address, now);
+        }
+    }
+
+    /// Ignores `address` for `KNOCK_IGNORE`: a failed candidate, or the address a member moved
+    /// from. Quinn's last packets to it then drop instead of revoking the socket.
+    pub(super) fn spend(&self, address: SocketAddrV4, now: Instant) {
+        Self::spend_in(&mut self.state(), address, now);
+    }
+
+    fn spend_in(state: &mut KnockState, address: SocketAddrV4, now: Instant) {
+        state.ignored.retain(|(ignored, _)| *ignored != address);
+        if state.ignored.len() == KNOCK_IGNORED {
+            state.ignored.pop_front();
+        }
+        state.ignored.push_back((address, now + KNOCK_IGNORE));
+    }
+
+    /// Whether `address` is the candidate being dialed back.
+    pub(super) fn dialing(&self, address: SocketAddrV4) -> bool {
+        self.state()
+            .candidate
+            .is_some_and(|candidate| candidate.dialing && candidate.address == address)
+    }
+
+    /// Whether `address` failed a dial-back lately: Quinn may still send it a close.
+    fn spent(&self, address: SocketAddrV4) -> bool {
+        self.state()
+            .ignored
+            .iter()
+            .any(|(ignored, _)| *ignored == address)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ignores(&self, address: SocketAddrV4) -> bool {
+        self.spent(address)
+    }
+
+    #[cfg(test)]
+    pub(super) fn candidate(&self) -> Option<SocketAddrV4> {
+        self.state().candidate.map(|candidate| candidate.address)
+    }
+}
+
 /// Which addresses a socket exchanges datagrams with, each counted in a member slot.
 enum Admission {
-    /// Fixed for the socket's life: exactly the lock's peers, each with its pinned port, in order.
-    Members(Box<[SocketAddrV4]>),
+    /// Exactly the lock's peers, each with its pinned port, in order; a member moves only after it
+    /// proved its pinned certificate at its new address.
+    Members(Arc<MemberSlots>),
     /// A pairing listener: any other private host of the selected subnet on `port`, all in one
     /// slot. Once the listener chooses a host only that host is heard, for the socket's life.
     Subnet {
@@ -299,7 +500,7 @@ impl Admission {
     /// listener may still answer an unchosen host, so Quinn's replies to it never revoke.
     fn reached(&self, local: Ipv4Addr, destination: SocketAddrV4) -> Option<usize> {
         match self {
-            Self::Members(members) => members.iter().position(|member| *member == destination),
+            Self::Members(members) => members.position(destination),
             Self::Subnet {
                 prefix_len, port, ..
             } => (destination.port() == *port
@@ -313,6 +514,9 @@ pub(super) struct GuardedSocket<I> {
     io: Arc<I>,
     local: SocketAddrV4,
     admission: Admission,
+    /// The selected subnet's prefix, when an unrecorded host of it may knock.
+    knock_prefix: Option<u8>,
+    knocks: Arc<Knocks>,
     /// In member order, like everything else below indexed by member.
     reachability: Arc<Reachability>,
     refusals: Arc<SendRefusals>,
@@ -359,14 +563,16 @@ impl<I: DatagramIo> GuardedSocket<I> {
                 "socket does not match the authorized network",
             ));
         }
-        Ok(Self::pinned(
+        let mut socket = Self::pinned(
             io,
             local,
             members,
             lock.selected().index,
             reachability,
             signal,
-        ))
+        );
+        socket.knock_prefix = Some(lock.selected().prefix_len);
+        Ok(socket)
     }
 
     /// A pairing listener's socket on `interface`, the selected adapter's checked snapshot. It
@@ -417,7 +623,7 @@ impl<I> GuardedSocket<I> {
         reachability: Arc<Reachability>,
         signal: RevocationSignal,
     ) -> Self {
-        let admission = Admission::Members(members.into());
+        let admission = Admission::Members(MemberSlots::new(members));
         Self::admitting(io, local, admission, interface_index, reachability, signal)
     }
 
@@ -431,18 +637,21 @@ impl<I> GuardedSocket<I> {
     ) -> Self {
         let now = Instant::now();
         let slots = admission.slots();
+        // One more slot than members: the candidate being dialed back.
         Self {
             io: Arc::new(io),
             local,
             admission,
+            knock_prefix: None,
+            knocks: Knocks::new(),
             reachability,
             refusals: SendRefusals::new(slots),
             first_packets: Mutex::new(
-                (0..slots)
+                (0..=slots)
                     .map(|_| TokenBucket::new(FIRST_PACKET_BURST, FIRST_PACKET_REFILL, now))
                     .collect(),
             ),
-            dropped: (0..slots).map(|_| Dropped::default()).collect(),
+            dropped: (0..=slots).map(|_| Dropped::default()).collect(),
             oversized: AtomicU64::new(0),
             interface_index,
             signal,
@@ -482,6 +691,27 @@ impl<I> GuardedSocket<I> {
     pub(super) fn refusals(&self) -> Arc<SendRefusals> {
         self.refusals.clone()
     }
+
+    pub(super) fn knocks(&self) -> Arc<Knocks> {
+        self.knocks.clone()
+    }
+
+    /// The member slots' addresses, or None for a pairing listener.
+    pub(super) fn slots(&self) -> Option<Arc<MemberSlots>> {
+        match &self.admission {
+            Admission::Members(slots) => Some(slots.clone()),
+            Admission::Subnet { .. } => None,
+        }
+    }
+
+    /// The slot of the candidate being dialed back, after every member's.
+    fn candidate_slot(&self) -> usize {
+        self.admission.slots()
+    }
+
+    fn is_member(&self, slot: usize) -> bool {
+        slot < self.admission.slots()
+    }
 }
 
 impl<I: DatagramIo> GuardedSocket<I> {
@@ -520,8 +750,27 @@ impl<I: DatagramIo> GuardedSocket<I> {
         {
             return None;
         }
-        let member = self.admission.heard(*self.local.ip(), packet.source)?;
+        let Some(member) = self.admission.heard(*self.local.ip(), packet.source) else {
+            return self.unrecorded(packet.source);
+        };
         self.reachability.reaches(member).then_some(member)
+    }
+
+    /// An unrecorded sender reaches Quinn only while it is the candidate being dialed back.
+    /// Otherwise, while a member is wanted, a host of the selected subnet on this socket's port
+    /// knocks: it may become the next candidate, and its datagram is dropped either way.
+    fn unrecorded(&self, source: SocketAddrV4) -> Option<usize> {
+        if self.knocks.dialing(source) {
+            return Some(self.candidate_slot());
+        }
+        if let Some(prefix) = self.knock_prefix
+            && source.port() == self.local.port()
+            && validate_subnet_peer(*self.local.ip(), prefix, *source.ip()).is_ok()
+            && self.knocks.knock(source, Instant::now())
+        {
+            log::info!("guarded socket: {source} knocked; dialing it back to learn who it is");
+        }
+        None
     }
 
     /// Whether `member`'s first-packet budget admits one more, so a flood from one recorded
@@ -549,17 +798,26 @@ impl<I: DatagramIo> GuardedSocket<I> {
         let SocketAddr::V4(destination) = transmit.destination else {
             return None;
         };
-        let member = self.admission.reached(*self.local.ip(), destination)?;
-        if transmit
+        let member = self
+            .admission
+            .reached(*self.local.ip(), destination)
+            .or_else(|| {
+                self.knocks
+                    .dialing(destination)
+                    .then(|| self.candidate_slot())
+            })?;
+        self.within_bounds(transmit)
+            .then_some((member, destination))
+    }
+
+    /// The transmit keeps the pinned source address and size bounds.
+    fn within_bounds(&self, transmit: &Transmit<'_>) -> bool {
+        !(transmit
             .src_ip
             .is_some_and(|ip| ip != IpAddr::V4(*self.local.ip()))
             || transmit.segment_size.is_some()
             || transmit.contents.is_empty()
-            || transmit.contents.len() > MAX_DATAGRAM_BYTES
-        {
-            return None;
-        }
-        Some((member, destination))
+            || transmit.contents.len() > MAX_DATAGRAM_BYTES)
     }
 
     /// Sends `PROBE` to `destination` when it is a member set aside, so the platform resolves that
@@ -578,7 +836,10 @@ impl<I: DatagramIo> GuardedSocket<I> {
             segment_size: None,
             src_ip: None,
         };
-        let Some((member, destination)) = self.permitted_destination(&transmit) else {
+        let Some((member, destination)) = self
+            .permitted_destination(&transmit)
+            .filter(|(slot, _)| self.is_member(*slot))
+        else {
             self.revoke_because(&"a probe left the pinned peers");
             return;
         };
@@ -601,6 +862,44 @@ impl<I: DatagramIo> GuardedSocket<I> {
             }
         })
     }
+
+    /// Sends `PROBE` to a member's recorded address as a knock, from a computer that followed its
+    /// adapter to a new address: the member's socket hears an unrecorded host and dials it back.
+    /// It takes the transmit path's checks, and failing one revokes; a send error is only counted.
+    fn knock(&self, destination: SocketAddrV4) {
+        if self.signal.is_revoked() {
+            return;
+        }
+        let transmit = Transmit {
+            destination: destination.into(),
+            ecn: None,
+            contents: &PROBE,
+            segment_size: None,
+            src_ip: None,
+        };
+        let Some((member, destination)) = self
+            .permitted_destination(&transmit)
+            .filter(|(slot, _)| self.is_member(*slot))
+        else {
+            self.revoke_because(&"a knock left the pinned peers");
+            return;
+        };
+        match self.io.try_send_to(transmit.contents, destination) {
+            Ok(length) if length == PROBE.len() => {}
+            Ok(_) => self.revoke_because(&"a knock was written short"),
+            Err(error) => count_drop(&self.dropped[member].probes, member, "knocks", &error),
+        }
+    }
+
+    /// Knocks through this socket only while something else keeps it open.
+    pub(super) fn knocker(self: &Arc<Self>) -> Prober {
+        let socket = Arc::downgrade(self);
+        Box::new(move |destination| {
+            if let Some(socket) = socket.upgrade() {
+                socket.knock(destination);
+            }
+        })
+    }
 }
 
 impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
@@ -617,11 +916,18 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         let Some((member, destination)) = self.permitted_destination(transmit) else {
+            // Quinn may still close a connection to a candidate whose dial-back failed.
+            if let SocketAddr::V4(destination) = transmit.destination
+                && self.within_bounds(transmit)
+                && self.knocks.spent(destination)
+            {
+                return Ok(());
+            }
             self.revoke_because(&"a transmit left the pinned peers, address, or size bounds");
             return Err(io::ErrorKind::WouldBlock.into());
         };
         // Reported as sent: QUIC loss recovery owns a datagram that cannot leave.
-        if !self.reachability.reaches(member) {
+        if self.is_member(member) && !self.reachability.reaches(member) {
             count_drop(
                 &self.dropped[member].sends,
                 member,

@@ -115,6 +115,13 @@ impl ConfirmedPeerRecord {
         self.local
     }
 
+    /// The same pairing, certificate pin and platform at the address the peer proved it holds now.
+    pub fn moved_to(&self, endpoint: SocketAddrV4) -> Result<Self, PairingError> {
+        let mut peer = PairingOffer::new(endpoint, &self.peer.certificate)?;
+        peer.platform = self.peer.platform;
+        Self::new(self.local, peer)
+    }
+
     // v1 records (no platform byte) stay readable so an existing pairing is never replaced.
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(46 + self.peer.certificate.len());
@@ -438,5 +445,31 @@ mod tests {
         let b = CertificateFingerprint::from_certificate_der(b"b");
         let c = CertificateFingerprint::from_certificate_der(b"c");
         assert_ne!(pair_badge(a, b), pair_badge(a, c));
+    }
+
+    #[test]
+    fn moved_to_keeps_pin() {
+        let local = DeviceIdentity::generate().unwrap();
+        let remote = DeviceIdentity::generate().unwrap();
+        let peer = offer(&remote).with_platform(Platform::Windows);
+        let record = ConfirmedPeerRecord::new(local.fingerprint(), peer).unwrap();
+        let moved = record
+            .moved_to("192.168.1.40:24872".parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            moved.peer().endpoint(),
+            "192.168.1.40:24872".parse().unwrap()
+        );
+        assert!(moved.peer().fingerprint() == remote.fingerprint());
+        assert_eq!(moved.peer().platform(), Some(Platform::Windows));
+        assert!(moved.local() == local.fingerprint());
+        let decoded = ConfirmedPeerRecord::decode(&moved.encode(), local.fingerprint()).unwrap();
+        assert!(decoded == moved);
+        for refused in ["8.8.8.8:24872", "192.168.1.40:24873"] {
+            assert_eq!(
+                record.moved_to(refused.parse().unwrap()).err(),
+                Some(PairingError::InvalidAddress)
+            );
+        }
     }
 }

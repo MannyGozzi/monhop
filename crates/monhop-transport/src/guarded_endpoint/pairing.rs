@@ -16,7 +16,7 @@ use super::{
     Carrier, EndpointRevoker, INCOMING_HANDSHAKE_DEADLINE, ListenSelection, NetworkSelection,
     PinnedNetwork, Shared, TokenBucket, handshake_budget, native, register_incoming,
     runtime::HandleRuntime,
-    socket::{self, GuardedSocket, SendRefusals},
+    socket::{self, GuardedSocket, Knocks, MemberSlots, SendRefusals},
     wait_idle_or_revoked,
 };
 use crate::crypto::{
@@ -142,9 +142,16 @@ impl PairingEndpoint {
         }
         let shared = Arc::new(Shared {
             members: Box::new([]),
+            slots: MemberSlots::new(&[]),
+            wanted: Vec::new().into(),
+            knocks: Knocks::new(),
+            knocker: None,
+            recognizer: None,
             reachability,
             signal,
             endpoint: Mutex::new(Some(endpoint.clone())),
+            #[cfg(test)]
+            answers_as: Mutex::new(None),
         });
         Ok(Self {
             endpoint,

@@ -41,6 +41,10 @@ pub const LOCAL_ALPN: &[u8] = b"monhop/1";
 /// The ALPN protocol of a pairing connection, so neither kind of configuration accepts the other.
 pub const PAIRING_ALPN: &[u8] = b"monhop-pair/1";
 
+/// The ALPN protocol of a dial-back, which only proves a paired computer's certificate at a new
+/// address: the side that answers ends it once its handshake finishes.
+pub const PROBE_ALPN: &[u8] = b"monhop-probe/1";
+
 /// Certificate DER is public but still bounded before parsing or pinning.
 pub const MAX_CERTIFICATE_DER_LENGTH: usize = 16 * 1024;
 
@@ -356,6 +360,30 @@ impl SecureQuicConfig {
         quic_client(identity, provider, verifier, LOCAL_ALPN)
     }
 
+    /// A client config for dialing back an address no member is recorded at. It presents
+    /// `identity` and accepts only the exact certificate of one of `pins` that `wanted` names
+    /// when the server shows it; a refused server certificate ends the handshake before this
+    /// computer's own certificate is sent.
+    pub(crate) fn client_recognizing(
+        identity: &DeviceIdentity,
+        pins: &[VerifiedPeer],
+        wanted: Arc<dyn Fn(CertificateFingerprint) -> bool + Send + Sync>,
+    ) -> Result<quinn::ClientConfig, CryptoError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let pins = pins
+            .iter()
+            .map(|pin| {
+                PinnedServerVerifier::new(pin, &provider, RefusedCertificate::default())
+                    .map(|verifier| (pin.fingerprint(), verifier))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if pins.is_empty() {
+            return Err(CryptoError::CertificateVerifier);
+        }
+        let verifier = Arc::new(RecognizingServerVerifier { pins, wanted });
+        quic_client(identity, provider, verifier, PROBE_ALPN)
+    }
+
     /// Build a TLS 1.3 server config that requires a client certificate and
     /// only accepts the exact `verified_client` certificate.
     pub fn server(
@@ -382,7 +410,7 @@ impl SecureQuicConfig {
             .map_err(|_| CryptoError::TlsConfiguration)?
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(Arc::new(SingleCertAndKey::from(identity.certified_key()?)));
-        quic_server(tls, LOCAL_ALPN)
+        quic_server(tls, &[LOCAL_ALPN, PROBE_ALPN])
     }
 
     /// Build a server config that presents no certificate and refuses every client. It is only
@@ -399,7 +427,7 @@ impl SecureQuicConfig {
             .map_err(|_| CryptoError::TlsConfiguration)?
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(Arc::new(NoServerCertificate));
-        quic_server(tls, LOCAL_ALPN)
+        quic_server(tls, &[LOCAL_ALPN])
     }
 
     /// A pairing client: TLS 1.3 presenting `identity` and accepting any well-formed MonHop
@@ -421,7 +449,7 @@ impl SecureQuicConfig {
             .map_err(|_| CryptoError::TlsConfiguration)?
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(Arc::new(SingleCertAndKey::from(identity.certified_key()?)));
-        quic_server(tls, PAIRING_ALPN)
+        quic_server(tls, &[PAIRING_ALPN])
     }
 }
 
@@ -451,9 +479,9 @@ fn quic_client(
 
 fn quic_server(
     mut tls: rustls::ServerConfig,
-    alpn: &[u8],
+    alpns: &[&[u8]],
 ) -> Result<quinn::ServerConfig, CryptoError> {
-    tls.alpn_protocols = vec![alpn.to_vec()];
+    tls.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
     tls.max_early_data_size = 0;
     tls.send_tls13_tickets = 0;
     tls.max_tls13_tickets = 0;
@@ -735,6 +763,72 @@ impl ServerCertVerifier for PinnedServerVerifier {
     }
 }
 
+/// Accepts a server certificate only when it is exactly one pin's and `wanted` names that pin.
+struct RecognizingServerVerifier {
+    pins: Vec<(CertificateFingerprint, PinnedServerVerifier)>,
+    wanted: Arc<dyn Fn(CertificateFingerprint) -> bool + Send + Sync>,
+}
+
+impl RecognizingServerVerifier {
+    /// Any pin verifies signatures alike: they share one provider.
+    fn signatures(&self) -> &PinnedServerVerifier {
+        &self.pins[0].1
+    }
+}
+
+impl fmt::Debug for RecognizingServerVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecognizingServerVerifier")
+    }
+}
+
+impl ServerCertVerifier for RecognizingServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, RustlsError> {
+        let presented = CertificateFingerprint::from_certificate_der(end_entity);
+        let Some((_, pin)) = self
+            .pins
+            .iter()
+            .find(|(fingerprint, _)| *fingerprint == presented && (self.wanted)(presented))
+        else {
+            return Err(RustlsError::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
+        };
+        pin.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signed: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, RustlsError> {
+        self.signatures()
+            .verify_tls12_signature(message, certificate, signed)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signed: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, RustlsError> {
+        self.signatures()
+            .verify_tls13_signature(message, certificate, signed)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.signatures().supported_verify_schemes()
+    }
+}
+
 struct PinnedClientVerifier {
     expected_certificate: Vec<u8>,
     inner: Arc<dyn ClientCertVerifier>,
@@ -866,6 +960,14 @@ impl RefusedCertificate {
 }
 
 /// The one certificate the other end presented on a finished handshake.
+/// Whether `connection` is a dial-back that only proves a certificate.
+pub(crate) fn is_probe(connection: &quinn::Connection) -> bool {
+    connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .is_some_and(|data| data.protocol.as_deref() == Some(PROBE_ALPN))
+}
+
 pub(crate) fn presented_certificate(
     connection: &quinn::Connection,
 ) -> Option<CertificateDer<'static>> {
@@ -1055,3 +1157,149 @@ impl Drop for ZeroizingKeyPair {
 
 #[cfg(test)]
 mod stall_recovery_tests;
+
+#[cfg(test)]
+mod recognizing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Requires a client certificate and counts each one a client sends.
+    #[derive(Debug)]
+    struct Counting {
+        seen: Arc<AtomicUsize>,
+        signatures: PinnedClientVerifier,
+    }
+
+    impl ClientCertVerifier for Counting {
+        fn offer_client_auth(&self) -> bool {
+            true
+        }
+
+        fn client_auth_mandatory(&self) -> bool {
+            true
+        }
+
+        fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+            &[]
+        }
+
+        fn verify_client_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: UnixTime,
+        ) -> Result<rustls::server::danger::ClientCertVerified, RustlsError> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            certificate: &CertificateDer<'_>,
+            signed: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, RustlsError> {
+            self.signatures
+                .verify_tls12_signature(message, certificate, signed)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            certificate: &CertificateDer<'_>,
+            signed: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, RustlsError> {
+            self.signatures
+                .verify_tls13_signature(message, certificate, signed)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.signatures.supported_verify_schemes()
+        }
+    }
+
+    fn pin(identity: &DeviceIdentity) -> VerifiedPeer {
+        VerifiedPeer::from_certificate_der(
+            identity.certificate_der(),
+            &identity.fingerprint().full_hex(),
+        )
+        .unwrap()
+    }
+
+    /// Dials a server presenting `server` with a dial-back config recognizing `recognized` when
+    /// `wanted`; returns whether it connected and how many client certificates the server saw.
+    async fn dial_back(
+        server: &DeviceIdentity,
+        recognized: &DeviceIdentity,
+        wanted: bool,
+    ) -> (bool, usize) {
+        let client = DeviceIdentity::generate().unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let verifier = Counting {
+            seen: seen.clone(),
+            signatures: PinnedClientVerifier::new(
+                &pin(&client),
+                &provider,
+                RefusedCertificate::default(),
+            )
+            .unwrap(),
+        };
+        let tls = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(Arc::new(verifier))
+            .with_cert_resolver(Arc::new(SingleCertAndKey::from(
+                server.certified_key().unwrap(),
+            )));
+        let listening = quinn::Endpoint::server(
+            quic_server(tls, &[LOCAL_ALPN, PROBE_ALPN]).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let address = listening.local_addr().unwrap();
+        let accepting = tokio::spawn(async move {
+            let incoming = listening.accept().await?;
+            incoming.await.ok()
+        });
+        let config = SecureQuicConfig::client_recognizing(
+            &client,
+            &[pin(recognized)],
+            Arc::new(move |_| wanted),
+        )
+        .unwrap();
+        let dialing = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connected = tokio::time::timeout(
+            Duration::from_secs(2),
+            dialing
+                .connect_with(config, address, LOCAL_TLS_SERVER_NAME)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(2), accepting)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Ok(connection) = &connected {
+            assert!(accepted.is_some());
+            connection.close(0_u32.into(), b"done");
+        }
+        (connected.is_ok(), seen.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn dial_back_aborts_on_wrong_server_cert_without_sending_client_cert() {
+        let member = DeviceIdentity::generate().unwrap();
+        let stranger = DeviceIdentity::generate().unwrap();
+        assert_eq!(dial_back(&stranger, &member, true).await, (false, 0));
+        assert_eq!(dial_back(&member, &member, false).await, (false, 0));
+        assert_eq!(dial_back(&member, &member, true).await, (true, 1));
+    }
+
+    #[test]
+    fn a_dial_back_config_needs_a_pin() {
+        let identity = DeviceIdentity::generate().unwrap();
+        assert!(SecureQuicConfig::client_recognizing(&identity, &[], Arc::new(|_| true)).is_err());
+    }
+}

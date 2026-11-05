@@ -637,3 +637,60 @@ test("a computer in the paused group reads as paused, not off", () => {
   const outside = computerStatus(computer, view({ phase: "off", paused: true, enabled: [] }), null);
   assert.equal(outside.label, "Paired");
 });
+
+test("a local network problem needs attention and says what to do, naming the computer", () => {
+  const notice = (patch) =>
+    computerStatus(
+      computer,
+      view({
+        peers: [{ fingerprint: WINDOWS, phase: "starting", message: "Waiting", notice: patch }],
+      }),
+      WINDOWS,
+      LOCAL_NAME,
+    );
+  const missing = notice({ kind: "adapterMissing" });
+  assert.deepEqual([missing.key, missing.label], ["attention", "Needs attention"]);
+  assert.match(missing.detail, /^This Mac's selected network adapter is off/);
+  assert.match(missing.detail, /Office Windows PC/);
+  for (const why of ["unrecorded", "otherNetwork", "otherSubnet"]) {
+    const moved = notice({ kind: "moved", from: "192.168.1.24", to: "192.168.1.160", why });
+    assert.deepEqual([moved.key, moved.label], ["attention", "Needs attention"], why);
+    assert.match(moved.detail, /from 192\.168\.1\.24 to 192\.168\.1\.160/, why);
+    assert.match(moved.detail, /Pair Office Windows PC again/, why);
+  }
+  assert.match(
+    notice({ kind: "moved", from: "a", to: "b", why: "otherNetwork" }).detail,
+    /joined another network/,
+  );
+});
+
+test("a computer that stays silent reads as not answering, amber like connecting", () => {
+  const silent = computerStatus(
+    computer,
+    view({
+      sync: { state: "applied", message: "" },
+      peers: [
+        { fingerprint: WINDOWS, phase: "starting", notice: { kind: "unanswered", minutes: 3 } },
+      ],
+    }),
+    WINDOWS,
+    LOCAL_NAME,
+  );
+  assert.deepEqual(
+    [silent.key, silent.label, silent.tone],
+    ["connecting", "Not answering", "checking"],
+  );
+  assert.match(silent.detail, /^Office Windows PC has not answered for 3 minutes\./);
+});
+
+test("a notice left on a computer that is reached again is not shown", () => {
+  const sharing = computerStatus(
+    computer,
+    view({
+      peers: [{ fingerprint: WINDOWS, phase: "sharing", notice: { kind: "adapterMissing" } }],
+    }),
+    WINDOWS,
+    LOCAL_NAME,
+  );
+  assert.equal(sharing.key, "sharing");
+});

@@ -90,6 +90,12 @@ unsafe extern "C" {
         attr_list: *mut SecKeychainAttributeList,
         data: *mut c_void,
     ) -> i32;
+    fn SecKeychainItemModifyAttributesAndData(
+        item: SecKeychainItemRef,
+        attr_list: *const SecKeychainAttributeList,
+        length: u32,
+        data: *const c_void,
+    ) -> i32;
 }
 
 /// The fixed accounts: the local identity, and the single confirmed peer of earlier builds,
@@ -439,6 +445,33 @@ impl KeychainItem {
         unsafe { SecKeychainItemFreeAttributesAndData(attributes, ptr::null_mut()) };
         account.ok_or(IdentityStoreError::InvalidKeychainResponse)
     }
+}
+
+/// Swaps the data of one confirmed-peer record, by the account `list_peers_after_user_action`
+/// reported, for `record`, keeping the item and its access rule. The Keychain writes one item's
+/// data at once, so a crash leaves the old record or the new one.
+pub fn replace_peer_after_user_action(
+    account: &str,
+    record: ProtectedRecord,
+) -> Result<(), IdentityStoreError> {
+    if !is_peer_account(account) {
+        return Err(IdentityStoreError::InvalidRecordName);
+    }
+    let length = u32::try_from(record.as_bytes().len())
+        .map_err(|_| IdentityStoreError::InvalidPayloadLength)?;
+    let keychain = DefaultKeychain::copy_after_user_action()?;
+    let item = KeychainItem::find(account, &keychain)?;
+    // SAFETY: the item reference is live, no attribute list is passed, and the record's bytes
+    // outlive the synchronous call.
+    let status = unsafe {
+        SecKeychainItemModifyAttributesAndData(
+            item.item_ref(),
+            ptr::null(),
+            length,
+            record.as_bytes().as_ptr().cast(),
+        )
+    };
+    status_result(status)
 }
 
 /// Deletes one confirmed-peer record by the account `list_peers_after_user_action` reported,

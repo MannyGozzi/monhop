@@ -1,5 +1,6 @@
 use super::*;
 use crate::crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig, VerifiedPeer};
+use crate::guarded_endpoint::{Relocation, TestAnswer, Unchecked};
 use std::{
     collections::VecDeque,
     future::pending,
@@ -1845,6 +1846,7 @@ async fn dropping_the_endpoint_stops_the_timer() {
         &group(LOCAL, &[(MEMBERS[0], &ids[0]), (MEMBERS[1], &ids[1])]),
         &hub_id,
         Some((check, cadence)),
+        Arc::new(Unchecked),
     )
     .unwrap();
     let signal = hub.revocation_signal();
@@ -1875,6 +1877,326 @@ async fn dropping_the_endpoint_stops_the_timer() {
     tokio::time::timeout(DEADLINE, closed)
         .await
         .expect("the timer kept no part of the endpoint open");
+}
+
+/// The address the first member moves to on the memory link, recorded for no one.
+const MOVED: SocketAddrV4 = MEMBERS[2];
+
+fn knock_from(source: SocketAddrV4) -> Arrival {
+    Arrival {
+        source,
+        ..arrival()
+    }
+}
+
+#[test]
+fn a_knock_from_an_unrecorded_on_link_host_names_one_candidate() {
+    let [hub, _, _] = two_member_network();
+    let knocks = hub.knocks();
+    let mut cx = Context::from_waker(Waker::noop());
+    hub.io.enqueue(knock_from(MOVED));
+    assert!(receive(&hub, &mut cx).0.is_pending());
+    assert_eq!(knocks.candidate(), None, "nothing is wanted");
+
+    knocks.set_wanted(true);
+    for source in [
+        SocketAddrV4::new(*MOVED.ip(), 24801),
+        SocketAddrV4::new(Ipv4Addr::new(192, 168, 51, 13), 24800),
+        SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 255), 24800),
+        SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 24800),
+    ] {
+        hub.io.enqueue(knock_from(source));
+    }
+    hub.io.enqueue(Arrival {
+        interface_index: INDEX + 1,
+        ..knock_from(MOVED)
+    });
+    assert!(receive(&hub, &mut cx).0.is_pending());
+    assert_eq!(
+        knocks.candidate(),
+        None,
+        "only an on-link host on the port knocks"
+    );
+
+    hub.io.enqueue(knock_from(MOVED));
+    hub.io.enqueue(knock_from(SocketAddrV4::new(
+        Ipv4Addr::new(192, 168, 50, 14),
+        24800,
+    )));
+    assert!(
+        receive(&hub, &mut cx).0.is_pending(),
+        "a knock never reaches Quinn"
+    );
+    assert_eq!(knocks.candidate(), Some(MOVED), "one candidate at a time");
+    assert!(!hub.signal.is_revoked());
+}
+
+#[test]
+fn a_failed_candidate_lands_in_the_ignore_table() {
+    let knocks = Knocks::new();
+    let host = |last| SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, last), 24800);
+    let now = Instant::now();
+    knocks.set_wanted(true);
+    assert!(knocks.knock(host(20), now));
+    knocks.finish(host(20), false, now);
+    assert!(knocks.ignores(host(20)));
+    assert!(!knocks.knock(host(21), now), "one knock per interval");
+
+    let later = now + KNOCK_INTERVAL;
+    assert!(
+        !knocks.knock(host(20), later),
+        "a failed candidate is ignored"
+    );
+    assert!(knocks.knock(host(21), later));
+    knocks.finish(host(21), true, later);
+    assert!(!knocks.ignores(host(21)), "a proven candidate is not");
+
+    for last in 30..30 + KNOCK_IGNORED as u8 {
+        knocks.spend(host(last), later);
+    }
+    assert!(
+        !knocks.ignores(host(20)),
+        "the oldest entry leaves a full table"
+    );
+    assert!(knocks.ignores(host(30)));
+    assert!(
+        knocks.knock(host(30), later + KNOCK_IGNORE),
+        "an entry expires"
+    );
+
+    knocks.set_wanted(false);
+    assert_eq!(
+        knocks.candidate(),
+        None,
+        "an undialed candidate goes with the last want"
+    );
+}
+
+#[tokio::test]
+async fn a_candidate_is_reached_only_while_dialed_back_and_never_revokes() {
+    let [hub, _, _] = two_member_network();
+    let knocks = hub.knocks();
+    knocks.set_wanted(true);
+    assert!(knocks.knock(MOVED, Instant::now()));
+    assert_eq!(knocks.next().await, MOVED);
+    hub.try_send(&to(MOVED)).unwrap();
+    assert_eq!(hub.io.attempts_to(MOVED).len(), 1);
+
+    knocks.finish(MOVED, false, Instant::now());
+    hub.try_send(&to(MOVED)).unwrap();
+    assert_eq!(
+        hub.io.attempts_to(MOVED).len(),
+        1,
+        "a spent candidate's packets drop"
+    );
+    assert!(!hub.signal.is_revoked());
+
+    let stranger = SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 14), 24800);
+    assert!(hub.try_send(&to(stranger)).is_err());
+    assert!(
+        hub.signal.is_revoked(),
+        "any other unrecorded destination still revokes"
+    );
+}
+
+/// Moves members in a lock as a bind's network lock does.
+struct LockMoves(Mutex<NetworkLock>);
+
+impl Relocation for LockMoves {
+    fn route_holds(&self, peer: Ipv4Addr) -> io::Result<()> {
+        crate::policy::validate_peer(self.0.lock().unwrap().selected(), peer)
+            .map_err(io::Error::other)
+    }
+
+    fn move_member(&self, slot: usize, peer: Ipv4Addr) -> io::Result<()> {
+        let route = RouteSnapshot {
+            interface_index: INDEX,
+            source: *LOCAL.ip(),
+            next_hop: Ipv4Addr::UNSPECIFIED,
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .move_peer(slot, peer, route)
+            .map_err(io::Error::other)
+    }
+}
+
+/// A hub admitting both members at their recorded addresses, moving them in a real lock, and
+/// whoever answers at `MOVED` admitting the hub.
+fn readdressing_hub(
+    hub_id: &DeviceIdentity,
+    ids: &[DeviceIdentity; 2],
+    at_moved: &DeviceIdentity,
+) -> (GuardedEndpoint, Arc<LockMoves>, GuardedEndpoint) {
+    let [hub_socket, moved_socket] =
+        memory_network([(LOCAL, &MEMBERS[..2]), (MOVED, &[LOCAL][..])]);
+    let lock = Arc::new(LockMoves(Mutex::new(memory_lock(LOCAL, &MEMBERS[..2]))));
+    let hub = GuardedEndpoint::over_socket_rechecking(
+        hub_socket,
+        &group(LOCAL, &[(MEMBERS[0], &ids[0]), (MEMBERS[1], &ids[1])]),
+        hub_id,
+        None,
+        lock.clone(),
+    )
+    .unwrap();
+    let moved = guarded(moved_socket, at_moved, &[(LOCAL, hub_id)]);
+    (hub, lock, moved)
+}
+
+/// Answers every dial-back, whether its handshake finishes or fails, until the endpoint stops.
+async fn answering(endpoint: &GuardedEndpoint) {
+    while endpoint.accept_any().await.is_ok() || !endpoint.is_revoked() {}
+}
+
+async fn until_ignored(hub: &GuardedEndpoint, address: SocketAddrV4) {
+    tokio::time::timeout(DEADLINE * 5, async {
+        while !hub.ignores(address) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the dial-back failed and its candidate is ignored");
+}
+
+#[tokio::test]
+async fn a_knocking_member_is_dialed_back_moved_and_then_dialed_at_its_new_address() {
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let (hub, lock, member) = readdressing_hub(&hub_id, &ids, &ids[0]);
+    let mut moves = hub.take_moves().unwrap();
+    let print = ids[0].fingerprint();
+    hub.handle().set_wanted(print, true);
+    member.handle().knock(hub_id.fingerprint());
+    let moved = tokio::time::timeout(DEADLINE * 5, async {
+        tokio::select! {
+            moved = moves.recv() => moved,
+            () = answering(&member) => None,
+        }
+    })
+    .await
+    .expect("the hub dialed the knock back")
+    .expect("the member was moved");
+    assert!(moved.member == print);
+    assert_eq!((moved.from, moved.to), (MEMBERS[0], MOVED));
+    assert_eq!(hub.recorded(), [MOVED, MEMBERS[1]]);
+    assert_eq!(
+        lock.0.lock().unwrap().peers(),
+        [*MOVED.ip(), *MEMBERS[1].ip()]
+    );
+    assert!(!hub.is_revoked());
+
+    hub.handle().set_wanted(print, false);
+    let (dialed, answered) = tokio::time::timeout(DEADLINE * 5, async {
+        tokio::join!(
+            async { hub.connect_member(print).unwrap().await.unwrap() },
+            async { member.accept().await.unwrap() }
+        )
+    })
+    .await
+    .expect("the member answers at its new address");
+    hub.confirm_member(print, &dialed).unwrap();
+    delivers(&dialed, &answered).await;
+    assert!(!hub.is_revoked());
+    hub.revoke();
+    member.revoke();
+}
+
+#[tokio::test]
+async fn a_member_answering_for_another_address_is_not_moved() {
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let (hub, lock, member) = readdressing_hub(&hub_id, &ids, &ids[0]);
+    // As a relay would make it: the real member, reached at MOVED, reports where it really is.
+    member.answer_as(TestAnswer::At(SocketAddrV4::new(
+        Ipv4Addr::new(192, 168, 50, 14),
+        24800,
+    )));
+    hub.handle().set_wanted(ids[0].fingerprint(), true);
+    member.handle().knock(hub_id.fingerprint());
+    tokio::select! {
+        () = until_ignored(&hub, MOVED) => {}
+        () = answering(&member) => panic!("the member's endpoint stopped"),
+    }
+    assert_eq!(hub.recorded(), MEMBERS[..2]);
+    assert_eq!(
+        lock.0.lock().unwrap().peers(),
+        [*MEMBERS[0].ip(), *MEMBERS[1].ip()]
+    );
+    assert!(!hub.is_revoked());
+    hub.revoke();
+    member.revoke();
+}
+
+#[tokio::test]
+async fn a_close_naming_the_candidate_is_no_answer() {
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let (hub, lock, member) = readdressing_hub(&hub_id, &ids, &ids[0]);
+    // A close's reason can be forged in an Initial packet, so even the exact address in one
+    // moves nothing.
+    member.answer_as(TestAnswer::ClosingWith(MOVED));
+    hub.handle().set_wanted(ids[0].fingerprint(), true);
+    member.handle().knock(hub_id.fingerprint());
+    tokio::select! {
+        () = until_ignored(&hub, MOVED) => {}
+        () = answering(&member) => panic!("the member's endpoint stopped"),
+    }
+    assert_eq!(hub.recorded(), MEMBERS[..2]);
+    assert_eq!(
+        lock.0.lock().unwrap().peers(),
+        [*MEMBERS[0].ip(), *MEMBERS[1].ip()]
+    );
+    assert!(!hub.is_revoked());
+    hub.revoke();
+    member.revoke();
+}
+
+#[tokio::test]
+async fn a_dial_back_proves_only_a_wanted_member() {
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let (hub, lock, unwanted) = readdressing_hub(&hub_id, &ids, &ids[1]);
+    hub.handle().set_wanted(ids[0].fingerprint(), true);
+    unwanted.handle().knock(hub_id.fingerprint());
+    tokio::select! {
+        () = until_ignored(&hub, MOVED) => {}
+        () = answering(&unwanted) => panic!("the member's endpoint stopped"),
+    }
+    assert_eq!(hub.recorded(), MEMBERS[..2]);
+    assert_eq!(
+        lock.0.lock().unwrap().peers(),
+        [*MEMBERS[0].ip(), *MEMBERS[1].ip()]
+    );
+    assert!(!hub.is_revoked());
+    hub.revoke();
+    unwanted.revoke();
+}
+
+#[tokio::test]
+async fn unrecorded_source_never_gets_a_tls_response() {
+    let hub_id = DeviceIdentity::generate().unwrap();
+    let ids = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let stranger_id = DeviceIdentity::generate().unwrap();
+    let (hub, _, stranger) = readdressing_hub(&hub_id, &ids, &stranger_id);
+    hub.handle().set_wanted(ids[0].fingerprint(), true);
+    let mut dialing = stranger.connect_member(hub_id.fingerprint()).unwrap();
+    let answered = tokio::select! {
+        answered = tokio::time::timeout(DEADLINE * 4, dialing.handshake_data()) => answered,
+        () = answering(&stranger) => panic!("the stranger's endpoint stopped"),
+    };
+    assert!(
+        answered.is_err(),
+        "the hub answered an unrecorded host's handshake"
+    );
+    assert!(
+        hub.ignores(MOVED),
+        "its dial-back failed on the stranger's certificate"
+    );
+    assert_eq!(hub.recorded(), MEMBERS[..2]);
+    assert!(!hub.is_revoked());
+    hub.revoke();
+    stranger.revoke();
 }
 
 /// Stands in for the production cadence, so probing runs in real time.
@@ -1916,6 +2238,7 @@ fn probing() -> Probing {
         &group(LOCAL, &[(MEMBERS[0], &ids[0]), (MEMBERS[1], &ids[1])]),
         &hub_id,
         Some((check, PROBING)),
+        Arc::new(Unchecked),
     )
     .unwrap();
     let members = [(first_socket, &ids[0]), (second_socket, &ids[1])].map(|(socket, id)| {

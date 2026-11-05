@@ -6,6 +6,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ### Fixed
 
+- Sharing now reconnects on its own when a computer's network address changes on the same network. A Mac on Wi-Fi can get a new address when macOS changes its private Wi-Fi address, and before, both computers kept trying the old address until you paired them again. Now the computer follows its own Wi-Fi or Ethernet adapter to the new address and lets the other computer know. The other computer connects back and uses the new address only after it confirms this is the same paired computer, and the pairing keeps the same identity. Both computers need this version.
+- A computer that cannot connect now says why instead of showing Connecting forever. Its card reads Needs attention when this computer's selected adapter is off or unplugged, or when its address changed in a way MonHop does not follow, such as joining another network. That card names both addresses and asks you to pair again. It reads Not answering when the other computer has not answered for 2 minutes.
 - On the arrangement screen right after pairing, the buttons under the displays and the menu that opens when you click a display work again. Before, every click was undone at once.
 
 ### Changed

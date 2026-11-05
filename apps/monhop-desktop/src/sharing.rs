@@ -31,7 +31,7 @@ use monhop_transport::{
     },
     session_link::{LinkCommand, LinkEvent, LinkPersist, LinkRejectReason},
     session_native,
-    session_setup::{self, InspectedPeer, PeerContact, SetupFailure},
+    session_setup::{self, InspectedPeer, PeerContact, SetupFailure, Unfollowed},
     session_source::SourceFailure,
 };
 use serde::{Deserialize, Serialize};
@@ -185,6 +185,49 @@ pub struct SharingView {
     peers: Vec<PeerView>,
     /// The active group's members as its record holds them.
     members: Vec<MemberView>,
+    /// Shown per computer only, in its `PeerView`.
+    #[serde(skip)]
+    notice: Option<NoticeView>,
+}
+
+/// Why a computer sharing keeps trying does not connect, when the card should say so instead of
+/// "Connecting…".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub(crate) enum NoticeView {
+    /// The selected adapter is off, gone, or no longer a connected Wi-Fi or Ethernet adapter.
+    AdapterMissing,
+    /// The selected adapter has a new address MonHop does not follow; pairing again does.
+    Moved {
+        from: String,
+        to: String,
+        /// "unrecorded", "otherNetwork" or "otherSubnet".
+        why: &'static str,
+    },
+    /// The other computer has not answered for `minutes`.
+    Unanswered { minutes: u64 },
+}
+
+/// How long a computer may stay silent before its card says it is not answering.
+const UNANSWERED_AFTER: Duration = Duration::from_secs(120);
+
+fn share_notice(error: SetupFailure, waited: Duration) -> Option<NoticeView> {
+    match error {
+        SetupFailure::NetworkSelection => Some(NoticeView::AdapterMissing),
+        SetupFailure::NetworkMoved(moved) => Some(NoticeView::Moved {
+            from: moved.from.to_string(),
+            to: moved.to.to_string(),
+            why: match moved.why {
+                Unfollowed::Unrecorded => "unrecorded",
+                Unfollowed::OtherNetwork => "otherNetwork",
+                Unfollowed::OtherSubnet => "otherSubnet",
+            },
+        }),
+        SetupFailure::Connection if waited >= UNANSWERED_AFTER => Some(NoticeView::Unanswered {
+            minutes: waited.as_secs() / 60,
+        }),
+        _ => None,
+    }
 }
 
 /// One computer's connection. The top-level fields above sum these up.
@@ -211,6 +254,8 @@ pub(crate) struct PeerView {
     link_quality: Option<&'static str>,
     /// How long that link has been degraded or bad without a break, in ms; 0 while healthy.
     link_unsteady_ms: u64,
+    /// Set while the computer cannot connect for a reason its card names.
+    notice: Option<NoticeView>,
 }
 
 #[derive(Clone, Serialize)]
@@ -317,6 +362,7 @@ impl Default for SharingView {
             paused: false,
             peers: Vec::new(),
             members: Vec::new(),
+            notice: None,
         }
     }
 }
@@ -1112,7 +1158,6 @@ impl SharingController {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn network(&self) -> &SharingNetwork {
         &self.network
     }
@@ -1482,6 +1527,11 @@ impl SharingController {
 
     /// Applies one change to the setup file and mirrors the result into the view. Every writer
     /// of that file goes through here or the link's commit, never around them.
+    /// A paired computer's address changed: the window reads the computers again.
+    pub(crate) fn note_computer_moved(&self) {
+        advance_setup_revision(&mut lock(&self.state));
+    }
+
     pub fn update_setup_file(
         &self,
         path: &Path,
@@ -2280,9 +2330,12 @@ impl SharingController {
                                 ) {
                                     log::info!("sharing: {line}");
                                 }
-                                let message = share_wait_message(error, window_started.elapsed());
+                                let waited = window_started.elapsed();
+                                let message = share_wait_message(error, waited);
+                                let notice = share_notice(error, waited);
                                 show(&mut lock(&state), &key, |view| {
                                     view.message.clone_from(&message);
+                                    view.notice.clone_from(&notice);
                                 });
                                 sleep_unless_cancelled(&cancel, RECONNECT_INTERVAL).await;
                                 continue;
@@ -2301,6 +2354,7 @@ impl SharingController {
                             let entry = peer_entry(&mut guard.peers, &key);
                             entry.not_paired = false;
                             entry.heard_at = Some(Instant::now());
+                            show(&mut guard, &key, |view| view.notice = None);
                         }
                         // Let go only after `heard_at` covers it, so the peer never reads as quiet.
                         drop(heard);
@@ -4472,6 +4526,7 @@ fn peer_views(state: &State, live: Option<bool>) -> Vec<PeerView> {
                 peer_arranging: peer.is_some_and(|peer| peer.peer_arranging),
                 link_quality: session.map(|stats| stats.link_quality.name()),
                 link_unsteady_ms: session.map_or(0, |stats| stats.unsteady_millis),
+                notice: view.notice,
             }
         })
         .collect()
@@ -5011,6 +5066,9 @@ fn setup_message(error: SetupFailure) -> String {
         SetupFailure::Identity => "The protected identity could not be read. Check pairing.",
         SetupFailure::PairingRequired => "Pair both computers before setting up sharing.",
         SetupFailure::NetworkSelection => "Select a connected physical Wi-Fi or Ethernet interface.",
+        SetupFailure::NetworkMoved(_) => {
+            "This computer's network address changed in a way MonHop does not follow. Pair the computers again."
+        }
         SetupFailure::NetworkRoute => {
             "The peer must use the selected direct physical network. Check for a VPN route or changed address."
         }
@@ -8242,6 +8300,7 @@ pub(crate) mod tests {
                 "linkQuality",
                 "linkUnsteadyMs",
                 "message",
+                "notice",
                 "peerArranging",
                 "phase",
                 "platform",
@@ -8985,6 +9044,45 @@ pub(crate) mod tests {
                 start + ATTEMPT_LOG_INTERVAL
             )
             .is_some()
+        );
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+    use monhop_transport::session_setup::NetworkMove;
+
+    #[test]
+    fn only_a_local_network_problem_or_a_long_silence_becomes_a_notice() {
+        let json = |error, waited| serde_json::to_value(share_notice(error, waited)).unwrap();
+        let moment = Duration::from_secs(5);
+        assert_eq!(
+            json(SetupFailure::NetworkSelection, moment),
+            serde_json::json!({ "kind": "adapterMissing" })
+        );
+        let moved = SetupFailure::NetworkMoved(NetworkMove {
+            from: "192.168.1.24".parse().unwrap(),
+            to: "192.168.1.160".parse().unwrap(),
+            why: Unfollowed::OtherNetwork,
+        });
+        assert_eq!(
+            json(moved, moment),
+            serde_json::json!({
+                "kind": "moved", "from": "192.168.1.24", "to": "192.168.1.160", "why": "otherNetwork"
+            })
+        );
+        assert_eq!(
+            json(SetupFailure::Connection, moment),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            json(SetupFailure::Connection, UNANSWERED_AFTER + moment),
+            serde_json::json!({ "kind": "unanswered", "minutes": 2 })
+        );
+        assert_eq!(
+            json(SetupFailure::Handshake, UNANSWERED_AFTER),
+            serde_json::Value::Null
         );
     }
 }

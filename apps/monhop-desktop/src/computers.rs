@@ -231,6 +231,22 @@ impl ComputerList {
             .any(|computer| computer.fingerprint == fingerprint.full_hex())
     }
 
+    /// Records a listed computer's new address in place. False when it is not listed or was
+    /// already there.
+    pub fn readdress(
+        &mut self,
+        fingerprint: CertificateFingerprint,
+        address: SocketAddrV4,
+    ) -> bool {
+        let fingerprint = fingerprint.full_hex();
+        self.computers
+            .iter_mut()
+            .find(|computer| computer.fingerprint == fingerprint)
+            .filter(|computer| computer.address != Some(address))
+            .map(|computer| computer.address = Some(address))
+            .is_some()
+    }
+
     /// Moves the computer to the front with its current address; a known one keeps its name.
     /// A full list refuses a new computer rather than dropping the oldest silently.
     pub fn remember(
@@ -384,6 +400,29 @@ mod tests {
     }
     fn endpoint() -> SocketAddrV4 {
         "192.168.1.9:24872".parse().unwrap()
+    }
+
+    #[test]
+    fn a_moved_computer_keeps_its_name_and_place_at_its_new_address() {
+        let mut list = ComputerList::default();
+        list.remember(fingerprint('a'), endpoint(), None).unwrap();
+        list.remember(fingerprint('b'), endpoint(), None).unwrap();
+        let moved: SocketAddrV4 = "192.168.1.160:24872".parse().unwrap();
+        assert!(list.readdress(fingerprint('a'), moved));
+        assert!(!list.readdress(fingerprint('a'), moved), "already there");
+        assert!(!list.readdress(fingerprint('c'), moved), "not listed");
+        let order: Vec<_> = list
+            .computers
+            .iter()
+            .map(|computer| (computer.fingerprint.clone(), computer.address))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (fingerprint('b').full_hex(), Some(endpoint())),
+                (fingerprint('a').full_hex(), Some(moved)),
+            ]
+        );
     }
 
     #[test]

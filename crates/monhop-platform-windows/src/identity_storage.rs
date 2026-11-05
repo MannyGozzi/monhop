@@ -30,13 +30,26 @@ use {
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
             FILE_SHARE_WRITE, FileDispositionInfo, GetDriveTypeW, GetFileInformationByHandle,
-            OPEN_EXISTING, SetFileInformationByHandle,
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
+            SetFileInformationByHandle,
         },
         System::Com::CoTaskMemFree,
         UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
     },
     zeroize::Zeroizing,
 };
+
+/// Held across every peer-record create, replace and delete, so a replace never recreates a
+/// record a forget deleted after the replace found it.
+#[cfg(windows)]
+static PEER_RECORDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+fn peer_records() -> std::sync::MutexGuard<'static, ()> {
+    PEER_RECORDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[cfg(windows)]
 const APP_DIRECTORY: &str = "MonHop";
@@ -139,9 +152,42 @@ pub fn create_peer_after_user_action(key: &str, record: &[u8]) -> io::Result<()>
         MAX_PROTECTED_BYTES,
         "protected confirmed peer record",
     )?;
+    let _records = peer_records();
     let path =
         peer_directory_for_create()?.join(format!("{PEER_FILE_PREFIX}{key}{PEER_FILE_SUFFIX}"));
     write_new_protected_file(&path, protected.as_slice())
+}
+
+/// Swaps one confirmed-peer record, by the file name `list_peers_after_user_action` reported, for
+/// `record`. The new DPAPI blob is flushed beside it and moved over it with write-through, so a
+/// crash leaves the old record or the new one, never neither.
+#[cfg(windows)]
+pub fn replace_peer_after_user_action(file_name: &str, record: &[u8]) -> io::Result<()> {
+    if !is_peer_file_name(file_name) {
+        return Err(invalid_record_name());
+    }
+    validate_length(
+        record.len(),
+        MIN_RECORD_BYTES,
+        MAX_RECORD_BYTES,
+        "confirmed peer record",
+    )?;
+    let protected = Zeroizing::new(identity::protect_key(record)?);
+    validate_length(
+        protected.len(),
+        MIN_PROTECTED_BYTES,
+        MAX_PROTECTED_BYTES,
+        "protected confirmed peer record",
+    )?;
+    let _records = peer_records();
+    let directory =
+        peer_directory_for_load()?.ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+    let path = directory.join(file_name);
+    // Only an existing regular record is replaced, never a link to somewhere else.
+    drop(open_regular_file_without_following(&path)?);
+    let mut temporary = OwnedTemporary::create(&directory)?;
+    temporary.write_and_sync(protected.as_slice())?;
+    temporary.replace(&path)
 }
 
 /// Deletes one confirmed-peer record by the file name `list_peers_after_user_action` reported,
@@ -152,6 +198,7 @@ pub fn delete_peer_after_user_action(file_name: &str) -> io::Result<()> {
     if !is_peer_file_name(file_name) {
         return Err(invalid_record_name());
     }
+    let _records = peer_records();
     let Some(directory) = peer_directory_for_load()? else {
         return Ok(());
     };
@@ -718,6 +765,28 @@ impl OwnedTemporary {
         fs::hard_link(&self.path, final_path)?;
         // Publication already succeeded. Cleanup cannot skip the caller's identity readback.
         let _ = cleanup(&mut self);
+        Ok(())
+    }
+
+    /// Moves the flushed temporary over `final_path` in one step that reaches the disk before it
+    /// returns. Both files are in one validated directory.
+    #[cfg(windows)]
+    fn replace(mut self, final_path: &Path) -> io::Result<()> {
+        self.close()?;
+        let from = wide_path(&self.path)?;
+        let to = wide_path(final_path)?;
+        // SAFETY: both paths are NUL-terminated buffers that outlive the synchronous call.
+        let moved = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.remove_on_drop = false;
         Ok(())
     }
 

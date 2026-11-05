@@ -1611,6 +1611,15 @@ mod tests {
             }
             Ok(())
         }
+        fn replace(&self, handle: &str, record: &[u8]) -> Result<(), StorageError> {
+            let mut records = self.records.borrow_mut();
+            let stored = records
+                .iter_mut()
+                .find(|(stored, _)| stored == handle)
+                .ok_or(StorageError::ReadFailed)?;
+            stored.1 = record.to_vec();
+            Ok(())
+        }
     }
     fn fixtures() -> (DeviceIdentity, DeviceIdentity, ConfirmedPeerRecord) {
         let local = DeviceIdentity::generate().unwrap();
@@ -1854,6 +1863,9 @@ mod tests {
                 Ok(())
             }
             fn delete(&self, _: &str) -> Result<(), StorageError> {
+                Err(StorageError::Unavailable)
+            }
+            fn replace(&self, _: &str, _: &[u8]) -> Result<(), StorageError> {
                 Err(StorageError::Unavailable)
             }
         }

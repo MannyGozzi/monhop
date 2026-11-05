@@ -14,7 +14,9 @@ use monhop_core::{
     DeviceId, DisplayId, EdgeLink, Machine, Platform, Point, RevocationSignal, Topology,
 };
 use monhop_protocol::{Capabilities, ControlPermissions};
-use tokio::sync::oneshot;
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc as channel, oneshot};
+use zeroize::Zeroizing;
 
 pub use monhop_protocol::{
     DisplayDescription, DisplayTopology, MAX_DISPLAY_NAME_BYTES, MAX_LOGICAL_ORIGIN_ABS,
@@ -25,12 +27,14 @@ use crate::{
     crypto::{CertificateFingerprint, DeviceIdentity, VerifiedPeer},
     guarded_endpoint::{
         Accepted, Acceptor, EndpointHandle, GroupMember, GroupSelection, GuardedEndpoint,
-        MemberHandshakeFailure, NetworkSelection, refused_by_this_computer,
+        MemberHandshakeFailure, MemberMoved, NetworkSelection, refused_by_this_computer,
     },
-    identity_store::{ProtectedPeerStore, load_identity},
+    identity_store::{ProtectedPeerStore, StoredPeer, load_identity},
     native_storage::{NativeIdentityStore, NativePeerStore},
     pairing::{ConfirmedPeerRecord, PAIRING_PORT, initiates_connection, opposite_platform},
-    policy::{InterfaceKind, InterfaceSnapshot, MAX_PINNED_PEERS, validate_peer},
+    policy::{
+        InterfaceKind, InterfaceSnapshot, MAX_PINNED_PEERS, validate_peer, validate_subnet_peer,
+    },
     session::NETWORK_REVOKED_REASON,
     session_handshake::{
         HandshakeConfig, HandshakeError, NegotiatedSession, SessionPurpose,
@@ -46,12 +50,17 @@ const CONNECT_WINDOW: Duration = Duration::from_secs(120);
 const DIAL_ATTEMPT_DEADLINE: Duration = Duration::from_secs(4);
 const DIAL_INTERVAL: Duration = Duration::from_secs(2);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How often a computer that followed its adapter knocks at a member it waits for.
+const KNOCK_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupFailure {
     Identity,
     PairingRequired,
     NetworkSelection,
+    /// The selected adapter has a new address MonHop cannot follow: the saved network has no
+    /// recorded identity, the address left its subnet, or the adapter joined another network.
+    NetworkMoved(NetworkMove),
     NetworkRoute,
     /// The pinned port is still closing from a previous session on this computer.
     PortBusy,
@@ -184,6 +193,140 @@ pub fn interface_id(stable_id: &str, index: u32, address: Ipv4Addr) -> String {
     format!("{stable_id}:{index}:{address}")
 }
 
+/// The stable id and address a saved network id names; the index is not needed to find it.
+fn saved_adapter(interface_id: &str) -> Option<(&str, Ipv4Addr)> {
+    // Split from the right: a stable id may itself contain ':'.
+    let mut parts = interface_id.rsplitn(3, ':');
+    let address = parts.next()?.parse().ok()?;
+    parts.next()?.parse::<u32>().ok()?;
+    Some((
+        parts.next().filter(|stable_id| !stable_id.is_empty())?,
+        address,
+    ))
+}
+
+/// What a saved network's identity is kept as: a digest of the attachment its adapter reports,
+/// the Wi-Fi network name or the Windows network profile. Never logged.
+pub fn network_digest(attachment: &[u8]) -> String {
+    Sha256::new()
+        .chain_update(b"monhop network v1\0")
+        .chain_update(attachment)
+        .finalize()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A selected adapter's address change MonHop would not follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkMove {
+    pub from: Ipv4Addr,
+    pub to: Ipv4Addr,
+    pub why: Unfollowed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unfollowed {
+    /// The network was saved before MonHop recorded which network it is.
+    Unrecorded,
+    /// The adapter joined another network than the saved one.
+    OtherNetwork,
+    /// The new address is outside the saved address's subnet.
+    OtherSubnet,
+}
+
+/// The saved network as a bind found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedNetwork {
+    /// The id the adapter answers to now: the saved one, or the saved one at its new address.
+    pub interface_id: String,
+    /// The saved address the adapter moved from, when the bind followed it.
+    pub followed_from: Option<Ipv4Addr>,
+    /// The digest of the network the adapter is on now.
+    pub digest: String,
+}
+
+/// What resolving a saved network reads of one adapter.
+struct AdapterFacts<'a> {
+    stable_id: &'a str,
+    index: u32,
+    address: Ipv4Addr,
+    prefix_len: u8,
+    /// Physical, up, Wi-Fi or Ethernet, with an identified network.
+    attachment: Option<&'a [u8]>,
+}
+
+/// The one adapter `interface_id` names, and how. The exact adapter wins, as before. Without it,
+/// the same physical adapter at a new address is followed only on the same subnet of the same
+/// network, proven by `digest`, the saved network's; anything else is `NetworkMoved`, and no such
+/// adapter at all is `NetworkSelection`. Never another adapter.
+fn resolve_network(
+    adapters: &[AdapterFacts<'_>],
+    interface_id: &str,
+    digest: Option<&str>,
+) -> Result<(usize, ResolvedNetwork), SetupFailure> {
+    let (stable_id, saved) = saved_adapter(interface_id).ok_or(SetupFailure::NetworkSelection)?;
+    let only = |found: Vec<usize>| match found[..] {
+        [one] => Ok(one),
+        _ => Err(SetupFailure::NetworkSelection),
+    };
+    let exact: Vec<usize> = (0..adapters.len())
+        .filter(|&index| {
+            names_adapter(
+                interface_id,
+                adapters[index].stable_id,
+                adapters[index].address,
+            )
+        })
+        .collect();
+    if !exact.is_empty() {
+        let index = only(exact)?;
+        let attachment = adapters[index]
+            .attachment
+            .ok_or(SetupFailure::NetworkSelection)?;
+        return Ok((
+            index,
+            ResolvedNetwork {
+                interface_id: interface_id.to_owned(),
+                followed_from: None,
+                digest: network_digest(attachment),
+            },
+        ));
+    }
+    let index = only(
+        (0..adapters.len())
+            .filter(|&index| {
+                adapters[index].stable_id == stable_id && adapters[index].attachment.is_some()
+            })
+            .collect(),
+    )?;
+    let adapter = &adapters[index];
+    let now = network_digest(adapter.attachment.unwrap_or_default());
+    let why = match digest {
+        None => Some(Unfollowed::Unrecorded),
+        Some(digest) if digest != now => Some(Unfollowed::OtherNetwork),
+        Some(_) if validate_subnet_peer(adapter.address, adapter.prefix_len, saved).is_err() => {
+            Some(Unfollowed::OtherSubnet)
+        }
+        Some(_) => None,
+    };
+    if let Some(why) = why {
+        return Err(SetupFailure::NetworkMoved(NetworkMove {
+            from: saved,
+            to: adapter.address,
+            why,
+        }));
+    }
+    Ok((
+        index,
+        ResolvedNetwork {
+            interface_id: self::interface_id(stable_id, adapter.index, adapter.address),
+            followed_from: Some(saved),
+            digest: now,
+        },
+    ))
+}
+
 /// Whether a saved network id names this adapter. The index is not compared: an adapter that
 /// resets can come back renumbered with the same stable id and address.
 pub fn names_adapter(interface_id: &str, stable_id: &str, address: Ipv4Addr) -> bool {
@@ -199,48 +342,51 @@ pub fn names_adapter(interface_id: &str, stable_id: &str, address: Ipv4Addr) -> 
 /// Whether two saved network ids resolve to the same adapter: ids that differ only in the index
 /// name one network, so neither needs the other's connections ended.
 pub fn same_network(saved: &str, chosen: &str) -> bool {
-    // Split from the right: a stable id may itself contain ':'.
-    let mut parts = chosen.rsplitn(3, ':');
-    let adapter = parts
-        .next()
-        .and_then(|address| address.parse().ok())
-        .and_then(|address| {
-            parts.next()?.parse::<u32>().ok()?;
-            Some((
-                parts.next().filter(|stable_id| !stable_id.is_empty())?,
-                address,
-            ))
-        });
     saved == chosen
-        || adapter.is_some_and(|(stable_id, address)| names_adapter(saved, stable_id, address))
+        || saved_adapter(chosen)
+            .is_some_and(|(stable_id, address)| names_adapter(saved, stable_id, address))
 }
 
 pub fn selected_network(interface_id: &str) -> Result<NetworkSelection, SetupFailure> {
-    selected_adapter(interface_id).map(|(selection, _)| selection)
+    selected_adapter(interface_id, None).map(|(selection, _, _)| selection)
 }
 
-/// The one adapter a saved network id names, fit to share over, and the facts its subnet checks
-/// read.
+/// The one adapter a saved network id names, or the same adapter followed to a new address on
+/// the network `digest` names, fit to share over, and the facts its subnet checks read.
 fn selected_adapter(
     interface_id: &str,
-) -> Result<(NetworkSelection, InterfaceSnapshot), SetupFailure> {
+    digest: Option<&str>,
+) -> Result<(NetworkSelection, InterfaceSnapshot, ResolvedNetwork), SetupFailure> {
     #[cfg(windows)]
     let adapters = monhop_platform_windows::network::enumerate_adapters()
         .map_err(|_| SetupFailure::NetworkSelection)?;
     #[cfg(target_os = "macos")]
     let adapters = monhop_platform_macos::network::enumerate_adapters_with_attachment()
         .map_err(|_| SetupFailure::NetworkSelection)?;
-    let mut matches = adapters
+    let facts: Vec<AdapterFacts<'_>> = adapters
+        .iter()
+        .map(|adapter| AdapterFacts {
+            stable_id: &adapter.stable_id,
+            index: adapter.index,
+            address: adapter.address,
+            prefix_len: adapter.prefix_len,
+            attachment: adapter
+                .attachment
+                .as_deref()
+                .filter(|_| adapter.physical && adapter.up && (adapter.wifi || adapter.ethernet)),
+        })
+        .collect();
+    let (index, resolved) = resolve_network(&facts, interface_id, digest)?;
+    drop(facts);
+    let adapter = adapters
         .into_iter()
-        .filter(|adapter| names_adapter(interface_id, &adapter.stable_id, adapter.address));
-    let adapter = matches.next().ok_or(SetupFailure::NetworkSelection)?;
-    if matches.next().is_some()
-        || !adapter.physical
-        || !adapter.up
-        || !(adapter.wifi || adapter.ethernet)
-        || adapter.attachment.is_none()
-    {
-        return Err(SetupFailure::NetworkSelection);
+        .nth(index)
+        .ok_or(SetupFailure::NetworkSelection)?;
+    if let Some(from) = resolved.followed_from {
+        log::info!(
+            "network: following the selected adapter from {from} to {} on the same network",
+            adapter.address
+        );
     }
     let snapshot = InterfaceSnapshot {
         stable_id: adapter.stable_id.clone(),
@@ -265,6 +411,7 @@ fn selected_adapter(
             peer: SocketAddrV4::new(adapter.address, PAIRING_PORT),
         },
         snapshot,
+        resolved,
     ))
 }
 
@@ -371,6 +518,44 @@ pub(crate) fn prepare_endpoint(
     })
 }
 
+/// Records `member`'s pairing at `to`, where it proved its pinned certificate, and reads it back.
+/// The record is swapped whole, so any failure leaves the old address recorded.
+pub fn record_moved_peer(
+    store: &impl ProtectedPeerStore,
+    local: CertificateFingerprint,
+    member: CertificateFingerprint,
+    to: SocketAddrV4,
+) -> Result<(), SetupFailure> {
+    let (handle, record) = listed_peers(store)?
+        .into_iter()
+        .find_map(|stored| {
+            let record = ConfirmedPeerRecord::decode(&stored.record, local).ok()?;
+            (record.peer().fingerprint() == member).then_some((stored.handle, record))
+        })
+        .ok_or(SetupFailure::PairingRequired)?;
+    if record.peer().endpoint() == to {
+        return Ok(());
+    }
+    let moved = Zeroizing::new(
+        record
+            .moved_to(to)
+            .map_err(|_| SetupFailure::PairingRequired)?
+            .encode(),
+    );
+    store.replace(&handle, &moved).map_err(|error| {
+        log::warn!("session setup: a moved pairing could not be recorded: {error}");
+        SetupFailure::Identity
+    })?;
+    let recorded = listed_peers(store)?
+        .iter()
+        .any(|stored| stored.handle == handle && *stored.record == *moved);
+    if !recorded {
+        log::warn!("session setup: a moved pairing did not read back as written");
+        return Err(SetupFailure::Identity);
+    }
+    Ok(())
+}
+
 /// The stored record for `peer` among this computer's pairings; a record that no longer decodes
 /// for the local identity is a stale pairing and never matches.
 pub fn confirmed_peer(
@@ -384,17 +569,19 @@ pub fn confirmed_peer(
         .ok_or(SetupFailure::PairingRequired)
 }
 
+fn listed_peers(store: &impl ProtectedPeerStore) -> Result<Vec<StoredPeer>, SetupFailure> {
+    store.list().map_err(|error| {
+        log::warn!("session setup: the paired computers could not be listed: {error}");
+        SetupFailure::Identity
+    })
+}
+
 /// Every pairing that still decodes for the local identity.
 fn confirmed_peers(
     store: &impl ProtectedPeerStore,
     local: CertificateFingerprint,
 ) -> Result<Vec<ConfirmedPeerRecord>, SetupFailure> {
-    Ok(store
-        .list()
-        .map_err(|error| {
-            log::warn!("session setup: the paired computers could not be listed: {error}");
-            SetupFailure::Identity
-        })?
+    Ok(listed_peers(store)?
         .into_iter()
         .filter_map(|stored| ConfirmedPeerRecord::decode(&stored.record, local).ok())
         .collect())
@@ -1356,9 +1543,14 @@ impl Drop for Waiting<'_> {
 }
 
 /// The one loop that owns the endpoint's incoming connections. A member no connect waits for is
-/// refused before any TLS runs.
-async fn route_incoming(mut acceptor: Acceptor, table: Arc<Mutex<Routes>>) {
-    let claimed = |member| routes(&table).claimed(member);
+/// refused before any TLS runs, unless `probing` takes its connection as a dial-back that proves
+/// this computer at a new address; nobody claims that one, so it is closed once it authenticates.
+async fn route_incoming(
+    mut acceptor: Acceptor,
+    table: Arc<Mutex<Routes>>,
+    probing: impl Fn(CertificateFingerprint) -> bool,
+) {
+    let claimed = |member| routes(&table).claimed(member) || probing(member);
     loop {
         let accepted = acceptor.accept_any(&claimed).await;
         let mut routed = routes(&table);
@@ -1374,8 +1566,95 @@ async fn route_incoming(mut acceptor: Acceptor, table: Arc<Mutex<Routes>>) {
     }
 }
 
-/// Stops the accept router when the endpoint goes.
+/// Stops the accept router, or another task of the endpoint, when the endpoint goes.
 struct Router(tokio::task::JoinHandle<()>);
+
+/// Saves a member's proven new address: `(this computer, member, new address)`.
+type RecordWriter =
+    fn(CertificateFingerprint, CertificateFingerprint, SocketAddrV4) -> Result<(), SetupFailure>;
+
+fn record_natively(
+    local: CertificateFingerprint,
+    member: CertificateFingerprint,
+    to: SocketAddrV4,
+) -> Result<(), SetupFailure> {
+    record_moved_peer(&NativePeerStore, local, member, to)
+}
+
+/// The first wait before saving a move again; each of `RECORD_RETRIES` waits doubles it.
+const RECORD_RETRY_FIRST: Duration = Duration::from_secs(1);
+const RECORD_RETRIES: u32 = 5;
+
+/// Saves each move the endpoint proves, retrying a failed write after `first`, then twice as
+/// long each time, and passes on only a move its pairing records, so the app never shows an
+/// address the pairing lacks. A member `admits` no longer names is left alone.
+async fn record_moves(
+    mut moves: channel::UnboundedReceiver<MemberMoved>,
+    local: CertificateFingerprint,
+    (record, first): (RecordWriter, Duration),
+    admits: impl Fn(CertificateFingerprint) -> bool,
+    recorded: channel::UnboundedSender<MemberMoved>,
+) {
+    let last = first * 2_u32.pow(RECORD_RETRIES - 1);
+    while let Some(moved) = moves.recv().await {
+        let mut wait = first;
+        while admits(moved.member) {
+            let written =
+                tokio::task::spawn_blocking(move || record(local, moved.member, moved.to)).await;
+            if matches!(written, Ok(Ok(()))) {
+                let _ = recorded.send(moved);
+                break;
+            }
+            if wait > last {
+                log::warn!(
+                    "group endpoint: paired computer {} moved to {} but its pairing still records \
+                     {}; the next bind finds it again",
+                    moved.member.short_hex(),
+                    moved.to,
+                    moved.from
+                );
+                break;
+            }
+            log::info!(
+                "group endpoint: saving paired computer {}'s move to {} failed; retrying in \
+                 {wait:?}",
+                moved.member.short_hex(),
+                moved.to
+            );
+            tokio::time::sleep(wait).await;
+            wait *= 2;
+        }
+    }
+}
+
+/// The saved network a group endpoint binds.
+pub struct SavedNetwork<'a> {
+    pub interface_id: &'a str,
+    /// The digest recorded for the saved network, when there is one.
+    pub digest: Option<&'a str>,
+    /// Members an endpoint this one replaces still owed a knock.
+    pub knocking: &'a [CertificateFingerprint],
+}
+
+/// Per member: the connects running for it, and whether this computer followed its adapter since
+/// it last reached the member, so a member it waits for is knocked at.
+#[derive(Clone, Copy, Default)]
+struct Want {
+    connects: usize,
+    knock: bool,
+}
+
+/// One connect's claim that its member is wanted, withdrawn when the connect ends.
+struct Wanted<'a> {
+    endpoint: &'a GroupEndpoint,
+    index: usize,
+}
+
+impl Drop for Wanted<'_> {
+    fn drop(&mut self) {
+        self.endpoint.want(self.index, false);
+    }
+}
 
 impl Drop for Router {
     fn drop(&mut self) {
@@ -1404,6 +1683,11 @@ pub struct GroupEndpoint {
     local: LocalFacts,
     displays: DisplayReader,
     interface_id: String,
+    network: ResolvedNetwork,
+    want: RefCell<Box<[Want]>>,
+    /// Moves the endpoint proved and saved, until the app takes them.
+    moves: RefCell<Option<channel::UnboundedReceiver<MemberMoved>>>,
+    _recording: Router,
     revocation: RevocationSignal,
     handle: EndpointHandle,
     endpoint: GuardedEndpoint,
@@ -1415,9 +1699,11 @@ impl GroupEndpoint {
     /// admitted computer without one can open only setup links. A paired computer left out, off
     /// the subnet, at an address a group member or an earlier record holds, or past the cap,
     /// fails every connect as `NetworkRoute`; only one with no pairing is `PairingRequired`.
+    /// The selected adapter is followed to a new address on the saved network, and then each
+    /// member this computer waits for is knocked at until it is reached.
     /// Must run on the network runtime, which then hosts the one accept router.
     pub fn bind(
-        interface_id: &str,
+        saved: &SavedNetwork<'_>,
         members: &[GroupMemberRecord],
         cancel: &RevocationSignal,
     ) -> Result<Rc<Self>, SetupFailure> {
@@ -1426,7 +1712,7 @@ impl GroupEndpoint {
         check_cancel(cancel)?;
         let records = confirmed_peers(&NativePeerStore, identity.fingerprint())?;
         check_cancel(cancel)?;
-        let (selection, selected) = selected_adapter(interface_id)?;
+        let (selection, selected, network) = selected_adapter(saved.interface_id, saved.digest)?;
         let local_platform = this_platform();
         let Admission { admitted, excluded } = admitted_peers(
             &selected,
@@ -1459,15 +1745,25 @@ impl GroupEndpoint {
         let endpoint = GuardedEndpoint::bind_group_after_local_enable(group, &identity)
             .map_err(bind_failure)?;
         check_cancel(cancel)?;
+        let followed = network.followed_from.is_some();
+        let peers: Box<[GroupPeer]> = admitted.into_iter().map(|(peer, _)| peer).collect();
+        let want = peers
+            .iter()
+            .map(|peer| Want {
+                connects: 0,
+                knock: followed || saved.knocking.contains(&peer.fingerprint),
+            })
+            .collect();
         Self::assemble(
             endpoint,
             LocalFacts::new(identity, local_platform),
-            admitted.into_iter().map(|(peer, _)| peer).collect(),
+            peers,
             excluded,
             members,
-            interface_id,
+            saved.interface_id,
             cancel,
             native_displays,
+            (network, want, record_natively),
         )
     }
 
@@ -1482,6 +1778,7 @@ impl GroupEndpoint {
         interface_id: &str,
         cancel: &RevocationSignal,
         displays: DisplayReader,
+        (network, want, record): (ResolvedNetwork, Box<[Want]>, RecordWriter),
     ) -> Result<Rc<Self>, SetupFailure> {
         let acceptor = endpoint
             .take_acceptor()
@@ -1489,7 +1786,26 @@ impl GroupEndpoint {
         let table = Arc::new(Mutex::new(Routes::new(
             peers.iter().map(|peer| peer.fingerprint).collect(),
         )));
-        let router = Router(tokio::spawn(route_incoming(acceptor, table.clone())));
+        let dialed: Box<[CertificateFingerprint]> = peers
+            .iter()
+            .filter(|peer| peer.dials)
+            .map(|peer| peer.fingerprint)
+            .collect();
+        let handle = endpoint.handle();
+        let router = Router(tokio::spawn(route_incoming(
+            acceptor,
+            table.clone(),
+            move |member| dialed.contains(&member) && handle.wanted(member),
+        )));
+        let (recorded, moves) = channel::unbounded_channel();
+        let admitting = endpoint.handle();
+        let recording = Router(tokio::spawn(record_moves(
+            endpoint.take_moves().ok_or(SetupFailure::NetworkRoute)?,
+            local.identity.fingerprint(),
+            (record, RECORD_RETRY_FIRST),
+            move |member| admitting.admits(member),
+            recorded,
+        )));
         let revoker = endpoint.revoker();
         // Cancellation must still close the socket while native startup blocks the runtime.
         let revocation = endpoint.revocation_signal();
@@ -1507,10 +1823,83 @@ impl GroupEndpoint {
             local,
             displays,
             interface_id: interface_id.to_owned(),
+            network,
+            want: RefCell::new(want),
+            moves: RefCell::new(Some(moves)),
+            _recording: recording,
             revocation,
             handle: endpoint.handle(),
             endpoint,
         }))
+    }
+
+    /// The saved network as this bind found it.
+    pub fn network(&self) -> &ResolvedNetwork {
+        &self.network
+    }
+
+    /// Members proven and saved at a new address, once; the app shows each.
+    pub fn take_moves(&self) -> Option<channel::UnboundedReceiver<MemberMoved>> {
+        self.moves.borrow_mut().take()
+    }
+
+    /// Members still owed a knock, for an endpoint that replaces this one.
+    pub fn knocking(&self) -> Vec<CertificateFingerprint> {
+        let want = self.want.borrow();
+        self.peers
+            .iter()
+            .zip(want.iter())
+            .filter(|(_, want)| want.knock)
+            .map(|(peer, _)| peer.fingerprint)
+            .collect()
+    }
+
+    /// Counts a connect for member `index` in (`starting`) or out, and marks the member wanted
+    /// while any runs and it has no live link. Only a wanted member is ever moved.
+    fn want(&self, index: usize, starting: bool) {
+        let connects = {
+            let mut want = self.want.borrow_mut();
+            let connects = &mut want[index].connects;
+            *connects = if starting {
+                *connects + 1
+            } else {
+                connects.saturating_sub(1)
+            };
+            *connects
+        };
+        self.refresh_want(index, connects);
+    }
+
+    fn refresh_want(&self, index: usize, connects: usize) {
+        let linked = self.live.borrow()[index]
+            .as_ref()
+            .is_some_and(|link| link.connection.close_reason().is_none());
+        self.handle
+            .set_wanted(self.peers[index].fingerprint, connects > 0 && !linked);
+    }
+
+    fn rewant(&self, index: usize) {
+        let connects = self.want.borrow()[index].connects;
+        self.refresh_want(index, connects);
+    }
+
+    fn wanting(&self, index: usize) -> Wanted<'_> {
+        self.want(index, true);
+        Wanted {
+            endpoint: self,
+            index,
+        }
+    }
+
+    /// Knocks at member `index` now and every `KNOCK_EVERY` while it is owed one.
+    async fn knock_while_owed(&self, index: usize) -> std::convert::Infallible {
+        let mut every = tokio::time::interval(KNOCK_EVERY);
+        loop {
+            every.tick().await;
+            if self.want.borrow()[index].knock {
+                self.handle.knock(self.peers[index].fingerprint);
+            }
+        }
     }
 
     /// Whether `member` is admitted here and not forgotten.
@@ -1554,6 +1943,7 @@ impl GroupEndpoint {
     ) -> Result<PairedMember, SetupFailure> {
         let index = self.admitted(member)?;
         self.check(index, Some(cancel))?;
+        let _wanted = self.wanting(index);
         let control = if purpose == SessionPurpose::Setup {
             ControlPermissions::BOTH
         } else {
@@ -1608,6 +1998,7 @@ impl GroupEndpoint {
     ) -> Result<Authenticated, SetupFailure> {
         let index = self.admitted(member)?;
         self.check(index, Some(cancel))?;
+        let _wanted = self.wanting(index);
         self.connection(index, cancel).await
     }
 
@@ -1678,6 +2069,7 @@ impl GroupEndpoint {
                 .connection
                 .close(0_u32.into(), MEMBER_SUPERSEDED_REASON);
         }
+        self.rewant(index);
         heard.keep();
         Ok(PairedMember {
             session,
@@ -1696,6 +2088,9 @@ impl GroupEndpoint {
             link.cancel.request_stop();
             link.connection.close(0_u32.into(), MEMBER_RELEASED_REASON);
         }
+        if let Some(index) = self.index(member) {
+            self.rewant(index);
+        }
     }
 
     /// Stops admitting `member` without a rebind: its waiting connect ends, its incoming is
@@ -1708,6 +2103,7 @@ impl GroupEndpoint {
             return;
         };
         self.endpoint.forget_member(member);
+        self.handle.set_wanted(member, false);
         routes(&self.routes).waiters[index] = None;
         let link = self.live.borrow_mut()[index].take();
         if let Some(link) = link {
@@ -1841,7 +2237,11 @@ impl GroupEndpoint {
             self.peers[index].fingerprint.short_hex()
         );
         self.while_member_active(index, cancel, async {
-            match delivered.await {
+            let delivered = tokio::select! {
+                delivered = delivered => delivered,
+                never = self.knock_while_owed(index) => match never {},
+            };
+            match delivered {
                 // The router hands over only connections bound to this member's address and pin.
                 Ok(Ok(connection)) => Ok(self.authenticated(index, connection)),
                 Ok(Err(failure)) => Err(member_failure(&what, &failure)),
@@ -1892,6 +2292,7 @@ impl GroupEndpoint {
     }
 
     fn authenticated(&self, index: usize, connection: quinn::Connection) -> Authenticated {
+        self.want.borrow_mut()[index].knock = false;
         Authenticated {
             connection,
             heard: self.contacts.borrow()[index].hear(),
@@ -2001,6 +2402,12 @@ impl GroupEndpoint {
                 dials: *dials,
             })
             .collect();
+        let want = members.iter().map(|_| Want::default()).collect();
+        let network = ResolvedNetwork {
+            interface_id: "loopback-test".into(),
+            followed_from: None,
+            digest: String::new(),
+        };
         Self::assemble(
             endpoint,
             LocalFacts::new(identity, platform),
@@ -2010,6 +2417,7 @@ impl GroupEndpoint {
             "loopback-test",
             cancel,
             displays,
+            (network, want, |_, _, _| Ok(())),
         )
         .unwrap()
     }
@@ -2138,6 +2546,88 @@ mod network_id_tests {
             String::new(),
         ] {
             assert!(!same_network(&saved, &other), "{other}");
+        }
+    }
+
+    const HOME: &[u8] = b"monhop/macos/wifi/2\0home";
+
+    fn adapter<'a>(
+        stable_id: &'a str,
+        address: [u8; 4],
+        attachment: Option<&'a [u8]>,
+    ) -> AdapterFacts<'a> {
+        AdapterFacts {
+            stable_id,
+            index: 4,
+            address: address.into(),
+            prefix_len: 24,
+            attachment,
+        }
+    }
+
+    #[test]
+    fn the_saved_adapter_is_followed_to_a_new_address_only_on_its_network_and_subnet() {
+        let saved = interface_id("en0", 4, ADDRESS);
+        let digest = network_digest(HOME);
+        let exact = [adapter("en0", [192, 168, 1, 4], Some(HOME))];
+        let (index, found) = resolve_network(&exact, &saved, None).unwrap();
+        assert_eq!(
+            (index, &found.interface_id, found.followed_from),
+            (0, &saved, None)
+        );
+        assert_eq!(found.digest, digest, "an exact match learns the network");
+
+        let moved = [
+            adapter("en1", [192, 168, 1, 9], Some(HOME)),
+            adapter("en0", [192, 168, 1, 160], Some(HOME)),
+        ];
+        let (index, found) = resolve_network(&moved, &saved, Some(&digest)).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(
+            found.interface_id,
+            interface_id("en0", 4, Ipv4Addr::new(192, 168, 1, 160))
+        );
+        assert_eq!(found.followed_from, Some(ADDRESS));
+
+        let unfollowed = |adapters: &[AdapterFacts<'_>], digest: Option<&str>| match resolve_network(
+            adapters, &saved, digest,
+        ) {
+            Err(SetupFailure::NetworkMoved(moved)) => {
+                assert_eq!(moved.from, ADDRESS);
+                moved.why
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(unfollowed(&moved, None), Unfollowed::Unrecorded);
+        let cafe: &[u8] = b"monhop/macos/wifi/2\0cafe";
+        assert_eq!(
+            unfollowed(
+                &[adapter("en0", [192, 168, 1, 160], Some(cafe))],
+                Some(&digest)
+            ),
+            Unfollowed::OtherNetwork
+        );
+        assert_eq!(
+            unfollowed(
+                &[adapter("en0", [192, 168, 2, 160], Some(HOME))],
+                Some(&digest)
+            ),
+            Unfollowed::OtherSubnet
+        );
+
+        for adapters in [
+            vec![adapter("en1", [192, 168, 1, 4], Some(HOME))],
+            vec![adapter("en0", [192, 168, 1, 160], None)],
+            vec![adapter("en0", [192, 168, 1, 4], None)],
+            vec![
+                adapter("en0", [192, 168, 1, 160], Some(HOME)),
+                adapter("en0", [192, 168, 1, 161], Some(HOME)),
+            ],
+        ] {
+            assert_eq!(
+                resolve_network(&adapters, &saved, Some(&digest)).map(|(index, _)| index),
+                Err(SetupFailure::NetworkSelection)
+            );
         }
     }
 }
@@ -2817,7 +3307,7 @@ mod group_tests {
 
     use super::*;
     use crate::{
-        crypto::LOCAL_TLS_SERVER_NAME,
+        crypto::{LOCAL_TLS_SERVER_NAME, SecureQuicConfig},
         guarded_endpoint::loopback::{self, pin},
         pairing::PairingOffer,
     };
@@ -3944,6 +4434,244 @@ mod group_tests {
         .unwrap()
         .with_platform(MEMBER);
         ConfirmedPeerRecord::new(local.fingerprint(), offer).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_dialer_answers_a_wanted_members_dial_back_and_closes_it() {
+        let computer = Computer::new();
+        let member = in_group(&computer.identity);
+        let hub = hub(&[&computer], true, std::slice::from_ref(&member));
+        let remote = computer.dialing(&hub);
+        let probe = SecureQuicConfig::client_recognizing(
+            &remote.identity,
+            std::slice::from_ref(&hub.pin),
+            Arc::new(|_| true),
+        )
+        .unwrap();
+        let dial_back = || {
+            remote
+                .endpoint
+                .connect_with(probe.clone(), hub.address, LOCAL_TLS_SERVER_NAME)
+                .unwrap()
+        };
+        let refused = tokio::time::timeout(DEADLINE, dial_back())
+            .await
+            .expect("the refusal is prompt");
+        assert!(
+            matches!(
+                &refused,
+                Err(quinn::ConnectionError::ConnectionClosed(close))
+                    if close.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED
+            ),
+            "{refused:?}"
+        );
+
+        let cancel = RevocationSignal::default();
+        let answered = tokio::time::timeout(DEADLINE, async {
+            tokio::select! {
+                biased;
+                _ = hub.group.connect(member.fingerprint, SessionPurpose::Share, NO_AGREEMENT, &cancel) => {
+                    panic!("the dialing connect ended");
+                }
+                answered = async {
+                    let proved = dial_back().await.expect("the dial-back is answered");
+                    let answered = crate::guarded_endpoint::read_probe_answer(&proved).await;
+                    proved.close(0_u32.into(), crate::guarded_endpoint::DIAL_BACK_DONE);
+                    answered
+                } => answered,
+            }
+        })
+        .await
+        .expect("the dial-back is answered in time");
+        let SocketAddr::V4(hub_address) = hub.address else {
+            unreachable!("bound to IPv4 loopback")
+        };
+        assert_eq!(
+            answered,
+            Some(hub_address),
+            "the answer names the dialer's own pinned address"
+        );
+    }
+
+    /// Pairing records in memory; `replace` writes, fails, or reports success and keeps the old.
+    struct Records {
+        stored: RefCell<Vec<StoredPeer>>,
+        replacing: Cell<Replacing>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Replacing {
+        Writes,
+        Fails,
+        Drops,
+    }
+
+    impl ProtectedPeerStore for Records {
+        fn list(&self) -> Result<Vec<StoredPeer>, crate::identity_store::StorageError> {
+            Ok(self
+                .stored
+                .borrow()
+                .iter()
+                .map(|stored| StoredPeer {
+                    handle: stored.handle.clone(),
+                    record: stored.record.clone(),
+                })
+                .collect())
+        }
+
+        fn create_new(
+            &self,
+            key: &str,
+            record: &[u8],
+        ) -> Result<(), crate::identity_store::StorageError> {
+            self.stored.borrow_mut().push(StoredPeer {
+                handle: key.to_owned(),
+                record: Zeroizing::new(record.to_vec()),
+            });
+            Ok(())
+        }
+
+        fn replace(
+            &self,
+            handle: &str,
+            record: &[u8],
+        ) -> Result<(), crate::identity_store::StorageError> {
+            match self.replacing.get() {
+                Replacing::Fails => Err(crate::identity_store::StorageError::WriteFailed),
+                Replacing::Drops => Ok(()),
+                Replacing::Writes => {
+                    let mut stored = self.stored.borrow_mut();
+                    let stored = stored
+                        .iter_mut()
+                        .find(|stored| stored.handle == handle)
+                        .ok_or(crate::identity_store::StorageError::ReadFailed)?;
+                    stored.record = Zeroizing::new(record.to_vec());
+                    Ok(())
+                }
+            }
+        }
+
+        fn delete(&self, handle: &str) -> Result<(), crate::identity_store::StorageError> {
+            self.stored
+                .borrow_mut()
+                .retain(|stored| stored.handle != handle);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_moved_pairing_is_recorded_whole_or_not_at_all() {
+        let local = DeviceIdentity::generate().unwrap();
+        let peers = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+        let store = Records {
+            stored: RefCell::default(),
+            replacing: Cell::new(Replacing::Fails),
+        };
+        for (host, peer) in [
+            ([192, 168, 50, 11], &peers[0]),
+            ([192, 168, 50, 12], &peers[1]),
+        ] {
+            let key = peer.fingerprint().full_hex();
+            store
+                .create_new(&key, &record(&local, host, peer).encode())
+                .unwrap();
+        }
+        let at = |host: [u8; 4]| SocketAddrV4::new(host.into(), PAIRING_PORT);
+        let recorded = || {
+            confirmed_peers(&store, local.fingerprint())
+                .unwrap()
+                .iter()
+                .map(|record| record.peer().endpoint())
+                .collect::<Vec<_>>()
+        };
+        let to = at([192, 168, 50, 160]);
+        let moving = || record_moved_peer(&store, local.fingerprint(), peers[0].fingerprint(), to);
+        assert_eq!(moving(), Err(SetupFailure::Identity));
+        store.replacing.set(Replacing::Drops);
+        assert_eq!(moving(), Err(SetupFailure::Identity), "it must read back");
+        assert_eq!(recorded(), [at([192, 168, 50, 11]), at([192, 168, 50, 12])]);
+
+        store.replacing.set(Replacing::Writes);
+        assert_eq!(moving(), Ok(()));
+        assert_eq!(recorded(), [to, at([192, 168, 50, 12])]);
+        let moved = confirmed_peer(&store, local.fingerprint(), peers[0].fingerprint()).unwrap();
+        assert_eq!(moved.peer().platform(), Some(MEMBER));
+        assert_eq!(
+            moving(),
+            Ok(()),
+            "an address already recorded is left alone"
+        );
+        let stranger = DeviceIdentity::generate().unwrap().fingerprint();
+        assert_eq!(
+            record_moved_peer(&store, local.fingerprint(), stranger, to),
+            Err(SetupFailure::PairingRequired)
+        );
+    }
+
+    static FAILED_WRITES: AtomicUsize = AtomicUsize::new(0);
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Fails while `FAILED_WRITES` is above zero, counting down; counts every call in `WRITES`.
+    fn flaky_writer(
+        _: CertificateFingerprint,
+        _: CertificateFingerprint,
+        _: SocketAddrV4,
+    ) -> Result<(), SetupFailure> {
+        WRITES.fetch_add(1, Ordering::SeqCst);
+        match FAILED_WRITES.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        }) {
+            Ok(_) => Err(SetupFailure::Identity),
+            Err(_) => Ok(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_saved_move_reaches_the_app_and_a_failed_save_is_retried_then_dropped() {
+        let local = DeviceIdentity::generate().unwrap().fingerprint();
+        let member = DeviceIdentity::generate().unwrap().fingerprint();
+        let moved = MemberMoved {
+            member,
+            from: SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 11), PAIRING_PORT),
+            to: SocketAddrV4::new(Ipv4Addr::new(192, 168, 50, 160), PAIRING_PORT),
+        };
+        let run = |failures, admitted: bool| async move {
+            FAILED_WRITES.store(failures, Ordering::SeqCst);
+            WRITES.store(0, Ordering::SeqCst);
+            let (moving, moves) = channel::unbounded_channel();
+            let (recorded, mut shown) = channel::unbounded_channel();
+            moving.send(moved).unwrap();
+            drop(moving);
+            let first = Duration::from_millis(1);
+            record_moves(
+                moves,
+                local,
+                (flaky_writer, first),
+                move |_| admitted,
+                recorded,
+            )
+            .await;
+            let mut forwarded = 0;
+            while shown.try_recv().is_ok() {
+                forwarded += 1;
+            }
+            (WRITES.load(Ordering::SeqCst), forwarded)
+        };
+        assert_eq!(
+            run(2, true).await,
+            (3, 1),
+            "saved on the third try, shown once"
+        );
+        assert_eq!(
+            run(usize::MAX, true).await,
+            (6, 0),
+            "given up after five waits"
+        );
+        assert_eq!(
+            run(0, false).await,
+            (0, 0),
+            "a forgotten member is left alone"
+        );
     }
 
     fn in_group(identity: &DeviceIdentity) -> GroupMemberRecord {

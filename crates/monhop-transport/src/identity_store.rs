@@ -73,12 +73,16 @@ pub struct StoredPeer {
 
 /// OS-protected storage holding one record per paired computer.
 ///
-/// Providers protect every byte with the platform facility, never replace a record, and reject
-/// `create_new` for a key that already has one. `key` is the peer's lowercase 64-hex fingerprint.
+/// Providers protect every byte with the platform facility and reject `create_new` for a key that
+/// already has one. `key` is the peer's lowercase 64-hex fingerprint.
 pub trait ProtectedPeerStore {
     fn list(&self) -> Result<Vec<StoredPeer>, StorageError>;
 
     fn create_new(&self, key: &str, record: &[u8]) -> Result<(), StorageError>;
+
+    /// Swaps the record `list` reported as `handle` for `record` whole: a crash leaves the old
+    /// bytes or the new, never neither. Only a record of the same pairing is ever swapped in.
+    fn replace(&self, handle: &str, record: &[u8]) -> Result<(), StorageError>;
 
     fn delete(&self, handle: &str) -> Result<(), StorageError>;
 }

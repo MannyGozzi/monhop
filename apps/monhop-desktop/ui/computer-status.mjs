@@ -51,7 +51,8 @@ export function computerStatus(computer, sharingView, active, localName) {
   const value = peer
     ? peerStatus(peer, sharingView, name, localName)
     : legacyStatus(fingerprint, name, phase, message, sharingView, active, localName);
-  return startingAfterApply(value, peer?.phase ?? phase, sharingView);
+  // A notice says why sharing has not started, so it is never read as starting.
+  return peer?.notice ? value : startingAfterApply(value, peer?.phase ?? phase, sharingView);
 }
 
 // Apply closes the arranging link and the session opens after it, which is one step for the user:
@@ -80,6 +81,8 @@ export function findPeer(sharingView, fingerprint) {
 // view's single legacy set, everything else (control, editing) still comes from the shared view
 // since only one arrangement editor and one control record exist across the whole group.
 function peerStatus(peer, sharingView, name, localName) {
+  const notice = noticeStatus(peer.notice, name, localName);
+  if (notice && !LIVE_PHASES.has(peer.phase)) return notice;
   if (peer.phase === "notPaired")
     return status(
       "attention",
@@ -110,6 +113,43 @@ function peerStatus(peer, sharingView, name, localName) {
     default:
       return reaching(name);
   }
+}
+
+// Phases in which a notice is stale: the computer is reached.
+const LIVE_PHASES = new Set(["sharing", "connected", "stopping"]);
+
+// Why a computer sharing keeps trying does not connect. Only a local problem the user can fix
+// needs attention; a computer that does not answer reads like connecting, under its own title.
+function noticeStatus(notice, name, localName) {
+  switch (notice?.kind) {
+    case "adapterMissing":
+      return status(
+        "attention",
+        "Needs attention",
+        `${localName}'s selected network adapter is off or not connected. Turn Wi-Fi or Ethernet back on to reach ${name}.`,
+      );
+    case "moved":
+      return status("attention", "Needs attention", movedDetail(notice, name, localName));
+    case "unanswered": {
+      const minutes = notice.minutes === 1 ? "1 minute" : `${notice.minutes} minutes`;
+      return status(
+        "connecting",
+        "Not answering",
+        `${name} has not answered for ${minutes}. Check that MonHop is open on it and that both computers are on the same network.`,
+      );
+    }
+    default:
+      return null;
+  }
+}
+
+function movedDetail({ from, to, why }, name, localName) {
+  const again = `Pair ${name} again to share at the new address.`;
+  if (why === "otherNetwork")
+    return `${localName} joined another network: its address changed from ${from} to ${to}. ${again}`;
+  if (why === "otherSubnet")
+    return `${localName}'s address changed from ${from} to ${to}, outside the network ${name} was paired on. ${again}`;
+  return `${localName}'s address changed from ${from} to ${to}. ${again}`;
 }
 
 // Today's single-peer reply: `sharingView` itself names the one computer it is live with.

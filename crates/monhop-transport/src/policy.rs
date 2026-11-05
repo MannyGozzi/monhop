@@ -213,6 +213,34 @@ impl NetworkLock {
         }
     }
 
+    /// Re-addresses peer `index` after it proved its pinned certificate at `peer`. The new address
+    /// must be another on-link host of the selected subnet that no other peer holds, with a direct
+    /// route through the selected interface. A refused move leaves the lock as it was.
+    pub fn move_peer(
+        &mut self,
+        index: usize,
+        peer: Ipv4Addr,
+        route: RouteSnapshot,
+    ) -> Result<(), PolicyError> {
+        if self.revoked {
+            return Err(PolicyError::SessionClosed);
+        }
+        if index >= self.peers.len()
+            || self
+                .peers
+                .iter()
+                .enumerate()
+                .any(|(other, held)| other != index && *held == peer)
+        {
+            return Err(PolicyError::InvalidPeerSet);
+        }
+        validate_peer(&self.selected, peer)?;
+        validate_route(&self.selected, route)?;
+        self.peers[index] = peer;
+        self.reachable[index] = true;
+        Ok(())
+    }
+
     fn revalidate_routes<R: Copy + Into<PeerRoute>>(
         &self,
         current: &InterfaceSnapshot,
@@ -348,7 +376,11 @@ fn validate_host(address: Ipv4Addr, prefix: u8) -> Result<(), PolicyError> {
     Ok(())
 }
 
-fn validate_route(interface: &InterfaceSnapshot, route: RouteSnapshot) -> Result<(), PolicyError> {
+/// `route` leaves through `interface` from its address straight to the peer, without a gateway.
+pub fn validate_route(
+    interface: &InterfaceSnapshot,
+    route: RouteSnapshot,
+) -> Result<(), PolicyError> {
     if route.interface_index != interface.index || route.source != interface.address {
         return Err(PolicyError::WrongInterface);
     }
@@ -770,6 +802,60 @@ mod tests {
         assert_eq!(
             NetworkLock::new(selected(), PEER, route(), true).unwrap_err(),
             PolicyError::DiscoveryDisabled
+        );
+    }
+
+    #[test]
+    fn lock_move_peer_on_link_only_and_refused_after_revoke() {
+        let other = Ipv4Addr::new(192, 168, 50, 13);
+        let moved = Ipv4Addr::new(192, 168, 50, 40);
+        let mut group =
+            NetworkLock::new_group(selected(), &[(PEER, route()), (other, route())], false)
+                .unwrap();
+        let routed = RouteSnapshot {
+            next_hop: Ipv4Addr::new(192, 168, 50, 1),
+            ..route()
+        };
+        let elsewhere = RouteSnapshot {
+            interface_index: 8,
+            ..route()
+        };
+        for (index, peer, route, refusal) in [
+            (0, other, route(), PolicyError::InvalidPeerSet),
+            (2, moved, route(), PolicyError::InvalidPeerSet),
+            (
+                0,
+                Ipv4Addr::new(192, 168, 51, 40),
+                route(),
+                PolicyError::OffLinkPeer,
+            ),
+            (
+                0,
+                Ipv4Addr::new(8, 8, 8, 8),
+                route(),
+                PolicyError::NonPrivateAddress,
+            ),
+            (0, selected().address, route(), PolicyError::PeerIsLocal),
+            (0, moved, routed, PolicyError::RoutedPeer),
+            (0, moved, elsewhere, PolicyError::WrongInterface),
+        ] {
+            assert_eq!(group.move_peer(index, peer, route), Err(refusal));
+            assert_eq!(group.peers(), [PEER, other]);
+            assert!(!group.is_revoked());
+        }
+        group.move_peer(0, moved, route()).unwrap();
+        assert_eq!(group.peers(), [moved, other]);
+        assert!(
+            group
+                .revalidate(Some(&selected()), &[(moved, route()), (other, route())])
+                .is_ok()
+        );
+
+        let mut revoked = lock();
+        assert!(revoked.revalidate::<RouteSnapshot>(None, &[]).is_err());
+        assert_eq!(
+            revoked.move_peer(0, moved, route()),
+            Err(PolicyError::SessionClosed)
         );
     }
 }

@@ -1147,6 +1147,44 @@ pub(crate) fn load_bounded<T: DeserializeOwned + Default>(
     Ok(value)
 }
 
+/// Which network the saved network id is on, as a digest of what its adapter reports. Kept in a
+/// file of its own beside the setup file, which older MonHop builds never read, so the selected
+/// adapter can be followed to a new address on that network without changing the setup file's
+/// format.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NetworkMemo {
+    pub(crate) interface_id: String,
+    pub(crate) digest: String,
+}
+
+pub(crate) const NETWORK_MEMO_FILE: &str = "sharing-network.json";
+const MAX_NETWORK_MEMO_BYTES: u64 = 4 * 1024;
+
+impl NetworkMemo {
+    /// Beside `setup`; an absent, damaged or oversized file is no memo, so the network is learned
+    /// again at the next bind.
+    pub(crate) fn load(setup: &Path) -> Option<Self> {
+        load_bounded::<Option<Self>>(
+            &setup.with_file_name(NETWORK_MEMO_FILE),
+            MAX_NETWORK_MEMO_BYTES,
+            |_| Ok(()),
+        )
+        .ok()
+        .flatten()
+        .filter(|memo| !memo.interface_id.is_empty() && memo.digest.len() <= 64)
+    }
+
+    pub(crate) fn save(&self, setup: &Path) -> io::Result<()> {
+        let bytes = serde_json::to_vec(self).map_err(|_| invalid_data())?;
+        save_bounded(
+            &setup.with_file_name(NETWORK_MEMO_FILE),
+            &bytes,
+            MAX_NETWORK_MEMO_BYTES,
+        )
+    }
+}
+
 /// The version a versioned JSON file names, read before anything else in it.
 pub(crate) fn file_version(bytes: &[u8]) -> io::Result<u8> {
     serde_json::from_slice::<VersionedFile>(bytes)
@@ -1514,6 +1552,22 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn the_network_memo_round_trips_beside_the_setup_file_and_a_bad_one_is_none() {
+        let directory = TestDirectory::new();
+        let setup = directory.path(SETUP_FILE);
+        assert_eq!(NetworkMemo::load(&setup), None);
+        let memo = NetworkMemo {
+            interface_id: "en0:4:192.168.1.160".into(),
+            digest: "0123456789abcdef0123456789abcdef".into(),
+        };
+        memo.save(&setup).unwrap();
+        assert_eq!(NetworkMemo::load(&setup), Some(memo));
+        assert!(!setup.exists(), "the setup file is untouched");
+        fs::write(directory.path(NETWORK_MEMO_FILE), b"{\"interfaceId\":1}").unwrap();
+        assert_eq!(NetworkMemo::load(&setup), None);
     }
 
     impl SharingPreferences {

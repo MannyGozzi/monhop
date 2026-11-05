@@ -34,6 +34,14 @@ impl ProtectedPeerStore for NativePeerStore {
         monhop_platform_macos::identity::delete_peer_after_user_action(handle)
             .map_err(|error| map_keychain_error(error, StorageError::WriteFailed))
     }
+
+    fn replace(&self, handle: &str, bytes: &[u8]) -> Result<(), StorageError> {
+        use monhop_platform_macos::identity::{self, ProtectedRecord};
+        let record = ProtectedRecord::from_zeroizing(Zeroizing::new(bytes.to_vec()))
+            .map_err(|_| StorageError::InvalidRecord)?;
+        identity::replace_peer_after_user_action(handle, record)
+            .map_err(|error| map_keychain_error(error, StorageError::WriteFailed))
+    }
 }
 
 #[cfg(windows)]
@@ -58,6 +66,11 @@ impl ProtectedPeerStore for NativePeerStore {
         monhop_platform_windows::identity_storage::delete_peer_after_user_action(handle)
             .map_err(|error| map_file_error(error.kind(), StorageError::WriteFailed))
     }
+
+    fn replace(&self, handle: &str, record: &[u8]) -> Result<(), StorageError> {
+        monhop_platform_windows::identity_storage::replace_peer_after_user_action(handle, record)
+            .map_err(|error| map_file_error(error.kind(), StorageError::WriteFailed))
+    }
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -69,6 +82,9 @@ impl ProtectedPeerStore for NativePeerStore {
         Err(StorageError::Unavailable)
     }
     fn delete(&self, _: &str) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable)
+    }
+    fn replace(&self, _: &str, _: &[u8]) -> Result<(), StorageError> {
         Err(StorageError::Unavailable)
     }
 }

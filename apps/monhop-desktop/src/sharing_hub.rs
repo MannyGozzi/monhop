@@ -21,13 +21,14 @@ use monhop_core::{DeviceId, NativeSessionClaim, RevocationSignal};
 use monhop_protocol::SessionPurpose;
 use monhop_transport::{
     crypto::CertificateFingerprint,
+    guarded_endpoint::MemberMoved,
     session::{SessionDiagnostics, SessionFailure, SessionProgress},
     session_handshake::{NegotiatedSession, device_id_from_fingerprint},
     session_hub::{HubClosed, HubConfig, HubEvent, HubEvents, PeerEnd, ShareHub, start_share_hub},
     session_link::{LinkCommand, LinkEvent, LinkPersist, run_setup_link_on},
     session_setup::{
-        GroupEndpoint, GroupMemberRecord, Heard, InspectedPeer, PeerContact, SetupFailure,
-        same_network,
+        GroupEndpoint, GroupMemberRecord, Heard, InspectedPeer, PeerContact, ResolvedNetwork,
+        SavedNetwork, SetupFailure, same_network,
     },
 };
 use tokio::{
@@ -43,7 +44,7 @@ use crate::{
     clipboard::{ClipboardAttachment, ClipboardHub},
     group_record::{GroupRecord, wire_control},
     sharing::{LinkFuture, validated_layout},
-    sharing_preferences::{fingerprint_key, topology_of},
+    sharing_preferences::{NetworkMemo, fingerprint_key, topology_of},
 };
 
 const NETWORK_THREAD: &str = "monhop-network";
@@ -244,6 +245,7 @@ enum Command {
 /// ending never overwrites a newer thread's.
 #[derive(Default)]
 struct Flags {
+    notes: Arc<NetworkNotes>,
     stopped: AtomicBool,
     /// Commands sent and not handled yet.
     in_flight: AtomicUsize,
@@ -301,8 +303,48 @@ struct Threads {
     ending: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// What the network thread learned about the saved network, for the app to record. It outlives
+/// each thread, so a restarted thread still knows the saved network's digest.
+#[derive(Default)]
+pub(crate) struct NetworkNotes {
+    /// None until the app hands over what it saved.
+    known: Mutex<Option<Option<NetworkMemo>>>,
+    heard: Mutex<Vec<NetworkNote>>,
+}
+
+/// Bounds the notes kept between two supervisor ticks.
+const MAX_NETWORK_NOTES: usize = 64;
+
+pub(crate) enum NetworkNote {
+    /// A bind for the saved id `requested` found `network`.
+    Resolved {
+        requested: String,
+        network: ResolvedNetwork,
+    },
+    /// A paired computer proved itself at a new address, which its pairing now records.
+    Moved(MemberMoved),
+}
+
+impl NetworkNotes {
+    fn digest_for(&self, interface_id: &str) -> Option<String> {
+        lock(&self.known)
+            .as_ref()
+            .and_then(Option::as_ref)
+            .filter(|memo| same_network(&memo.interface_id, interface_id))
+            .map(|memo| memo.digest.clone())
+    }
+
+    fn hear(&self, note: NetworkNote) {
+        let mut heard = lock(&self.heard);
+        if heard.len() < MAX_NETWORK_NOTES {
+            heard.push(note);
+        }
+    }
+}
+
 /// The controller's handle on the network thread, which starts with the first command.
 pub(crate) struct SharingNetwork {
+    notes: Arc<NetworkNotes>,
     launch: Launch,
     threads: Mutex<Threads>,
     shutdown: Arc<AtomicBool>,
@@ -329,10 +371,25 @@ impl SharingNetwork {
                     .name(NETWORK_THREAD.into())
                     .spawn(move || run_thread(make(), incoming, to_self, flags, shutdown))
             }),
+            notes: Arc::default(),
             threads: Mutex::default(),
             shutdown: Arc::default(),
             plan: Mutex::default(),
         }
+    }
+
+    /// Whether the app handed over the saved network's memo yet.
+    pub(crate) fn knows_network(&self) -> bool {
+        lock(&self.notes.known).is_some()
+    }
+
+    pub(crate) fn know_network(&self, memo: Option<NetworkMemo>) {
+        *lock(&self.notes.known) = Some(memo);
+    }
+
+    /// Everything learned about the saved network since the last call, oldest first.
+    pub(crate) fn take_network_notes(&self) -> Vec<NetworkNote> {
+        std::mem::take(&mut *lock(&self.notes.heard))
     }
 
     /// Sends `command`, starting the thread first when none runs. False once shut down or when
@@ -348,7 +405,10 @@ impl SharingNetwork {
                 return false;
             }
             let (commands, incoming) = mpsc::unbounded_channel();
-            let flags = Arc::new(Flags::default());
+            let flags = Arc::new(Flags {
+                notes: Arc::clone(&self.notes),
+                ..Flags::default()
+            });
             let launched = (self.launch)(
                 incoming,
                 commands.clone(),
@@ -495,7 +555,7 @@ pub(crate) trait ShareHubPort: 'static {
 
     fn bind(
         &self,
-        interface_id: &str,
+        saved: &SavedNetwork<'_>,
         members: &[GroupMemberRecord],
         cancel: &RevocationSignal,
     ) -> Result<Rc<Self::Endpoint>, SetupFailure>;
@@ -539,6 +599,21 @@ pub(crate) trait PortEndpoint: 'static {
     fn close_member(&self, member: CertificateFingerprint);
 
     fn forget(&self, member: CertificateFingerprint);
+
+    /// The saved network as the bind found it; None for an endpoint that does not say.
+    fn network(&self) -> Option<ResolvedNetwork> {
+        None
+    }
+
+    /// Members proven and saved at a new address, once.
+    fn take_moves(&self) -> Option<UnboundedReceiver<MemberMoved>> {
+        None
+    }
+
+    /// Members still owed a knock, for the endpoint that replaces this one.
+    fn knocking(&self) -> Vec<CertificateFingerprint> {
+        Vec::new()
+    }
 
     /// Every other handle must be gone first.
     async fn retire(self: Rc<Self>);
@@ -594,11 +669,11 @@ impl ShareHubPort for TransportPort {
 
     fn bind(
         &self,
-        interface_id: &str,
+        saved: &SavedNetwork<'_>,
         members: &[GroupMemberRecord],
         cancel: &RevocationSignal,
     ) -> Result<Rc<GroupEndpoint>, SetupFailure> {
-        GroupEndpoint::bind(interface_id, members, cancel)
+        GroupEndpoint::bind(saved, members, cancel)
     }
 
     fn start_hub(
@@ -667,6 +742,18 @@ impl PortEndpoint for GroupEndpoint {
 
     fn forget(&self, member: CertificateFingerprint) {
         Self::forget(self, member);
+    }
+
+    fn network(&self) -> Option<ResolvedNetwork> {
+        Some(Self::network(self).clone())
+    }
+
+    fn take_moves(&self) -> Option<UnboundedReceiver<MemberMoved>> {
+        Self::take_moves(self)
+    }
+
+    fn knocking(&self) -> Vec<CertificateFingerprint> {
+        Self::knocking(self)
     }
 
     async fn retire(self: Rc<Self>) {
@@ -777,10 +864,16 @@ struct Net<P: ShareHubPort> {
     native_started: bool,
     /// By lowercase fingerprint.
     members: BTreeMap<String, Member<P::Attachment>>,
+    /// Members a retired endpoint still owed a knock, for the next bind.
+    owed_knocks: Vec<CertificateFingerprint>,
 }
 
 struct Bound<E> {
     endpoint: Rc<E>,
+    /// The saved id the bind was asked for; requests naming it keep using this endpoint after
+    /// the adapter was followed to a new address.
+    requested: String,
+    /// The id the adapter answers to now.
     interface_id: String,
     /// The group members the bind named, which won their recorded addresses over other records.
     named: Vec<CertificateFingerprint>,
@@ -896,6 +989,7 @@ async fn run_network<P: ShareHubPort>(
         hub_ended: Rc::new(Notify::new()),
         native_started: false,
         members: BTreeMap::new(),
+        owed_knocks: Vec::new(),
     }));
     while let Some(command) = incoming.recv().await {
         let counted = !matches!(command, Command::Tick);
@@ -1021,7 +1115,8 @@ async fn ensure_endpoint<P: ShareHubPort>(
                 );
             }
             (
-                same_network(&bound.interface_id, interface_id)
+                (same_network(&bound.interface_id, interface_id)
+                    || same_network(&bound.requested, interface_id))
                     && !bound.endpoint.revocation().is_stopping()
                     && !left_out,
                 Rc::clone(&bound.endpoint),
@@ -1031,8 +1126,10 @@ async fn ensure_endpoint<P: ShareHubPort>(
     match current {
         Some((true, endpoint)) => return Ok(endpoint),
         Some((false, endpoint)) => {
+            let owed = endpoint.knocking();
             drop(endpoint);
             teardown(net).await;
+            net.borrow_mut().owed_knocks = owed;
         }
         None => {}
     }
@@ -1042,14 +1139,39 @@ async fn ensure_endpoint<P: ShareHubPort>(
         .as_ref()
         .map(GroupPlan::member_controls)
         .unwrap_or_default();
+    let notes = Arc::clone(&state.flags.notes);
+    let digest = notes.digest_for(interface_id);
+    let saved = SavedNetwork {
+        interface_id,
+        digest: digest.as_deref(),
+        knocking: &state.owed_knocks,
+    };
     let endpoint = state
         .port
-        .bind(interface_id, &members, &RevocationSignal::default())?;
+        .bind(&saved, &members, &RevocationSignal::default())?;
     drop(state);
+    let network = endpoint.network();
+    if let Some(network) = network.clone() {
+        notes.hear(NetworkNote::Resolved {
+            requested: interface_id.to_owned(),
+            network,
+        });
+    }
+    if let Some(mut moves) = endpoint.take_moves() {
+        let notes = Arc::clone(&notes);
+        tokio::task::spawn_local(async move {
+            while let Some(moved) = moves.recv().await {
+                notes.hear(NetworkNote::Moved(moved));
+            }
+        });
+    }
     let mut state = net.borrow_mut();
+    state.owed_knocks.clear();
     state.endpoint = Some(Bound {
         endpoint: Rc::clone(&endpoint),
-        interface_id: interface_id.to_owned(),
+        requested: interface_id.to_owned(),
+        interface_id: network
+            .map_or_else(|| interface_id.to_owned(), |network| network.interface_id),
         named: members.iter().map(|member| member.fingerprint).collect(),
     });
     state.flags.bound.store(true, Ordering::Release);
@@ -1793,7 +1915,7 @@ mod tests {
 
         fn bind(
             &self,
-            _interface_id: &str,
+            _saved: &SavedNetwork<'_>,
             members: &[GroupMemberRecord],
             _cancel: &RevocationSignal,
         ) -> Result<Rc<FakeEndpoint>, SetupFailure> {

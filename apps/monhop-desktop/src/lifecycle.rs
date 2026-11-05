@@ -9,7 +9,8 @@ use std::{
 
 use monhop_transport::{
     crypto::CertificateFingerprint,
-    session_setup::{DisplayTopology, InspectedPeer, same_network},
+    guarded_endpoint::MemberMoved,
+    session_setup::{DisplayTopology, InspectedPeer, ResolvedNetwork, same_network},
 };
 
 use crate::{
@@ -22,8 +23,9 @@ use crate::{
         ARRANGEMENTS_FILE, DisplayNotice, LayoutRequest, PAUSED, SWITCHING_COMPUTER, SessionPlan,
         SharingController, SharingView, current_local_displays, local_platform, still_unsettled,
     },
+    sharing_hub::NetworkNote,
     sharing_preferences::{
-        DisplayGeometry, SetupFile, fingerprint_key, local_decides, parse_fingerprint,
+        DisplayGeometry, NetworkMemo, SetupFile, fingerprint_key, local_decides, parse_fingerprint,
     },
 };
 
@@ -605,6 +607,7 @@ impl AppController {
         let Ok(path) = self.setup_path() else {
             return;
         };
+        self.record_network_notes(&path);
         self.watch_local_displays(&path);
         if lock(&self.sharing_retry_after).is_some_and(|until| Instant::now() < until) {
             return;
@@ -618,6 +621,70 @@ impl AppController {
                 self.sharing.note_supervisor_failure(message);
             }
         }
+    }
+
+    /// Saves what the network thread learned: which network the saved one is, the adapter
+    /// followed to a new address on it, and paired computers proven at new addresses.
+    fn record_network_notes(&self, path: &Path) {
+        let network = self.sharing.network();
+        if !network.knows_network() {
+            network.know_network(NetworkMemo::load(path));
+        }
+        for note in network.take_network_notes() {
+            let recorded = match note {
+                NetworkNote::Resolved { requested, network } => {
+                    self.record_network(path, &requested, network)
+                }
+                NetworkNote::Moved(moved) => self.record_move(moved),
+            };
+            if let Err(message) = recorded {
+                log::warn!("supervisor: {message}");
+            }
+        }
+    }
+
+    fn record_network(
+        &self,
+        path: &Path,
+        requested: &str,
+        resolved: ResolvedNetwork,
+    ) -> Result<(), String> {
+        // The setup file names the new id before the memo does, so a failed save never leaves a
+        // memo the saved id no longer matches.
+        if let Some(from) = resolved.followed_from {
+            let file = self.cached_setup(path, SETUP_UNREADABLE)?;
+            if file.interface_id() != Some(requested) {
+                return Ok(());
+            }
+            self.sharing
+                .update_setup_file(path, |file| file.set_interface_id(&resolved.interface_id))?;
+            log::info!("supervisor: saved the selected network's new address in place of {from}");
+        }
+        let memo = NetworkMemo {
+            interface_id: resolved.interface_id,
+            digest: resolved.digest,
+        };
+        if NetworkMemo::load(path).as_ref() != Some(&memo) {
+            memo.save(path)
+                .map_err(|_| "the network sharing uses could not be recorded".to_owned())?;
+        }
+        self.sharing.network().know_network(Some(memo));
+        Ok(())
+    }
+
+    fn record_move(&self, moved: MemberMoved) -> Result<(), String> {
+        let list_path = self.list_path()?;
+        let mut list = ComputerList::load(&list_path)?;
+        if list.readdress(moved.member, moved.to) {
+            list.save(&list_path)?;
+            self.sharing.note_computer_moved();
+        }
+        log::info!(
+            "supervisor: a paired computer moved from {} to {}",
+            moved.from,
+            moved.to
+        );
+        Ok(())
     }
 
     /// Ok(None) means nothing to do: no enabled computer, or another action owns input or the

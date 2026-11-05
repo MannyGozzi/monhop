@@ -15,14 +15,14 @@ use tokio::{runtime::Handle, task::AbortHandle};
 use crate::{
     policy::{
         InterfaceKind, InterfaceSnapshot, NetworkLock, PeerRoute, PolicyError, RouteSnapshot,
-        validate_interface, validate_peer,
+        validate_interface, validate_peer, validate_route,
     },
     session_health::HOLD_LIMIT,
 };
 
 #[cfg(target_os = "macos")]
 use super::NetworkSelection;
-use super::{ListenSelection, PinnedNetwork, RouteCheckFailure, socket::Reachability};
+use super::{ListenSelection, PinnedNetwork, Relocation, RouteCheckFailure, socket::Reachability};
 
 #[cfg(target_os = "macos")]
 use monhop_platform_macos::{
@@ -93,6 +93,8 @@ pub(super) struct PreparedNetwork {
     pub watch: Watch,
     /// The watch's own check, for the readmission timer to rerun.
     pub check: SharedCheck,
+    /// Moves a member that proved itself at a new address in the lock the watch revalidates.
+    pub relocation: Arc<dyn Relocation>,
 }
 
 struct PreparedSelection {
@@ -102,6 +104,7 @@ struct PreparedSelection {
     signal: RevocationSignal,
     watch: Watch,
     check: SharedCheck,
+    watched: PinnedLock,
 }
 
 pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
@@ -112,6 +115,7 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
         signal,
         watch,
         check,
+        watched,
     } = prepare_selection(pinned, None)?;
 
     require_active(&signal, None)?;
@@ -139,6 +143,7 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
         signal,
         watch,
         check,
+        relocation: Arc::new(LockRelocation(watched)),
     })
 }
 
@@ -269,6 +274,7 @@ fn prepare_selection(
     let reachability = Reachability::new(pinned.peers.len());
     let watched: PinnedLock = Arc::new(Watched {
         lock: Mutex::new(None),
+        reads: Mutex::new(()),
         reachability: reachability.clone(),
         ended: OnceLock::new(),
     });
@@ -297,6 +303,7 @@ fn prepare_selection(
         signal,
         watch,
         check,
+        watched,
     })
 }
 
@@ -467,11 +474,68 @@ fn enumerate_initial() -> io::Result<Vec<Adapter>> {
 /// watch's revocation, known once the watch has started, which cuts short a check's rereads.
 struct Watched {
     lock: Mutex<Option<NetworkLock>>,
+    /// Held across each whole read and its verdict, and across a member's move, so a read never
+    /// judges routes for peers a move replaced while it ran.
+    reads: Mutex<()>,
     reachability: Arc<Reachability>,
     ended: OnceLock<RevocationSignal>,
 }
 
 type PinnedLock = Arc<Watched>;
+
+impl Watched {
+    /// The lock's peers now, in member order; None before the first snapshot.
+    fn peers(&self) -> Option<Vec<Ipv4Addr>> {
+        self.lock
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|lock| lock.peers().to_vec())
+    }
+
+    fn selected(&self) -> io::Result<InterfaceSnapshot> {
+        self.lock
+            .lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::Other))?
+            .as_ref()
+            .filter(|lock| !lock.is_revoked())
+            .map(|lock| lock.selected().clone())
+            .ok_or_else(|| policy_category(PolicyError::SessionClosed))
+    }
+}
+
+/// The bound lock's own relocation: routes read through the selected adapter, and moves made in
+/// the lock every network check revalidates.
+struct LockRelocation(PinnedLock);
+
+impl Relocation for LockRelocation {
+    fn route_holds(&self, peer: Ipv4Addr) -> io::Result<()> {
+        let selected = self.0.selected()?;
+        validate_peer(&selected, peer).map_err(policy_category)?;
+        let route = route_snapshot(&selected, peer)?;
+        validate_route(&selected, route).map_err(policy_category)
+    }
+
+    fn move_member(&self, slot: usize, peer: Ipv4Addr) -> io::Result<()> {
+        let _read = self
+            .0
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut lock = self
+            .0
+            .lock
+            .lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+        let lock = lock
+            .as_mut()
+            .ok_or_else(|| policy_category(PolicyError::SessionClosed))?;
+        let route = route_snapshot(lock.selected(), peer)?;
+        lock.move_peer(slot, peer, route).map_err(policy_category)?;
+        self.0.reachability.set(lock.reachable());
+        Ok(())
+    }
+}
 
 /// The one check both the change watch and the readmission timer run; `false` revokes.
 pub(super) type SharedCheck = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -574,25 +638,26 @@ enum Settled {
 /// aside earlier is admitted again once its route is back.
 fn pinned_check(initial: &Adapter, pinned: &PinnedNetwork, watched: &PinnedLock) -> SharedCheck {
     let initial = initial.clone();
-    let pinned = pinned.clone();
+    let bound: Vec<Ipv4Addr> = pinned.peers.iter().map(|peer| *peer.ip()).collect();
+    let current = Arc::clone(watched);
     checking(watched, REREADS, SystemClock, move |deadline| {
-        observe_pinned(&initial, &pinned, deadline)
+        let peers = current.peers().unwrap_or_else(|| bound.clone());
+        observe_pinned(&initial, &peers, deadline)
     })
 }
 
 /// Its route lookups give up at `deadline`, this read's own.
 fn observe_pinned(
     initial: &Adapter,
-    pinned: &PinnedNetwork,
+    peers: &[Ipv4Addr],
     deadline: Instant,
 ) -> Result<Observed, Unread> {
     let current = read_selected(initial)?;
-    let sole = pinned.peers.len() == 1;
+    let sole = peers.len() == 1;
     let lookup = |selected: &InterfaceSnapshot, peer| route_snapshot_by(selected, peer, deadline);
-    let routes = pinned
-        .peers
+    let routes = peers
         .iter()
-        .map(|peer| Ok((*peer.ip(), read_route(&current, *peer.ip(), sole, lookup)?)))
+        .map(|peer| Ok((*peer, read_route(&current, *peer, sole, lookup)?)))
         .collect::<Result<PeerRoutes, Unread>>()?;
     Ok((current, routes))
 }
@@ -611,7 +676,13 @@ fn checking(
             rereads,
             &clock,
             || session_ended(&watched.ended),
-            |deadline| recheck(&watched, observe(deadline)),
+            |deadline| {
+                let _read = watched
+                    .reads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                recheck(&watched, observe(deadline))
+            },
         );
         concluded(settled, &watched.ended)
     })
@@ -1178,6 +1249,7 @@ mod tests {
         reachability.set(lock.reachable());
         Watched {
             lock: Mutex::new(Some(lock)),
+            reads: Mutex::new(()),
             reachability,
             ended: OnceLock::new(),
         }

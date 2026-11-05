@@ -99,6 +99,12 @@ At connection time:
 6. If the selected interface disappears or its network configuration materially changes, terminate the input session and fail closed.
 7. Never automatically fall back to another interface.
 
+When a DHCP lease gives an address a new value (macOS rotating the Wi-Fi hardware address does this), sharing recovers without pairing again, inside these limits:
+
+* A computer follows its own selected adapter (the same adapter) to a new address only when the network identity saved for it matches and the new address is on the saved subnet. Any other change is shown on the computer's card with both addresses, and pairing again is the fix.
+* After following, it sends one empty datagram from its new address to each paired computer it waits for. That datagram is dropped unread. It only prompts the other computer to dial the new address as a TLS client that accepts nothing but the exact pinned certificate of a computer it is waiting for. Limits: one such dial at a time, one new address per 2 seconds, and a failed address ignored for 30 seconds.
+* Only a proven certificate moves the recorded address, and only to an on-link private address no other paired computer holds, with a direct route through the selected interface. The pairing record keeps the same pin and is rewritten whole.
+
 This is specifically intended to prevent MonHop from suddenly using a VPN, another Wi-Fi network, WAN route, hotspot, etc.
 
 Provide an optional configuration such as:
