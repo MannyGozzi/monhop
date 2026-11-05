@@ -4,15 +4,17 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-11-05
+
+### Changed
+
+- Smoother motion on the arrangement screens. Done fades out after Apply instead of vanishing. The display area glides when the bottom bar changes height. The error line under the status fades in and out. Menus glide when they flip above or below a display. Changing labels no longer changes a button's width. With reduced motion turned on, every change is still instant.
+
 ### Fixed
 
 - Sharing now reconnects on its own when a computer's network address changes on the same network. A Mac on Wi-Fi can get a new address when macOS changes its private Wi-Fi address, and before, both computers kept trying the old address until you paired them again. Now the computer follows its own Wi-Fi or Ethernet adapter to the new address and lets the other computer know. The other computer connects back and uses the new address only after it confirms this is the same paired computer, and the pairing keeps the same identity. Both computers need this version.
 - A computer that cannot connect now says why instead of showing Connecting forever. Its card reads Needs attention when this computer's selected adapter is off or unplugged, or when its address changed in a way MonHop does not follow, such as joining another network. That card names both addresses and asks you to pair again. It reads Not answering when the other computer has not answered for 2 minutes.
 - On the arrangement screen right after pairing, the buttons under the displays and the menu that opens when you click a display work again. Before, every click was undone at once.
-
-### Changed
-
-- Smoother motion on the arrangement screens. Done fades out after Apply instead of vanishing. The display area glides when the bottom bar changes height. The error line under the status fades in and out. Menus glide when they flip above or below a display. Changing labels no longer changes a button's width. With reduced motion turned on, every change is still instant.
 
 ## [0.2.19] - 2026-11-04
 
@@ -393,7 +395,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.19...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.20...HEAD
+[0.2.20]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.20
 [0.2.19]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.19
 [0.2.18]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.18
 [0.2.17]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.17
