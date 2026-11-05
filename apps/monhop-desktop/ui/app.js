@@ -146,6 +146,7 @@ import {
   sameSelection,
   selectionFromKey,
   selectionKey,
+  settleArrange,
   sidebarRows,
   toolbarState,
 } from "./studio-model.mjs";
@@ -919,14 +920,18 @@ function render() {
   // The canvas hands back the same editor across polls; only a view it dropped is torn down.
   const previousArrangementView = arrangementView;
   arrangementView = null;
-  // The arrange request has done its job once the backend reports the edit.
-  if (arrangeRequested && isEditingLayout(sharing)) arrangeRequested = false;
-  // An edit that ended any other way, an Apply included, keeps the computer switched on and takes
-  // its menu with it.
-  if (!arrangeRequested && !isEditingLayout(sharing)) {
-    arrangeSwitchedOn = null;
-    canvasMenu = null;
-  }
+  // An edit that ended any other way, an Apply included, keeps the computer switched on.
+  ({
+    requested: arrangeRequested,
+    switchedOn: arrangeSwitchedOn,
+    menu: canvasMenu,
+  } = settleArrange({
+    connected: isConnected(sharing),
+    editing: isEditingLayout(sharing),
+    requested: arrangeRequested,
+    switchedOn: arrangeSwitchedOn,
+    menu: canvasMenu,
+  }));
   settleLoadOnConnect();
   lastActive = activeFingerprint() ?? lastActive;
   const ctx = context();

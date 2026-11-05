@@ -23,7 +23,9 @@ import {
   createSeamPreview,
   createTilePaint,
   labelBoxes,
+  GLIDE_MOTION,
   matrixOf,
+  SPRING_MOTION,
   seamPlaces,
   tileMarks,
   refineText,
@@ -251,6 +253,9 @@ export function createArrangementView(options) {
   // A drag just ended: the next render carries each group and its crossings from where they show,
   // and a crossing on the dropped group rides with it rather than with the group it lands against.
   let landing = false;
+  // What that carry moves on, and the stage foot's slide with the Apply bar.
+  let landingMotion = SPRING_MOTION;
+  let footSlides = [];
   let dropped = null;
   let groupLayer = null;
   // Each group's running spring to its place, cancelled when a new one starts or the group lifts.
@@ -515,7 +520,7 @@ export function createArrangementView(options) {
     seams.hide(false);
     // A first drawing appears with its view; a crossing new to a later one fades in where it lands.
     if (drawnFor) for (const seamKey of entered) seams.appear(seamKey);
-    if (drawn) flipGroups(drawn, { rebuilt: !sameSet });
+    if (drawn) flipGroups(drawn, { rebuilt: !sameSet, timing: landingMotion });
     rendered = { shape, scale: transform.scale, disabled };
     drawnFor = { content, size, transform };
     refineText(svg);
@@ -524,6 +529,18 @@ export function createArrangementView(options) {
     if (!disabled && focused)
       svg.querySelector(`[data-focus-key="${focused}"]`)?.focus({ preventScroll: true });
     handlers.onScene?.();
+  }
+
+  // The legend and the cabled monitors' row sit on the stage's foot, which moved with the bar, so
+  // they slide from where they were drawn as the bar does; a new slide takes over from the last.
+  function slideFoot(shift) {
+    for (const slide of footSlides) slide.cancel();
+    footSlides = [];
+    if (!shift || !motionEnabled()) return;
+    const timing = { duration: motionMs(GLIDE_MOTION[0]), easing: motionEase(GLIDE_MOTION[1]) };
+    footSlides = [legend, sharedPanel].map((node) =>
+      node.animate({ translate: [`0 ${shift}px`, "0 0"] }, timing),
+    );
   }
 
   function markSelected() {
@@ -565,7 +582,7 @@ export function createArrangementView(options) {
   // they had. Each crossing rides with a group that moves, from where that group shows it. The spring
   // animates the CSS transform over the group's translate attribute, already at its place: WebKit
   // never transitions that attribute itself.
-  function flipGroups(drawn, { rebuilt }) {
+  function flipGroups(drawn, { rebuilt, timing }) {
     const starts = [];
     const lifted = [];
     const entering = [];
@@ -578,7 +595,11 @@ export function createArrangementView(options) {
           !resting(drawn[key], rects.groups[key]),
       );
       if (groupKey)
-        seams.glide(place.key, carriedPlace(place, drawn[groupKey], rects.groups[groupKey]));
+        seams.glide(
+          place.key,
+          carriedPlace(place, drawn[groupKey], rects.groups[groupKey]),
+          timing,
+        );
     }
     for (const [groupKey, node] of Object.entries(nodes)) {
       const from = drawn[groupKey];
@@ -615,7 +636,7 @@ export function createArrangementView(options) {
         node,
         node.animate(
           { transform: [start, `translate(${to.x}px, ${to.y}px)`] },
-          { duration: motionMs("--motion-spring"), easing: motionEase("--ease-spring") },
+          { duration: motionMs(timing[0]), easing: motionEase(timing[1]) },
         ),
       );
     }
@@ -1012,13 +1033,20 @@ export function createArrangementView(options) {
       }
       renderScene();
     },
-    // The stage changed size in one step: the drawing glides to its new fit from where it shows,
-    // instead of holding until the resize watch settles.
-    restage() {
+    // The stage changed size in one step under the Apply bar, which slides `shift` px to its new
+    // place: the drawing glides to its new fit from where it shows, on the bar's motion, instead of
+    // holding until the resize watch settles, and what sits on the stage's foot rides with the bar.
+    restage(shift = 0) {
       if (destroyed || drag || !drawnFor) return;
       observed = null;
       landing = true;
-      renderScene();
+      landingMotion = GLIDE_MOTION;
+      try {
+        renderScene();
+      } finally {
+        landingMotion = SPRING_MOTION;
+      }
+      slideFoot(shift);
     },
     // Where a display rests on screen, its group's glide aside, for a menu to point at; null once
     // it is out of the picture.

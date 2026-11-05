@@ -9,6 +9,10 @@ import {
 import { icon } from "./icons.mjs";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
+// The motion tokens a drawing moves on: a drop or refit springs; a restage under the Apply bar
+// glides with the bar.
+export const SPRING_MOTION = Object.freeze(["--motion-spring", "--ease-spring"]);
+export const GLIDE_MOTION = Object.freeze(["--motion-slow", "--ease-glide"]);
 // The fonts text is measured with; studio-canvas.css draws it with the same families and weights.
 const FAMILY =
   '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable", "Segoe UI", ui-sans-serif, sans-serif';
@@ -466,13 +470,14 @@ export function createSeamOverlay(motion = null) {
         );
   }
 
-  // A crossing starts where `start` puts it and springs to its place, as the group under it does.
-  // The glide ends on the node's own transform, so a place laid mid-glide becomes its new target.
-  function glide(key, start) {
+  // A crossing starts where `start` puts it and moves to its place as the group under it does,
+  // springing unless told otherwise. The glide ends on the node's own transform, so a place laid
+  // mid-glide becomes its new target.
+  function glide(key, start, [ms, ease] = SPRING_MOTION) {
     const seam = shown.get(key);
     if (!seam || !moving()) return [];
     for (const animation of seam.glides) animation.cancel();
-    const timing = { duration: motion.ms("--motion-spring"), easing: motion.ease("--ease-spring") };
+    const timing = { duration: motion.ms(ms), easing: motion.ease(ease) };
     const along = start.length / Math.max(1e-6, seam.place.length);
     const scale = seam.place.axis === "v" ? [1, along] : [along, 1];
     const starts = [

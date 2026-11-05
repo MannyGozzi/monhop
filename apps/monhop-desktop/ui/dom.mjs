@@ -579,6 +579,11 @@ export function swap(key, node, signature, { block = false, scale = true } = {})
   return wrapper;
 }
 
+// A keyed swap whose container was put away starts over, with nothing left to fade out.
+export function forgetSwap(key) {
+  motionMemory.delete(key);
+}
+
 // Read only while its own enter runs: asking the node for its animations would force a layout.
 function drawnMidEnter(live) {
   if (!live?.node.isConnected || live.enter.playState !== "running") return null;

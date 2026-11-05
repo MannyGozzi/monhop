@@ -143,6 +143,12 @@ export function presence(key, node) {
   return panel;
 }
 
+// A keyed block whose container was put away starts over: the next call draws it fresh, without
+// replaying what it showed before.
+export function forgetPresence(key) {
+  presences.delete(key);
+}
+
 // Opens or closes each presence panel once it is in the page and can be measured, before it paints.
 function placeLater(panel, open) {
   if (!unplaced.length) queueMicrotask(placePanels);

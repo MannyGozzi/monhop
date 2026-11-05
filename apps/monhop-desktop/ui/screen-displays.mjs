@@ -23,9 +23,10 @@ import { createArrangementView } from "./arrangement-view.mjs";
 import { membersFromOptions } from "./arrangement-view-model.mjs";
 import { createCanvasMenu, createDisplaysPage, createSavedPage } from "./canvas-menus.mjs";
 import { displayOwner, displaySections } from "./canvas-menus-model.mjs";
-import { watchSize } from "./arrangement-render.mjs";
+import { GLIDE_MOTION, watchSize } from "./arrangement-render.mjs";
 import { newestFirst, resolveEnabledList } from "./computer-card-model.mjs";
-import { presence } from "./accordion.mjs";
+import { leaveSlot } from "./studio-model.mjs";
+import { forgetPresence, presence } from "./accordion.mjs";
 import { moved } from "./glide-model.mjs";
 import { createDashboardArrangement, createLocalPicture } from "./dashboard-arrangement.mjs";
 import { UPDATE_READY_NOTE, canInstall, installHint } from "./updates-model.mjs";
@@ -36,6 +37,7 @@ import {
   clear,
   copyAnimation,
   el,
+  forgetSwap,
   icon,
   motionEase,
   motionEnabled,
@@ -47,6 +49,7 @@ import {
   sinceChanged,
   stableLabel,
   stateCard,
+  swap,
 } from "./dom.mjs";
 
 // The picture's motion runs on the same tokens and helpers as every other UI motion.
@@ -72,22 +75,32 @@ let escapePlatform = null;
 let dockBar = null;
 let dockHeight = 0;
 let dockSlide = null;
+// Where the bar's running slide is heading, in the pane's layout, which its slide does not move.
+let dockLaidTop = null;
+// Whether the bar keeps a place for its way out until it sinks (studio-model.mjs leaveSlot), and
+// the label it showed last, which it keeps while it fades.
+let leaveHeld = false;
+let leaveLabel = 1;
+// The bar's controls still gliding to where the last render put them.
+let controlGlides = [];
 // A bar rewritten this render, not measured yet: whether it was up already, and where it was drawn.
 let dockPending = null;
 let canvasStage = null;
 // What the last frame drew, read before the render writes anything, so reading it forces no layout.
 let drawn = null;
 
-// Call first in a render: where the view and the Apply bar were drawn, and how opaque the view was.
+// Call first in a render: where the view, the Apply bar and its controls were drawn, and how opaque
+// the view was.
 export function captureCanvas() {
   const element = shown?.element?.isConnected ? shown.element : null;
   const motion = motionEnabled();
+  const dockShown = motion && dockBar?.dataset.shown === "true";
   drawn = {
     element,
     box: element && motion ? { width: element.offsetWidth, height: element.offsetHeight } : null,
     opacity: element && motion ? Number(getComputedStyle(element).opacity) : 0,
-    dockTop:
-      motion && dockBar?.dataset.shown === "true" ? dockBar.getBoundingClientRect().top : null,
+    dockTop: dockShown ? dockBar.getBoundingClientRect().top : null,
+    controls: dockShown ? controlOffsets(dockBar) : null,
   };
 }
 
@@ -159,36 +172,97 @@ function renderDock(dock, ctx, mode) {
   const bar = dockBar;
   const show = ctx.arrange.active;
   const was = bar.dataset.shown === "true";
+  const leave = leaveSlot({
+    active: show,
+    leavable: ctx.arrange.leavable,
+    applied: hasAppliedCurrentLayout(ctx.sharing),
+    held: leaveHeld,
+  });
+  leaveHeld = leave.holds;
   if (!show) {
     if (was) leaveDock(bar);
     dockPending = null;
     return;
   }
-  dockPending = { was, drawnTop: was ? (drawn?.dockTop ?? null) : null };
-  bar.replaceChildren(...applyBarParts(ctx, mode));
+  // A bar coming back starts clean: a note the last one showed is not replayed leaving.
+  if (!was) {
+    forgetPresence(NOTE_KEY);
+    forgetSwap(`${NOTE_KEY}-text`);
+  }
+  dockPending = {
+    was,
+    drawnTop: was ? (drawn?.dockTop ?? null) : null,
+    controls: was ? (drawn?.controls ?? null) : null,
+  };
+  bar.replaceChildren(...applyBarParts(ctx, mode, leave.slot));
   bar.dataset.shown = "true";
   bar.inert = false;
   bar.removeAttribute("aria-hidden");
 }
 
-// A new height slides the bar from where it was drawn; with `restage`, the view on the stage
-// refits: a picture from where it is drawn, the editor, which watches its own stage, at once.
+// A new height slides the bar from where it was drawn, and a slide still heading for the same
+// place carries on; with `restage`, the view on the stage refits: a picture from where it is
+// drawn, the editor with the bar, by the same slide.
 function settleDock({ restage }) {
   const pending = dockPending;
   if (!pending || !dockBar) return;
   dockPending = null;
-  dockSlide?.cancel();
-  dockSlide = null;
-  const box = dockBar.getBoundingClientRect();
-  const resized = pending.was && moved(box.height, dockHeight);
-  dockHeight = box.height;
-  if (pending.drawnTop !== null && moved(pending.drawnTop, box.top))
-    dockSlide = dockBar.animate(
-      { translate: [`0 ${pending.drawnTop - box.top}px`, "0 0"] },
-      { duration: motionMs("--motion-slow"), easing: motionEase("--ease-glide") },
-    );
-  if (restage && resized && shown?.element.isConnected)
-    (shown.restage ?? shown.refit)?.(stageSize(canvasStage));
+  const laidTop = dockBar.parentElement.offsetTop + dockBar.offsetTop;
+  const height = dockBar.offsetHeight;
+  const resized = pending.was && moved(height, dockHeight);
+  dockHeight = height;
+  const heading = dockSlide?.playState === "running" && !moved(laidTop, dockLaidTop ?? laidTop);
+  dockLaidTop = laidTop;
+  let shift = 0;
+  if (!heading) {
+    dockSlide?.cancel();
+    dockSlide = null;
+    const top = dockBar.getBoundingClientRect().top;
+    if (pending.drawnTop !== null && moved(pending.drawnTop, top)) {
+      shift = pending.drawnTop - top;
+      dockSlide = dockBar.animate(
+        { translate: [`0 ${shift}px`, "0 0"] },
+        { duration: motionMs(GLIDE_MOTION[0]), easing: motionEase(GLIDE_MOTION[1]) },
+      );
+    }
+  }
+  glideControls(pending.controls);
+  if (!restage || !resized || !shown?.element.isConnected) return;
+  if (shown.restage) shown.restage(shift);
+  else shown.refit?.(stageSize(canvasStage));
+}
+
+// Where each of the bar's controls is drawn, from the bar's own corner so the bar's slide does not
+// count, under what stays the same across renders: a rebuilt one's focus key, else the node the
+// editor keeps.
+function controlOffsets(bar) {
+  const origin = bar.getBoundingClientRect();
+  return new Map(
+    Array.from(bar.querySelectorAll(":is(.apply-bar-tools, .apply-bar-actions) button"), (node) => {
+      const box = node.getBoundingClientRect();
+      return [
+        node.dataset.focusKey ?? node,
+        { node, x: box.left - origin.left, y: box.top - origin.top },
+      ];
+    }),
+  );
+}
+
+// A control this render moved within the bar glides over from where it was drawn, and one new to a
+// bar already up fades in where it lands. Read after the bar's own slide starts, as the controls are.
+function glideControls(drawnAt) {
+  for (const glide of controlGlides) glide.cancel();
+  controlGlides = [];
+  if (!drawnAt) return;
+  const timing = { duration: motionMs("--motion-base"), easing: motionEase("--ease-glide") };
+  for (const [key, { node, x, y }] of controlOffsets(dockBar)) {
+    const from = drawnAt.get(key);
+    if (!from) controlGlides.push(node.animate({ opacity: [0, 1] }, timing));
+    else if (moved(from.x, x) || moved(from.y, y))
+      controlGlides.push(
+        node.animate({ translate: [`${from.x - x}px ${from.y - y}px`, "0 0"] }, timing),
+      );
+  }
 }
 
 // The bar keeps what it last showed while it sinks away, as a copy would, out of reach of focus.
@@ -781,7 +855,7 @@ function editView(ctx) {
       first?.mounted();
       first = null;
     },
-    restage: () => live?.editor.restage?.(),
+    restage: (shift) => live?.editor.restage?.(shift),
   };
 }
 
@@ -803,8 +877,8 @@ function resetControl({ sharing, actions, busy }) {
 
 // Apply and the way out, the editor's own Reset and Fit, and the saved arrangements and the
 // displays in use a press away in menus over the canvas.
-function applyBarParts(ctx, mode) {
-  const { sharing, actions, busy, arrange, canvasMenu } = ctx;
+function applyBarParts(ctx, mode, leave) {
+  const { sharing, canvasMenu } = ctx;
   const applying = sharing.pending?.kind === "apply" || isSyncing(sharing);
   const editing = mode === "edit";
   if (!sharing.view?.editing) draftChanged = false;
@@ -812,7 +886,7 @@ function applyBarParts(ctx, mode) {
     draftChanged = canResetArrangement(sharing);
   const toggles = editing
     ? [
-        menuToggle(ctx, "saved", savedLabel(sharing)),
+        menuToggle(ctx, "saved", "Saved arrangements", sharing.arrangements.length),
         Object.values(displayUseChoices(sharing)).some((list) => list.length)
           ? menuToggle(ctx, "use", "Displays in use")
           : null,
@@ -821,15 +895,7 @@ function applyBarParts(ctx, mode) {
   return [
     el("div", {
       className: "apply-bar-status",
-      children: [
-        editing
-          ? syncStatus(ctx, draftChanged)
-          : el("p", {
-              className: "progress-line",
-              text: "Sharing is paused while you arrange. Apply turns on once both computers connect.",
-            }),
-        sharing.message && editing ? note(sharing.message, "danger") : null,
-      ],
+      children: [statusCell(ctx, editing), noteLine(editing ? sharing.message : "")],
     }),
     // The tools wrap as one group and the way out as another, so Apply never strays from Done.
     el("div", {
@@ -842,26 +908,21 @@ function applyBarParts(ctx, mode) {
     el("div", {
       className: "apply-bar-actions",
       children: [
-        arrange.leavable ? leaveButton(ctx, applying) : null,
-        button(applying ? "Applying…" : "Apply on both computers", {
-          busy: applying,
-          size: "sm",
-          disabled: !editing || applying || busy || !canApplySetup(sharing),
-          focusKey: "displays-apply",
-          onClick: actions.applySetup,
-        }),
+        leave ? leaveButton(ctx, applying, leave === "gone") : null,
+        applyButton(ctx, editing, applying),
       ],
     }),
   ];
-  function menuToggle(context, kind, label) {
+  function menuToggle(context, kind, label, count = 0) {
     const open = canvasMenu?.kind === kind && !canvasMenu.display;
-    const toggle = button(label, {
+    const toggle = button("", {
       variant: "ghost",
       size: "sm",
       pressed: open,
       focusKey: `apply-bar-${kind}`,
       onClick: () => context.actions.toggleCanvasMenu(kind),
     });
+    toggle.append(el("span", { text: label, children: [count ? countLabel(kind, count) : null] }));
     toggle.classList.add("apply-bar-drawer-toggle");
     toggle.dataset.menuOpener = "true";
     toggle.setAttribute("aria-haspopup", "dialog");
@@ -879,24 +940,83 @@ function applyBarParts(ctx, mode) {
   }
 }
 
+// The count is read after the toggle is drawn, so it fades in instead of popping, across rebuilds.
+function countLabel(kind, count) {
+  const node = el("span", { className: "apply-bar-count", text: ` (${count})` });
+  const elapsed = sinceChanged(`apply-bar-${kind}-count`, count);
+  if (elapsed < motionMs("--motion-base")) {
+    node.dataset.enter = "true";
+    node.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+  }
+  return node;
+}
+
 // The only way out of arranging. Leaving keeps what both computers already run, so once the draft
 // differs from it the button says it discards; before the edit opens there is nothing to discard.
-function leaveButton({ sharing, actions, busy }, applying) {
-  const leave = button(sharing.view?.editing ? "" : "Cancel", {
+// An Apply that ends the edit leaves it `gone`: it fades out where it stands until the bar sinks.
+function leaveButton({ sharing, actions, busy }, applying, gone) {
+  const leave = button("", {
     variant: "ghost",
     size: "sm",
-    disabled: busy && !applying,
+    disabled: gone || (busy && !applying),
     focusKey: "apply-bar-leave",
     onClick: actions.leaveArrange,
   });
-  if (sharing.view?.editing)
-    leave.append(stableLabel("apply-bar-leave", LEAVE_LABELS, draftChanged ? 1 : 0));
+  if (!gone) leaveLabel = !sharing.view?.editing ? 0 : draftChanged ? 2 : 1;
+  leave.append(stableLabel("apply-bar-leave", LEAVE_LABELS, leaveLabel));
+  leave.dataset.gone = String(gone);
+  leave.inert = gone;
+  if (gone) leave.setAttribute("aria-hidden", "true");
+  // Rebuilt on every poll, so the fade carries on from when the edit ended.
+  const elapsed = sinceChanged("apply-bar-leave-gone", gone);
+  if (elapsed < motionMs("--motion-base")) {
+    leave.dataset.enter = "true";
+    leave.style.setProperty("--motion-delay", `${-Math.round(elapsed)}ms`);
+  }
   return leave;
 }
 
-function savedLabel(sharing) {
-  const count = sharing.arrangements.length;
-  return count ? `Saved arrangements (${count})` : "Saved arrangements";
+// The error under the status comes and goes by height and fade, and a new one cross-fades in.
+function noteLine(message) {
+  return presence(
+    NOTE_KEY,
+    message ? swap(`${NOTE_KEY}-text`, note(message, "danger"), message, { block: true }) : null,
+  );
+}
+
+function applyButton({ sharing, actions, busy }, editing, applying) {
+  const apply = button("", {
+    busy: applying,
+    size: "sm",
+    disabled: !editing || applying || busy || !canApplySetup(sharing),
+    focusKey: "displays-apply",
+    onClick: actions.applySetup,
+  });
+  apply.append(stableLabel("displays-apply", APPLY_LABELS, applying ? 1 : 0));
+  return apply;
+}
+
+// The status cross-fades between its states in one cell that keeps the height of the longest line
+// this mode can show, so a change of state never resizes the bar under the canvas.
+function statusCell(ctx, editing) {
+  const copy = editing ? [STATUS_COPY.unchanged, STATUS_COPY.moved] : [STATUS_COPY.waiting];
+  const line = editing
+    ? syncStatus(ctx, draftChanged)
+    : el("p", { className: "progress-line", text: STATUS_COPY.waiting });
+  return el("div", {
+    className: "apply-bar-sync",
+    children: [
+      ...copy.map((sentence) =>
+        el("p", {
+          className: "progress-line",
+          text: sentence,
+          dataset: { sizer: "true" },
+          attrs: { "aria-hidden": "true" },
+        }),
+      ),
+      swap("apply-bar-sync", line, line.textContent, { block: true }),
+    ],
+  });
 }
 
 // The overall state on the left, and the way to take input back, drawn as the keys to hold.
@@ -954,7 +1074,14 @@ let live = null;
 // Whether the draft differs from what both computers run. canResetArrangement reads false while a
 // command is in flight or the link is down, so its last answer stands until it can answer again.
 let draftChanged = false;
-const LEAVE_LABELS = ["Done", "Discard changes"];
+const LEAVE_LABELS = ["Cancel", "Done", "Discard changes"];
+const NOTE_KEY = "apply-bar-note";
+const APPLY_LABELS = ["Apply on both computers", "Applying…"];
+const STATUS_COPY = {
+  waiting: "Sharing is paused while you arrange. Apply turns on once both computers connect.",
+  unchanged: "Apply saves this arrangement on both computers.",
+  moved: "You moved displays. Apply to use this arrangement on both computers.",
+};
 
 // Today's exactly-two-computer options (`localPlatform`/`peerPlatform`/`localLabel`/`peerLabel`) for
 // up to two members, unchanged; past that the picture needs a member per computer, so this instead
@@ -1122,14 +1249,7 @@ function syncStatus(ctx, changed) {
         onClick: actions.applySetup,
       }),
     );
-  } else
-    line.append(
-      el("span", {
-        text: changed
-          ? "You moved displays. Apply to use this arrangement on both computers."
-          : "Apply saves this arrangement on both computers.",
-      }),
-    );
+  } else line.append(el("span", { text: changed ? STATUS_COPY.moved : STATUS_COPY.unchanged }));
   return line;
 }
 
@@ -1222,7 +1342,7 @@ function showDisplaysMenu(nodes, ctx, display, animate) {
   const members = membersFromOptions(liveOptions(ctx));
   const owner = display ? displayOwner(choices, display) : null;
   const scope = owner ?? "all";
-  const swap = menus.scope !== scope;
+  const rescoped = menus.scope !== scope;
   menus.scope = scope;
   const sections = displaySections({ choices, members, scope: owner, selected: display });
   menus.shell.show({
@@ -1235,13 +1355,18 @@ function showDisplaysMenu(nodes, ctx, display, animate) {
     prefer: owner ? "below" : "above",
     align: owner ? "center" : "start",
     openers: "[data-menu-opener], .arrangement-display",
-    swap,
+    swap: rescoped,
     returnFocus: () =>
       owner
         ? nodes.canvasStage.querySelector(`[data-focus-key="arrangement-group-${owner}"]`)
         : menuToggleOf(nodes, "use"),
     update: () =>
-      menus.displays.update({ sections, scoped: owner !== null, busy, animate: animate && !swap }),
+      menus.displays.update({
+        sections,
+        scoped: owner !== null,
+        busy,
+        animate: animate && !rescoped,
+      }),
   });
 }
 

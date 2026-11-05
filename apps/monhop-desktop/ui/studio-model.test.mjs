@@ -16,6 +16,7 @@ import {
   inspectorPresentation,
   isArrangeable,
   isPaused,
+  leaveSlot,
   localRowStatus,
   networkChip,
   networkMenuItems,
@@ -26,6 +27,7 @@ import {
   sameSelection,
   selectionFromKey,
   selectionKey,
+  settleArrange,
   sidebarRows,
   listStep,
   toolbarState,
@@ -242,6 +244,62 @@ test("arranging stays on while the link waits for Apply, and a click on the pict
   // The Apply bar's own button is the one way out, so a click on the editor never starts it again.
   for (const arrange of [arrangeState({ editing: true }), arrangeState({ requested: true })])
     assert.equal(isArrangeable({ ...canvas, arrange, canArrange: true }), false);
+});
+
+test("a menu over the canvas stays open on the standing link before the first Apply", () => {
+  const saved = { kind: "saved" };
+  const display = { kind: "use", display: "4294580720193276391" };
+  // Right after pairing the link is up with no edit opened, and the canvas arranges all the same.
+  for (const menu of [saved, { kind: "use" }, display])
+    assert.deepEqual(settleArrange({ connected: true, menu }), {
+      requested: false,
+      switchedOn: null,
+      menu,
+    });
+  // Arrange pressed, link still dialing: everything is held.
+  assert.deepEqual(settleArrange({ requested: true, switchedOn: "b", menu: saved }), {
+    requested: true,
+    switchedOn: "b",
+    menu: saved,
+  });
+  // The backend reports the edit: the request is spent, the rest stays.
+  assert.deepEqual(
+    settleArrange({
+      connected: true,
+      editing: true,
+      requested: true,
+      switchedOn: "b",
+      menu: saved,
+    }),
+    { requested: false, switchedOn: "b", menu: saved },
+  );
+  // Once nothing arranges, an Apply that closed the link included, the menu goes with it.
+  assert.deepEqual(settleArrange({ switchedOn: "b", menu: display }), {
+    requested: false,
+    switchedOn: null,
+    menu: null,
+  });
+});
+
+test("the way out keeps its place, faded, from an Apply until the bar sinks", () => {
+  // The standing link before the first Apply never offers one.
+  assert.deepEqual(leaveSlot({ active: true }), { holds: false, slot: null });
+  assert.deepEqual(leaveSlot({ active: true, applied: true }), { holds: false, slot: null });
+  // An edit the user opened shows it.
+  const open = leaveSlot({ active: true, leavable: true });
+  assert.deepEqual(open, { holds: true, slot: "live" });
+  // Apply ends the edit while the link is still up: the place stays, gone, render after render.
+  const applied = leaveSlot({ active: true, applied: true, held: open.holds });
+  assert.deepEqual(applied, { holds: true, slot: "gone" });
+  assert.equal(leaveSlot({ active: true, applied: true, held: applied.holds }).slot, "gone");
+  // Done on a link that stays up ends the edit without an Apply: the place goes with it.
+  assert.deepEqual(leaveSlot({ active: true, held: open.holds }), { holds: false, slot: null });
+  // The bar sinks, and one that comes back for a standing link starts without it.
+  const sunk = leaveSlot({ applied: true, held: applied.holds });
+  assert.deepEqual(sunk, { holds: false, slot: null });
+  assert.equal(leaveSlot({ active: true, applied: true, held: sunk.holds }).slot, null);
+  // Arranging again in the same bar brings it back live.
+  assert.equal(leaveSlot({ active: true, leavable: true, held: true }).slot, "live");
 });
 
 test("the toolbar titles the view and offers Start, Pause, Resume or nothing", () => {

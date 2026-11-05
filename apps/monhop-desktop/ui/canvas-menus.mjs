@@ -72,6 +72,8 @@ export function createCanvasMenu(pane, { onDismiss }) {
     root.dataset.kind = next.kind;
     surface.setAttribute("aria-label", next.label);
     if (!opening) {
+      // The room beside the new anchor bounds the content, so it is set before the glide measures.
+      fitRoom();
       glideSize(from);
       place();
       return;
@@ -95,9 +97,9 @@ export function createCanvasMenu(pane, { onDismiss }) {
   }
 
   // The anchor is read again on every call, so a display that moved takes the menu with it; one
-  // that left the picture keeps the menu where it last pointed.
-  function place({ jump = false } = {}) {
-    if (!open || !current) return;
+  // that left the picture keeps the menu where it last pointed. Returns the pane's box, or null
+  // while there is nothing to point at.
+  function fitRoom() {
     const paneBox = pane.getBoundingClientRect();
     const rect = current.anchor();
     if (rect && (rect.width || rect.height))
@@ -109,11 +111,18 @@ export function createCanvasMenu(pane, { onDismiss }) {
         width: rect.width,
         height: rect.height,
       };
-    if (!anchorBox) return;
-    const bounds = { left: 0, top: 0, right: paneBox.width, bottom: paneBox.height };
-    const room = Math.max(anchorBox.top, bounds.bottom - anchorBox.bottom) - MENU_GAP - MENU_INSET;
+    if (!anchorBox) return null;
+    const room = Math.max(anchorBox.top, paneBox.height - anchorBox.bottom) - MENU_GAP - MENU_INSET;
     root.style.setProperty("--canvas-menu-room", `${Math.max(Math.floor(room), 0)}px`);
     root.style.setProperty("--canvas-menu-fit", `${Math.max(paneBox.width - MENU_INSET * 2, 0)}px`);
+    return paneBox;
+  }
+
+  function place({ jump = false } = {}) {
+    if (!open || !current) return;
+    const paneBox = fitRoom();
+    if (!paneBox) return;
+    const bounds = { left: 0, top: 0, right: paneBox.width, bottom: paneBox.height };
     const box = measure();
     const spot = menuPlacement({
       anchor: anchorBox,
@@ -123,6 +132,7 @@ export function createCanvasMenu(pane, { onDismiss }) {
       align: current.align,
     });
     if (jump || !motionEnabled()) root.dataset.glide = "false";
+    else if (spot.side !== root.dataset.side && shown()) pivot(spot.side);
     root.dataset.side = spot.side;
     root.style.setProperty("--canvas-menu-x", `${spot.x}px`);
     root.style.setProperty(
@@ -134,6 +144,21 @@ export function createCanvasMenu(pane, { onDismiss }) {
       root.getBoundingClientRect();
       root.dataset.glide = "true";
     }
+  }
+
+  // The surface hangs from the point below its anchor and stands on the one above it, so turning to
+  // the other side first moves that point to the edge it is drawn from, without a glide; the glide
+  // then carries the surface from where it shows instead of flipping it by its own height.
+  function pivot(side) {
+    const [x, y = "0px"] = getComputedStyle(root).translate.split(" ");
+    const height = surface.offsetHeight;
+    const top = parseFloat(y) - (root.dataset.side === "above" ? height : 0);
+    root.dataset.glide = "false";
+    root.dataset.side = side;
+    root.style.setProperty("--canvas-menu-x", x === "none" ? "0px" : x);
+    root.style.setProperty("--canvas-menu-y", `${side === "above" ? top + height : top}px`);
+    root.getBoundingClientRect();
+    root.dataset.glide = "true";
   }
 
   // Content written all at once glides the surface from the size it showed, a glide still running

@@ -4,6 +4,14 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- On the arrangement screen right after pairing, the buttons under the displays and the menu that opens when you click a display work again. Before, every click was undone at once.
+
+### Changed
+
+- Smoother motion on the arrangement screens. Done fades out after Apply instead of vanishing. The display area glides when the bottom bar changes height. The error line under the status fades in and out. Menus glide when they flip above or below a display. Changing labels no longer changes a button's width. With reduced motion turned on, every change is still instant.
+
 ## [0.2.19] - 2026-11-04
 
 ### Added
