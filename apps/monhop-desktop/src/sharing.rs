@@ -254,6 +254,8 @@ pub(crate) struct PeerView {
     link_quality: Option<&'static str>,
     /// How long that link has been degraded or bad without a break, in ms; 0 while healthy.
     link_unsteady_ms: u64,
+    /// While a session runs, whether its link keeps dropping out on a regular beat.
+    link_hopping: bool,
     /// Set while the computer cannot connect for a reason its card names.
     notice: Option<NoticeView>,
 }
@@ -4526,6 +4528,7 @@ fn peer_views(state: &State, live: Option<bool>) -> Vec<PeerView> {
                 peer_arranging: peer.is_some_and(|peer| peer.peer_arranging),
                 link_quality: session.map(|stats| stats.link_quality.name()),
                 link_unsteady_ms: session.map_or(0, |stats| stats.unsteady_millis),
+                link_hopping: session.is_some_and(|stats| stats.radio_hopping),
                 notice: view.notice,
             }
         })
@@ -8297,6 +8300,7 @@ pub(crate) mod tests {
                 "held",
                 "lastFailure",
                 "link",
+                "linkHopping",
                 "linkQuality",
                 "linkUnsteadyMs",
                 "message",

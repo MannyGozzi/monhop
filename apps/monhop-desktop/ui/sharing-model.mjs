@@ -1345,6 +1345,7 @@ function normalizePeerView(value) {
       Number.isSafeInteger(source.linkUnsteadyMs) && source.linkUnsteadyMs >= 0
         ? source.linkUnsteadyMs
         : 0,
+    linkHopping: source.linkHopping === true,
   };
 }
 

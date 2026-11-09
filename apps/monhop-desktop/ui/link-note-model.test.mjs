@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AIRDROP_STUTTER_COPY } from "./airdrop-model.mjs";
+import { AIRDROP_STUTTER_COPY, UNIVERSAL_CONTROL_STUTTER_COPY } from "./airdrop-model.mjs";
 import {
   LINK_NOTE_AFTER_MS,
   WIFI_UNSTABLE_COPY,
+  WIFI_UNSTABLE_SLOWER_COPY,
   connectionUnstableCopy,
   linkWarning,
   networkNote,
@@ -18,7 +19,7 @@ test("a link degraded or bad for two seconds earns the note, a shorter stall doe
   for (const quality of ["degraded", "bad"]) {
     assert.equal(
       linkWarning(unsteady(quality, LINK_NOTE_AFTER_MS), wifi, "Office PC"),
-      WIFI_UNSTABLE_COPY,
+      WIFI_UNSTABLE_SLOWER_COPY,
     );
     assert.equal(linkWarning(unsteady(quality, LINK_NOTE_AFTER_MS - 1), wifi, "Office PC"), null);
   }
@@ -34,24 +35,41 @@ test("a steady, unknown or malformed link shows nothing", () => {
 });
 
 test("only a computer sharing over Wi-Fi blames its Wi-Fi; a wired one names the connection", () => {
-  assert.equal(linkWarning(unsteady("bad", 9000), wifi, "Office PC"), WIFI_UNSTABLE_COPY);
+  assert.equal(linkWarning(unsteady("bad", 9000), wifi, "Office PC"), WIFI_UNSTABLE_SLOWER_COPY);
   const wired = linkWarning(unsteady("bad", 9000), ethernet, "Office PC");
-  assert.equal(wired, connectionUnstableCopy("Office PC"));
+  assert.match(wired, /^The connection to Office PC looks unstable\. MonHop is sending/);
   assert.doesNotMatch(wired, /Wi-Fi/);
   assert.match(wired, /The connection to Office PC looks unstable/);
   assert.equal(linkWarning(unsteady("bad", 9000), null, "Office PC"), wired);
 });
 
-test("both notes say MonHop slows the pointer updates until the link steadies", () => {
-  for (const copy of [WIFI_UNSTABLE_COPY, connectionUnstableCopy("Studio Mac")]) {
-    assert.match(copy, /MonHop is sending pointer updates less often until it steadies\.$/);
+test("only a capped link says MonHop sends less often", () => {
+  for (const quality of ["degraded", "bad"]) {
+    for (const copy of [
+      linkWarning(unsteady(quality, 3000), wifi, "Studio Mac"),
+      linkWarning(unsteady(quality, 3000), ethernet, "Studio Mac"),
+    ]) {
+      assert.match(copy, /MonHop is sending pointer updates less often until it steadies\.$/);
+    }
   }
-  assert.match(WIFI_UNSTABLE_COPY, /^Wi-Fi looks unstable\./);
+  assert.equal(linkWarning(unsteady("healthy", 3000), wifi, "Studio Mac"), WIFI_UNSTABLE_COPY);
+  assert.equal(
+    linkWarning(unsteady("healthy", 3000), ethernet, "Studio Mac"),
+    connectionUnstableCopy("Studio Mac"),
+  );
+  assert.doesNotMatch(WIFI_UNSTABLE_COPY, /less often/);
 });
 
-test("AirDrop keeps priority, so a card shows one note at most", () => {
-  assert.equal(networkNote(AIRDROP_STUTTER_COPY, WIFI_UNSTABLE_COPY), AIRDROP_STUTTER_COPY);
-  assert.equal(networkNote(null, WIFI_UNSTABLE_COPY), WIFI_UNSTABLE_COPY);
-  assert.equal(networkNote(AIRDROP_STUTTER_COPY, null), AIRDROP_STUTTER_COPY);
-  assert.equal(networkNote(null, null), null);
+test("a card shows one note at most: AirDrop, then Universal Control, then the link", () => {
+  const universal = UNIVERSAL_CONTROL_STUTTER_COPY;
+  assert.equal(
+    networkNote(AIRDROP_STUTTER_COPY, universal, WIFI_UNSTABLE_COPY),
+    AIRDROP_STUTTER_COPY,
+  );
+  assert.equal(networkNote(AIRDROP_STUTTER_COPY, null, WIFI_UNSTABLE_COPY), AIRDROP_STUTTER_COPY);
+  assert.equal(networkNote(null, universal, WIFI_UNSTABLE_COPY), universal);
+  assert.equal(networkNote(null, universal, null), universal);
+  assert.equal(networkNote(null, null, WIFI_UNSTABLE_COPY), WIFI_UNSTABLE_COPY);
+  assert.equal(networkNote(AIRDROP_STUTTER_COPY, null, null), AIRDROP_STUTTER_COPY);
+  assert.equal(networkNote(null, null, null), null);
 });

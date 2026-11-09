@@ -23,7 +23,7 @@ use monhop_transport::session_health::{
     BARRIER_RESEND_AFTER, HOLD_LIMIT, HealthError, PEER_LIVENESS, RETREAT_AFTER,
     SUPPRESSION_LEASE_CAP,
 };
-use monhop_transport::session_quality::{DEGRADED_MARKS, LinkQuality};
+use monhop_transport::session_quality::{DEGRADED_DIVISOR, LinkQuality, MIN_HEARTBEATS};
 use monhop_transport::session_receiver::{
     DestinationAction, DestinationFailure, InputDestination, InputReceiver, ReceiverFailure,
 };
@@ -32,6 +32,9 @@ use monhop_transport::session_source::{
     PUSH_THROUGH_RECENT, PUSH_THROUGH_RESET, SourceController, SourceEffect, SourceFailure,
     SourceMode, SourceOutcome, TaggedInput,
 };
+
+/// Late heartbeats that degrade a link with nothing else in its window yet.
+const DEGRADING_REPLIES: usize = MIN_HEARTBEATS.div_ceil(DEGRADED_DIVISOR);
 
 fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
@@ -6326,7 +6329,7 @@ fn positions(outcome: &SourceOutcome) -> Vec<Point> {
 /// at most every 4 ms. Yields when the link turned degraded and the next peer heartbeat.
 fn controlling_over_a_degraded_link(source: &mut SourceController) -> (Duration, u64) {
     activate_remote(source);
-    let degraded = answer_challenges(source, ms(1), ms(35), DEGRADED_MARKS, 3);
+    let degraded = answer_challenges(source, ms(1), ms(35), DEGRADING_REPLIES, 3);
     assert_eq!(source.link_quality(), LinkQuality::Degraded);
     degraded
 }
@@ -6358,7 +6361,7 @@ fn motion_coalesced_on_a_degraded_link_lands_exactly_where_every_record_would_ha
     let run = |delay: Duration| {
         let mut source = source().with_pointer_speed(&SPEED);
         activate_remote(&mut source);
-        let (mut now, _) = answer_challenges(&mut source, ms(1), delay, DEGRADED_MARKS, 3);
+        let (mut now, _) = answer_challenges(&mut source, ms(1), delay, DEGRADING_REPLIES, 3);
         let quality = source.link_quality();
         let mut sent = Vec::new();
         for _ in 0..5 {
@@ -6550,7 +6553,7 @@ fn a_link_that_stays_clean_climbs_back_to_every_record_and_logs_each_change() {
     let (now, sequence) = controlling_over_a_degraded_link(&mut source);
     assert_eq!(
         logged(
-            "link quality for slot 1: healthy -> degraded, sending motion at most one every 4 ms (in the last 3000 ms: 10 replies, 0 unanswered, 10 late, 0 stalled, slowest 35 ms)"
+            "link quality for slot 1: healthy -> degraded, sending motion at most one every 4 ms (in the last 3000 ms: 11 replies, 0 unanswered, 11 late, 0 stalled, slowest 35 ms)"
         ),
         1
     );

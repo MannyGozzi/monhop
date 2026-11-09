@@ -4,6 +4,18 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Added
+
+- On a Mac sharing over Wi-Fi, the other computer's card now says when Universal Control is the likely reason Wi-Fi keeps pausing, and names the switch to turn off in System Settings. Universal Control can make a Mac's Wi-Fi leave its channel for a moment about twice a second, which freezes the pointer each time. The note appears only when the pauses keep a regular beat and Universal Control is on, and leaves within a few seconds of turning it off.
+
+### Changed
+
+- The note on a computer's card that says the connection looks unstable now mentions slower pointer updates only when MonHop is actually sending them less often.
+
+### Fixed
+
+- Brief, regular Wi-Fi pauses no longer slow the pointer. On a Mac whose Wi-Fi pauses for a moment about twice a second, MonHop used to send pointer updates as little as 125 times a second almost all the time, which looked choppy on a 120 Hz display and did nothing for the pauses. MonHop now lowers the rate only when a large share of updates are really arriving late.
+
 ## [0.2.20] - 2026-11-05
 
 ### Changed

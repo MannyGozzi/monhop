@@ -142,6 +142,9 @@ test("each computer's link quality survives normalizing and anything malformed r
   assert.equal(peer({ linkUnsteadyMs: -1 }).linkUnsteadyMs, 0);
   assert.equal(peer({ linkUnsteadyMs: 1.5 }).linkUnsteadyMs, 0);
   assert.equal(peer({ linkUnsteadyMs: "3000" }).linkUnsteadyMs, 0);
+  assert.equal(peer({ linkHopping: true }).linkHopping, true);
+  assert.equal(peer({ linkHopping: "true" }).linkHopping, false);
+  assert.equal(peer({}).linkHopping, false);
 });
 
 test("the view names which computer is live and which one is in use, in one case", () => {

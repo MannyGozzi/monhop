@@ -13,6 +13,7 @@ import { DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
 import { normalizeClipboardView } from "./clipboard-model.mjs";
 import { clipboardLine } from "./studio-model.mjs";
 import { inspectorHeader } from "./screen-ready.mjs";
+import { universalControlWarning } from "./airdrop-model.mjs";
 import { linkWarning, networkNote } from "./link-note-model.mjs";
 import { pairBadgeLabel } from "./pair-badge-model.mjs";
 import {
@@ -33,6 +34,7 @@ import {
   button,
   copyFeedbackControls,
   el,
+  forgetSwap,
   icon,
   motionMs,
   note,
@@ -276,16 +278,28 @@ function stateBlock(ctx, computer, { name, status, enabled, on, key }) {
   });
 }
 
-// AirDrop open to everyone keeps pausing the Wi-Fi this Mac shares over, and a link that keeps
-// stalling slows the pointer. Only a live session feels either, and one note at most shows; a change
-// between them cross-fades in place.
+// AirDrop open to everyone or Universal Control can keep pausing the Wi-Fi this Mac shares over, and
+// a link that keeps stalling slows the pointer. Only a live session feels any of them, and one note
+// at most shows; a change between them cross-fades in place.
 function networkLine(ctx, computer, { name, status, enabled, key }) {
-  if (!enabled || status.key !== "sharing") return null;
-  const peer = findPeer(ctx.sharing.view, computer.fingerprint);
-  const text = networkNote(ctx.airdropWarning, linkWarning(peer, ctx.network, name));
-  if (!text) return null;
+  const swapKey = `${key}-network-text`;
+  const text = enabled && status.key === "sharing" ? networkLineText(ctx, computer, name) : null;
+  if (!text) {
+    // The next note enters on its own, with no earlier one fading out over it.
+    forgetSwap(swapKey);
+    return null;
+  }
   const node = inlineNote(text, "warning", icon("triangle-alert"));
-  return swap(`${key}-network-text`, node, text, { block: true });
+  return swap(swapKey, node, text, { block: true });
+}
+
+function networkLineText(ctx, computer, name) {
+  const peer = findPeer(ctx.sharing.view, computer.fingerprint);
+  return networkNote(
+    ctx.airdropWarning,
+    universalControlWarning(ctx.platform, ctx.airdrop, ctx.network, peer),
+    linkWarning(peer, ctx.network, name),
+  );
 }
 
 // The kit's switch, lifted out of its row: the state above is its label, so the whole block is not

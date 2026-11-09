@@ -13,10 +13,19 @@ pub const STALLED_REPLY: Duration = Duration::from_millis(60);
 /// Evidence counts toward the link's tier for this long. One stall marks several heartbeats at
 /// once, so a short window would grade a single hiccup as a bad link.
 pub const QUALITY_WINDOW: Duration = Duration::from_secs(3);
-/// Late marks within the window that degrade a link: about one heartbeat in ten.
-pub const DEGRADED_MARKS: usize = 10;
-/// Stalled marks within the window that make a link bad: three 120 ms stalls or one of 300 ms.
-pub const BAD_MARKS: usize = 9;
+/// Late marks within the window that keep a run of trouble alive: about one heartbeat in ten.
+pub const UNSTEADY_LATE_MARKS: usize = 10;
+/// Stalled marks within the window that keep a run of trouble alive.
+pub const UNSTEADY_STALLED_MARKS: usize = 9;
+/// Shares of a window's heartbeats divide by at least this, so first replies cannot set a tier.
+pub const MIN_HEARTBEATS: usize = 33;
+/// One heartbeat in this many late or unanswered means the typical one queued: a link degrades.
+/// A radio away 14% of the time with clean replies between stays near one in ten.
+pub const DEGRADED_DIVISOR: usize = 3;
+/// One heartbeat in this many overdue or unanswered makes a link bad.
+pub const BAD_DIVISOR: usize = 2;
+/// Keeping a tier takes this much less of the share that earned it, so the line cannot flip it.
+pub const KEEP_DIVISOR: usize = 2;
 /// Quinn's packet loss over one judged span that counts as a late mark.
 pub const LATE_LOSS: f64 = 0.01;
 /// Quinn's packet loss over one judged span that counts as a stalled mark.
@@ -31,6 +40,22 @@ pub const UPGRADE_AFTER: Duration = Duration::from_secs(2);
 pub const DEGRADED_MOTION_INTERVAL: Duration = Duration::from_millis(4);
 /// The least time between two motion frames on a bad link: 125 Hz.
 pub const BAD_MOTION_INTERVAL: Duration = Duration::from_millis(8);
+
+/// Overdue challenges sent closer together than this are one absence of the radio.
+const HOP_SAME_ABSENCE: Duration = Duration::from_millis(200);
+/// Gaps between absence starts that count as a beat, around a peer-to-peer radio's 525 ms.
+const HOP_BEAT_MIN: Duration = Duration::from_millis(400);
+const HOP_BEAT_MAX: Duration = Duration::from_millis(700);
+/// How far a gap may differ from the one before it; heartbeats quantize absence starts to 30 ms.
+const HOP_GAP_TOLERANCE: Duration = Duration::from_millis(60);
+/// Absences in a row on the beat that make a train.
+const HOP_TRAIN: u32 = 6;
+/// One unbroken run this long is a schedule without waiting for a second train.
+const HOP_LONG_RUN: Duration = Duration::from_secs(20);
+/// A train starting this soon after the last train's final stall turns hopping on.
+const HOP_TRAIN_WINDOW: Duration = Duration::from_secs(300);
+/// Hopping stays on this long after a train stall, which bridges bursts 47 to 104 s apart.
+const HOP_HOLD: Duration = Duration::from_secs(120);
 
 /// Bounds memory if a caller feeds evidence faster than the window ages it out.
 const MAX_MARKS: usize = 256;
@@ -156,6 +181,10 @@ pub struct QualitySummary {
     pub late: usize,
     pub stalled: usize,
     pub slowest_reply: Duration,
+    /// Heartbeats answered late or not at all.
+    pub slow_beats: usize,
+    /// Heartbeats answered past STALLED_REPLY or not at all.
+    pub overdue_beats: usize,
     pub held: bool,
     /// The newest path sample's round trip and judged loss.
     pub path_rtt: Option<Duration>,
@@ -163,10 +192,26 @@ pub struct QualitySummary {
 }
 
 impl QualitySummary {
-    fn tier(&self) -> LinkQuality {
-        if self.held || self.stalled >= BAD_MARKS {
+    /// Whether the trouble marks still add up to a run; the card's note follows this.
+    fn unsteady(&self) -> bool {
+        self.held || self.stalled >= UNSTEADY_STALLED_MARKS || self.late >= UNSTEADY_LATE_MARKS
+    }
+
+    /// The tier these heartbeats call for at `current`. Only heartbeats count: quinn's samples
+    /// feed the unsteady run and the log, and a lower rate cannot help a radio that is away.
+    fn tier(&self, current: LinkQuality) -> LinkQuality {
+        let beats = (self.replies + self.unanswered).max(MIN_HEARTBEATS);
+        let reaches = |count: usize, divisor: usize, tier: LinkQuality| {
+            let divisor = if current >= tier {
+                divisor * KEEP_DIVISOR
+            } else {
+                divisor
+            };
+            count * divisor >= beats
+        };
+        if self.held || reaches(self.overdue_beats, BAD_DIVISOR, LinkQuality::Bad) {
             LinkQuality::Bad
-        } else if self.late >= DEGRADED_MARKS {
+        } else if reaches(self.slow_beats, DEGRADED_DIVISOR, LinkQuality::Degraded) {
             LinkQuality::Degraded
         } else {
             LinkQuality::Healthy
@@ -206,6 +251,75 @@ pub struct TierChange {
     pub summary: QualitySummary,
 }
 
+/// Finds a radio leaving its channel on a beat, from when overdue challenges were sent. It never
+/// feeds the tier, the rate or health, and each event is O(1) over these few times.
+#[derive(Debug, Default)]
+struct HopDetector {
+    last_overdue: Option<Duration>,
+    run_first: Duration,
+    run_last: Duration,
+    run_len: u32,
+    /// The run's latest gap; `None` until it has one.
+    run_gap: Option<Duration>,
+    /// The last stall of the most recent run that grew into a train and then broke.
+    last_train: Option<Duration>,
+    /// The stall that last turned hopping on or extended it; `None` while off.
+    last_hop: Option<Duration>,
+}
+
+impl HopDetector {
+    fn overdue(&mut self, sent: Duration) {
+        let previous = self.last_overdue;
+        // A reply can report an older send after a newer one.
+        self.last_overdue = previous.max(Some(sent));
+        if previous.is_none_or(|previous| sent.saturating_sub(previous) >= HOP_SAME_ABSENCE) {
+            self.absence(sent);
+        }
+    }
+
+    fn absence(&mut self, at: Duration) {
+        let gap = at.saturating_sub(self.run_last);
+        let on_beat = self.run_len > 0
+            && (HOP_BEAT_MIN..=HOP_BEAT_MAX).contains(&gap)
+            && self
+                .run_gap
+                .is_none_or(|previous| gap.abs_diff(previous) <= HOP_GAP_TOLERANCE);
+        if on_beat {
+            self.run_len = self.run_len.saturating_add(1);
+            self.run_gap = Some(gap);
+        } else {
+            if self.run_len >= HOP_TRAIN {
+                self.last_train = Some(self.run_last);
+            }
+            self.run_first = at;
+            self.run_len = 1;
+            self.run_gap = None;
+        }
+        self.run_last = at;
+        if self.run_len < HOP_TRAIN {
+            return;
+        }
+        let follows_a_train = self
+            .last_train
+            .is_some_and(|last| self.run_first.saturating_sub(last) <= HOP_TRAIN_WINDOW);
+        if self.last_hop.is_some()
+            || follows_a_train
+            || at.saturating_sub(self.run_first) >= HOP_LONG_RUN
+        {
+            self.last_hop = Some(at);
+        }
+    }
+
+    fn expire(&mut self, now: Duration) {
+        if self
+            .last_hop
+            .is_some_and(|last| now.saturating_sub(last) >= HOP_HOLD)
+        {
+            self.last_hop = None;
+        }
+    }
+}
+
 /// Downgrades as soon as the window's evidence reads worse than the tier, and climbs one tier at
 /// a time once it has read better for UPGRADE_AFTER. Every `now` is on the session clock.
 #[derive(Debug, Default)]
@@ -219,6 +333,7 @@ pub struct LinkMonitor {
     marks: VecDeque<(Duration, Evidence)>,
     /// The counters loss was last judged from.
     path_base: Option<PathSample>,
+    hops: HopDetector,
 }
 
 impl LinkMonitor {
@@ -231,6 +346,11 @@ impl LinkMonitor {
     pub fn unsteady_for(&self) -> Duration {
         self.trouble
             .map_or(Duration::ZERO, |(first, last)| last.saturating_sub(first))
+    }
+
+    /// The link keeps dropping out on a regular beat, as a radio leaving its channel does.
+    pub fn radio_hopping(&self) -> bool {
+        self.hops.last_hop.is_some()
     }
 
     pub fn challenge_sent(&mut self, token: u64, now: Duration) {
@@ -247,7 +367,11 @@ impl LinkMonitor {
             .iter()
             .position(|(sent, _)| *sent == token)?;
         let (_, sent) = self.challenges.remove(index)?;
-        self.mark(now, Evidence::Reply(now.saturating_sub(sent)));
+        let delay = now.saturating_sub(sent);
+        if delay >= STALLED_REPLY {
+            self.hops.overdue(sent);
+        }
+        self.mark(now, Evidence::Reply(delay));
         self.settle(now)
     }
 
@@ -287,8 +411,10 @@ impl LinkMonitor {
                 break;
             }
             self.challenges.pop_front();
+            self.hops.overdue(sent);
             self.mark(now, Evidence::Unanswered);
         }
+        self.hops.expire(now);
         self.settle(now)
     }
 
@@ -302,8 +428,14 @@ impl LinkMonitor {
                 Evidence::Reply(delay) => {
                     summary.replies += 1;
                     summary.slowest_reply = summary.slowest_reply.max(delay);
+                    summary.slow_beats += usize::from(severity >= Severity::Late);
+                    summary.overdue_beats += usize::from(severity == Severity::Stalled);
                 }
-                Evidence::Unanswered => summary.unanswered += 1,
+                Evidence::Unanswered => {
+                    summary.unanswered += 1;
+                    summary.slow_beats += 1;
+                    summary.overdue_beats += 1;
+                }
                 Evidence::Path { rtt, loss } => {
                     summary.path_rtt = Some(rtt);
                     summary.loss = loss.or(summary.loss);
@@ -334,10 +466,10 @@ impl LinkMonitor {
             self.marks.pop_front();
         }
         let summary = self.summary();
-        let evidence = summary.tier();
-        if evidence == LinkQuality::Healthy {
+        if !summary.unsteady() {
             self.trouble = None;
         }
+        let evidence = summary.tier(self.tier);
         let from = self.tier;
         if evidence > from {
             self.tier = evidence;
@@ -378,6 +510,16 @@ mod tests {
         from: Duration,
         delays: &[Option<u64>],
     ) -> Vec<(Duration, LinkQuality)> {
+        play_watching(monitor, first_token, from, delays, |_, _| {})
+    }
+
+    fn play_watching(
+        monitor: &mut LinkMonitor,
+        first_token: u64,
+        from: Duration,
+        delays: &[Option<u64>],
+        mut watch: impl FnMut(&LinkMonitor, Duration),
+    ) -> Vec<(Duration, LinkQuality)> {
         let mut replies: Vec<(Duration, u64)> = Vec::new();
         let mut changes = Vec::new();
         for elapsed in 0..=30 * delays.len() as u64 + 200 {
@@ -401,8 +543,25 @@ mod tests {
             if let Some(change) = monitor.tick(now) {
                 changes.push((now, change.to));
             }
+            watch(monitor, now);
         }
         changes
+    }
+
+    /// Plays a trace and also yields when the monitor first read as hopping.
+    fn play_until_hopping(
+        monitor: &mut LinkMonitor,
+        first_token: u64,
+        from: Duration,
+        delays: &[Option<u64>],
+    ) -> (Vec<(Duration, LinkQuality)>, Option<Duration>) {
+        let mut first_hopping = None;
+        let changes = play_watching(monitor, first_token, from, delays, |monitor, now| {
+            if monitor.radio_hopping() && first_hopping.is_none() {
+                first_hopping = Some(now);
+            }
+        });
+        (changes, first_hopping)
     }
 
     fn idle(
@@ -433,30 +592,64 @@ mod tests {
     }
 
     #[test]
-    fn airdrop_hops_every_half_second_degrade_within_a_few_hops_and_stop_there() {
-        let stalls: Vec<(u64, u64)> = (1..8).map(|hop| (hop * 500, 80)).collect();
+    fn radio_absences_with_a_clean_link_between_keep_the_full_rate() {
+        // Universal Control's 75-100 ms every 525 ms, as measured, and AirDrop's 80 every 500.
+        for (length, every) in [(75, 525), (100, 525), (80, 500)] {
+            let stalls: Vec<(u64, u64)> = (1..60).map(|hop| (hop * every, length)).collect();
+            let mut monitor = LinkMonitor::default();
+            let heartbeats = 60 * every / 30;
+            let changes = play(&mut monitor, 1, ms(0), &stalled_trace(heartbeats, &stalls));
+            assert!(
+                changes.is_empty(),
+                "{length} ms every {every} ms: {changes:?}"
+            );
+            assert_eq!(monitor.quality(), LinkQuality::Healthy);
+        }
+    }
+
+    #[test]
+    fn a_link_where_a_third_of_the_replies_queue_degrades_once_and_holds_through_a_wobble() {
+        // 40% late, then 20% (under the entry line, over the keep line), then clean.
+        let trace: Vec<Option<u64>> = (0..110usize)
+            .map(|beat| if beat % 5 < 2 { Some(40) } else { Some(3) })
+            .collect();
         let mut monitor = LinkMonitor::default();
-        let changes = play(&mut monitor, 1, ms(0), &stalled_trace(140, &stalls));
-        assert_eq!(
-            changes.first().map(|(_, to)| *to),
-            Some(LinkQuality::Degraded)
+        let mut changes = play(&mut monitor, 1, ms(0), &trace);
+        assert_eq!(changes, vec![(changes[0].0, LinkQuality::Degraded)]);
+        let wobble: Vec<Option<u64>> = (0..200usize)
+            .map(|beat| if beat % 5 == 0 { Some(40) } else { Some(3) })
+            .collect();
+        changes = play(&mut monitor, 200, ms(3_500), &wobble);
+        assert!(
+            changes.is_empty(),
+            "a share above the keep line holds the tier: {changes:?}"
         );
-        let (at, _) = changes[0];
-        assert!(at <= ms(3_000), "degraded within a few hops, at {at:?}");
-        assert!(!changes.iter().any(|(_, to)| *to == LinkQuality::Bad));
+        assert_eq!(monitor.quality(), LinkQuality::Degraded);
+        let changes = play(&mut monitor, 500, ms(9_700), &vec![Some(3); 200]);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].1, LinkQuality::Healthy);
+    }
+
+    #[test]
+    fn replies_that_mostly_arrive_overdue_make_the_link_bad_within_the_window() {
+        let mut monitor = LinkMonitor::default();
+        let trace = vec![Some(70u64); MIN_HEARTBEATS.div_ceil(BAD_DIVISOR) + 4];
+        let changes = play(&mut monitor, 1, ms(0), &trace);
+        assert_eq!(changes.last().map(|(_, to)| *to), Some(LinkQuality::Bad));
+        assert!(changes.last().unwrap().0 < ms(30 * trace.len() as u64 + 70));
     }
 
     #[test]
     fn a_stall_that_keeps_going_is_bad_before_any_reply_arrives() {
         let mut monitor = LinkMonitor::default();
-        let changes = play(&mut monitor, 1, ms(0), &stalled_trace(20, &[(60, 400)]));
+        let changes = play(&mut monitor, 1, ms(0), &stalled_trace(30, &[(60, 1_200)]));
         let bad = changes
             .iter()
             .find(|(_, to)| *to == LinkQuality::Bad)
-            .expect("the stall makes the link bad");
+            .expect("the outage makes the link bad");
         assert!(
-            bad.0 < ms(60 + 400),
-            "bad while the stall is still running, at {:?}",
+            bad.0 < ms(60 + 1_200),
+            "bad while the outage is still running, at {:?}",
             bad.0
         );
     }
@@ -473,18 +666,6 @@ mod tests {
                 "{length} ms every {every} ms: {changes:?}"
             );
         }
-    }
-
-    #[test]
-    fn stalls_that_keep_coming_make_the_link_bad_within_the_window() {
-        let stalls: Vec<(u64, u64)> = (1..8).map(|second| (second * 1_000, 150)).collect();
-        let mut monitor = LinkMonitor::default();
-        let changes = play(&mut monitor, 1, ms(0), &stalled_trace(250, &stalls));
-        let bad = changes
-            .iter()
-            .find(|(_, to)| *to == LinkQuality::Bad)
-            .expect("repeated stalls make the link bad");
-        assert!(bad.0 <= ms(4_000), "bad at {:?}", bad.0);
     }
 
     #[test]
@@ -511,7 +692,7 @@ mod tests {
     #[test]
     fn fresh_evidence_restarts_the_clean_stretch_and_can_drop_two_tiers_at_once() {
         let mut monitor = LinkMonitor::default();
-        let late = [Some(35); DEGRADED_MARKS];
+        let late = [Some(35); MIN_HEARTBEATS.div_ceil(DEGRADED_DIVISOR)];
         assert_eq!(
             play(&mut monitor, 1, ms(0), &late)
                 .last()
@@ -525,13 +706,14 @@ mod tests {
         assert_eq!(
             changes,
             vec![(
-                ms(4_535) + QUALITY_WINDOW + UPGRADE_AFTER,
+                ms(4_535 + 5 * 30) + QUALITY_WINDOW + UPGRADE_AFTER,
                 LinkQuality::Healthy
             )]
         );
-        // An outage from healthy crosses the stalled count first and goes straight to bad.
-        let changes = play(&mut monitor, 40, ms(11_000), &[None; BAD_MARKS + 2]);
-        assert_eq!(changes.first().map(|(_, to)| *to), Some(LinkQuality::Bad));
+        // An outage from healthy degrades first and turns bad as the overdue share climbs.
+        let outage = [None; MIN_HEARTBEATS.div_ceil(BAD_DIVISOR) + 2];
+        let changes = play(&mut monitor, 40, ms(11_000), &outage);
+        assert_eq!(changes.last().map(|(_, to)| *to), Some(LinkQuality::Bad));
     }
 
     /// Heartbeats 30 ms apart answered in 2 ms, except that the link carries nothing during each
@@ -577,10 +759,10 @@ mod tests {
         let mut monitor = LinkMonitor::default();
         play(&mut monitor, 1, ms(0), &stalled_trace(170, &stalls));
         assert!(monitor.unsteady_for() >= NOTE_AFTER);
-        // Well before the tier climbs back, the window has read clean.
+        // The rate never dropped: the note's run reads trouble the tier does not act on.
+        assert_eq!(monitor.quality(), LinkQuality::Healthy);
         idle(&mut monitor, ms(5_300), ms(6_000));
         assert_eq!(monitor.unsteady_for(), Duration::ZERO);
-        assert_ne!(monitor.quality(), LinkQuality::Healthy);
     }
 
     #[test]
@@ -591,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn quinn_loss_and_round_trip_count_once_enough_packets_went_out() {
+    fn quinn_loss_and_round_trip_feed_the_unsteady_run_but_never_the_rate() {
         let mut monitor = LinkMonitor::default();
         let sample = |rtt: u64, lost: u64, sent: u64| PathSample {
             rtt: ms(rtt),
@@ -604,23 +786,223 @@ mod tests {
         assert_eq!(monitor.summary().loss, None);
         assert_eq!(monitor.path(sample(2, 6, 300), ms(500)), None);
         assert_eq!(monitor.summary().loss, Some(0.03));
-        let mut change = None;
-        for span in 3..=DEGRADED_MARKS as u64 + 1 {
-            assert_eq!(change, None);
-            change = monitor.path(sample(35, 8, 400), ms(250 * span));
+        for span in 3..=UNSTEADY_LATE_MARKS as u64 + 1 {
+            assert_eq!(monitor.path(sample(35, 8, 400), ms(250 * span)), None);
         }
-        let change = change.expect("enough late round trips degrade the link");
-        assert_eq!(change.to, LinkQuality::Degraded);
-        assert_eq!(change.summary.late, DEGRADED_MARKS);
+        assert_eq!(monitor.summary().late, UNSTEADY_LATE_MARKS);
+        let later = ms(250 * (UNSTEADY_LATE_MARKS as u64 + 2));
+        assert_eq!(monitor.path(sample(35, 8, 400), later), None);
+        assert_eq!(monitor.quality(), LinkQuality::Healthy);
+        assert!(
+            monitor.unsteady_for() > Duration::ZERO,
+            "late round trips still run the note"
+        );
         let mut monitor = LinkMonitor::default();
-        let mut tier = None;
-        for index in 0..BAD_MARKS as u64 {
-            tier = monitor
-                .path(sample(70, 0, 0), ms(250 * index))
-                .map(|change| change.to)
-                .or(tier);
+        for index in 0..UNSTEADY_STALLED_MARKS as u64 {
+            assert_eq!(monitor.path(sample(70, 0, 0), ms(250 * index)), None);
         }
-        assert_eq!(tier, Some(LinkQuality::Bad));
+        assert_eq!(monitor.quality(), LinkQuality::Healthy);
+    }
+
+    /// Absences of `length` ms every 525 ms, which heartbeats quantize to 510 and 540 ms gaps.
+    fn radio_absences(span: u64, length: u64) -> Vec<(u64, u64)> {
+        (1..span / 525).map(|hop| (hop * 525, length)).collect()
+    }
+
+    fn radio_trace(span: u64, length: u64) -> (Vec<(u64, u64)>, Vec<Option<u64>>) {
+        let stalls = radio_absences(span, length);
+        let trace = stalled_trace(span / 30, &stalls);
+        (stalls, trace)
+    }
+
+    #[test]
+    fn a_radio_on_a_steady_beat_reads_as_hopping_and_keeps_the_full_rate() {
+        for length in [75, 102] {
+            let (_, trace) = radio_trace(60_000, length);
+            let mut monitor = LinkMonitor::default();
+            let (changes, hopping) = play_until_hopping(&mut monitor, 1, ms(0), &trace);
+            assert!(changes.is_empty(), "{length} ms: {changes:?}");
+            assert!(
+                hopping.is_some_and(|at| at <= ms(25_000)),
+                "{length} ms: first hopping at {hopping:?}"
+            );
+            assert!(monitor.radio_hopping(), "{length} ms");
+            assert_eq!(monitor.quality(), LinkQuality::Healthy, "{length} ms");
+        }
+    }
+
+    #[test]
+    fn bursts_minutes_apart_read_as_hopping_from_the_second_full_train() {
+        let (stalls, trace) = radio_trace(8_000, 75);
+        let sixth_absence_overdue = ms(stalls[5].0) + STALLED_REPLY;
+        let mut monitor = LinkMonitor::default();
+        let mut idle_from = ms(0);
+        for (burst, offset) in [0, 47, 112, 189, 266, 370].into_iter().enumerate() {
+            let start = ms(offset * 1_000);
+            idle(&mut monitor, idle_from, start.saturating_sub(ms(1)));
+            let token = 1 + burst as u64 * 1_000;
+            let (_, hopping) = play_until_hopping(&mut monitor, token, start, &trace);
+            match burst {
+                0 => assert_eq!(hopping, None),
+                1 => assert_eq!(hopping, Some(start + sixth_absence_overdue)),
+                _ => assert_eq!(hopping, Some(start), "burst at {offset} s"),
+            }
+            assert_eq!(monitor.radio_hopping(), burst > 0, "burst at {offset} s");
+            idle_from = start + ms(30 * trace.len() as u64 + 201);
+        }
+    }
+
+    #[test]
+    fn isolated_stalls_never_read_as_hopping() {
+        let stalls = [10_020, 30_000, 49_980, 70_020].map(|at| (at, 70));
+        let mut monitor = LinkMonitor::default();
+        let trace = stalled_trace(150_000 / 30, &stalls);
+        let (_, hopping) = play_until_hopping(&mut monitor, 1, ms(0), &trace);
+        assert_eq!(hopping, None);
+        assert_eq!(
+            monitor.hops.run_last,
+            ms(stalls[3].0),
+            "the stalls were seen"
+        );
+        assert_eq!(monitor.hops.run_len, 1);
+    }
+
+    #[test]
+    fn hopping_ends_two_minutes_after_the_last_train_stall() {
+        let (stalls, trace) = radio_trace(8_000, 75);
+        let mut monitor = LinkMonitor::default();
+        play(&mut monitor, 1, ms(0), &trace);
+        let second = ms(30_000);
+        play(&mut monitor, 1_000, second, &trace);
+        assert!(monitor.radio_hopping());
+        let last_stall = second + ms(stalls[stalls.len() - 1].0);
+        monitor.tick(last_stall + ms(119_999));
+        assert!(monitor.radio_hopping(), "still inside the two minutes");
+        monitor.tick(last_stall + ms(120_000));
+        assert!(!monitor.radio_hopping());
+    }
+
+    #[test]
+    fn a_second_train_counts_for_five_minutes_after_the_first() {
+        let (stalls, trace) = radio_trace(8_000, 75);
+        let first_train_ends = stalls[stalls.len() - 1].0;
+        // The first absence starts mid-beat, so the heartbeat that sees it goes out 15 ms in.
+        let second_train_seen = stalls[0].0 + 15;
+        for (past_the_window, hopping) in [(0, true), (1, false)] {
+            let start = first_train_ends + 300_000 + past_the_window - second_train_seen;
+            let mut monitor = LinkMonitor::default();
+            play(&mut monitor, 1, ms(0), &trace);
+            idle(
+                &mut monitor,
+                ms(30 * trace.len() as u64 + 201),
+                ms(start - 1),
+            );
+            play(&mut monitor, 1_000, ms(start), &trace);
+            assert_eq!(
+                monitor.radio_hopping(),
+                hopping,
+                "{past_the_window} ms past"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_that_beats_the_tick_still_marks_an_absence() {
+        for (delay, hopping) in [(STALLED_REPLY, true), (STALLED_REPLY - ms(1), false)] {
+            let mut monitor = LinkMonitor::default();
+            for beat in 0..60 {
+                let sent = ms(beat * 525);
+                monitor.challenge_sent(beat + 1, sent);
+                monitor.reply(beat + 1, sent + delay);
+                monitor.tick(sent + delay + ms(1));
+            }
+            assert_eq!(monitor.radio_hopping(), hopping, "{delay:?}");
+        }
+    }
+
+    #[test]
+    fn a_reply_for_an_older_send_cannot_split_an_absence() {
+        let mut hops = HopDetector::default();
+        hops.overdue(ms(1_000));
+        hops.overdue(ms(500));
+        hops.overdue(ms(1_100));
+        assert_eq!((hops.run_first, hops.run_len), (ms(1_000), 1));
+    }
+
+    #[test]
+    fn gaps_on_the_beat_must_also_hold_steady() {
+        for (short, long, hopping) in [(480, 570, false), (510, 570, true)] {
+            let mut at = 0;
+            let stalls: Vec<(u64, u64)> = (0..240)
+                .map(|hop| {
+                    at += if hop % 2 == 0 { short } else { long };
+                    (at, 75)
+                })
+                .collect();
+            let trace = stalled_trace((at + 1_000) / 30, &stalls);
+            let mut monitor = LinkMonitor::default();
+            let (_, first) = play_until_hopping(&mut monitor, 1, ms(0), &trace);
+            assert_eq!(first.is_some(), hopping, "{short}/{long}: {first:?}");
+            assert_eq!(
+                monitor.hops.last_overdue,
+                Some(ms(at)),
+                "the stalls were seen"
+            );
+        }
+    }
+
+    const TEN_MINUTES: u64 = 600_000;
+
+    /// Xorshift, seeded so a failure replays exactly.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn unit(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    #[test]
+    fn stalls_at_random_never_read_as_hopping() {
+        for seed in 1..=3 {
+            let mut rng = Rng::new(seed);
+            let mut stalls = Vec::new();
+            let mut at = 0.0;
+            loop {
+                // Exponential gaps averaging one stall a second.
+                at -= (1.0 - rng.unit()).ln() * 1_000.0;
+                if at >= TEN_MINUTES as f64 {
+                    break;
+                }
+                stalls.push((at as u64, 90));
+            }
+            let trace = stalled_trace(TEN_MINUTES / 30, &stalls);
+            let mut monitor = LinkMonitor::default();
+            let (_, hopping) = play_until_hopping(&mut monitor, 1, ms(0), &trace);
+            assert_eq!(hopping, None, "seed {seed}");
+            assert!(monitor.hops.last_overdue.is_some(), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn heartbeats_late_at_random_never_read_as_hopping() {
+        for seed in 1..=3 {
+            let mut rng = Rng::new(seed);
+            let trace: Vec<Option<u64>> = (0..TEN_MINUTES / 30)
+                .map(|_| Some(if rng.unit() < 0.05 { 70 } else { 2 }))
+                .collect();
+            let mut monitor = LinkMonitor::default();
+            let (_, hopping) = play_until_hopping(&mut monitor, 1, ms(0), &trace);
+            assert_eq!(hopping, None, "seed {seed}");
+            assert!(monitor.hops.last_overdue.is_some(), "seed {seed}");
+        }
     }
 
     #[test]

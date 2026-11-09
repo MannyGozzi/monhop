@@ -459,6 +459,7 @@ pub struct SourceController {
     health: PeerHealth,
     /// The link's quality, from this controller's challenges and the runtime's path samples.
     quality: LinkMonitor,
+    logged_hopping: bool,
     /// Motion waiting for its slot while the link is degraded or bad.
     pacer: MotionPacer,
     remote_limiter: RateLimiter,
@@ -778,6 +779,7 @@ impl SourceController {
             clicks: ClickCounter::default(),
             health: PeerHealth::new(now),
             quality: LinkMonitor::default(),
+            logged_hopping: false,
             pacer: MotionPacer::default(),
             remote_limiter: RateLimiter::new(20_000).expect("bounded remote control rate"),
             last_now: now,
@@ -1739,6 +1741,7 @@ impl SourceController {
         }
         let change = self.quality.tick(now);
         self.note_quality(change);
+        self.note_hopping();
         if let Some(since) = self.held_since {
             if now.saturating_sub(since) >= HOLD_LIMIT {
                 let failure = SourceFailure::PeerHealth(HealthError::DeadlineExpired);
@@ -1801,6 +1804,11 @@ impl SourceController {
         self.quality.unsteady_for()
     }
 
+    /// The link keeps dropping out on a regular beat, as a radio leaving its channel does.
+    pub fn radio_hopping(&self) -> bool {
+        self.quality.radio_hopping()
+    }
+
     fn note_quality(&self, change: Option<TierChange>) {
         let Some(TierChange { from, to, summary }) = change else {
             return;
@@ -1813,6 +1821,18 @@ impl SourceController {
             "link quality for slot {}: {from} -> {to}, sending motion {pace} ({summary})",
             self.slot.get()
         );
+    }
+
+    fn note_hopping(&mut self) {
+        let hopping = self.quality.radio_hopping();
+        if hopping != self.logged_hopping {
+            self.logged_hopping = hopping;
+            log::info!(
+                "link for slot {}: regular radio absences {}",
+                self.slot.get(),
+                if hopping { "started" } else { "ended" }
+            );
+        }
     }
 
     fn on_pong(&mut self, token: u64, now: Duration, effects: &mut SourceEffects) {

@@ -1225,8 +1225,11 @@ impl<N: NativeInput> HubLoop<N> {
                     || actor.is_some_and(|actor| actor.is_held(slot)),
             );
             if let Some(source) = source {
-                link.progress
-                    .link_quality(source.link_quality(), source.unsteady_for());
+                link.progress.link_quality(
+                    source.link_quality(),
+                    source.unsteady_for(),
+                    source.radio_hopping(),
+                );
             }
             link.progress.block(self.core.blocking_presses());
         }

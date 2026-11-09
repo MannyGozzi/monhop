@@ -41,9 +41,10 @@ struct ProgressState {
     half: AtomicU64,
     /// The peer went silent past the deadline; input is local until the link proves itself.
     held: AtomicBool,
-    /// The source controller's [`LinkQuality`] code and how long it has been below healthy.
+    /// The source controller's [`LinkQuality`] code and how long trouble has kept arriving.
     quality: AtomicU8,
     unsteady_ms: AtomicU64,
+    radio_hopping: AtomicBool,
     /// Presses held since capture started, which keep the pointer from crossing until released.
     blocking: std::sync::Mutex<Vec<HeldInput>>,
     /// The user ended this session (pause, switch, quit): its close tells the peer it was no failure.
@@ -104,8 +105,10 @@ pub struct SessionDiagnostics {
     pub held: bool,
     /// The link's tier as the source controller judges it now.
     pub link_quality: LinkQuality,
-    /// How long the link has been degraded or bad without a break; zero while healthy.
+    /// How long trouble on the link has kept arriving; a healthy tier can still show this.
     pub unsteady_millis: u64,
+    /// The link keeps dropping out on a regular beat, as a radio leaving its channel does.
+    pub radio_hopping: bool,
     /// Receiving-side load at the end of a destination session.
     pub receiver: Option<crate::session_actor::ReceiverStats>,
     /// Transport facts at the end of the session.
@@ -131,11 +134,12 @@ impl SessionProgress {
     pub(crate) fn hold(&self, held: bool) {
         self.0.held.store(held, Ordering::Release);
     }
-    pub(crate) fn link_quality(&self, quality: LinkQuality, unsteady: Duration) {
+    pub(crate) fn link_quality(&self, quality: LinkQuality, unsteady: Duration, hopping: bool) {
         self.0.quality.store(quality.code(), Ordering::Relaxed);
         self.0
             .unsteady_ms
             .store(millis_u64(unsteady), Ordering::Relaxed);
+        self.0.radio_hopping.store(hopping, Ordering::Relaxed);
     }
     /// Empty while nothing keeps the pointer from crossing to another computer.
     pub fn blocking_presses(&self) -> Vec<HeldInput> {
@@ -183,6 +187,7 @@ impl SessionProgress {
             held: self.0.held.load(Ordering::Acquire),
             link_quality: LinkQuality::from_code(self.0.quality.load(Ordering::Relaxed)),
             unsteady_millis: self.0.unsteady_ms.load(Ordering::Relaxed),
+            radio_hopping: self.0.radio_hopping.load(Ordering::Relaxed),
             receiver: self.0.receiver.lock().ok().and_then(|slot| *slot),
             link: self.0.link.lock().ok().and_then(|slot| *slot),
         }

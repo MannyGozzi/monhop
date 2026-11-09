@@ -95,7 +95,7 @@ import {
   requestComputersLoad,
   setComputerArrangements,
 } from "./computers-model.mjs";
-import { activeStatus } from "./computer-status.mjs";
+import { activeStatus, findPeer } from "./computer-status.mjs";
 import {
   ARRANGE_PAUSES,
   clearForgetFor,
@@ -174,7 +174,12 @@ import {
 import { canCheck, canInstall, normalizeUpdatesView } from "./updates-model.mjs";
 import { normalizeAutostartView } from "./autostart-model.mjs";
 import { islandContext, normalizeIslandView } from "./island-model.mjs";
-import { AIRDROP_RECHECK_MS, airdropWarning, normalizeAirDropView } from "./airdrop-model.mjs";
+import {
+  AIRDROP_RECHECK_MS,
+  airdropWarning,
+  normalizeAirDropView,
+  universalControlWarning,
+} from "./airdrop-model.mjs";
 import { localInspector } from "./screen-ready.mjs";
 import { computerInspector } from "./computer-card.mjs";
 import { banner, captureCanvas, renderCanvas, settleCanvas } from "./screen-displays.mjs";
@@ -275,6 +280,7 @@ let islandPending = false;
 // Undefined until the Mac answers; the one pending re-ask while it warns.
 let airdrop;
 let airdropRecheck = null;
+let universalControlNoteShown = false;
 let computers = initialComputers();
 let computersRequest = 0;
 let computersLoad = initialComputersLoad();
@@ -818,6 +824,7 @@ function context() {
     autostart: { view: autostart, pending: autostartPending },
     island: islandContext(platform, island, islandPending),
     airdropWarning: airdropWarning(platform, airdrop, selectedInterface(state)),
+    airdrop,
     network: selectedInterface(state),
     theme,
     themePending,
@@ -962,6 +969,8 @@ function render() {
     previousArrangementView.destroy();
   syncArrangements();
   syncPairingCountdown();
+  universalControlNoteShown = universalControlNoteShowing(studio);
+  syncAirDropRecheck();
 }
 
 // Settings takes over the canvas and inspector; it rises in over them, and they come back as it leaves.
@@ -2357,22 +2366,39 @@ function openAutostartSettings() {
 
 // ---------- AirDrop ----------
 
-// Asked at launch and on each return; while it warns, asked again until AirDrop changes.
+// Asked at launch and on each return; while a note shows, asked again until the setting changes.
 async function loadAirDropStatus() {
   if (!core?.invoke) return;
   window.clearTimeout(airdropRecheck);
   airdropRecheck = null;
   try {
     const next = normalizeAirDropView(await core.invoke("airdrop_status"));
-    const changed = next.everyone !== airdrop?.everyone;
+    const changed =
+      next.everyone !== airdrop?.everyone || next.universalControl !== airdrop?.universalControl;
     airdrop = next;
     if (changed) render();
   } catch {
     // The card keeps what it last showed; the next return to MonHop asks again.
   }
-  if (!airdrop?.everyone || document.visibilityState !== "visible") return;
-  window.clearTimeout(airdropRecheck);
-  airdropRecheck = window.setTimeout(() => void loadAirDropStatus(), AIRDROP_RECHECK_MS);
+  syncAirDropRecheck();
+}
+
+function universalControlNoteShowing({ inspectorKind: kind, selection }) {
+  if (kind !== "computer" || nodes.inspector.dataset.open !== "true") return false;
+  const peer = findPeer(sharing.view, selection.fingerprint);
+  return universalControlWarning(platform, airdrop, selectedInterface(state), peer) !== null;
+}
+
+// Every render lands here, so a peer that starts hopping starts the recheck with its note.
+function syncAirDropRecheck() {
+  const wanted =
+    (airdrop?.everyone || universalControlNoteShown) && document.visibilityState === "visible";
+  if (!wanted) {
+    window.clearTimeout(airdropRecheck);
+    airdropRecheck = null;
+  } else if (airdropRecheck === null) {
+    airdropRecheck = window.setTimeout(() => void loadAirDropStatus(), AIRDROP_RECHECK_MS);
+  }
 }
 
 // ---------- notch island ----------
