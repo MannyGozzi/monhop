@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.22] - 2026-11-09
+
 ### Changed
 
 - The note about Wi-Fi pausing about twice a second now names Handoff as well as Universal Control, and shows even when Universal Control is off. Two Macs on the same account can keep a Mac's radio leaving your network for about 75 ms every half second over Handoff, which a faster router can't fix.
@@ -417,7 +419,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.21...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.22...HEAD
+[0.2.22]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.22
 [0.2.21]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.21
 [0.2.20]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.20
 [0.2.19]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.19
