@@ -178,7 +178,7 @@ import {
   AIRDROP_RECHECK_MS,
   airdropWarning,
   normalizeAirDropView,
-  universalControlWarning,
+  hoppingWarning,
 } from "./airdrop-model.mjs";
 import { localInspector } from "./screen-ready.mjs";
 import { computerInspector } from "./computer-card.mjs";
@@ -280,7 +280,7 @@ let islandPending = false;
 // Undefined until the Mac answers; the one pending re-ask while it warns.
 let airdrop;
 let airdropRecheck = null;
-let universalControlNoteShown = false;
+let hoppingNoteShown = false;
 let computers = initialComputers();
 let computersRequest = 0;
 let computersLoad = initialComputersLoad();
@@ -936,6 +936,7 @@ function render() {
     connected: isConnected(sharing),
     editing: isEditingLayout(sharing),
     requested: arrangeRequested,
+    starting: sharing.pending?.kind === "edit",
     switchedOn: arrangeSwitchedOn,
     menu: canvasMenu,
   }));
@@ -969,7 +970,7 @@ function render() {
     previousArrangementView.destroy();
   syncArrangements();
   syncPairingCountdown();
-  universalControlNoteShown = universalControlNoteShowing(studio);
+  hoppingNoteShown = hoppingNoteShowing(studio);
   syncAirDropRecheck();
 }
 
@@ -2383,16 +2384,15 @@ async function loadAirDropStatus() {
   syncAirDropRecheck();
 }
 
-function universalControlNoteShowing({ inspectorKind: kind, selection }) {
+function hoppingNoteShowing({ inspectorKind: kind, selection }) {
   if (kind !== "computer" || nodes.inspector.dataset.open !== "true") return false;
   const peer = findPeer(sharing.view, selection.fingerprint);
-  return universalControlWarning(platform, airdrop, selectedInterface(state), peer) !== null;
+  return hoppingWarning(platform, airdrop, selectedInterface(state), peer) !== null;
 }
 
 // Every render lands here, so a peer that starts hopping starts the recheck with its note.
 function syncAirDropRecheck() {
-  const wanted =
-    (airdrop?.everyone || universalControlNoteShown) && document.visibilityState === "visible";
+  const wanted = (airdrop?.everyone || hoppingNoteShown) && document.visibilityState === "visible";
   if (!wanted) {
     window.clearTimeout(airdropRecheck);
     airdropRecheck = null;

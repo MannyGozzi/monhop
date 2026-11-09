@@ -6,8 +6,14 @@ import { isWifiInterface } from "./model.mjs";
 export const AIRDROP_STUTTER_COPY =
   "AirDrop is set to Everyone, which pauses this Mac's Wi-Fi a few times a second and makes the pointer stutter. Set AirDrop to Contacts Only in Control Center, or use a cable.";
 
-export const UNIVERSAL_CONTROL_STUTTER_COPY =
-  "Wi-Fi keeps pausing on this connection, and Universal Control on this Mac can cause that. If you don't use it, turn off “Allow your pointer and keyboard to move between any nearby Mac or iPad” in System Settings > Displays > Advanced.";
+const RADIO_AWAY =
+  "Wi-Fi keeps pausing about twice a second because a Mac's radio keeps leaving your network to reach another Apple device nearby, which a faster router can't fix.";
+const HANDOFF_SWITCH = "Allow Handoff in System Settings > General > AirDrop & Handoff";
+const UNIVERSAL_CONTROL_SWITCH =
+  "“Allow your pointer and keyboard to move between any nearby Mac or iPad” in System Settings > Displays > Advanced";
+
+export const HANDOFF_STUTTER_COPY = `${RADIO_AWAY} Handoff can cause this: on a Mac that doesn't need it, turn off ${HANDOFF_SWITCH}.`;
+export const CONTINUITY_STUTTER_COPY = `${RADIO_AWAY} Handoff or Universal Control can cause this: on a Mac that doesn't need them, turn off ${HANDOFF_SWITCH}, and ${UNIVERSAL_CONTROL_SWITCH}.`;
 
 // While a warning shows, how often MonHop asks again so it leaves once the setting changes.
 export const AIRDROP_RECHECK_MS = 3000;
@@ -25,9 +31,9 @@ export function airdropWarning(platform, view, network) {
   return AIRDROP_STUTTER_COPY;
 }
 
-// The setting alone is on for most Macs and the hopping alone has other causes, so both must agree.
-export function universalControlWarning(platform, view, network, peer) {
-  if (platform !== "macos" || view?.universalControl !== true) return null;
-  if (!isWifiInterface(network) || peer?.linkHopping !== true) return null;
-  return UNIVERSAL_CONTROL_STUTTER_COPY;
+// The beat alone marks a Mac's peer-to-peer radio. Which service holds it cannot be read from here,
+// so Universal Control is named only while its setting is on.
+export function hoppingWarning(platform, view, network, peer) {
+  if (platform !== "macos" || !isWifiInterface(network) || peer?.linkHopping !== true) return null;
+  return view?.universalControl === true ? CONTINUITY_STUTTER_COPY : HANDOFF_STUTTER_COPY;
 }

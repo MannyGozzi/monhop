@@ -13,7 +13,7 @@ import { DRAWN_DISPLAYS_NOTE } from "./dashboard-arrangement.mjs";
 import { normalizeClipboardView } from "./clipboard-model.mjs";
 import { clipboardLine } from "./studio-model.mjs";
 import { inspectorHeader } from "./screen-ready.mjs";
-import { universalControlWarning } from "./airdrop-model.mjs";
+import { hoppingWarning } from "./airdrop-model.mjs";
 import { linkWarning, networkNote } from "./link-note-model.mjs";
 import { pairBadgeLabel } from "./pair-badge-model.mjs";
 import {
@@ -297,7 +297,7 @@ function networkLineText(ctx, computer, name) {
   const peer = findPeer(ctx.sharing.view, computer.fingerprint);
   return networkNote(
     ctx.airdropWarning,
-    universalControlWarning(ctx.platform, ctx.airdrop, ctx.network, peer),
+    hoppingWarning(ctx.platform, ctx.airdrop, ctx.network, peer),
     linkWarning(peer, ctx.network, name),
   );
 }

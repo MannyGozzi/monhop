@@ -3,10 +3,11 @@ import test from "node:test";
 
 import {
   AIRDROP_STUTTER_COPY,
-  UNIVERSAL_CONTROL_STUTTER_COPY,
+  CONTINUITY_STUTTER_COPY,
+  HANDOFF_STUTTER_COPY,
   airdropWarning,
+  hoppingWarning,
   normalizeAirDropView,
-  universalControlWarning,
 } from "./airdrop-model.mjs";
 
 const wifi = { kind: "Wi-Fi" };
@@ -35,26 +36,29 @@ test("anything but a plain true reads as off", () => {
   assert.deepEqual(normalizeAirDropView(null), { everyone: false, universalControl: false });
 });
 
-test("Universal Control warns only a Mac on Wi-Fi whose setting and link both agree", () => {
+test("a Mac on Wi-Fi whose link keeps hopping is warned whatever Universal Control's setting", () => {
+  assert.equal(hoppingWarning("macos", universalOn, wifi, hopping), CONTINUITY_STUTTER_COPY);
   assert.equal(
-    universalControlWarning("macos", universalOn, wifi, hopping),
-    UNIVERSAL_CONTROL_STUTTER_COPY,
+    hoppingWarning("macos", { universalControl: false }, wifi, hopping),
+    HANDOFF_STUTTER_COPY,
   );
-  assert.equal(universalControlWarning("windows", universalOn, wifi, hopping), null);
-  assert.equal(universalControlWarning("macos", universalOn, { kind: "Ethernet" }, hopping), null);
-  assert.equal(universalControlWarning("macos", universalOn, null, hopping), null);
-  assert.equal(universalControlWarning("macos", { universalControl: false }, wifi, hopping), null);
-  assert.equal(universalControlWarning("macos", undefined, wifi, hopping), null);
-  assert.equal(universalControlWarning("macos", universalOn, wifi, { linkHopping: false }), null);
-  assert.equal(universalControlWarning("macos", universalOn, wifi, { linkHopping: "true" }), null);
-  assert.equal(universalControlWarning("macos", universalOn, wifi, null), null);
+  assert.equal(hoppingWarning("macos", undefined, wifi, hopping), HANDOFF_STUTTER_COPY);
+  assert.equal(hoppingWarning("windows", universalOn, wifi, hopping), null);
+  assert.equal(hoppingWarning("macos", universalOn, { kind: "Ethernet" }, hopping), null);
+  assert.equal(hoppingWarning("macos", universalOn, null, hopping), null);
+  assert.equal(hoppingWarning("macos", universalOn, wifi, { linkHopping: false }), null);
+  assert.equal(hoppingWarning("macos", universalOn, wifi, { linkHopping: "true" }), null);
+  assert.equal(hoppingWarning("macos", universalOn, wifi, null), null);
 });
 
-test("the Universal Control note names the exact switch", () => {
-  assert.equal(
-    UNIVERSAL_CONTROL_STUTTER_COPY,
-    "Wi-Fi keeps pausing on this connection, and Universal Control on this Mac can cause that. If you don't use it, turn off “Allow your pointer and keyboard to move between any nearby Mac or iPad” in System Settings > Displays > Advanced.",
-  );
+test("the hopping notes say a router will not help and name each switch", () => {
+  for (const copy of [HANDOFF_STUTTER_COPY, CONTINUITY_STUTTER_COPY]) {
+    assert.match(copy, /about twice a second/);
+    assert.match(copy, /faster router can't fix/);
+    assert.match(copy, /Allow Handoff in System Settings > General > AirDrop & Handoff/);
+  }
+  assert.doesNotMatch(HANDOFF_STUTTER_COPY, /Universal Control/);
+  assert.match(CONTINUITY_STUTTER_COPY, /System Settings > Displays > Advanced/);
 });
 
 test("the warning names the effect, the cause and both ways out", () => {

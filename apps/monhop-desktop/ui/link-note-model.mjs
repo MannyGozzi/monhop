@@ -28,7 +28,7 @@ export function linkWarning(peer, network, name) {
   return CAPPED.has(peer.linkQuality) ? `${unstable} ${SLOWER}` : unstable;
 }
 
-// One note at most, the surest cause first: AirDrop is certain, Universal Control likely.
-export function networkNote(airdrop, universalControl, link) {
-  return airdrop || universalControl || link || null;
+// One note at most, the surest cause first: AirDrop is certain, a radio on a regular beat likely.
+export function networkNote(airdrop, hopping, link) {
+  return airdrop || hopping || link || null;
 }

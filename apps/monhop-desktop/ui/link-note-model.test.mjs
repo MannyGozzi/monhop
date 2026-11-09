@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AIRDROP_STUTTER_COPY, UNIVERSAL_CONTROL_STUTTER_COPY } from "./airdrop-model.mjs";
+import { AIRDROP_STUTTER_COPY, CONTINUITY_STUTTER_COPY } from "./airdrop-model.mjs";
 import {
   LINK_NOTE_AFTER_MS,
   WIFI_UNSTABLE_COPY,
@@ -60,15 +60,15 @@ test("only a capped link says MonHop sends less often", () => {
   assert.doesNotMatch(WIFI_UNSTABLE_COPY, /less often/);
 });
 
-test("a card shows one note at most: AirDrop, then Universal Control, then the link", () => {
-  const universal = UNIVERSAL_CONTROL_STUTTER_COPY;
+test("a card shows one note at most: AirDrop, then a hopping radio, then the link", () => {
+  const hopping = CONTINUITY_STUTTER_COPY;
   assert.equal(
-    networkNote(AIRDROP_STUTTER_COPY, universal, WIFI_UNSTABLE_COPY),
+    networkNote(AIRDROP_STUTTER_COPY, hopping, WIFI_UNSTABLE_COPY),
     AIRDROP_STUTTER_COPY,
   );
   assert.equal(networkNote(AIRDROP_STUTTER_COPY, null, WIFI_UNSTABLE_COPY), AIRDROP_STUTTER_COPY);
-  assert.equal(networkNote(null, universal, WIFI_UNSTABLE_COPY), universal);
-  assert.equal(networkNote(null, universal, null), universal);
+  assert.equal(networkNote(null, hopping, WIFI_UNSTABLE_COPY), hopping);
+  assert.equal(networkNote(null, hopping, null), hopping);
   assert.equal(networkNote(null, null, WIFI_UNSTABLE_COPY), WIFI_UNSTABLE_COPY);
   assert.equal(networkNote(AIRDROP_STUTTER_COPY, null, null), AIRDROP_STUTTER_COPY);
   assert.equal(networkNote(null, null, null), null);

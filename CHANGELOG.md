@@ -4,6 +4,14 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Changed
+
+- The note about Wi-Fi pausing about twice a second now names Handoff as well as Universal Control, and shows even when Universal Control is off. Two Macs on the same account can keep a Mac's radio leaving your network for about 75 ms every half second over Handoff, which a faster router can't fix.
+
+### Fixed
+
+- The arrangement screen no longer gets stuck saying sharing is paused while sharing is actually running. When Arrange could not start, the screen stayed up until you pressed Cancel. It now goes back to the normal view and shows why.
+
 ## [0.2.21] - 2026-11-08
 
 ### Added

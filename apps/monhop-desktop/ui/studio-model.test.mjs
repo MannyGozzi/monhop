@@ -256,11 +256,20 @@ test("a menu over the canvas stays open on the standing link before the first Ap
       switchedOn: null,
       menu,
     });
-  // Arrange pressed, link still dialing: everything is held.
+  // Arrange pressed, the start command still out: everything is held.
+  assert.deepEqual(
+    settleArrange({ requested: true, starting: true, switchedOn: "b", menu: saved }),
+    {
+      requested: true,
+      switchedOn: "b",
+      menu: saved,
+    },
+  );
+  // A start the backend refused leaves nothing arranging, even with a session running.
   assert.deepEqual(settleArrange({ requested: true, switchedOn: "b", menu: saved }), {
-    requested: true,
-    switchedOn: "b",
-    menu: saved,
+    requested: false,
+    switchedOn: null,
+    menu: null,
   });
   // The backend reports the edit: the request is spent, the rest stays.
   assert.deepEqual(

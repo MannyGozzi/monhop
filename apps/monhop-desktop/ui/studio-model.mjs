@@ -213,17 +213,19 @@ export function arrangeState({ connected = false, editing = false, requested = f
   return { active: connected || editing || requested, leavable: editing || requested };
 }
 
-// What each render keeps of arranging: the request until the backend reports the edit, the computer
-// Arrange switched on while that edit lasts, and a menu over the canvas while the canvas arranges,
-// which a standing link does before its first Apply as much as an edit the user opened.
+// What each render keeps of arranging: the request while its start command is out, so a refused
+// start leaves nothing arranging; the computer Arrange switched on while that edit lasts; and a menu
+// over the canvas while the canvas arranges, which a standing link does before its first Apply as
+// much as an edit the user opened.
 export function settleArrange({
   connected = false,
   editing = false,
   requested = false,
+  starting = false,
   switchedOn = null,
   menu = null,
 }) {
-  const pending = requested && !editing;
+  const pending = requested && starting && !editing;
   const { active, leavable } = arrangeState({ connected, editing, requested: pending });
   return {
     requested: pending,

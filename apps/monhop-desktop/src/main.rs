@@ -163,6 +163,18 @@ async fn sharing_edit_begin(
     interface_id: String,
     fingerprint: Option<String>,
 ) -> Result<SharingView, String> {
+    let started = begin_layout_edit(app, interface_id, fingerprint).await;
+    if let Err(reason) = &started {
+        log::warn!("arranging did not start: {reason}");
+    }
+    started
+}
+
+async fn begin_layout_edit(
+    app: tauri::AppHandle,
+    interface_id: String,
+    fingerprint: Option<String>,
+) -> Result<SharingView, String> {
     #[cfg(target_os = "macos")]
     on_main_thread(&app, display_labels::refresh).await?;
     #[cfg(windows)]
