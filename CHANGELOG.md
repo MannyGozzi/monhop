@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.21] - 2026-11-08
+
 ### Added
 
 - On a Mac sharing over Wi-Fi, the other computer's card now says when Universal Control is the likely reason Wi-Fi keeps pausing, and names the switch to turn off in System Settings. Universal Control can make a Mac's Wi-Fi leave its channel for a moment about twice a second, which freezes the pointer each time. The note appears only when the pauses keep a regular beat and Universal Control is on, and leaves within a few seconds of turning it off.
@@ -407,7 +409,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.20...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.21...HEAD
+[0.2.21]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.21
 [0.2.20]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.20
 [0.2.19]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.19
 [0.2.18]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.18
