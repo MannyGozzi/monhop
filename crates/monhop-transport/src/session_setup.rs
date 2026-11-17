@@ -49,6 +49,12 @@ const CONNECT_WINDOW: Duration = Duration::from_secs(120);
 /// One Windows dial attempt covers connect plus negotiate; the Mac may not be listening yet.
 const DIAL_ATTEMPT_DEADLINE: Duration = Duration::from_secs(4);
 const DIAL_INTERVAL: Duration = Duration::from_secs(2);
+/// Unanswered share dialing toward one member before its first quiet period.
+const QUIET_AFTER: Duration = Duration::from_secs(30);
+/// Further unanswered share dialing toward one member between its later quiet periods.
+const QUIET_EVERY: Duration = Duration::from_secs(15 * 60);
+/// One quiet period, long enough for a router's stale state for the pinned port pair to expire.
+const QUIET_FOR: Duration = Duration::from_secs(120);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// How often a computer that followed its adapter knocks at a member it waits for.
 const KNOCK_EVERY: Duration = Duration::from_secs(5);
@@ -1644,6 +1650,50 @@ pub struct SavedNetwork<'a> {
     pub knocking: &'a [CertificateFingerprint],
 }
 
+/// Unanswered share dialing toward one member and the quiet periods it earns: dials on the one
+/// pinned port pair keep a router's stale state for that pair alive. It never reads a clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DialPace {
+    /// Unanswered dialing since a session was last handed out.
+    dialed: Duration,
+    /// The `dialed` total that starts the next quiet period.
+    quiet_at: Duration,
+    /// When the latest quiet period ends.
+    quiet_until: Option<Instant>,
+}
+
+impl DialPace {
+    const fn new() -> Self {
+        Self {
+            dialed: Duration::ZERO,
+            quiet_at: QUIET_AFTER,
+            quiet_until: None,
+        }
+    }
+
+    /// The end of the quiet period running at `now`, if one runs.
+    fn quiet_until(&self, now: Instant) -> Option<Instant> {
+        self.quiet_until.filter(|until| *until > now)
+    }
+
+    /// Counts one unanswered pass that took `took`; true when it starts a quiet period at `now`.
+    /// A pass counts at most one attempt and one interval, so time asleep is not dialing.
+    fn unanswered(&mut self, took: Duration, now: Instant) -> bool {
+        self.dialed += took.min(DIAL_ATTEMPT_DEADLINE + DIAL_INTERVAL);
+        if self.dialed < self.quiet_at {
+            return false;
+        }
+        self.quiet_at = self.dialed + QUIET_EVERY;
+        self.quiet_until = Some(now + QUIET_FOR);
+        true
+    }
+
+    /// A session was handed out, so the path works and the schedule starts over.
+    fn answered(&mut self) {
+        *self = Self::new();
+    }
+}
+
 /// Per member: the connects running for it, and whether this computer followed its adapter since
 /// it last reached the member, so a member it waits for is knocked at.
 #[derive(Clone, Copy, Default)]
@@ -1693,6 +1743,8 @@ pub struct GroupEndpoint {
     interface_id: String,
     network: ResolvedNetwork,
     want: RefCell<Box<[Want]>>,
+    /// Each member's share dial pacing, kept across connect windows.
+    pace: RefCell<Box<[DialPace]>>,
     /// Moves the endpoint proved and saved, until the app takes them.
     moves: RefCell<Option<channel::UnboundedReceiver<MemberMoved>>>,
     _recording: Router,
@@ -1819,6 +1871,7 @@ impl GroupEndpoint {
         let revocation = endpoint.revocation_signal();
         let cancellation =
             CancellationWatch::start(cancel.clone(), revocation.clone(), move || revoker.revoke())?;
+        let pace = RefCell::new(peers.iter().map(|_| DialPace::new()).collect());
         Ok(Rc::new(Self {
             _cancellation: cancellation,
             router,
@@ -1833,6 +1886,7 @@ impl GroupEndpoint {
             interface_id: interface_id.to_owned(),
             network,
             want: RefCell::new(want),
+            pace,
             moves: RefCell::new(Some(moves)),
             _recording: recording,
             revocation,
@@ -2078,6 +2132,7 @@ impl GroupEndpoint {
                 .close(0_u32.into(), MEMBER_SUPERSEDED_REASON);
         }
         self.rewant(index);
+        self.pace.borrow_mut()[index].answered();
         heard.keep();
         if session.purpose() == SessionPurpose::Share {
             session.priority = Some(self.handle.session_priority());
@@ -2346,6 +2401,8 @@ impl GroupEndpoint {
         cancel: &RevocationSignal,
     ) -> Result<(NegotiatedSession, InspectedPeer, Heard), SetupFailure> {
         loop {
+            self.wait_out_quiet(index, cancel).await?;
+            let pass = Instant::now();
             // A failed or timed-out attempt drops its `Heard`, so between attempts nothing reads
             // as coming up.
             let attempt = tokio::time::timeout(DIAL_ATTEMPT_DEADLINE, async {
@@ -2373,7 +2430,39 @@ impl GroupEndpoint {
             }
             self.check(index, Some(cancel))?;
             tokio::time::sleep(DIAL_INTERVAL).await;
+            self.count_unanswered(index, pass.elapsed());
             self.check(index, Some(cancel))?;
+        }
+    }
+
+    /// Holds the next share dial to member `index` while its quiet period runs. The period is
+    /// read again on every poll, so a session handed out meanwhile ends the wait.
+    async fn wait_out_quiet(
+        &self,
+        index: usize,
+        cancel: &RevocationSignal,
+    ) -> Result<(), SetupFailure> {
+        // Checked as often as the dial loop's own interval, so the network thread mostly sleeps.
+        loop {
+            let now = Instant::now();
+            let Some(until) = self.pace.borrow()[index].quiet_until(now) else {
+                return Ok(());
+            };
+            tokio::time::sleep(until.saturating_duration_since(now).min(DIAL_INTERVAL)).await;
+            self.check(index, Some(cancel))?;
+        }
+    }
+
+    fn count_unanswered(&self, index: usize, took: Duration) {
+        let mut pace = self.pace.borrow_mut();
+        let pace = &mut pace[index];
+        if pace.unanswered(took, Instant::now()) {
+            log::info!(
+                "sharing: no answer from {} after {:?} of dialing; sending it nothing for \
+                 {QUIET_FOR:?} so a stale network path can clear",
+                self.peers[index].fingerprint.short_hex(),
+                Duration::from_secs(pace.dialed.as_secs())
+            );
         }
     }
 
@@ -3002,6 +3091,92 @@ mod retry_policy_tests {
             SetupFailure::VersionMismatch
         );
         assert!(!is_transient(SetupFailure::VersionMismatch));
+    }
+
+    /// One unanswered pass at the longest it counts: a timed-out attempt and the interval after.
+    const PASS: Duration = DIAL_ATTEMPT_DEADLINE.saturating_add(DIAL_INTERVAL);
+
+    /// Feeds whole passes from `now` until one starts a quiet period; the dialing that took.
+    fn dial_until_quiet(pace: &mut DialPace, now: &mut Instant) -> Duration {
+        let mut dialed = Duration::ZERO;
+        loop {
+            assert_eq!(pace.quiet_until(*now), None, "quiet before it was earned");
+            *now += PASS;
+            dialed += PASS;
+            if pace.unanswered(PASS, *now) {
+                return dialed;
+            }
+            assert!(
+                dialed < QUIET_EVERY + QUIET_AFTER,
+                "no quiet period ever starts"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_quiet_period_starts_after_thirty_seconds_of_unanswered_dialing() {
+        let mut pace = DialPace::new();
+        let mut now = Instant::now();
+        let dialed = dial_until_quiet(&mut pace, &mut now);
+        assert!(dialed >= QUIET_AFTER && dialed - PASS < QUIET_AFTER);
+        let end = now + QUIET_FOR;
+        assert_eq!(pace.quiet_until(now), Some(end));
+        assert_eq!(pace.quiet_until(end - Duration::from_millis(1)), Some(end));
+        assert_eq!(
+            pace.quiet_until(end),
+            None,
+            "the quiet period lasts {QUIET_FOR:?}"
+        );
+    }
+
+    #[test]
+    fn dialing_resumes_after_a_quiet_period_and_the_next_comes_fifteen_minutes_later() {
+        let mut pace = DialPace::new();
+        let mut now = Instant::now();
+        dial_until_quiet(&mut pace, &mut now);
+        now += QUIET_FOR;
+        assert_eq!(pace.quiet_until(now), None);
+        let dialed = dial_until_quiet(&mut pace, &mut now);
+        assert!(dialed >= QUIET_EVERY && dialed - PASS < QUIET_EVERY);
+        assert_eq!(pace.quiet_until(now), Some(now + QUIET_FOR));
+    }
+
+    #[test]
+    fn a_handed_out_session_starts_the_schedule_over() {
+        let mut pace = DialPace::new();
+        let mut now = Instant::now();
+        dial_until_quiet(&mut pace, &mut now);
+        now += QUIET_FOR;
+        assert!(!pace.unanswered(PASS, now));
+        pace.answered();
+        assert_eq!(pace, DialPace::new());
+        // The next quiet period comes after the first threshold again, not the later one.
+        let dialed = dial_until_quiet(&mut pace, &mut now);
+        assert!(dialed - PASS < QUIET_AFTER);
+    }
+
+    #[test]
+    fn one_pass_after_a_sleep_counts_at_most_one_attempt_and_one_interval() {
+        let mut pace = DialPace::new();
+        let now = Instant::now();
+        assert!(!pace.unanswered(Duration::from_secs(8 * 60 * 60), now));
+        assert_eq!(pace.dialed, PASS);
+        assert_eq!(pace.quiet_until(now), None);
+    }
+
+    #[test]
+    fn a_quiet_period_runs_on_through_a_new_connect_window() {
+        let mut pace = DialPace::new();
+        let mut now = Instant::now();
+        dial_until_quiet(&mut pace, &mut now);
+        let end = now + QUIET_FOR;
+        // The window that earned it ends mid-quiet; the next one reads the same period.
+        let next_window = now + QUIET_FOR / 2;
+        assert_eq!(pace.quiet_until(next_window), Some(end));
+        // A pass that began before the quiet period and ends inside it neither ends nor restarts it.
+        assert!(!pace.unanswered(PASS, next_window));
+        assert_eq!(pace.quiet_until(next_window), Some(end));
+        assert_eq!(pace.quiet_until(end), None);
     }
 }
 
@@ -4392,6 +4567,75 @@ mod group_tests {
         let (paired, answered) = dial_setup(&hub, &down).await;
         assert!(paired.unwrap().inspection.peer_fingerprint == down.fingerprint());
         answered.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_member_is_not_dialed_while_quiet_even_by_the_next_connect_window() {
+        let computer = Computer::new();
+        let member = in_group(&computer.identity);
+        let hub = hub(&[&computer], true, std::slice::from_ref(&member));
+        let remote = computer.listening(&hub);
+        let fingerprint = remote.fingerprint();
+        let pace = || hub.group.pace.borrow()[0];
+        let share = || {
+            hub.group.connect(
+                fingerprint,
+                SessionPurpose::Share,
+                NO_AGREEMENT,
+                &hub.cancel,
+            )
+        };
+        // Every dial fails at once, and the next unanswered pass earns the quiet period.
+        hub.group.endpoint.set_reachable(&[false]);
+        hub.group.pace.borrow_mut()[0].dialed = QUIET_AFTER - Duration::from_millis(1);
+        // Shortened from `QUIET_FOR` once it starts, to keep the test quick.
+        let quiet = Duration::from_secs(1);
+
+        let ((quiet_end, paired), (dialed_at, answered)) =
+            tokio::time::timeout(DEADLINE * 2, async {
+                tokio::join!(
+                    async {
+                        let quiet_end = tokio::select! {
+                            ended = share() => panic!("the connect ended: {:?}", ended.err()),
+                            end = async {
+                                until(|| pace().quiet_until.is_some()).await;
+                                let end = Instant::now() + quiet;
+                                hub.group.pace.borrow_mut()[0].quiet_until = Some(end);
+                                // Any dial from here on reaches the member.
+                                hub.group.endpoint.set_reachable(&[true]);
+                                tokio::time::sleep(quiet / 2).await;
+                                end
+                            } => end,
+                        };
+                        // The connect window ended mid-quiet; the next one keeps the same period.
+                        (quiet_end, share().await)
+                    },
+                    async {
+                        let incoming = remote.endpoint.accept().await.unwrap();
+                        let dialed_at = Instant::now();
+                        let connection = incoming.await.unwrap();
+                        let answered = remote_negotiates(
+                            &remote,
+                            &hub,
+                            connection,
+                            SessionPurpose::Share,
+                            NO_AGREEMENT,
+                        )
+                        .await;
+                        (dialed_at, answered)
+                    }
+                )
+            })
+            .await
+            .expect("the member is dialed once its quiet period ends");
+        assert!(
+            dialed_at >= quiet_end,
+            "dialed {:?} before the quiet period ended",
+            quiet_end - dialed_at
+        );
+        answered.unwrap();
+        assert!(paired.unwrap().inspection.peer_fingerprint == fingerprint);
+        assert_eq!(pace(), DialPace::new(), "a handed-out session starts over");
     }
 
     #[tokio::test]

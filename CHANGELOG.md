@@ -7,6 +7,7 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 ### Fixed
 
 - Sharing no longer goes dead when Wi-Fi stops carrying high-priority traffic. MonHop asks Wi-Fi to send its updates ahead of other traffic, and some routers stop delivering that kind of traffic to a computer after it moves to another access point, while everything else keeps working. Sharing then dropped and could not reconnect for hours. Now MonHop connects at normal priority, uses high priority only while it gets through, and drops back to normal priority the moment the other computer stops answering. Both computers need this version.
+- Sharing now recovers on its own when a router keeps a broken route between the two computers. Some routers hold on to a bad route after a computer moves to another access point, and MonHop's retries every few seconds kept that route alive, so they never got through. Now a computer that gets no answer for 30 seconds stops trying for two minutes, which lets the router forget the route, then tries again. If the other computer comes back during those two minutes, sharing can take up to two minutes longer to reconnect.
 - Switching a computer back on after this computer's network address changed while sharing was paused no longer needs pairing again. MonHop treated the new address as a different network, so the other computer kept trying the old one. Now it follows the same Wi-Fi or Ethernet adapter to its new address and lets the other computer know, as it already did while sharing was on.
 
 ### Security
