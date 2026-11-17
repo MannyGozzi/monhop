@@ -1975,14 +1975,14 @@
   },
   {
     "name": "quinn-proto",
-    "version": "0.11.18",
+    "version": "0.11.19",
     "license": "MIT OR Apache-2.0",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://github.com/quinn-rs/quinn"
   },
   {
     "name": "quinn-udp",
-    "version": "0.5.15",
+    "version": "0.5.16",
     "license": "MIT OR Apache-2.0",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "repository": "https://github.com/quinn-rs/quinn"
