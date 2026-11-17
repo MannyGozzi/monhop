@@ -128,6 +128,7 @@ impl PairingEndpoint {
             lifetime,
             reachability,
             refusals,
+            priority,
         } = carrier;
         let refusing = SecureQuicConfig::server_refusing_all().map_err(io::Error::other)?;
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
@@ -148,6 +149,7 @@ impl PairingEndpoint {
             knocker: None,
             recognizer: None,
             reachability,
+            priority,
             signal,
             endpoint: Mutex::new(Some(endpoint.clone())),
             #[cfg(test)]

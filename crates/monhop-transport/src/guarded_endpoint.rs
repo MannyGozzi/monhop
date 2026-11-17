@@ -32,6 +32,7 @@ use crate::{
         CertificateFingerprint, DeviceIdentity, LOCAL_TLS_SERVER_NAME, RefusedCertificate,
         SecureQuicConfig, VerifiedPeer, is_probe, presented_certificate,
     },
+    link_priority::{LinkPriority, SessionPriority},
     policy::{MAX_PINNED_PEERS, is_private_or_link_local},
 };
 use runtime::HandleRuntime;
@@ -441,6 +442,8 @@ struct Shared {
     recognizer: Option<quinn::ClientConfig>,
     /// The socket's route verdict for each member, in member order.
     reachability: Arc<Reachability>,
+    /// The socket's voice priority, which dials and dial-backs keep at normal.
+    priority: Arc<LinkPriority>,
     signal: RevocationSignal,
     endpoint: Mutex<Option<quinn::Endpoint>>,
     /// How a test answers dial-backs instead.
@@ -520,11 +523,12 @@ impl Shared {
             return;
         };
         self.wanted[index].store(wanted, Ordering::Release);
-        self.knocks.set_wanted(
-            self.wanted
-                .iter()
-                .any(|wanted| wanted.load(Ordering::Acquire)),
-        );
+        let any = self
+            .wanted
+            .iter()
+            .any(|wanted| wanted.load(Ordering::Acquire));
+        self.knocks.set_wanted(any);
+        self.priority.set_connecting(any);
     }
 
     fn wanted(&self, member: CertificateFingerprint) -> bool {
@@ -1033,6 +1037,11 @@ impl EndpointHandle {
     pub fn knock(&self, member: CertificateFingerprint) {
         self.shared.knock(member);
     }
+
+    /// A new share session's part in this endpoint's voice priority.
+    pub(crate) fn session_priority(&self) -> SessionPriority {
+        self.shared.priority.session()
+    }
 }
 
 /// Aborts its task when dropped.
@@ -1057,7 +1066,9 @@ async fn readdress(
         let Some(shared) = shared.upgrade() else {
             return;
         };
+        let dialing_back = shared.priority.dialing_back();
         let moved = dial_back(&shared, &relocation, candidate).await;
+        drop(dialing_back);
         let recorded = moved.is_some();
         if let Some(moved) = moved {
             let _ = moves.send(moved);
@@ -1169,6 +1180,7 @@ struct Carrier {
     lifetime: watch::Receiver<()>,
     reachability: Arc<Reachability>,
     refusals: Arc<SendRefusals>,
+    priority: Arc<LinkPriority>,
 }
 
 impl Carrier {
@@ -1178,6 +1190,7 @@ impl Carrier {
             lifetime: socket.lifetime(),
             reachability: socket.reachability(),
             refusals: socket.refusals(),
+            priority: socket.priority(),
             socket,
         }
     }
@@ -1296,6 +1309,7 @@ impl GuardedEndpoint {
             lifetime,
             reachability,
             refusals: _,
+            priority,
         } = carrier;
         let MemberSet {
             members,
@@ -1333,6 +1347,7 @@ impl GuardedEndpoint {
             knocker,
             recognizer,
             reachability,
+            priority,
             signal,
             endpoint: Mutex::new(Some(endpoint.clone())),
             #[cfg(test)]
@@ -1768,6 +1783,7 @@ pub(crate) mod loopback {
                 signal,
                 reachability: Reachability::new(members.len()),
                 refusals: SendRefusals::new(members.len()),
+                priority: LinkPriority::new(),
             };
             let addresses: Vec<_> = members.iter().map(|member| member.address).collect();
             let readdressing = Readdressing {

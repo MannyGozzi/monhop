@@ -26,6 +26,7 @@ use tokio::{
 use super::{TokenBucket, native::NativeSocket};
 use crate::{
     crypto::MAX_PENDING_INCOMING,
+    link_priority::LinkPriority,
     policy::{
         InterfaceSnapshot, MAX_PINNED_PEERS, NetworkLock, validate_interface, validate_subnet_peer,
     },
@@ -235,6 +236,8 @@ pub(super) trait DatagramIo: Send + Sync + 'static {
     fn try_send_to(&self, buffer: &[u8], peer: SocketAddrV4) -> io::Result<usize>;
     fn writable(self: Arc<Self>) -> WritableFuture;
     fn local_addr(&self) -> io::Result<SocketAddrV4>;
+    /// Marks datagrams to `peers` as voice, or returns every datagram to normal priority.
+    fn set_voice(&self, voice: bool, peers: &[SocketAddrV4]) -> io::Result<()>;
 }
 
 impl DatagramIo for NativeSocket {
@@ -267,6 +270,10 @@ impl DatagramIo for NativeSocket {
 
     fn local_addr(&self) -> io::Result<SocketAddrV4> {
         NativeSocket::local_addr(self)
+    }
+
+    fn set_voice(&self, voice: bool, peers: &[SocketAddrV4]) -> io::Result<()> {
+        NativeSocket::set_voice(self, voice, peers)
     }
 }
 
@@ -305,6 +312,10 @@ impl MemberSlots {
 
     pub(super) fn len(&self) -> usize {
         self.0.len()
+    }
+
+    fn addresses(&self) -> Vec<SocketAddrV4> {
+        (0..self.len()).filter_map(|slot| self.get(slot)).collect()
     }
 }
 
@@ -526,6 +537,8 @@ pub(super) struct GuardedSocket<I> {
     oversized: AtomicU64,
     interface_index: u32,
     signal: RevocationSignal,
+    /// Applied on the send path, so no session or dial ever touches the OS socket.
+    priority: Arc<LinkPriority>,
     /// Dropped with the socket, ending every `lifetime()` wait. Declared after `io`, so the OS
     /// socket is closed by the time a wait ends.
     lifetime: watch::Sender<()>,
@@ -655,6 +668,7 @@ impl<I> GuardedSocket<I> {
             oversized: AtomicU64::new(0),
             interface_index,
             signal,
+            priority: LinkPriority::new(),
             lifetime: watch::Sender::new(()),
         }
     }
@@ -696,6 +710,10 @@ impl<I> GuardedSocket<I> {
         self.knocks.clone()
     }
 
+    pub(super) fn priority(&self) -> Arc<LinkPriority> {
+        self.priority.clone()
+    }
+
     /// The member slots' addresses, or None for a pairing listener.
     pub(super) fn slots(&self) -> Option<Arc<MemberSlots>> {
         match &self.admission {
@@ -715,6 +733,17 @@ impl<I> GuardedSocket<I> {
 }
 
 impl<I: DatagramIo> GuardedSocket<I> {
+    /// Brings the voice mark in line with the endpoint's priority before a datagram leaves; one
+    /// atomic load while nothing changed.
+    fn settle_priority(&self) {
+        self.priority.settle(|voice| {
+            let members = self
+                .slots()
+                .map_or_else(Vec::new, |slots| slots.addresses());
+            self.io.set_voice(voice, &members)
+        });
+    }
+
     fn check_active(&self) -> io::Result<()> {
         if self.signal.is_revoked() {
             Err(revoked_error())
@@ -846,6 +875,7 @@ impl<I: DatagramIo> GuardedSocket<I> {
         if self.reachability.reaches(member) {
             return;
         }
+        self.settle_priority();
         match self.io.try_send_to(transmit.contents, destination) {
             Ok(length) if length == PROBE.len() => {}
             Ok(_) => self.revoke_because(&"a probe was written short"),
@@ -884,6 +914,7 @@ impl<I: DatagramIo> GuardedSocket<I> {
             self.revoke_because(&"a knock left the pinned peers");
             return;
         };
+        self.settle_priority();
         match self.io.try_send_to(transmit.contents, destination) {
             Ok(length) if length == PROBE.len() => {}
             Ok(_) => self.revoke_because(&"a knock was written short"),
@@ -936,6 +967,7 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
             );
             return Ok(());
         }
+        self.settle_priority();
         // No outgoing source/ECN ancillary data: IP_PKTINFO could override macOS interface pinning.
         let result = self.io.try_send_to(transmit.contents, destination);
         if self.signal.is_revoked() {

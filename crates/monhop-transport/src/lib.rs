@@ -5,6 +5,7 @@ pub mod display_arrangement;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod guarded_endpoint;
 pub mod identity_store;
+pub(crate) mod link_priority;
 pub mod policy;
 
 pub mod native_storage;

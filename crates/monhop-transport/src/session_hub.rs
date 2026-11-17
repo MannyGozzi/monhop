@@ -8,6 +8,7 @@
 //! [`HubEvents`] reports each peer's start and end.
 
 use crate::{
+    link_priority::SessionPriority,
     session::{
         LinkIo, LinkStats, SESSION_POLL_INTERVAL, SESSION_QUEUE_CAPACITY, SessionDiagnostics,
         SessionFailure, SessionHalf, SessionProgress, SessionStartupFailure, TickGap,
@@ -751,16 +752,19 @@ struct Link {
     /// Its receiver runs in the destination actor.
     joined: bool,
     started_at: Option<Duration>,
+    /// Its endpoint's voice priority: running from startup's end until the link drops.
+    priority: Option<SessionPriority>,
 }
 
 impl Link {
     fn open(
-        session: NegotiatedSession,
+        mut session: NegotiatedSession,
         progress: SessionProgress,
         cancel: RevocationSignal,
         wake: Arc<Notify>,
     ) -> Self {
         let (peer, platform) = (session.peer.device_id, session.peer.platform);
+        let priority = session.priority.take();
         let (mut reader, io) = LinkIo::split(session, progress.clone());
         let (frames, inbox) = mpsc::channel(SESSION_QUEUE_CAPACITY);
         let reader = tokio::spawn(async move {
@@ -787,6 +791,7 @@ impl Link {
             end: PeerEnd::default(),
             joined: false,
             started_at: None,
+            priority,
         }
     }
 
@@ -919,7 +924,36 @@ impl<N: NativeInput> HubLoop<N> {
         if housekeeping {
             self.housekeeping()?;
         }
+        self.note_holds();
         Ok(None)
+    }
+
+    /// Passes each new hold to its endpoint's priority before the loop yields, so the mark is
+    /// gone before any datagram queued after the hold leaves.
+    fn note_holds(&mut self) {
+        for index in 0..MAX_GROUP_PEERS {
+            if !matches!(&self.seats[index], Seat::Live(link) if link.priority.is_some()) {
+                continue;
+            }
+            let held = self.is_held(slot_at(index));
+            if let Seat::Live(link) = &mut self.seats[index]
+                && let Some(priority) = &mut link.priority
+            {
+                priority.note_hold(held);
+            }
+        }
+    }
+
+    /// Whether `slot`'s source or its receiver holds for a silent peer.
+    fn is_held(&self, slot: FloorPeer) -> bool {
+        self.core
+            .source(slot)
+            .is_some_and(|source| source.held_since().is_some())
+            || self
+                .workers
+                .destination
+                .as_ref()
+                .is_some_and(|actor| actor.is_held(slot))
     }
 
     fn take_commands(&mut self) -> Result<Option<PeerEnd>, SessionFailure> {
@@ -1220,10 +1254,7 @@ impl<N: NativeInput> HubLoop<N> {
                 FloorOwner::Outbound => SessionHalf::Outbound,
                 FloorOwner::Inbound => SessionHalf::Inbound,
             }));
-            link.progress.hold(
-                source.is_some_and(|source| source.held_since().is_some())
-                    || actor.is_some_and(|actor| actor.is_held(slot)),
-            );
+            link.progress.hold(self.is_held(slot));
             if let Some(source) = source {
                 link.progress.link_quality(
                     source.link_quality(),
@@ -1278,6 +1309,9 @@ impl<N: NativeInput> HubLoop<N> {
                 if let Seat::Live(link) = &mut self.seats[seat(slot)] {
                     link.started_at = Some(self.origin.elapsed());
                     link.progress.mark_started();
+                    if let Some(priority) = &mut link.priority {
+                        priority.start();
+                    }
                 }
                 self.emit(HubEvent::PeerStarted { peer });
                 Ok(())
@@ -1624,6 +1658,7 @@ mod tests {
     use super::*;
     use crate::{
         crypto::{DeviceIdentity, LOCAL_TLS_SERVER_NAME, SecureQuicConfig, VerifiedPeer},
+        link_priority::LinkPriority,
         session::SessionIo,
         session_actor::{EnvironmentFailure, WatchedDestination, WatchedEnvironment},
         session_handshake::{HandshakeConfig, device_id_from_fingerprint, negotiate},
@@ -2128,6 +2163,8 @@ mod tests {
         /// Frames for the link: (outbound, frame).
         out: Vec<(bool, Frame)>,
         closed: bool,
+        /// Goes silent, as a link whose datagrams stopped arriving.
+        muted: bool,
     }
 
     impl Peer {
@@ -2166,6 +2203,7 @@ mod tests {
                 events: VecDeque::new(),
                 out: Vec::new(),
                 closed: false,
+                muted: false,
             }
         }
 
@@ -2307,6 +2345,10 @@ mod tests {
         }
         let mut tick = tokio::time::interval(Duration::from_millis(1));
         while !peer.borrow().closed {
+            if peer.borrow().muted {
+                tick.tick().await;
+                continue;
+            }
             tokio::select! {
                 frame = io.next_frame() => match frame {
                     Ok(frame) => peer.borrow_mut().frame(frame),
@@ -2573,6 +2615,42 @@ mod tests {
         .collect();
         assert_eq!(served, [0, 4, 0, 4, 0, 0]);
         assert_eq!(queues[0].len(), 996);
+    }
+
+    #[test]
+    fn a_started_link_keeps_voice_priority_until_it_holds_or_ends() {
+        scenario(async {
+            let mut group = Group::start(3);
+            let priority = LinkPriority::new();
+            for id in [1, 2] {
+                let mut pair = group.negotiate(id).await;
+                pair.ours.priority = Some(priority.session());
+                let go = group.attach(id, pair);
+                group
+                    .until("the hub holds the link", |group| {
+                        group.hub.status().peers.len() == id
+                    })
+                    .await;
+                assert!(!priority.wants_voice(), "a starting link stays at normal");
+                go.send(()).unwrap();
+                group.started(id).await;
+                assert!(priority.wants_voice());
+            }
+
+            group.hub.remove_peer(group.device(2), DELIBERATE).unwrap();
+            assert_eq!(group.ended(2).await, Err(SessionFailure::Revoked));
+            assert!(priority.wants_voice(), "one link still runs");
+            group.peers[1].as_ref().unwrap().borrow_mut().muted = true;
+            group
+                .until("computer 1's hold reaches the priority", |_| {
+                    !priority.wants_voice()
+                })
+                .await;
+            group.peers[1].as_ref().unwrap().borrow_mut().muted = false;
+            group.hub.remove_peer(group.device(1), DELIBERATE).unwrap();
+            assert_eq!(group.ended(1).await, Err(SessionFailure::Revoked));
+            group.finish().await;
+        });
     }
 
     #[test]

@@ -77,6 +77,8 @@ struct TestIo {
     write_pending: Notify,
     revoke_on_receive: Mutex<Option<RevocationSignal>>,
     revoke_on_send: Mutex<Option<RevocationSignal>>,
+    /// Each voice mark set or cleared, with how many sends had been attempted by then.
+    marks: Arc<Mutex<Vec<(usize, bool)>>>,
 }
 
 impl TestIo {
@@ -100,6 +102,7 @@ impl TestIo {
             write_pending: Notify::new(),
             revoke_on_receive: Mutex::new(None),
             revoke_on_send: Mutex::new(None),
+            marks: Arc::default(),
         }
     }
     fn enqueue(&self, arrival: Arrival) {
@@ -227,6 +230,11 @@ impl DatagramIo for TestIo {
     }
     fn local_addr(&self) -> io::Result<SocketAddrV4> {
         Ok(self.local)
+    }
+    fn set_voice(&self, voice: bool, _: &[SocketAddrV4]) -> io::Result<()> {
+        let sent = self.sends.load(Ordering::SeqCst);
+        self.marks.lock().unwrap().push((sent, voice));
+        Ok(())
     }
 }
 
@@ -539,6 +547,103 @@ fn writer_pollers_do_not_replace_revocation_observer_and_can_be_reused() {
     assert!(poller.as_mut().poll_writable(&mut cx).is_pending());
 }
 
+/// Each voice mark the socket set or cleared, with how many sends it had attempted by then.
+fn marks(io: &TestIo) -> Vec<(usize, bool)> {
+    io.marks.lock().unwrap().clone()
+}
+
+#[test]
+fn a_socket_starts_unmarked_and_a_hold_unmarks_it_before_the_next_datagram() {
+    let socket = fixture();
+    let mut session = socket.priority().session();
+    assert!(socket.try_send(&transmit()).is_ok());
+    assert_eq!(
+        marks(&socket.io),
+        [],
+        "a bound socket and a starting session send unmarked"
+    );
+    session.start();
+    assert!(socket.try_send(&transmit()).is_ok());
+    assert!(socket.try_send(&transmit()).is_ok());
+    assert_eq!(
+        marks(&socket.io),
+        [(1, true)],
+        "marked once, before the second datagram"
+    );
+    session.note_hold(true);
+    assert!(socket.try_send(&transmit()).is_ok());
+    assert_eq!(
+        marks(&socket.io),
+        [(1, true), (3, false)],
+        "unmarked before the first datagram after the hold"
+    );
+    drop(session);
+    assert!(socket.try_send(&transmit()).is_ok());
+    assert_eq!(marks(&socket.io).len(), 2);
+}
+
+#[tokio::test]
+async fn a_dial_and_its_knocks_go_unmarked_while_another_session_runs() {
+    let identity = DeviceIdentity::generate().unwrap();
+    let others = [(); 2].map(|()| DeviceIdentity::generate().unwrap());
+    let [socket] = memory_network([(LOCAL, &MEMBERS[..2])]);
+    let marks = socket.io.marks.clone();
+    let hub = guarded(
+        socket,
+        &identity,
+        &[(MEMBERS[0], &others[0]), (MEMBERS[1], &others[1])],
+    );
+    let handle = hub.handle();
+    let (running, dialed) = (others[0].fingerprint(), others[1].fingerprint());
+    let mut session = handle.session_priority();
+    session.start();
+    handle.knock(running);
+    assert_eq!(*marks.lock().unwrap(), [(0, true)]);
+    handle.set_wanted(dialed, true);
+    handle.knock(dialed);
+    assert_eq!(*marks.lock().unwrap(), [(0, true), (1, false)]);
+    handle.set_wanted(dialed, false);
+    handle.knock(running);
+    assert_eq!(*marks.lock().unwrap(), [(0, true), (1, false), (2, true)]);
+    drop(session);
+    handle.knock(running);
+    assert_eq!(marks.lock().unwrap().last(), Some(&(3, false)));
+    hub.revoke();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_native_socket_reads_back_unmarked_at_bind_and_again_after_a_hold() {
+    let bind = || std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let theirs = bind();
+    let SocketAddr::V4(peer) = theirs.local_addr().unwrap() else {
+        unreachable!("bound to IPv4 loopback")
+    };
+    let io = NativeSocket::configured(bind()).unwrap();
+    let local = io.local_addr().unwrap();
+    let socket = pinned_socket(io, local, &[peer], INDEX);
+    let send = || {
+        socket.try_send(&Transmit {
+            destination: peer.into(),
+            ecn: None,
+            contents: b"fixed",
+            segment_size: None,
+            src_ip: None,
+        })
+    };
+    assert!(!socket.io.is_voice().unwrap());
+    NativeSocket::writable(&socket.io).await.unwrap();
+    let mut session = socket.priority().session();
+    send().unwrap();
+    assert!(!socket.io.is_voice().unwrap(), "startup goes unmarked");
+    session.start();
+    send().unwrap();
+    assert!(socket.io.is_voice().unwrap());
+    session.note_hold(true);
+    send().unwrap();
+    assert!(!socket.io.is_voice().unwrap());
+}
+
 fn paired(identity: &DeviceIdentity) -> VerifiedPeer {
     VerifiedPeer::from_certificate_der(
         identity.certificate_der(),
@@ -774,6 +879,9 @@ impl<I: DatagramIo> DatagramIo for ObservedIo<I> {
     }
     fn local_addr(&self) -> io::Result<SocketAddrV4> {
         self.inner.local_addr()
+    }
+    fn set_voice(&self, voice: bool, peers: &[SocketAddrV4]) -> io::Result<()> {
+        self.inner.set_voice(voice, peers)
     }
 }
 
@@ -2631,11 +2739,7 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
     let make_io = || -> NativeSocket {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         platform::network::restrict_udp_interface(&socket, index).unwrap();
-        platform::udp_receive::UdpReceiver::configure(socket)
-            .unwrap()
-            .into_async()
-            .unwrap()
-            .into()
+        NativeSocket::configured(socket).unwrap()
     };
     let io_a = make_io();
     let io_b = make_io();
@@ -2706,7 +2810,7 @@ async fn native_loopback_guarded_quic_delivers_and_revokes() {
 #[ignore = "set MONHOP_TEST_SOURCE and MONHOP_TEST_SILENT_PEER to an unused address on its subnet"]
 async fn native_probe_lifts_the_rejection_of_a_member_that_stopped_answering() {
     use super::super::native::{CADENCE, Probe, Readmission};
-    use monhop_platform_macos::{network, udp_receive};
+    use monhop_platform_macos::network;
 
     /// XNU's default net.link.ether.inet.host_down_time is 20 s; this allows for a longer one.
     const HOLD_DOWN: Duration = Duration::from_secs(30);
@@ -2726,11 +2830,7 @@ async fn native_probe_lifts_the_rejection_of_a_member_that_stopped_answering() {
         .index;
     let socket = std::net::UdpSocket::bind((source, 0)).unwrap();
     network::restrict_udp_interface(&socket, index).unwrap();
-    let receiver: NativeSocket = udp_receive::UdpReceiver::configure(socket)
-        .unwrap()
-        .into_async()
-        .unwrap()
-        .into();
+    let receiver = NativeSocket::configured(socket).unwrap();
     let local = receiver.local_addr().unwrap();
     let member = SocketAddrV4::new(silent, 9);
     // Only this private fixture skips the lock; its member is an on-link private address all the same.

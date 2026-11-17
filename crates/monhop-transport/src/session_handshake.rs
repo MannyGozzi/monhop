@@ -16,6 +16,7 @@ pub use monhop_protocol::SessionPurpose;
 
 use crate::{
     crypto::{CertificateFingerprint, DeviceIdentity, VerifiedPeer},
+    link_priority::SessionPriority,
     session_wire::{FrameReader, SessionWireError, write_frame},
 };
 
@@ -232,6 +233,8 @@ pub struct NegotiatedSession {
     pub control: ControlContinuation,
     pub input_epochs: InputEpochContinuation,
     pub control_streams: ControlStreams,
+    /// Its endpoint's voice priority, which the share hub runs while this session runs.
+    pub(crate) priority: Option<SessionPriority>,
 }
 
 impl NegotiatedSession {
@@ -346,6 +349,7 @@ pub async fn negotiate(
             recv: parts.recv,
             reader: parts.reader,
         },
+        priority: None,
     })
 }
 

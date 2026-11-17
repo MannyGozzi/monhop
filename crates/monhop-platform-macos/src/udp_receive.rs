@@ -5,7 +5,7 @@ use std::{
     io,
     mem::size_of,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
-    os::fd::AsRawFd,
+    os::fd::{AsFd, AsRawFd, BorrowedFd},
     task::{Context, Poll},
 };
 
@@ -223,6 +223,13 @@ impl AsyncUdpReceiver {
     #[cfg(test)]
     fn native_would_block_count(&self) -> u32 {
         self.native_would_block_count.load(Ordering::Relaxed)
+    }
+}
+
+/// For socket options on the socket the receiver owns.
+impl AsFd for AsyncUdpReceiver {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
     }
 }
 

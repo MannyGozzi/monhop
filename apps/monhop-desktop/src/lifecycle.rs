@@ -10,7 +10,7 @@ use std::{
 use monhop_transport::{
     crypto::CertificateFingerprint,
     guarded_endpoint::MemberMoved,
-    session_setup::{DisplayTopology, InspectedPeer, ResolvedNetwork, same_network},
+    session_setup::{DisplayTopology, InspectedPeer, ResolvedNetwork, same_adapter, same_network},
 };
 
 use crate::{
@@ -414,7 +414,12 @@ impl AppController {
                 None => log::info!("user: paused sharing"),
             }
             let path = self.setup_path()?;
-            let view = self.sharing.set_active(&path, fingerprint, interface_id)?;
+            let interface_id = interface_id
+                .map(|chosen| self.network_choice(&path, chosen))
+                .transpose()?;
+            let view = self
+                .sharing
+                .set_active(&path, fingerprint, interface_id.as_deref())?;
             *lock(&self.sharing_retry_after) = None;
             view
         };
@@ -442,12 +447,15 @@ impl AppController {
                 if enabled { "on" } else { "off" }
             );
             let path = self.setup_path()?;
-            if enabled && let Some(interface_id) = interface_id {
+            let interface_id = interface_id
+                .map(|chosen| self.network_choice(&path, chosen))
+                .transpose()?;
+            if enabled && let Some(interface_id) = &interface_id {
                 self.leave_network_for(&path, interface_id)?;
             }
-            let view = self
-                .sharing
-                .set_enabled(&path, fingerprint, enabled, interface_id)?;
+            let view =
+                self.sharing
+                    .set_enabled(&path, fingerprint, enabled, interface_id.as_deref())?;
             *lock(&self.sharing_retry_after) = None;
             view
         };
@@ -483,6 +491,7 @@ impl AppController {
             Some(fingerprint) => log::info!("user: started arranging with {}", short(fingerprint)),
             None => log::info!("user: started arranging"),
         }
+        let interface_id = self.network_choice(&path, &interface_id)?;
         self.leave_network_for(&path, &interface_id)?;
         let file = self.sharing.try_update_setup_file(&path, |file| {
             if let Some(fingerprint) = &fingerprint {
@@ -510,6 +519,16 @@ impl AppController {
                 .connect_link(path.clone(), interface_id.clone(), peer)?;
         }
         Ok(self.sharing.begin_editing())
+    }
+
+    /// The network id a user action should save for `chosen`; see [`network_choice`].
+    fn network_choice(&self, path: &Path, chosen: &str) -> Result<String, String> {
+        let file = self.load_setup(path, "The saved setup could not be read.")?;
+        let kept = network_choice(file.interface_id(), chosen);
+        if kept != chosen {
+            log::info!("user: chose the saved adapter at a new address; following it there");
+        }
+        Ok(kept.to_owned())
     }
 
     /// Every connection runs on the one network the setup file records, and the endpoint they
@@ -1306,6 +1325,15 @@ fn transition(
         None => "unknown",
     };
     format!("{action} [{displays}; record {record}; decider {decider}]")
+}
+
+/// A choice naming the saved adapter at another address keeps the saved id: only a bind that
+/// follows the adapter knocks, so the paired computers learn the new address.
+fn network_choice<'a>(saved: Option<&'a str>, chosen: &'a str) -> &'a str {
+    match saved {
+        Some(saved) if same_adapter(saved, chosen) && !same_network(saved, chosen) => saved,
+        _ => chosen,
+    }
 }
 
 /// The first hex digits of a fingerprint: enough to tell computers apart in a log line.
@@ -2379,6 +2407,57 @@ mod tests {
         }
         assert!(controller.shutdown_ready());
         assert!(controller.gate.begin().is_err());
+    }
+
+    #[test]
+    fn choosing_the_saved_adapter_at_a_new_address_keeps_the_saved_id_so_it_is_followed() {
+        let saved = "mac:fcb214d3f79e:15:192.168.0.160";
+        assert_eq!(
+            network_choice(Some(saved), "mac:fcb214d3f79e:15:192.168.0.242"),
+            saved
+        );
+        assert_eq!(
+            network_choice(Some(saved), "mac:fcb214d3f79e:16:192.168.0.160"),
+            "mac:fcb214d3f79e:16:192.168.0.160"
+        );
+        assert_eq!(
+            network_choice(Some(saved), "mac:0123456789ab:4:10.0.0.7"),
+            "mac:0123456789ab:4:10.0.0.7"
+        );
+        assert_eq!(
+            network_choice(None, "en0:4:192.168.1.4"),
+            "en0:4:192.168.1.4"
+        );
+    }
+
+    #[test]
+    fn switching_a_computer_on_from_a_moved_address_leaves_the_saved_network_to_follow() {
+        let _test = lock(&crate::NATIVE_LIFECYCLE_TEST_LOCK);
+        let folder = folder("moved-switch-on");
+        let path = folder.join("sharing.json");
+        let mut file = SetupFile::default();
+        file.set_interface_id("en0:4:192.168.1.4");
+        file.save(&path).unwrap();
+        let controller = AppController::default();
+        controller.use_setup_path(path.clone());
+        let peer = "B".repeat(64);
+
+        controller
+            .set_enabled(&peer, true, Some("en0:4:192.168.1.9"))
+            .unwrap();
+        assert_eq!(
+            SetupFile::load(&path).unwrap().interface_id(),
+            Some("en0:4:192.168.1.4")
+        );
+        controller
+            .set_active(Some(&peer), Some("en0:4:192.168.1.9"))
+            .unwrap();
+        assert_eq!(
+            SetupFile::load(&path).unwrap().interface_id(),
+            Some("en0:4:192.168.1.4")
+        );
+        stop(&controller);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]

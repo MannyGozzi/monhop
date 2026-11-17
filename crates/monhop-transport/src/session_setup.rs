@@ -347,6 +347,14 @@ pub fn same_network(saved: &str, chosen: &str) -> bool {
             .is_some_and(|(stable_id, address)| names_adapter(saved, stable_id, address))
 }
 
+/// Whether two saved network ids name the same physical adapter, at the same address or not.
+pub fn same_adapter(saved: &str, chosen: &str) -> bool {
+    matches!(
+        (saved_adapter(saved), saved_adapter(chosen)),
+        (Some((saved, _)), Some((chosen, _))) if saved == chosen
+    )
+}
+
 pub fn selected_network(interface_id: &str) -> Result<NetworkSelection, SetupFailure> {
     selected_adapter(interface_id, None).map(|(selection, _, _)| selection)
 }
@@ -2046,7 +2054,7 @@ impl GroupEndpoint {
     fn hand_out(
         &self,
         index: usize,
-        session: NegotiatedSession,
+        mut session: NegotiatedSession,
         inspection: InspectedPeer,
         mut heard: Heard,
         cancel: &RevocationSignal,
@@ -2071,6 +2079,9 @@ impl GroupEndpoint {
         }
         self.rewant(index);
         heard.keep();
+        if session.purpose() == SessionPurpose::Share {
+            session.priority = Some(self.handle.session_priority());
+        }
         Ok(PairedMember {
             session,
             inspection,
@@ -2629,6 +2640,22 @@ mod network_id_tests {
                 Err(SetupFailure::NetworkSelection)
             );
         }
+    }
+
+    #[test]
+    fn ids_with_one_stable_id_name_the_same_adapter_whatever_their_addresses() {
+        let saved = interface_id("en0", 4, ADDRESS);
+        assert!(same_adapter(
+            &saved,
+            &interface_id("en0", 7, Ipv4Addr::new(192, 168, 1, 160))
+        ));
+        assert!(same_adapter(
+            "mac:fcb214d3f79e:15:192.168.0.160",
+            "mac:fcb214d3f79e:15:192.168.0.242"
+        ));
+        assert!(!same_adapter(&saved, &interface_id("en1", 4, ADDRESS)));
+        assert!(!same_adapter("en0", &saved));
+        assert!(!same_adapter(&saved, "en0:4:not-an-address"));
     }
 }
 
@@ -3536,6 +3563,10 @@ mod group_tests {
                 SocketAddr::V4(remote.address)
             );
             assert_eq!(dialed.peer.device_id, paired.inspection.local_device);
+            assert!(
+                paired.session.priority.is_none(),
+                "a setup link never marks"
+            );
         }
         assert!(
             unclaimed.is_err(),
@@ -3705,6 +3736,10 @@ mod group_tests {
         let ours = ours.unwrap();
         theirs.unwrap();
         assert!(ours.inspection.peer_fingerprint == fingerprint);
+        assert!(
+            ours.session.priority.is_some(),
+            "a share session carries its endpoint's voice priority"
+        );
         assert_eq!(
             ours.session.connection.remote_address(),
             SocketAddr::V4(remote.address)

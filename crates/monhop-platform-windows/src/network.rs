@@ -3,7 +3,7 @@
 use std::{
     io,
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
-    os::windows::io::AsRawSocket,
+    os::windows::io::{AsRawSocket, AsSocket},
     ptr,
 };
 use windows_sys::{
@@ -320,7 +320,7 @@ pub fn restrict_udp_interface(socket: &UdpSocket, index: u32) -> io::Result<()> 
 }
 
 /// Keeps a socket's datagrams to its peers in the voice class, which Windows tags so Wi-Fi queues
-/// them ahead of bulk traffic; dropping it ends the marking.
+/// them ahead of bulk traffic; dropping it removes every flow and ends the marking.
 pub struct InteractiveTraffic(HANDLE);
 
 // SAFETY: the qWAVE handle is used only when created and when closed on drop, never shared.
@@ -330,8 +330,9 @@ unsafe impl Sync for InteractiveTraffic {}
 
 /// An unconnected socket names each peer, one flow apiece on one handle; any refused flow drops
 /// them all. A non-adaptive flow sends no probes, and a traffic type needs no administrator rights.
+/// The socket may be marked again once an earlier `InteractiveTraffic` for it is dropped.
 pub fn mark_interactive_traffic(
-    socket: &UdpSocket,
+    socket: &impl AsSocket,
     peers: &[SocketAddrV4],
 ) -> io::Result<InteractiveTraffic> {
     if peers.is_empty() {
@@ -354,7 +355,7 @@ pub fn mark_interactive_traffic(
         let added = unsafe {
             QOSAddSocketToFlow(
                 traffic.0,
-                socket.as_raw_socket() as SOCKET,
+                socket.as_socket().as_raw_socket() as SOCKET,
                 (&raw const destination).cast(),
                 QOSTrafficTypeVoice,
                 QOS_NON_ADAPTIVE_FLOW,

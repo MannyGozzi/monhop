@@ -35,15 +35,55 @@ use monhop_platform_windows::{
     network_watch, udp_receive,
 };
 
-/// The session socket, owning on Windows the flow that keeps its datagrams marked interactive.
+/// The session socket, owning on Windows the flows that mark its datagrams as voice while it is
+/// marked. It starts unmarked; only the socket's send path changes the mark.
 pub(super) struct NativeSocket {
-    // Declared first so the flow is removed while its socket is still open.
+    // Declared first so the flows are removed while their socket is still open.
     #[cfg(windows)]
-    _traffic: Option<network::InteractiveTraffic>,
+    traffic: Mutex<Option<network::InteractiveTraffic>>,
     receiver: udp_receive::AsyncUdpReceiver,
 }
 
 impl NativeSocket {
+    /// Takes a bound socket for asynchronous receive with arrival metadata, unmarked. Must run
+    /// inside the runtime that will drive it.
+    pub(super) fn configured(socket: UdpSocket) -> io::Result<Self> {
+        let receiver = udp_receive::UdpReceiver::configure(socket)
+            .and_then(udp_receive::UdpReceiver::into_async)?;
+        Ok(Self {
+            #[cfg(windows)]
+            traffic: Mutex::new(None),
+            receiver,
+        })
+    }
+
+    /// Marks datagrams to `peers` as voice, so Wi-Fi queues them ahead of bulk traffic, or returns
+    /// every datagram to normal priority.
+    pub(super) fn set_voice(&self, voice: bool, peers: &[SocketAddrV4]) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = peers;
+            network::set_interactive_traffic(&self.receiver, voice)
+        }
+        #[cfg(windows)]
+        {
+            let mut traffic = self
+                .traffic
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *traffic = None;
+            if voice {
+                *traffic = Some(network::mark_interactive_traffic(&self.receiver, peers)?);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn is_voice(&self) -> io::Result<bool> {
+        network::is_interactive_traffic(&self.receiver)
+    }
+
     /// A datagram the OS truncated and already discarded, rather than a failed socket.
     pub(super) fn is_truncated(error: &io::Error) -> bool {
         udp_receive::is_truncated(error)
@@ -67,16 +107,6 @@ impl NativeSocket {
 
     pub(super) fn local_addr(&self) -> io::Result<SocketAddrV4> {
         self.receiver.local_addr()
-    }
-}
-
-impl From<udp_receive::AsyncUdpReceiver> for NativeSocket {
-    fn from(receiver: udp_receive::AsyncUdpReceiver) -> Self {
-        Self {
-            receiver,
-            #[cfg(windows)]
-            _traffic: None,
-        }
     }
 }
 
@@ -119,19 +149,10 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
     } = prepare_selection(pinned, None)?;
 
     require_active(&signal, None)?;
-    let socket = bind_on_interface(pinned.local, pinned.interface_index)?;
-    // Wi-Fi queues marked datagrams ahead of bulk traffic; a refusal only costs that priority.
-    #[cfg(target_os = "macos")]
-    let _ = network::mark_interactive_traffic(&socket).inspect_err(warn_unmarked);
-    #[cfg(windows)]
-    let traffic = network::mark_interactive_traffic(&socket, &pinned.peers)
-        .inspect_err(warn_unmarked)
-        .ok();
-    let socket = NativeSocket {
-        receiver: receiver(socket, pinned.local)?,
-        #[cfg(windows)]
-        _traffic: traffic,
-    };
+    let socket = native_socket(
+        bind_on_interface(pinned.local, pinned.interface_index)?,
+        pinned.local,
+    )?;
 
     revalidate_selection(&initial, pinned, &mut lock, &signal, None)?;
     reachability.set(lock.reachable());
@@ -147,10 +168,6 @@ pub(super) fn prepare(pinned: &PinnedNetwork) -> io::Result<PreparedNetwork> {
     })
 }
 
-fn warn_unmarked(error: &io::Error) {
-    log::warn!("session datagrams keep ordinary Wi-Fi priority: {error}");
-}
-
 /// A socket bound to exactly `local` and restricted to the selected interface.
 fn bind_on_interface(local: SocketAddrV4, interface_index: u32) -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(local).map_err(native_category)?;
@@ -159,15 +176,13 @@ fn bind_on_interface(local: SocketAddrV4, interface_index: u32) -> io::Result<Ud
     Ok(socket)
 }
 
-/// The asynchronous receiver that reports each datagram's destination and arrival interface.
-fn receiver(socket: UdpSocket, local: SocketAddrV4) -> io::Result<udp_receive::AsyncUdpReceiver> {
-    let receiver = udp_receive::UdpReceiver::configure(socket)
-        .and_then(udp_receive::UdpReceiver::into_async)
-        .map_err(native_category)?;
-    if receiver.local_addr().map_err(native_category)? != local {
+/// The asynchronous socket that reports each datagram's destination and arrival interface.
+fn native_socket(socket: UdpSocket, local: SocketAddrV4) -> io::Result<NativeSocket> {
+    let socket = NativeSocket::configured(socket).map_err(native_category)?;
+    if socket.local_addr().map_err(native_category)? != local {
         return Err(io::Error::from(io::ErrorKind::InvalidData));
     }
-    Ok(receiver)
+    Ok(socket)
 }
 
 /// A pairing listener's network: the selected adapter, bound and watched, with no peer. The
@@ -209,8 +224,10 @@ pub(super) fn prepare_listener(selection: &ListenSelection) -> io::Result<Prepar
         .map_err(|_| io::Error::from(io::ErrorKind::Other))? = Some(interface.clone());
     require_active(&signal, None)?;
 
-    let socket = bind_on_interface(selection.local, selection.interface_index)?;
-    let socket = NativeSocket::from(receiver(socket, selection.local)?);
+    let socket = native_socket(
+        bind_on_interface(selection.local, selection.interface_index)?,
+        selection.local,
+    )?;
     if read_selected(&initial)? != interface {
         return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
     }

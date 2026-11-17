@@ -20,6 +20,10 @@ pub const STREAM_STALL_LIMIT: Duration = PEER_LIVENESS.saturating_add(HOLD_LIMIT
 /// A held source whose barrier was acknowledged but that hears no fresh reply sends another
 /// barrier after this long: the receiver consumed the last one just before holding itself.
 pub const BARRIER_RESEND_AFTER: Duration = PEER_LIVENESS;
+/// After a hold, an endpoint's datagrams keep normal Wi-Fi priority this long from the latest one.
+pub const VOICE_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// A hold this soon after voice priority was applied ends voice priority for the socket's life.
+pub const VOICE_PROOF: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HealthError {

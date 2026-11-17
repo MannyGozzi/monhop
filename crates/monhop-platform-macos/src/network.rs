@@ -10,7 +10,7 @@ use std::{
     io,
     mem::{offset_of, size_of},
     net::{Ipv4Addr, UdpSocket},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
     ptr,
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
@@ -61,6 +61,7 @@ const IP_RECVIF: c_int = 20;
 const IP_BOUND_IF: c_int = 25;
 const SOL_SOCKET: c_int = 0xffff;
 const SO_NET_SERVICE_TYPE: c_int = 0x1116;
+const NET_SERVICE_TYPE_BE: c_int = 0;
 const NET_SERVICE_TYPE_VO: c_int = 4;
 const MAX_INTERFACES: usize = 4096;
 const MAX_IOKIT_INTERFACES: usize = 256;
@@ -210,6 +211,13 @@ unsafe extern "C" {
         option: c_int,
         value: *const c_void,
         length: u32,
+    ) -> c_int;
+    fn getsockopt(
+        fd: c_int,
+        level: c_int,
+        option: c_int,
+        value: *mut c_void,
+        length: *mut u32,
     ) -> c_int;
 }
 
@@ -546,14 +554,39 @@ pub fn restrict_udp_interface(socket: &UdpSocket, index: u32) -> io::Result<()> 
 }
 
 /// Marks the socket as interactive voice, so Wi-Fi queues its datagrams (WMM AC_VO) ahead of bulk
-/// traffic; the system decides whether a DSCP mark follows.
-pub fn mark_interactive_traffic(socket: &UdpSocket) -> io::Result<()> {
+/// traffic, or returns it to best effort; the system decides whether a DSCP mark follows.
+pub fn set_interactive_traffic(socket: &impl AsFd, voice: bool) -> io::Result<()> {
+    let service = if voice {
+        NET_SERVICE_TYPE_VO
+    } else {
+        NET_SERVICE_TYPE_BE
+    };
     set_int_option(
-        socket.as_raw_fd(),
+        socket.as_fd().as_raw_fd(),
         SOL_SOCKET,
         SO_NET_SERVICE_TYPE,
-        NET_SERVICE_TYPE_VO,
+        service,
     )
+}
+
+/// Whether the socket is marked as interactive voice.
+pub fn is_interactive_traffic(socket: &impl AsFd) -> io::Result<bool> {
+    let mut value: c_int = -1;
+    let mut length = u32::try_from(size_of::<c_int>()).expect("c_int size fits socklen_t");
+    // SAFETY: the value pointer and length describe one c_int the call may write.
+    let read = unsafe {
+        getsockopt(
+            socket.as_fd().as_raw_fd(),
+            SOL_SOCKET,
+            SO_NET_SERVICE_TYPE,
+            (&raw mut value).cast(),
+            &mut length,
+        )
+    };
+    if read != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value == NET_SERVICE_TYPE_VO)
 }
 
 fn system_configuration_metadata() -> io::Result<BTreeMap<String, InterfaceMetadata>> {
@@ -1535,35 +1568,14 @@ fn set_int_option(fd: RawFd, level: c_int, option: c_int, value: c_int) -> io::R
 mod tests {
     use super::*;
 
-    // SAFETY: getsockopt writes at most `length` bytes into the caller's buffer.
-    unsafe extern "C" {
-        fn getsockopt(
-            fd: c_int,
-            level: c_int,
-            option: c_int,
-            value: *mut c_void,
-            length: *mut u32,
-        ) -> c_int;
-    }
-
     #[test]
-    fn a_marked_socket_reads_back_as_interactive_voice() {
+    fn a_socket_reads_back_as_interactive_voice_only_while_marked() {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        mark_interactive_traffic(&socket).unwrap();
-        let mut value: c_int = -1;
-        let mut length = u32::try_from(size_of::<c_int>()).unwrap();
-        // SAFETY: the socket is live and the buffer and its length describe one c_int.
-        let read = unsafe {
-            getsockopt(
-                socket.as_raw_fd(),
-                SOL_SOCKET,
-                SO_NET_SERVICE_TYPE,
-                (&raw mut value).cast(),
-                &mut length,
-            )
-        };
-        assert_eq!(read, 0);
-        assert_eq!(value, NET_SERVICE_TYPE_VO);
+        assert!(!is_interactive_traffic(&socket).unwrap());
+        set_interactive_traffic(&socket, true).unwrap();
+        assert!(is_interactive_traffic(&socket).unwrap());
+        set_interactive_traffic(&socket, false).unwrap();
+        assert!(!is_interactive_traffic(&socket).unwrap());
     }
 
     fn metadata(kind: InterfaceType) -> InterfaceMetadata {

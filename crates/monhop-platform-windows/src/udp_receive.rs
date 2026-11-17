@@ -179,7 +179,7 @@ mod windows {
         io,
         mem::size_of,
         net::{SocketAddr, SocketAddrV4, UdpSocket},
-        os::windows::io::AsRawSocket,
+        os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket},
         ptr,
         task::{Context, Poll},
     };
@@ -331,6 +331,13 @@ mod windows {
         #[cfg(test)]
         fn record_native_would_block(&self) {
             self.native_would_blocks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// For socket options and QoS flows on the socket the receiver owns.
+    impl AsSocket for AsyncUdpReceiver {
+        fn as_socket(&self) -> BorrowedSocket<'_> {
+            self.socket.as_socket()
         }
     }
 
