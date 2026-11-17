@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-11-17
+
 ### Fixed
 
 - Sharing no longer goes dead when Wi-Fi stops carrying high-priority traffic. MonHop asks Wi-Fi to send its updates ahead of other traffic, and some routers stop delivering that kind of traffic to a computer after it moves to another access point, while everything else keeps working. Sharing then dropped and could not reconnect for hours. Now MonHop connects at normal priority, uses high priority only while it gets through, and drops back to normal priority the moment the other computer stops answering. Both computers need this version.
@@ -429,7 +431,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.22...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.23...HEAD
+[0.2.23]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.23
 [0.2.22]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.22
 [0.2.21]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.21
 [0.2.20]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.20
