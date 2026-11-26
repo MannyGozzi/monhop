@@ -6,7 +6,7 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::{CStr, c_char, c_int, c_ulong, c_void},
+    ffi::{CStr, CString, c_char, c_int, c_ulong, c_void},
     io,
     mem::{offset_of, size_of},
     net::{Ipv4Addr, UdpSocket},
@@ -55,6 +55,7 @@ const RTF_BROADCAST: i32 = 0x40_0000;
 const RTF_MULTICAST: i32 = 0x80_0000;
 const RTF_IFSCOPE: i32 = 0x100_0000;
 const ESRCH: i32 = 3;
+const ENXIO: i32 = 6;
 const EHOSTDOWN: i32 = 64;
 pub(crate) const IPPROTO_IP: c_int = 0;
 const IP_RECVIF: c_int = 20;
@@ -105,8 +106,11 @@ pub enum AdapterReading {
     /// Read back with its link active, as `enumerate_adapters_with_attachment` lists it; the
     /// attachment is `None` while the Wi-Fi network name does not read back.
     Present(Adapter),
-    /// The interface, its link, or the selected address on it is gone.
+    /// The interface is gone, renumbered or turned off.
     Lost,
+    /// The interface keeps its name and index, but its link is down or the selected address is
+    /// not on it: macOS removes the address while a Wi-Fi rejoin has the link down.
+    Settling,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,20 +308,57 @@ pub fn read_selected_adapter(selected: &Adapter) -> io::Result<AdapterReading> {
         name.to_bytes() == selected.name.as_bytes()
     })?;
     let Some(mut adapter) = found.pop() else {
-        return Ok(AdapterReading::Lost);
+        return keeps_index(selected).map(|kept| {
+            if kept {
+                AdapterReading::Settling
+            } else {
+                AdapterReading::Lost
+            }
+        });
     };
     if !found.is_empty() {
         return Err(io::Error::other("macOS listed the selected address twice"));
     }
-    // macOS keeps IFF_RUNNING set when a cable is pulled or Wi-Fi drops, so only the media status
-    // shows the link down that any move to a same-named network passes through.
-    if !adapter.up || adapter.physical && !read_link_active(&adapter.name)? {
+    if !adapter.up || !keeps_identity(&adapter, selected) {
         return Ok(AdapterReading::Lost);
+    }
+    // macOS keeps IFF_RUNNING set when a cable is pulled or Wi-Fi drops, so only the media status
+    // shows the link down that a rejoin, or a move to a same-named network, passes through.
+    if adapter.physical && !read_link_active(&adapter.name)? {
+        return Ok(AdapterReading::Settling);
     }
     if adapter.physical && adapter.wifi {
         adapter.attachment = crate::wifi_attachment::read_attachment(&adapter.name)?;
     }
     Ok(AdapterReading::Present(adapter))
+}
+
+/// A change the record already shows is final before any link state is read: a down link must
+/// not hide it until the next read.
+fn keeps_identity(found: &Adapter, selected: &Adapter) -> bool {
+    found.stable_id == selected.stable_id
+        && found.index == selected.index
+        && found.prefix_len == selected.prefix_len
+        && found.physical == selected.physical
+        && found.ethernet == selected.ethernet
+        && found.wifi == selected.wifi
+}
+
+/// Whether the selected interface still exists under the index it was selected with. A lookup
+/// that fails for any reason but the name being gone (ENXIO) is unreadable, not a loss.
+fn keeps_index(selected: &Adapter) -> io::Result<bool> {
+    let name = CString::new(selected.name.as_str())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: name is a NUL-terminated C string that outlives the call.
+    let index = unsafe { if_nametoindex(name.as_ptr()) };
+    if index == 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(ENXIO) => Ok(false),
+            _ => Err(error),
+        };
+    }
+    Ok(index == selected.index)
 }
 
 /// `struct ifmediareq` from net/if.h, asking for the status words only. The SDK packs it to 4
@@ -1683,6 +1724,7 @@ mod tests {
         match read_selected_adapter(&listed).unwrap() {
             AdapterReading::Present(read) => assert!(read == listed),
             AdapterReading::Lost => panic!("the listed loopback read back lost"),
+            AdapterReading::Settling => panic!("the listed loopback read back settling"),
         }
     }
 
@@ -1736,17 +1778,33 @@ mod tests {
     }
 
     #[test]
-    fn a_selected_address_or_interface_that_is_gone_reads_as_lost() {
+    fn an_address_missing_from_its_interface_settles_and_a_gone_interface_is_lost() {
         let listed = listed_loopback();
         let readdressed = Adapter {
             address: Ipv4Addr::new(192, 0, 2, 1),
             ..listed.clone()
         };
+        assert!(matches!(
+            read_selected_adapter(&readdressed).unwrap(),
+            AdapterReading::Settling
+        ));
         let renamed = Adapter {
             name: "zz9".to_owned(),
-            ..listed
+            ..readdressed.clone()
         };
-        for gone in [readdressed, renamed] {
+        let renumbered = Adapter {
+            index: listed.index + 1000,
+            ..readdressed
+        };
+        let renumbered_in_place = Adapter {
+            index: listed.index + 1000,
+            ..listed.clone()
+        };
+        let resized = Adapter {
+            prefix_len: listed.prefix_len.wrapping_sub(1),
+            ..listed.clone()
+        };
+        for gone in [renamed, renumbered, renumbered_in_place, resized] {
             assert!(matches!(
                 read_selected_adapter(&gone).unwrap(),
                 AdapterReading::Lost

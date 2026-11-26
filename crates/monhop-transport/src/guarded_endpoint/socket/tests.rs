@@ -1865,6 +1865,88 @@ fn a_policy_violation_still_revokes() {
 }
 
 #[tokio::test]
+async fn a_send_while_the_bound_address_is_away_is_dropped_without_revoking() {
+    let mut failures = vec![SendFailure::Kind(io::ErrorKind::AddrNotAvailable)];
+    if cfg!(windows) {
+        failures.push(SendFailure::Os(10_049)); // WSAEADDRNOTAVAIL
+    } else if cfg!(target_os = "macos") {
+        failures.push(SendFailure::Os(49)); // EADDRNOTAVAIL
+    }
+    for failure in failures {
+        assert_eq!(failure.error().kind(), io::ErrorKind::AddrNotAvailable);
+        let [hub, back, _] = two_member_network();
+        hub.io.fail_sends_to(MEMBERS[0], failure);
+        hub.try_send(&to(MEMBERS[0])).unwrap();
+        assert!(!hub.signal.is_revoked());
+        assert_eq!(hub.dropped[0].sends.load(Ordering::SeqCst), 1);
+        assert_eq!(back.io.inbox.lock().unwrap().arrivals, 0);
+        hub.io.heal_sends();
+        hub.try_send(&to(MEMBERS[0])).unwrap();
+        assert_eq!(back.io.inbox.lock().unwrap().arrivals, 1);
+    }
+}
+
+#[tokio::test]
+async fn a_paused_socket_passes_nothing_until_a_whole_read_resumes_it() {
+    let [hub, first, _] = two_member_network();
+    let mut cx = Context::from_waker(Waker::noop());
+    // Member 0 set aside, so a probe to it would otherwise be sent.
+    hub.reachability.set(&[false, true]);
+    hub.reachability.pause();
+    hub.knocks().set_wanted(true);
+    hub.try_send(&to(MEMBERS[1])).unwrap();
+    hub.probe(MEMBERS[0]);
+    hub.knock(MEMBERS[1]);
+    assert_eq!(hub.io.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(hub.dropped[1].sends.load(Ordering::SeqCst), 1);
+    hub.io.enqueue(Arrival {
+        source: MEMBERS[1],
+        ..arrival()
+    });
+    hub.io.enqueue(knock_from(MOVED));
+    assert!(receive(&hub, &mut cx).0.is_pending());
+    assert_eq!(hub.knocks().candidate(), None, "no knock is learned");
+
+    // A member's move republishes the flags without lifting the pause.
+    hub.reachability.set(&[true, true]);
+    hub.try_send(&to(MEMBERS[0])).unwrap();
+    assert_eq!(hub.io.sends.load(Ordering::SeqCst), 0);
+
+    hub.reachability.resume(&[true, true]);
+    hub.try_send(&to(MEMBERS[0])).unwrap();
+    assert_eq!(hub.io.sends.load(Ordering::SeqCst), 1);
+    assert_eq!(first.io.inbox.lock().unwrap().arrivals, 1);
+    hub.io.enqueue(Arrival {
+        source: MEMBERS[1],
+        ..arrival()
+    });
+    assert!(matches!(receive(&hub, &mut cx).0, Poll::Ready(Ok(1))));
+    assert!(!hub.signal.is_revoked());
+}
+
+#[tokio::test]
+async fn a_paused_socket_drops_a_dial_back_candidate_both_ways() {
+    let [hub, _, _] = two_member_network();
+    let mut cx = Context::from_waker(Waker::noop());
+    let knocks = hub.knocks();
+    knocks.set_wanted(true);
+    hub.io.enqueue(knock_from(MOVED));
+    assert!(receive(&hub, &mut cx).0.is_pending());
+    assert_eq!(knocks.next().await, MOVED);
+    assert!(knocks.dialing(MOVED));
+
+    hub.reachability.pause();
+    hub.try_send(&to(MOVED)).unwrap();
+    assert_eq!(hub.io.sends.load(Ordering::SeqCst), 0);
+    hub.io.enqueue(knock_from(MOVED));
+    assert!(receive(&hub, &mut cx).0.is_pending());
+    hub.reachability.resume(&[true, true]);
+    hub.io.enqueue(knock_from(MOVED));
+    assert!(matches!(receive(&hub, &mut cx).0, Poll::Ready(Ok(1))));
+    assert!(!hub.signal.is_revoked());
+}
+
+#[tokio::test]
 async fn a_member_set_aside_by_a_route_check_is_absent_until_one_finds_it() {
     let [hub, first, second] = two_member_network();
     hub.reachability.set(&[false, true]);

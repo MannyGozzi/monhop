@@ -2,9 +2,8 @@
 //!
 //! This module only subscribes to the dynamic store and the kernel routing socket after a local
 //! enable action. Every notice re-reads the selected interface through the caller's check; a
-//! changed or missing interface, or one that stays unreadable, permanently revokes the watcher. A
-//! notice that the selected interface's link changed revokes without the check. Drop it before an
-//! explicitly reconnected session.
+//! changed or missing interface, or one that stays unreadable, permanently revokes the watcher.
+//! Drop it before an explicitly reconnected session.
 
 use std::{
     error::Error,
@@ -37,6 +36,15 @@ const MAX_LOGGED_KEYS: usize = 6;
 /// Re-reads the selected interface after a change notice; `false` revokes. It runs on the watch
 /// queue or the route check thread, and may block while it reads a network mid-transition again.
 pub type PinnedCheck = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// What a notice that the selected interface's link changed does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkChange {
+    /// Checks like any other notice, so a session rides out a rejoin to the same network.
+    Recheck,
+    /// Revokes without a check: coalesced notices may find the link up again by now.
+    Revoke,
+}
 
 type SCDynamicStoreRef = CFTypeRef;
 type DispatchQueueRef = *mut c_void;
@@ -130,10 +138,15 @@ impl NetworkChangeWatcher {
     pub fn start_after_local_enable(
         interface_name: &str,
         interface_index: u32,
+        link_change: LinkChange,
         still_pinned: PinnedCheck,
     ) -> Result<Self, NetworkWatchError> {
         let patterns = notification_patterns(interface_name)?;
-        let state = Arc::new(WatcherState::new(interface_name, still_pinned));
+        let state = WatcherState::new(still_pinned);
+        let state = Arc::new(match link_change {
+            LinkChange::Recheck => state,
+            LinkChange::Revoke => state.revoking_on_link(interface_name),
+        });
         let power =
             crate::power_watch::PowerWatch::start_after_local_enable(state.signal.clone(), None)
                 .map_err(|_| NetworkWatchError::PowerRegistrationFailed)?;
@@ -189,16 +202,23 @@ impl Drop for NetworkChangeWatcher {
 struct WatcherState {
     signal: RevocationSignal,
     still_pinned: PinnedCheck,
-    /// The dynamic-store key holding the selected interface's link state.
-    link_key: String,
+    /// The dynamic-store key of the selected interface's link state, when a change to it revokes.
+    revoking_link_key: Option<String>,
 }
 
 impl WatcherState {
-    fn new(interface_name: &str, still_pinned: PinnedCheck) -> Self {
+    fn new(still_pinned: PinnedCheck) -> Self {
         Self {
             signal: RevocationSignal::default(),
             still_pinned,
-            link_key: format!("State:/Network/Interface/{interface_name}/Link"),
+            revoking_link_key: None,
+        }
+    }
+
+    fn revoking_on_link(self, interface_name: &str) -> Self {
+        Self {
+            revoking_link_key: Some(format!("State:/Network/Interface/{interface_name}/Link")),
+            ..self
         }
     }
 
@@ -210,10 +230,14 @@ impl WatcherState {
         self.signal.is_revoked()
     }
 
-    /// A change to the selected link's key revokes without a check: the link was active at bind,
-    /// so it went down at least once, and coalesced notices may find it active again by now.
+    /// A change to the selected link's key revokes at once under `LinkChange::Revoke`; otherwise it
+    /// is checked like any other notice, and keeps the session only if the same network reads back.
     fn notice(&self, changed_keys: &[String]) {
-        if !changed_keys.contains(&self.link_key) {
+        if !self
+            .revoking_link_key
+            .as_ref()
+            .is_some_and(|key| changed_keys.contains(key))
+        {
             self.observe(&key_summary(changed_keys));
         } else if !self.is_revoked() {
             self.revoke();
@@ -545,7 +569,7 @@ mod tests {
 
     #[test]
     fn a_notice_with_unchanged_facts_keeps_the_session() {
-        let state = WatcherState::new("en0", Box::new(|| true));
+        let state = WatcherState::new(Box::new(|| true));
         state.observe("State:/Network/Interface/en0/IPv6");
         assert!(!state.is_revoked());
     }
@@ -553,13 +577,10 @@ mod tests {
     fn counted(holds: bool) -> (WatcherState, Arc<std::sync::atomic::AtomicUsize>) {
         let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&runs);
-        let state = WatcherState::new(
-            "en0",
-            Box::new(move || {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                holds
-            }),
-        );
+        let state = WatcherState::new(Box::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            holds
+        }));
         (state, runs)
     }
 
@@ -568,10 +589,8 @@ mod tests {
     }
 
     #[test]
-    fn a_change_to_the_selected_link_revokes_without_a_check() {
-        // Even with the network reading back unchanged, as a link already back up would.
-        let (state, runs) = counted(true);
-        state.notice(&keys(&[
+    fn a_change_to_the_selected_link_rechecks_and_revokes_only_when_the_network_differs() {
+        let rejoin = keys(&[
             "State:/Network/Interface/en0/AirPort",
             "State:/Network/Interface/en0/IPv4",
             "State:/Network/Interface/en0/AirPort/SSID_STR",
@@ -579,9 +598,23 @@ mod tests {
             "State:/Network/Interface/en0/AirPort/ProfileID",
             "State:/Network/Interface/en0/AirPort/WEP40",
             "State:/Network/Interface/en0/Link",
-        ]));
+        ]);
+        for holds in [true, false] {
+            let (state, runs) = counted(holds);
+            state.notice(&rejoin);
+            assert_eq!(state.is_revoked(), !holds);
+            assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        // A pairing listener's watch revokes without a check, even with the network unchanged.
+        let (state, runs) = counted(true);
+        let state = state.revoking_on_link("en0");
+        state.notice(&rejoin);
         assert!(state.is_revoked());
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let (state, _) = counted(true);
+        let state = state.revoking_on_link("en0");
+        state.notice(&keys(&["State:/Network/Interface/en1/Link"]));
+        assert!(!state.is_revoked());
     }
 
     #[test]
@@ -616,14 +649,14 @@ mod tests {
 
     #[test]
     fn a_notice_with_changed_facts_revokes() {
-        let state = WatcherState::new("en0", Box::new(|| false));
+        let state = WatcherState::new(Box::new(|| false));
         state.observe("State:/Network/Interface/en0/IPv4");
         assert!(state.is_revoked());
     }
 
     #[test]
     fn a_panicking_check_revokes_instead_of_unwinding() {
-        let state = WatcherState::new("en0", Box::new(|| -> bool { panic!("check failed") }));
+        let state = WatcherState::new(Box::new(|| -> bool { panic!("check failed") }));
         state.observe("State:/Network/Global/IPv4");
         assert!(state.is_revoked());
     }
@@ -638,7 +671,7 @@ mod tests {
 
     #[test]
     fn route_changes_queue_one_check_without_waiting_and_a_stopped_listener_keeps_the_session() {
-        let state = WatcherState::new("en0", Box::new(|| true));
+        let state = WatcherState::new(Box::new(|| true));
         let (changes, pending) = sync_channel(1);
         let reads = [
             RouteChange::Added,
@@ -655,7 +688,7 @@ mod tests {
 
     #[test]
     fn a_route_change_with_no_checker_left_revokes() {
-        let state = WatcherState::new("en0", Box::new(|| true));
+        let state = WatcherState::new(Box::new(|| true));
         let (changes, pending) = sync_channel(1);
         drop(pending);
         let reads = vec![Ok(Some(RouteChange::Changed)), Ok(Some(RouteChange::Added))];
@@ -678,7 +711,7 @@ mod tests {
 
     #[test]
     fn a_failed_route_read_revokes() {
-        let state = WatcherState::new("en0", Box::new(|| true));
+        let state = WatcherState::new(Box::new(|| true));
         let (changes, _pending) = sync_channel(1);
         let reads = vec![Err(io::Error::other("routing socket closed"))];
         forward_route_changes(route_reads(reads), &changes, &state);
@@ -697,7 +730,7 @@ mod tests {
 
     #[test]
     fn revocation_latch_is_irreversible() {
-        let state = WatcherState::new("en0", Box::new(|| true));
+        let state = WatcherState::new(Box::new(|| true));
         assert!(!state.is_revoked());
         state.revoke();
         assert!(state.is_revoked());
@@ -706,7 +739,7 @@ mod tests {
     #[test]
     fn dropping_owner_revokes_escaped_socket_signal() {
         let watcher = NetworkChangeWatcher {
-            state: Arc::new(WatcherState::new("en0", Box::new(|| true))),
+            state: Arc::new(WatcherState::new(Box::new(|| true))),
             registration: None,
         };
         let signal = watcher.revocation_signal();
@@ -717,7 +750,7 @@ mod tests {
 
     #[test]
     fn registration_failure_revokes_and_propagates() {
-        let state = WatcherState::new("en0", Box::new(|| true));
+        let state = WatcherState::new(Box::new(|| true));
         assert_eq!(
             require_native_success(&state, 0, NetworkWatchError::DispatchRegistrationFailed,),
             Err(NetworkWatchError::DispatchRegistrationFailed)
@@ -727,14 +760,14 @@ mod tests {
 
     #[test]
     fn failed_unregistration_revokes_without_rearming() {
-        let state = WatcherState::new("en0", Box::new(|| true));
+        let state = WatcherState::new(Box::new(|| true));
         record_unregistration_result(&state, 0);
         assert!(state.is_revoked());
     }
 
     #[test]
     fn context_retain_release_keeps_state_alive_for_native_callbacks() {
-        let state = Arc::new(WatcherState::new("en0", Box::new(|| true)));
+        let state = Arc::new(WatcherState::new(Box::new(|| true)));
         let weak = Arc::downgrade(&state);
         let info = Arc::as_ptr(&state).cast::<c_void>();
 
@@ -750,9 +783,13 @@ mod tests {
     fn native_repeated_immediate_start_drop_is_bounded() {
         let started = Instant::now();
         for _ in 0..NATIVE_LIFECYCLE_ITERATIONS {
-            let watcher =
-                NetworkChangeWatcher::start_after_local_enable("lo0", 1, Box::new(|| true))
-                    .unwrap();
+            let watcher = NetworkChangeWatcher::start_after_local_enable(
+                "lo0",
+                1,
+                LinkChange::Recheck,
+                Box::new(|| true),
+            )
+            .unwrap();
             let signal = watcher.revocation_signal();
             drop(watcher);
             assert!(signal.is_revoked());

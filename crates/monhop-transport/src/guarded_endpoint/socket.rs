@@ -79,6 +79,12 @@ fn destination_unreachable(error: &io::Error) -> bool {
         .is_some_and(|code| UNREACHABLE_SEND_ERRORS.contains(&code))
 }
 
+/// A send that failed because the bound address is off this computer for now, as while a Wi-Fi
+/// rejoin has the link down. Nothing left, and the network check decides whether it comes back.
+fn source_away(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AddrNotAvailable
+}
+
 /// A QUIC long-header Initial, the only packet that makes Quinn queue a new incoming handshake.
 fn is_first_packet(datagram: &[u8]) -> bool {
     datagram.first().is_some_and(|first| first & 0xB0 == 0x80)
@@ -98,6 +104,9 @@ pub(super) type Prober = Box<dyn Fn(SocketAddrV4) + Send + Sync>;
 /// finds its route. Shared by the route checks, the socket and the dialer.
 pub(super) struct Reachability {
     unreachable: Box<[AtomicBool]>,
+    /// While the selected network is between states no member is reachable, whatever the flags
+    /// say, and nothing else passes either, until a whole read lifts it.
+    paused: AtomicBool,
     /// Woken by every verdict that leaves a member set aside.
     set_aside: Notify,
 }
@@ -107,6 +116,7 @@ impl Reachability {
     pub(super) fn new(members: usize) -> Arc<Self> {
         Arc::new(Self {
             unreachable: (0..members).map(|_| AtomicBool::new(false)).collect(),
+            paused: AtomicBool::new(false),
             set_aside: Notify::new(),
         })
     }
@@ -116,15 +126,42 @@ impl Reachability {
     }
 
     pub(super) fn reaches(&self, member: usize) -> bool {
-        self.unreachable
-            .get(member)
-            .is_some_and(|unreachable| !unreachable.load(Ordering::Acquire))
+        !self.is_paused()
+            && self
+                .unreachable
+                .get(member)
+                .is_some_and(|unreachable| !unreachable.load(Ordering::Acquire))
     }
 
     pub(super) fn reaches_all(&self) -> bool {
-        self.unreachable
-            .iter()
-            .all(|unreachable| !unreachable.load(Ordering::Acquire))
+        !self.is_paused()
+            && self
+                .unreachable
+                .iter()
+                .all(|unreachable| !unreachable.load(Ordering::Acquire))
+    }
+
+    pub(super) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Stops every datagram in either direction, probes, knocks and dial-backs included.
+    pub(super) fn pause(&self) {
+        if !self.paused.swap(true, Ordering::AcqRel) {
+            log::info!(
+                "guarded socket: the selected network is between states; nothing passes until it \
+                 reads back whole"
+            );
+        }
+        self.set_aside.notify_one();
+    }
+
+    /// Takes a whole read's verdict and lifts a pause, which `set` alone never does.
+    pub(super) fn resume(&self, reachable: &[bool]) {
+        self.set(reachable);
+        if self.paused.swap(false, Ordering::AcqRel) {
+            log::info!("guarded socket: the selected network read back whole; traffic resumes");
+        }
     }
 
     /// Resolves once a verdict leaves some member set aside.
@@ -789,6 +826,9 @@ impl<I: DatagramIo> GuardedSocket<I> {
     /// Otherwise, while a member is wanted, a host of the selected subnet on this socket's port
     /// knocks: it may become the next candidate, and its datagram is dropped either way.
     fn unrecorded(&self, source: SocketAddrV4) -> Option<usize> {
+        if self.reachability.is_paused() {
+            return None;
+        }
         if self.knocks.dialing(source) {
             return Some(self.candidate_slot());
         }
@@ -872,7 +912,7 @@ impl<I: DatagramIo> GuardedSocket<I> {
             self.revoke_because(&"a probe left the pinned peers");
             return;
         };
-        if self.reachability.reaches(member) {
+        if self.reachability.is_paused() || self.reachability.reaches(member) {
             return;
         }
         self.settle_priority();
@@ -914,6 +954,9 @@ impl<I: DatagramIo> GuardedSocket<I> {
             self.revoke_because(&"a knock left the pinned peers");
             return;
         };
+        if self.reachability.is_paused() {
+            return;
+        }
         self.settle_priority();
         match self.io.try_send_to(transmit.contents, destination) {
             Ok(length) if length == PROBE.len() => {}
@@ -958,13 +1001,15 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
             return Err(io::ErrorKind::WouldBlock.into());
         };
         // Reported as sent: QUIC loss recovery owns a datagram that cannot leave.
-        if self.is_member(member) && !self.reachability.reaches(member) {
-            count_drop(
-                &self.dropped[member].sends,
-                member,
-                "datagrams",
-                &"no usable route",
-            );
+        let held = if self.reachability.is_paused() {
+            Some("the selected network is between states")
+        } else if self.is_member(member) && !self.reachability.reaches(member) {
+            Some("no usable route")
+        } else {
+            None
+        };
+        if let Some(cause) = held {
+            count_drop(&self.dropped[member].sends, member, "datagrams", &cause);
             return Ok(());
         }
         self.settle_priority();
@@ -979,7 +1024,7 @@ impl<I: DatagramIo> AsyncUdpSocket for GuardedSocket<I> {
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(error),
-            Err(error) if destination_unreachable(&error) => {
+            Err(error) if destination_unreachable(&error) || source_away(&error) => {
                 // EHOSTUNREACH alone; EHOSTDOWN is a host that stopped answering, not a refusal.
                 if error.kind() == io::ErrorKind::HostUnreachable {
                     self.refusals.refuse(member);

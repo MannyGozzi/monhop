@@ -4,6 +4,14 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+### Fixed
+
+- Sharing now carries on when a Mac rejoins the same Wi-Fi network, such as when it moves to the router's faster band. The rejoin takes the Mac's Wi-Fi away for about a second, and sharing used to end and take about five seconds to reconnect. Now sharing pauses for that second and continues, as long as the Mac comes back on the same network at the same address. Moving to another network still ends sharing. A Windows PC that rejoins Wi-Fi still reconnects, because Windows takes longer to come back than sharing can wait.
+
+### Security
+
+- Updated cookie to 0.18.3 and url to 2.5.9, libraries under the app window and the update check, to fix private cookie nonces that could repeat after a fork and a crash on deeply nested blob addresses (RUSTSEC-2026-0594, RUSTSEC-2026-0592).
+
 ## [0.2.23] - 2026-11-17
 
 ### Fixed

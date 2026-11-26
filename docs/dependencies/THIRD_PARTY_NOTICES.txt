@@ -6321,7 +6321,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
-===== cookie 0.18.2 / LICENSE-APACHE =====
+===== cookie 0.18.3 / LICENSE-APACHE =====
 
                               Apache License
                         Version 2.0, January 2004
@@ -6526,7 +6526,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-===== cookie 0.18.2 / LICENSE-MIT =====
+===== cookie 0.18.3 / LICENSE-MIT =====
 
 Copyright (c) 2017 Sergio Benitez
 Copyright (c) 2014 Alex Crichton
@@ -18279,7 +18279,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-===== form_urlencoded 1.2.2 / LICENSE-APACHE =====
+===== form_urlencoded 1.2.3 / LICENSE-APACHE =====
 
                               Apache License
                         Version 2.0, January 2004
@@ -18483,7 +18483,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-===== form_urlencoded 1.2.2 / LICENSE-MIT =====
+===== form_urlencoded 1.2.3 / LICENSE-MIT =====
 
 Copyright (c) 2013-2016 The rust-url developers
 
@@ -55458,7 +55458,7 @@ DEALINGS IN THE SOFTWARE.
 // ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-===== url 2.5.8 / LICENSE-APACHE =====
+===== url 2.5.9 / LICENSE-APACHE =====
 
                               Apache License
                         Version 2.0, January 2004
@@ -55662,7 +55662,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-===== url 2.5.8 / LICENSE-MIT =====
+===== url 2.5.9 / LICENSE-MIT =====
 
 Copyright (c) 2013-2025 The rust-url developers
 

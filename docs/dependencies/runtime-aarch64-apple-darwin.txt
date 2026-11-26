@@ -19,7 +19,7 @@ cfb v0.7.3 MIT
 cfg-if v1.0.4 MIT OR Apache-2.0
 chacha20 v0.10.2 MIT OR Apache-2.0
 const-oid v0.10.2 Apache-2.0 OR MIT
-cookie v0.18.2 MIT OR Apache-2.0
+cookie v0.18.3 MIT OR Apache-2.0
 core-foundation v0.10.1 MIT OR Apache-2.0
 core-foundation v0.9.4 MIT OR Apache-2.0
 core-foundation-sys v0.8.7 MIT OR Apache-2.0
@@ -53,7 +53,7 @@ flate2 v1.1.10 MIT OR Apache-2.0
 fnv v1.0.7 Apache-2.0 / MIT
 foreign-types v0.5.0 MIT/Apache-2.0
 foreign-types-shared v0.3.1 MIT/Apache-2.0
-form_urlencoded v1.2.2 MIT OR Apache-2.0
+form_urlencoded v1.2.3 MIT OR Apache-2.0
 futures-channel v0.3.34 MIT OR Apache-2.0
 futures-core v0.3.34 MIT OR Apache-2.0
 futures-sink v0.3.34 MIT OR Apache-2.0
@@ -217,7 +217,7 @@ unic-ucd-ident v0.9.0 MIT/Apache-2.0
 unic-ucd-version v0.9.0 MIT/Apache-2.0
 unicode-segmentation v1.13.3 MIT OR Apache-2.0
 untrusted v0.9.0 ISC
-url v2.5.8 MIT OR Apache-2.0
+url v2.5.9 MIT OR Apache-2.0
 urlpattern v0.3.0 MIT
 utf8_iter v1.0.4 Apache-2.0 OR MIT
 uuid v1.26.1 Apache-2.0 OR MIT
