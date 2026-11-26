@@ -4,6 +4,8 @@ All notable changes to MonHop are recorded here. The format follows Keep a Chang
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-11-26
+
 ### Fixed
 
 - Sharing now carries on when a Mac rejoins the same Wi-Fi network, such as when it moves to the router's faster band. The rejoin takes the Mac's Wi-Fi away for about a second, and sharing used to end and take about five seconds to reconnect. Now sharing pauses for that second and continues, as long as the Mac comes back on the same network at the same address. Moving to another network still ends sharing. A Windows PC that rejoins Wi-Fi still reconnects, because Windows takes longer to come back than sharing can wait.
@@ -439,7 +441,8 @@ Use one keyboard and mouse across Mac and Windows. Pair once, then switch comput
 - Apple notarization and Windows publisher signing are not configured. Your operating system may block or warn about installation.
 - macOS permissions may need approval again after an update.
 
-[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.23...HEAD
+[Unreleased]: https://github.com/MannyGozzi/monhop/compare/v0.2.24...HEAD
+[0.2.24]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.24
 [0.2.23]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.23
 [0.2.22]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.22
 [0.2.21]: https://github.com/MannyGozzi/monhop/releases/tag/v0.2.21
